@@ -190,13 +190,20 @@ function loadAll(report) {
     }
   }
 
+  // ASKED BY PRESENCE FIRST, for the same reason the PUBLIC_STORE check above is — and this is where that
+  // rule was written down and then not applied. On a fresh install this directory has never been created,
+  // so the guarded read below fired `guardExternalSync`'s own ⚠️ line before the ENOENT branch could
+  // decide it was not news: **the first thing a new person saw was the word "failed"**, about a folder
+  // whose absence is the correct state of a machine nobody has hired a contractor on yet. The branch that
+  // suppressed the REPORT could never suppress the guard's warning, because the guard logs at the moment
+  // it catches. A directory either exists or it does not, which is a question with an answer.
+  if (!fs.existsSync(MEMORY_DIR)) return out;
+
   const listed = guardExternalSync(TAG, `list ${MEMORY_DIR}`, () => fs.readdirSync(MEMORY_DIR));
   if (!listed.ok) {
-    // ENOENT IS THE FIRST RUN AND IS NOT NEWS. Any other code is — the directory exists and could not be
-    // read, which means player memory may be there and is not being loaded.
-    if (listed.error.code !== 'ENOENT') {
-      report(`${TAG}: could not read ${MEMORY_DIR} (${listed.reason}) — starting with no player memory.`);
-    }
+    // IT EXISTED A MOMENT AGO AND WOULD NOT READ, which is news whatever the code: player memory may be
+    // sitting there and not being loaded.
+    report(`${TAG}: could not read ${MEMORY_DIR} (${listed.reason}) — starting with no player memory.`);
     return out;
   }
   let players = 0, rooms = 0, stations = 0;

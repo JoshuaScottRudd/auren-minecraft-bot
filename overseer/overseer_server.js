@@ -946,12 +946,33 @@ function onConnection(ws) {
 const wss = new WebSocket.Server({ port: PORT });
 wss.on('connection', onConnection);
 
+// A PORT ALREADY IN USE IS THE FIRST ERROR A NEW PERSON MEETS, and it reached them as an unhandled
+// 'error' event: a nine-line Node stack naming `websocket-server.js` and the word EADDRINUSE, which
+// says nothing about what they did or what to do. The commonest cause is the most innocent one —
+// running a launcher twice, or leaving yesterday's overseer alive — so it is a world-fact rather than a
+// coding violation, and it is refused in the world's terms with the two things that actually fix it
+// (Law 13: every failure states exactly what caused it; Law 25: a message that does not say what to do
+// costs a search). Anything else is re-thrown untouched rather than swallowed into this one diagnosis.
+const listenFailure = (which) => (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`\n  The overseer cannot start: something is already using port ${err.port || PORT}`
+      + ` (${which}).\n`
+      + `\n  Almost always this is an overseer that is already running — a second launcher, or one left`
+      + `\n  over from earlier. There is only meant to be one.\n`
+      + `\n  Either use the one that is running, or close it and start again.\n`);
+    process.exit(1);
+  }
+  throw err;
+};
+wss.on('error', listenFailure('the fleet port'));
+
 // The second door. Bound to localhost EXPLICITLY, unlike the fleet port: this is the one surface that
 // carries a stranger's authority, and the machine it runs on is the only place it has any business
 // being reachable from. A door open to the network would let anything that can route to this host
 // command the contractors without ever joining the world the foreman listens in.
 const ingameDoor = new WebSocket.Server({ port: INGAME_DOOR_PORT, host: '127.0.0.1' });
 ingameDoor.on('connection', onIngameConnection);
+ingameDoor.on('error', listenFailure('the in-game door'));
 
 // Startup banner (bright magenta, bold) — deliberately a DIFFERENT colour from the bots' cyan banner
 // so the two window types are told apart at a glance. This is the one window that carries the whole

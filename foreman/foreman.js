@@ -27,13 +27,12 @@
 // foreman's own listing shows both species because a human standing in the world should be able to see
 // what is out there; it simply does not offer to command the ones that were never fetched for them.
 //
-// WHY IT SHELLS OUT TO fleet_control RATHER THAN SPAWNING master_core ITSELF: fleet_control's
-// `botStart` is the ONE launcher of master_core in the tree (Law 16), and it owns three things this
-// file must not re-derive — the roster ceiling, the already-running check, and the standing rule that
-// every fleet process gets its OWN VISIBLE CONSOLE WINDOW. A second spawn path here would be a second
-// place to keep those in step, and the windowless-orphan rule exists because one already got out.
+// WHY IT SPAWNS `start_bot.js` RATHER THAN REQUIRING master_core ITSELF: `start_bot.js` is the ONE birth
+// in this tree (Law 16) — it stamps the mandate, and every other caller including the Architect's own
+// `fleet_control` goes through it. A second spawn path here would be a second place a bot can be born
+// wrong. See `startBot()` below for what that inherited and what it did not.
 //
-// Run:  node Auren_Workshop/fleet_control.js foreman-start        (never directly — it wants its own window)
+// Run:  node start_contractor_bots.js        (raises the overseer and this desk together)
 
 const path = require('path');
 const { spawn } = require('child_process');
@@ -192,26 +191,79 @@ function log(msg) {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-// Talking to fleet_control — the one launcher
+// Fetching a body — through start_bot.js, the one birth
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-// Runs a fleet_control verb and hands back what it actually printed. The OUTPUT is the answer, never
-// the exit code alone: `bot-start` reports "already running" and succeeds, which is a different fact
-// from having started one, and a human who asked for a bot needs to be told which happened (Law 25).
-function fleetControl(args) {
+// Launches ONE contractor body and hands back what happened.
+//
+// ── IT SPAWNS `start_bot.js`, WHICH IS THE TREE'S ONE BIRTH (Law 16) ─────────────────────────────────
+// It used to spawn `fleet_control.js`, and that had been BROKEN since the workshop carve (commit
+// 4296854) moved the file to `Auren_Workshop/` without repointing this line — the path resolved under
+// `Auren_Bot/`, where no such file exists, so every `get` reached a human as "could not run
+// fleet_control". The carve is also why pointing it back would be wrong rather than merely awkward:
+// `fleet_control` is the Architect's own equipment and does not ship, so a desk that needs it is a desk
+// that only works on his machine. `start_bot.js` is the file the whole split was built around — it
+// stamps the mandate, it is what `fleet_control` itself spawns, and it exists in every copy.
+//
+// ── WHAT MOVED HERE WITH IT, AND WHAT DID NOT ────────────────────────────────────────────────────────
+// `fleet_control.botStart` owned three things this file deliberately does not re-derive: the roster
+// ceiling, the already-running check, and a visible console window per process. The first two are
+// answered upstream — the caller picks from bots the overseer reports FREE, so a name that is already
+// working is never passed here. The third is workshop behaviour: it exists because his fleet is twenty
+// windows he watches, and a published copy has one terminal that everything streams into.
+//
+// ── IT RESOLVES ON LAUNCH, NOT ON EXIT, AND THAT IS THE REAL CHANGE ──────────────────────────────────
+// `bot-start` was a command that returned; `start_bot.js` REQUIRES master_core in its own process, so it
+// does not return until the bot dies. Awaiting `close` here would hang the desk for the life of the bot.
+// Resolving on launch is also more honest: a launcher returning was never evidence a body stood up, and
+// the caller already polls the overseer's registry for the arrival, which is the world's fact rather than
+// the launcher's (Law 26). An exit inside the grace window is the one thing that IS evidence — of
+// failure — so it is reported with whatever the child managed to say.
+const BOT_LAUNCH_GRACE_MS = 3000;
+
+// Bodies this desk fetched, so they leave when it does (Law 8 — whatever raised a process terminates it).
+// Without this, Ctrl-C on the desk leaves a crew running under roster names nothing can hand out again.
+const fetched = [];
+
+function startBot(botId, owner) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [path.join(BOT_DIR, 'fleet_control.js'), ...args], {
+    const child = spawn(process.execPath, [path.join(BOT_DIR, 'start_bot.js')], {
       cwd: BOT_DIR,
-      env: process.env,
+      // The mandate, stamped as environment because that is the path `start_bot.js` documents for a
+      // non-human caller: an absent flag falls back to the variable it would have set, so this passes
+      // through whole. BOT_ID is overridden explicitly — this process carries `foreman` in it for its
+      // own record, and inheriting that would file the bot's log under the desk.
+      env: { ...process.env, BOT_ID: botId, BOT_MODE: 'contractor', BOT_OWNER: owner },
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
+    fetched.push(child);
+
     let out = '';
+    let settled = false;
+    const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
+
     child.stdout.on('data', d => { out += d.toString(); });
     child.stderr.on('data', d => { out += d.toString(); });
-    child.on('close', code => resolve({ code, out: out.trim() }));
-    child.on('error', e => resolve({ code: -1, out: `could not run fleet_control: ${e.message}` }));
+    child.on('error', e => finish({ code: -1, out: `could not start ${botId}: ${e.message}` }));
+    child.on('exit', code => finish({
+      code,
+      out: out.trim() || `${botId}: stopped immediately (exit ${code}) — nothing was said about why`,
+    }));
+    setTimeout(() => finish({ code: 0, out: `${botId}: launched` }), BOT_LAUNCH_GRACE_MS);
   });
 }
+
+// Ends every body this desk fetched. Registered for the ordinary exits and for Ctrl-C, because a desk
+// killed at the keyboard is the common case rather than the exotic one.
+function releaseFetched() {
+  for (const child of fetched) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+  }
+}
+process.on('exit', releaseFetched);
+process.on('SIGINT', () => { releaseFetched(); process.exit(0); });
+process.on('SIGTERM', () => { releaseFetched(); process.exit(0); });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // The vocabulary
@@ -219,8 +271,8 @@ function fleetControl(args) {
 
 // TWO KINDS OF WORD, AND THEY TAKE DIFFERENT ROADS FOR A REASON THAT IS NOT INCIDENTAL.
 //
-//   get / list / help — the CLERK's own words. `get` starts an OS process, which fleet_control owns
-//           along with the roster ceiling, the already-running check and the visible-window rule
+//   get / list / help — the CLERK's own words. `get` starts an OS process by spawning `start_bot.js`,
+//           the one birth; the FREE-bot list read off the live fleet is what keeps it off a busy name
 //           (Law 16). Nothing about a process launch is an operator verb.
 //   every OPERATOR VERB — travels the in-game door instead. Sent through fleet_control they would be
 //           stamped TERMINAL, because fleet_control's socket IS the operator's console, and a human in
@@ -454,8 +506,8 @@ async function handle(from, text, reply) {
       : `you have ${mine.map(b => b.id).join(' and ')} — getting ${crew.join(' and ')} to finish the crew...`);
     // THE OWNER IS STAMPED AT EACH LAUNCH, which is what makes it un-forgeable later: it becomes an
     // environment fact of that process, the bot declares it on register, and no message anywhere can
-    // change whose it is. Launched in sequence rather than together because fleet_control owns the
-    // already-running check and the roster ceiling, and two concurrent launches would race it.
+    // change whose it is. Launched in sequence rather than together because two concurrent launches
+    // would race the FREE-bot list this crew was chosen from.
     // ── ONE BODY AT A TIME: LAUNCH IT, WAIT FOR IT TO STAND, BRING IT OVER, THEN THE NEXT ──────────
     // (Architect 2026-09-05, on the dedicated server: *"foreman only spawns one bot and doesent teleport
     // it to the player. it works when i do the local server but not on the dedicated."*)
@@ -470,7 +522,7 @@ async function handle(from, text, reply) {
     // for each body to REGISTER before launching the next spaces the knocks by however long a real join
     // takes, and `CREW_LAUNCH_GAP_MS` is the floor for when a body fails so fast there is nothing to wait
     // for. Sequencing on the launcher's RETURN was never sequencing at all — that is Law 26's line again:
-    // `bot-start` returning is the launcher's fact, a body registering is the world's.
+    // the launcher returning is its own fact; a body registering is the world's.
     //
     // THE MISSING TELEPORT, and it is the same phase boundary from the other side. The teleport used to
     // run after the wait for the WHOLE crew, so one body arriving and one never coming meant the person
@@ -490,8 +542,8 @@ async function handle(from, text, reply) {
     for (let i = 0; i < crew.length; i++) {
       const target = crew[i];
       if (i > 0) await new Promise(r => setTimeout(r, CREW_LAUNCH_GAP_MS));
-      const r = await fleetControl(['bot-start', target, '--mode=contractor', `--owner=${from}`]);
-      said.push(firstMeaningfulLine(r.out) || `${target}: fleet_control exited ${r.code}`);
+      const r = await startBot(target, from);
+      said.push(firstMeaningfulLine(r.out) || `${target}: the launcher exited ${r.code}`);
 
       // POLLED, NEVER SLEPT-THEN-CHECKED: a body that registers in four seconds is brought over in four
       // seconds, and a fixed wait would make the fast case cost as much as the worst one.
@@ -522,7 +574,7 @@ async function handle(from, text, reply) {
     // ── WHAT ARRIVED IS ASKED OF THE FLEET, NEVER QUOTED FROM THE LAUNCHER ─────────────────────────
     // A launcher says whether it STARTED a process; the overseer's registry says whether a body is
     // STANDING IN THE WORLD. Those are different facts and they diverge exactly when something has gone
-    // wrong, so grading `get` on `bot-start`'s own output is a component reporting on itself (Law 26).
+    // wrong, so grading `get` on the launcher's own output is a component reporting on itself (Law 26).
     // `tools/foreman_probe.js` has always graded this on the server's player list for that reason; the
     // loop above is the live desk holding the same standard.
     //
@@ -909,7 +961,7 @@ function describeDoorResult(verb, r) {
 // the crew branch now takes the first CREW_SIZE free names in the same seniority order, in the one place
 // that needs them. The rule those two carried and the crew branch still honours: the ROSTER is read off
 // the LIVE fleet, never off the launcher's PID file, which remembers processes that died last week
-// (Invariant B) — and fleet_control remains the final arbiter of whether a name may launch.
+// (Invariant B) — and a name reaches `startBot` only after the live fleet has reported it FREE.
 
 function firstMeaningfulLine(out) {
   if (!out) return null;
