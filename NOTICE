@@ -1,0 +1,15 @@
+Auren
+Copyright 2026 Joshua Rudd
+
+This product includes software developed by Joshua Rudd.
+
+Licensed under the Apache License, Version 2.0. See LICENSE for the full terms.
+
+The Structural Laws (Auren_Structural_Laws.md, Auren_Structural_Laws_LLM.md and
+Auren_Structural_Laws_Glossary.md) are authored design philosophy distributed under the
+same terms as the code they govern.
+
+This software connects to Minecraft servers using third-party libraries, each under its
+own license. Their terms are in node_modules/ after `npm install`, and their names and
+versions are declared in package.json. Auren is not affiliated with or endorsed by
+Mojang Studios or Microsoft.

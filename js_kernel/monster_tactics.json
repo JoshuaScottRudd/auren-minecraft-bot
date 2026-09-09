@@ -1,0 +1,2751 @@
+{
+  "_meta": {
+    "purpose": "What every hostile DOES — its own tactics, not the bot's counters. Read monster_tactics_registry.js before using this.",
+    "authored": "2026-07-30",
+    "game_version": "Java 1.21.5 (matches master_core.js:54)",
+    "difficulty_basis": "normal — melee damage is typically x1.5 on hard and x0.5 on easy; several effects (cave spider poison, husk hunger) do not apply on easy at all",
+    "CONFIDENCE": {
+      "warning": "This document is AUTHORED FROM KNOWLEDGE, NOT MEASURED IN-WORLD. Nothing here has been observed by this fleet. Treat every field as a CLAIM to verify (Law 23), never as a sensed fact — a counter built on a wrong number will fail in a way that looks like bad tactics rather than bad data.",
+      "high": [
+        "health",
+        "group",
+        "approach.style",
+        "attack.kind",
+        "aggro.triggers",
+        "special",
+        "exploitable"
+      ],
+      "medium": [
+        "attack.damage_normal",
+        "attack.range",
+        "aggro.range"
+      ],
+      "low": [
+        "approach.speed_attribute",
+        "attack.interval_ms",
+        "approach.speed_relative"
+      ],
+      "verify_first": "approach.speed_relative decides whether the bot can disengage on foot at all. It is the lowest-confidence field with the highest consequence — measure it before any counter relies on outrunning something."
+    },
+    "VOCABULARY": {
+      "note": "Closed enums, so the interpreter reads a contract and not free text (Law 10). `group` is the TACTICAL taxonomy: two monsters share a group only if the SAME counter, unmodified, works on both. It replaced a descriptive `archetype` field on 2026-07-30 — two taxonomies over the same 42 monsters was a redundant route that would have drifted (Law 16). The RUNTIME authority is the table in combat_utils.js; this field is the design-time record and monster_tactics_test asserts the two agree.",
+      "hostility": [
+        "hostile",
+        "neutral",
+        "boss"
+      ],
+      "group": [
+        "BRAWLER",
+        "DETONATOR",
+        "ARCHER",
+        "CASTER",
+        "BRUISER",
+        "JUGGERNAUT",
+        "SWARM_CALLER",
+        "SPLITTER",
+        "SWOOPER",
+        "PHASER",
+        "TELEPORTER",
+        "OBSERVER_LOCKED",
+        "TURRET",
+        "DISPLACER",
+        "UNWINNABLE"
+      ],
+      "approach.style": [
+        "closes",
+        "kites",
+        "holds_distance",
+        "hops",
+        "climbs_to",
+        "swoops",
+        "charges",
+        "stationary",
+        "phases",
+        "erratic",
+        "freezes_when_observed"
+      ],
+      "aggro.triggers": [
+        "proximity_los",
+        "looked_at",
+        "damaged",
+        "ally_damaged",
+        "player_action",
+        "vibration",
+        "smell",
+        "unobserved",
+        "always_hostile",
+        "low_light"
+      ],
+      "attack.kind": [
+        "melee",
+        "projectile",
+        "explosion",
+        "spell",
+        "beam",
+        "sonic",
+        "contact"
+      ],
+      "threat.tier": [
+        "trivial",
+        "low",
+        "moderate",
+        "high",
+        "extreme"
+      ]
+    },
+    "FIELD_NOTES": {
+      "aggro.range": "blocks at which it will BEGIN pursuing, not the range at which it can attack",
+      "attack.range": "0 for melee-only; for projectile users this is effective firing range",
+      "approach.preferred_range": "the gap it TRIES to hold. 0 = wants to be in your face; >0 = it will back off if the bot closes inside this",
+      "exploitable": "mechanical openings the monster's own behaviour creates. Still facts about the MONSTER — the bot's counter for each is a separate layer and is deliberately not in this file",
+      "unverified": "per-monster list of claims I am least sure of, so review lands there first"
+    }
+  },
+  "monsters": {
+    "zombie": {
+      "display": "Zombie",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "BRAWLER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 20,
+      "armor": 2,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 35,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_relentlessly_until_dead_or_target_lost"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.23,
+        "speed_relative": "slower_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 3,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": "hard_difficulty_only",
+        "pathfinds": true
+      },
+      "special": [
+        "burns in daylight unless in water, in shade, or wearing a helmet",
+        "calls REINFORCEMENTS when damaged — nearby zombies aggro and new ones may spawn (hard difficulty)",
+        "also targets villagers, iron golems and turtle eggs, so it may already be busy when found"
+      ],
+      "exploitable": [
+        "slower than a walking player — disengaging on flat ground always works",
+        "cannot open doors below hard difficulty; a closed door is a full stop",
+        "daylight kills it unaided if the fight can be stalled to sunrise"
+      ],
+      "threat": {
+        "tier": "low",
+        "why": "no ranged option, slower than the bot, and its damage is small; dangerous only in numbers or in a corner"
+      },
+      "unverified": [
+        "reinforcement radius",
+        "interval_ms"
+      ]
+    },
+    "zombie_villager": {
+      "display": "Zombie Villager",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "BRAWLER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 20,
+      "armor": 2,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 35,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_relentlessly_until_dead_or_target_lost"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.23,
+        "speed_relative": "slower_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 3,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": "hard_difficulty_only",
+        "pathfinds": true
+      },
+      "special": [
+        "mechanically a zombie in every combat respect",
+        "CURABLE with a splash weakness potion + golden apple — the only hostile in this file that is worth more alive than dead"
+      ],
+      "exploitable": [
+        "identical to zombie"
+      ],
+      "threat": {
+        "tier": "low",
+        "why": "a zombie, with an economic reason not to kill it"
+      },
+      "unverified": []
+    },
+    "husk": {
+      "display": "Husk",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "BRAWLER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 20,
+      "armor": 2,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 35,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_relentlessly_until_dead_or_target_lost"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.23,
+        "speed_relative": "slower_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 3,
+        "effects": [
+          "hunger_7s"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": "hard_difficulty_only",
+        "pathfinds": true
+      },
+      "special": [
+        "DOES NOT BURN IN DAYLIGHT — the stall-until-sunrise option that works on zombies does not work here",
+        "applies Hunger, which drains saturation and blocks natural regeneration during a long fight",
+        "converts to a normal zombie if submerged in water"
+      ],
+      "exploitable": [
+        "still slower than a walking player",
+        "desert-only, so encounters are biome-predictable"
+      ],
+      "threat": {
+        "tier": "low",
+        "why": "a zombie that survives the day and taxes food"
+      },
+      "unverified": [
+        "hunger duration on normal"
+      ]
+    },
+    "drowned": {
+      "display": "Drowned",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "BRAWLER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 20,
+      "armor": 2,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 20,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_in_water_relentlessly"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.23,
+        "speed_relative": "slower_on_land_faster_in_water"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 3,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "attack_ranged": {
+        "kind": "projectile",
+        "weapon": "trident",
+        "range": 20,
+        "damage_normal": 9,
+        "condition": "only if holding a trident",
+        "interval_ms": 1500
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": "hard_difficulty_only",
+        "pathfinds": true
+      },
+      "special": [
+        "a TRIDENT-carrying drowned is a ranged threat for 9 damage — nearly triple its melee, and the single most damaging common Overworld projectile",
+        "swims faster than it walks, and faster than the bot can swim",
+        "burns in daylight on land but not while submerged"
+      ],
+      "exploitable": [
+        "on dry land it loses its speed advantage entirely",
+        "whether it is a melee or ranged threat is READABLE from its held item before the fight starts"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "trident variant out-damages everything else common, and water is its terrain not the bot's"
+      },
+      "unverified": [
+        "trident throw interval",
+        "in-water aggro range"
+      ]
+    },
+    "skeleton": {
+      "display": "Skeleton",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "ARCHER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 20,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_while_it_has_a_shot"
+      },
+      "approach": {
+        "style": "kites",
+        "preferred_range": 8,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk",
+        "notes": "the Architect's example — it BACKS AWAY when the bot closes, and strafes sideways while firing rather than standing still"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "bow",
+        "range": 16,
+        "damage_normal": 4,
+        "effects": [],
+        "interval_ms": 2000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "burns in daylight unless helmeted or in shade",
+        "leads its shots against a moving target and fires faster on hard difficulty (~1s)",
+        "will retreat to keep its preferred gap, so a naive close-and-melee chases it indefinitely"
+      ],
+      "exploitable": [
+        "the arrow needs LINE OF SIGHT — any solid block between the two is a full stop to its entire offence",
+        "it retreats rather than fights in melee, so it can be walked into a corner where it has nowhere to back into",
+        "it does not lead vertically well; a target above or below it is harder for it to hit"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "the only common Overworld hostile that can hurt the bot without ever being reachable; the chase is the danger, not the arrow"
+      },
+      "unverified": [
+        "exact preferred_range",
+        "fire interval on normal"
+      ]
+    },
+    "stray": {
+      "display": "Stray",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "ARCHER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 20,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_while_it_has_a_shot"
+      },
+      "approach": {
+        "style": "kites",
+        "preferred_range": 8,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "bow",
+        "range": 16,
+        "damage_normal": 4,
+        "effects": [
+          "slowness_30s"
+        ],
+        "interval_ms": 2000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "arrows apply SLOWNESS for 30 seconds — the compounding threat here is not the damage but that a slowed bot can no longer disengage from anything else on the field"
+      ],
+      "exploitable": [
+        "identical to skeleton: block line of sight and its offence is zero"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "one hit degrades every other engagement for the next half minute"
+      },
+      "unverified": [
+        "slowness tier"
+      ]
+    },
+    "bogged": {
+      "display": "Bogged",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "ARCHER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 16,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_while_it_has_a_shot"
+      },
+      "approach": {
+        "style": "kites",
+        "preferred_range": 8,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "bow",
+        "range": 16,
+        "damage_normal": 4,
+        "effects": [
+          "poison"
+        ],
+        "interval_ms": 3000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "poison arrows — poison cannot kill on its own but it BLOCKS natural regeneration, so it turns every subsequent hit into permanent damage",
+        "fires more slowly than a skeleton but has less health",
+        "sheared with shears for mushrooms"
+      ],
+      "exploitable": [
+        "lowest health of the skeleton family",
+        "same line-of-sight shutdown"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "the regeneration block matters more than the damage in a long sentry watch"
+      },
+      "unverified": [
+        "health",
+        "fire interval"
+      ]
+    },
+    "wither_skeleton": {
+      "display": "Wither Skeleton",
+      "dimension": "nether",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "BRUISER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 20,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_relentlessly"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 8,
+        "effects": [
+          "wither_10s"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "2.4 blocks TALL — it cannot follow into a 2-block-high corridor, which is a hard geometric counter",
+        "Wither effect damages over time and, like poison, blocks regeneration — but unlike poison it CAN kill",
+        "immune to fire"
+      ],
+      "exploitable": [
+        "the height restriction is the single most reliable exploit in this file: a 2-high tunnel is a wall to it",
+        "does not burn, does not flee, does not kite — it only ever walks straight at the target"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "8 damage a swing plus a killing damage-over-time, on a mob with a zombie's simplicity"
+      },
+      "unverified": [
+        "wither duration on normal"
+      ]
+    },
+    "creeper": {
+      "display": "Creeper",
+      "dimension": "overworld",
+      "family": "arthropod_none",
+      "hostility": "hostile",
+      "group": "DETONATOR",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 20,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_silently"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "explosion",
+        "range": 3,
+        "damage_normal": 49,
+        "effects": [],
+        "fuse_ms": 1500,
+        "ignite_distance": 3,
+        "blast_radius": 3
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "SILENT until the fuse — no approach sound, unlike every other hostile here",
+        "fuse RESETS if the target leaves ~7 blocks before it completes, so a broken approach costs it everything",
+        "destroys terrain, so the damage to the base can exceed the damage to the bot",
+        "charged by lightning into a far larger blast",
+        "FLEES from cats and ocelots"
+      ],
+      "exploitable": [
+        "the fuse reset is the whole basis of strike-and-fade and is already implemented",
+        "the ignite distance (3.0) and the fuse duration (1.5s) together define a jump-crit window that is already calculated in calculator_utils section 6",
+        "20 health means two axe jump-crits are enough DAMAGE to kill it, but NOT inside one fuse: breaking the 7-block hold distance from contact range costs ~0.9-1.3s of the 1.5s, so one hit per approach is the survivable maximum for every weapon. Corrected 2026-08-01 when the escape leg entered calculator_utils section 6; combat_calculators_test pins it"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "the only common hostile that can one-shot the bot from full health, and the only one that damages the base"
+      },
+      "unverified": [
+        "point-blank damage on normal"
+      ]
+    },
+    "spider": {
+      "display": "Spider",
+      "dimension": "overworld",
+      "family": "arthropod",
+      "hostility": "conditional",
+      "group": "BRAWLER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 16,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los",
+          "damaged",
+          "low_light"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_and_climbs",
+        "notes": "NEUTRAL in light level 12 or above — a spider in daylight will not initiate. It stays hostile once provoked regardless of light."
+      },
+      "approach": {
+        "style": "climbs_to",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 2,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": true,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "CLIMBS WALLS — vertical separation is not cover against it, unlike every other Overworld melee mob",
+        "leaps at the target from a short distance rather than only walking",
+        "1 block tall, so it fits under a 1-high overhang the bot cannot",
+        "does not burn in daylight"
+      ],
+      "exploitable": [
+        "hostility is LIGHT-GATED: lighting an area makes existing spiders passive, which is a counter no other mob has",
+        "low health for a melee mob"
+      ],
+      "threat": {
+        "tier": "low",
+        "why": "fast and unblockable by walls, but hits for very little"
+      },
+      "unverified": [
+        "leap distance",
+        "exact light threshold behaviour after provocation"
+      ]
+    },
+    "cave_spider": {
+      "display": "Cave Spider",
+      "dimension": "overworld",
+      "family": "arthropod",
+      "hostility": "hostile",
+      "group": "BRAWLER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 12,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los",
+          "damaged"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_and_climbs"
+      },
+      "approach": {
+        "style": "climbs_to",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 2,
+        "effects": [
+          "poison_7s"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": true,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "0.5 blocks wide — fits through gaps nothing else does, so 'sealed' is a higher bar against it",
+        "poison blocks regeneration",
+        "spawns from mineshaft spawners, so it arrives CONTINUOUSLY rather than as a fixed number"
+      ],
+      "exploitable": [
+        "12 health — dies to a single well-charged axe hit",
+        "no poison on easy difficulty"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "individually trivial; the spawner makes it an endurance problem and poison stops the bot healing through it"
+      },
+      "unverified": [
+        "poison duration on normal"
+      ]
+    },
+    "enderman": {
+      "display": "Enderman",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "neutral",
+      "group": "TELEPORTER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 40,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "looked_at",
+          "damaged"
+        ],
+        "range": 64,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_by_teleport_until_dead",
+        "notes": "THE ARCHITECT'S EXAMPLE. It is provoked by the CROSSHAIR CROSSING ITS HEAD from up to 64 blocks — an act the bot performs constantly while scanning, aiming and pathing. This is the only entry in this file where the bot's own perception routine is the aggro trigger, and it is the reason a 'look at everything' scanner is dangerous."
+      },
+      "approach": {
+        "style": "phases",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 7,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": true,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "TELEPORTS to close distance, so range is meaningless against it — there is no disengage",
+        "teleports AWAY from any projectile, so it cannot be shot at all",
+        "takes damage from water and from rain, and teleports away to escape it",
+        "2.9 blocks TALL — cannot enter a 2-high space",
+        "picks up and places blocks, so it alters the terrain a plan was made against"
+      ],
+      "exploitable": [
+        "NOT LOOKING AT IT IS A COMPLETE COUNTER — it is the only hostile whose entire engagement is optional and controlled by the bot's own aim",
+        "a 2-high roof makes it unable to reach the bot while the bot can still strike its legs",
+        "rain and water damage it without the bot doing anything"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "40 health, 7 damage, cannot be outrun and cannot be shot — and the bot can provoke it by accident with a camera movement"
+      },
+      "unverified": [
+        "exact look-aggro cone",
+        "aggro range upper bound"
+      ]
+    },
+    "endermite": {
+      "display": "Endermite",
+      "dimension": "overworld",
+      "family": "arthropod",
+      "hostility": "hostile",
+      "group": "BRAWLER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 8,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 2,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "spawns from thrown ender pearls (5% chance) — a mob the bot can create for itself",
+        "ENDERMEN ATTACK IT, so its presence redirects an enderman that was hunting the bot",
+        "despawns on its own after ~2 minutes"
+      ],
+      "exploitable": [
+        "waiting it out is valid — it has a lifespan",
+        "8 health"
+      ],
+      "threat": {
+        "tier": "trivial",
+        "why": "negligible damage and it removes itself"
+      },
+      "unverified": [
+        "despawn timer"
+      ]
+    },
+    "witch": {
+      "display": "Witch",
+      "dimension": "overworld",
+      "family": "illager",
+      "hostility": "hostile",
+      "group": "CASTER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 26,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_at_throwing_range"
+      },
+      "approach": {
+        "style": "holds_distance",
+        "preferred_range": 8,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "spell",
+        "weapon": "splash_potion",
+        "range": 8,
+        "damage_normal": 6,
+        "effects": [
+          "poison",
+          "slowness",
+          "weakness",
+          "instant_damage"
+        ],
+        "interval_ms": 3000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "HEALS ITSELF and drinks fire resistance / swiftness reactively — the only common hostile that undoes the bot's damage, so a slow fight can be unwinnable rather than merely long",
+        "takes 85% reduced damage from its own potion types",
+        "WEAKNESS reduces the bot's melee damage, which compounds against a mob that is already healing",
+        "splash potions are AREA effects — breaking line of sight does not fully protect, and the puddle persists"
+      ],
+      "exploitable": [
+        "it must hold ~8 blocks to throw; closing inside that range gives it a problem it has no answer for",
+        "it drinks and heals on a visible animation, so a burst that outpaces the heal beats an attrition fight"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "self-healing plus weakness makes it the one common mob that can win an attrition fight outright"
+      },
+      "unverified": [
+        "heal rate",
+        "throw interval",
+        "potion selection logic"
+      ]
+    },
+    "slime": {
+      "display": "Slime",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "SPLITTER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 16,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "hops_toward_target"
+      },
+      "approach": {
+        "style": "hops",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "size_dependent"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 4,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "SPLITS ON DEATH into smaller slimes — killing it INCREASES the number of enemies, which inverts the usual 'reduce the field' logic entirely",
+        "only the large (16 HP / 4 dmg) and medium (4 HP / 2 dmg) sizes hurt; small slimes deal no damage",
+        "moves only in hops, so its position is discontinuous and its approach is interruptible"
+      ],
+      "exploitable": [
+        "small slimes are harmless and can be ignored rather than fought — a 'field is clear' test that counts entities will be wrong here",
+        "it can only change direction between hops"
+      ],
+      "threat": {
+        "tier": "low",
+        "why": "low damage, but it multiplies under attack and will inflate any entity-count-based clear check"
+      },
+      "unverified": [
+        "small slime damage",
+        "hop cadence"
+      ]
+    },
+    "silverfish": {
+      "display": "Silverfish",
+      "dimension": "overworld",
+      "family": "arthropod",
+      "hostility": "hostile",
+      "group": "SWARM_CALLER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 8,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los",
+          "ally_damaged"
+        ],
+        "range": 16,
+        "requires_line_of_sight": false,
+        "persistence": "pursues"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 1,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "CALLS EVERY SILVERFISH IN RANGE when damaged — attacking one summons the rest, so the first swing decides the size of the fight",
+        "hides inside infested stone, so it appears from a block the bot mines rather than from the field",
+        "0.3 blocks tall — very hard to hit, and slips through gaps"
+      ],
+      "exploitable": [
+        "8 health, 1 damage — the danger is entirely the swarm trigger, not the mob",
+        "an unprovoked silverfish is a much smaller problem than a provoked one; this is a mob where NOT attacking is a real tactic"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "trivial alone, and the one mob where the bot's own first strike is what creates the threat"
+      },
+      "unverified": [
+        "call radius"
+      ]
+    },
+    "phantom": {
+      "display": "Phantom",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "SWOOPER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 20,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "always_hostile"
+        ],
+        "range": 64,
+        "requires_line_of_sight": false,
+        "persistence": "circles_and_dives_repeatedly"
+      },
+      "approach": {
+        "style": "swoops",
+        "preferred_range": 20,
+        "speed_attribute": 0.7,
+        "speed_relative": "much_faster_than_player_sprint",
+        "notes": "it does NOT hold a position — it climbs to altitude, dives through the target, and climbs again. It is only reachable during the dive."
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 2,
+        "effects": [],
+        "interval_ms": 3000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": true,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "spawns only when the player has NOT SLEPT for 3+ in-game days — a bot that never sleeps generates these itself, indefinitely",
+        "burns in daylight",
+        "arrives in groups and attacks from above, which is the one axis the ground-based ladder does not cover",
+        "cats scare it off"
+      ],
+      "exploitable": [
+        "it is only in reach during the dive, so the entire fight is a timing window rather than a positioning problem",
+        "a solid roof removes the threat completely",
+        "the spawn condition is under the fleet's control — this is a threat the system creates by its own operating pattern"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "low damage, but permanent, aerial, and self-inflicted by a bot that never sleeps"
+      },
+      "unverified": [
+        "dive cadence",
+        "speed attribute"
+      ]
+    },
+    "pillager": {
+      "display": "Pillager",
+      "dimension": "overworld",
+      "family": "illager",
+      "hostility": "hostile",
+      "group": "ARCHER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 24,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_while_it_has_a_shot"
+      },
+      "approach": {
+        "style": "holds_distance",
+        "preferred_range": 8,
+        "speed_attribute": 0.35,
+        "speed_relative": "faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "crossbow",
+        "range": 8,
+        "damage_normal": 5,
+        "effects": [],
+        "interval_ms": 3000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "arrives in PATROLS of several, never alone — the entity count is the threat, not the individual",
+        "killing a patrol captain gives Bad Omen, which triggers a RAID on entering a village: the bot can convert a small fight into a siege of its own base by winning",
+        "the crossbow must reload between shots, giving a visible gap"
+      ],
+      "exploitable": [
+        "the reload gap is a reliable approach window",
+        "line of sight shuts down its offence like any archer",
+        "NOT killing the captain is a legitimate tactic — this is a case where a full clear is worse than a partial one"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "manageable individually; the raid consequence makes the WIN condition ambiguous"
+      },
+      "unverified": [
+        "health",
+        "reload interval"
+      ]
+    },
+    "vindicator": {
+      "display": "Vindicator",
+      "dimension": "overworld",
+      "family": "illager",
+      "hostility": "hostile",
+      "group": "BRUISER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 24,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_relentlessly"
+      },
+      "approach": {
+        "style": "charges",
+        "preferred_range": 0,
+        "speed_attribute": 0.35,
+        "speed_relative": "faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "weapon": "iron_axe",
+        "range": 0,
+        "damage_normal": 13,
+        "effects": [
+          "disables_shield"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": true,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "13 damage a swing on normal — the highest common melee number in the Overworld, roughly two-thirds of full health per hit",
+        "ITS AXE DISABLES SHIELDS for 5 seconds, so the defend-and-swing rung is not available against it",
+        "FASTER than a walking player, so disengaging on foot fails",
+        "OPENS DOORS, unlike a zombie"
+      ],
+      "exploitable": [
+        "24 health — it dies fast if the bot lands full-charge hits first",
+        "no ranged option at all"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "outruns the bot, out-damages everything, and removes the shield option — a pure race the bot must win on damage"
+      },
+      "unverified": [
+        "damage on normal",
+        "shield disable duration"
+      ]
+    },
+    "evoker": {
+      "display": "Evoker",
+      "dimension": "overworld",
+      "family": "illager",
+      "hostility": "hostile",
+      "group": "CASTER",
+      "pack": {
+        "packs": false,
+        "reinforces": true
+      },
+      "health": 24,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "flees_to_maintain_casting_range"
+      },
+      "approach": {
+        "style": "kites",
+        "preferred_range": 12,
+        "speed_attribute": 0.5,
+        "speed_relative": "faster_than_player_walk",
+        "notes": "it RUNS FROM the target — it never closes, and it is fast enough that chasing it on foot is a losing proposition"
+      },
+      "attack": {
+        "kind": "spell",
+        "weapon": "evocation_fangs",
+        "range": 16,
+        "damage_normal": 6,
+        "effects": [
+          "ignores_armor"
+        ],
+        "interval_ms": 5000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": true,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "SUMMONS VEXES — three at a time, which fly and pass through walls, so the fight it creates is worse than the fight it fights",
+        "fangs erupt from the GROUND at the target's position and ignore armour, so armour and cover are both irrelevant",
+        "never engages in melee and actively retreats",
+        "the summon is the real attack; killing the evoker stops the reinforcement stream at the source"
+      ],
+      "exploitable": [
+        "24 health and no melee — it is fragile if it can be reached at all",
+        "its casts have a long, visible wind-up",
+        "it flees, so it can be cornered but never chased down in the open"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "it turns one fight into four, from a range the bot cannot close, and the vexes ignore every wall the ladder relies on"
+      },
+      "unverified": [
+        "cast interval",
+        "flee speed",
+        "vex count per cast"
+      ]
+    },
+    "vex": {
+      "display": "Vex",
+      "dimension": "overworld",
+      "family": "illager",
+      "hostility": "hostile",
+      "group": "PHASER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 14,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "always_hostile"
+        ],
+        "range": 16,
+        "requires_line_of_sight": false,
+        "persistence": "charges_in_bursts"
+      },
+      "approach": {
+        "style": "phases",
+        "preferred_range": 0,
+        "speed_attribute": 0.7,
+        "speed_relative": "much_faster_than_player_sprint"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 9,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": true,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": false
+      },
+      "special": [
+        "PASSES THROUGH SOLID BLOCKS — every cover-based and geometry-based counter in this file fails against it",
+        "flies, and much faster than the bot moves",
+        "attacks in charging bursts rather than continuously, so it is only in reach intermittently",
+        "has a LIFESPAN and dies on its own after a while"
+      ],
+      "exploitable": [
+        "waiting it out genuinely works — it is one of two mobs here that removes itself",
+        "14 health, so one full-charge axe hit nearly kills it"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "9 damage, unreachable by cover, faster than the bot — and it arrives three at a time"
+      },
+      "unverified": [
+        "lifespan",
+        "damage on normal"
+      ]
+    },
+    "ravager": {
+      "display": "Ravager",
+      "dimension": "overworld",
+      "family": "illager",
+      "hostility": "hostile",
+      "group": "JUGGERNAUT",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 100,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 32,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_relentlessly"
+      },
+      "approach": {
+        "style": "charges",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 12,
+        "effects": [
+          "knockback_high"
+        ],
+        "interval_ms": 1000
+      },
+      "attack_secondary": {
+        "kind": "melee",
+        "weapon": "roar",
+        "range": 4,
+        "damage_normal": 6,
+        "effects": [
+          "knockback_area"
+        ],
+        "notes": "area roar that throws everything nearby"
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "100 HEALTH — five times anything else common, so every fight with it is long and every damage inefficiency compounds",
+        "STUNNED FOR 2 SECONDS when its attack is blocked by a shield: the single largest tactical opening any mob in this file gives",
+        "its roar throws the bot back, breaking positioning and any timing window mid-sequence",
+        "tramples crops, so it damages the farm as well as the bot"
+      ],
+      "exploitable": [
+        "the shield-stun is a repeatable free-damage cycle, and it is the clearest example in this file of a monster behaviour that is worth building a dedicated counter for",
+        "it cannot swim"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "12 damage, 100 health, and knockback that breaks every timed sequence — but it hands over a 2-second stun for a correctly timed block"
+      },
+      "unverified": [
+        "roar damage",
+        "stun duration"
+      ]
+    },
+    "warden": {
+      "display": "Warden",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "UNWINNABLE",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 500,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "vibration",
+          "smell"
+        ],
+        "range": 16,
+        "requires_line_of_sight": false,
+        "persistence": "hunts_by_sound_and_smell_burrows_away_if_it_loses_the_target",
+        "notes": "BLIND. It does not use line of sight at all — it tracks VIBRATION (movement, digging, block placement) and SMELL. Every other entry's line-of-sight logic is inapplicable here, in both directions."
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 16,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "attack_secondary": {
+        "kind": "sonic",
+        "weapon": "sonic_boom",
+        "range": 15,
+        "damage_normal": 10,
+        "effects": [
+          "ignores_armor",
+          "ignores_shields",
+          "passes_through_blocks"
+        ],
+        "notes": "fired when it cannot reach the target — cover does not stop it"
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "500 HEALTH and immune to knockback — it cannot be won against on damage in any realistic loadout",
+        "the sonic boom PASSES THROUGH BLOCKS and ignores both armour and shields, so there is no cover and no block",
+        "burrows away and despawns if it loses track of the target for ~60 seconds",
+        "cannot be aggroed by looking, only by being noisy — the inverse of the enderman"
+      ],
+      "exploitable": [
+        "IT IS NOT A FIGHT. It has a documented disengage condition (stop making vibrations for ~60s) and that is the only counter that exists",
+        "sneaking produces no vibration; wool blocks it entirely"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "unkillable in practice and unavoidable by cover — the one entry in this file where the correct tactic is not combat at all"
+      },
+      "unverified": [
+        "despawn timer",
+        "sonic boom range"
+      ]
+    },
+    "creaking": {
+      "display": "Creaking",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "OBSERVER_LOCKED",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 1,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "unobserved",
+          "proximity_los"
+        ],
+        "range": 32,
+        "requires_line_of_sight": false,
+        "persistence": "advances_only_while_unwatched",
+        "notes": "THE EXACT INVERSE OF THE ENDERMAN, and worth pairing with it in any interpreter. Looking at an enderman starts a fight; looking at a creaking STOPS one. A scanner that avoids looking at things to dodge endermen makes creakings maximally dangerous."
+      },
+      "approach": {
+        "style": "freezes_when_observed",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 3,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "INVULNERABLE while its linked creaking heart block survives — damage dealt to it is transferred to the heart, and killing it directly is impossible",
+        "completely motionless while any player is looking at it",
+        "does not burn, does not despawn, and cannot be knocked back",
+        "pale garden biome only"
+      ],
+      "exploitable": [
+        "sustained observation is a COMPLETE freeze — it is the only entry here that can be neutralised with zero damage and zero movement",
+        "the real target is the creaking heart block, not the mob: this is the one case where the correct action is a MINING task, not a combat one"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "low damage and fully stoppable by looking, but unkillable by the combat ladder as it exists — it needs a block broken, not a mob fought"
+      },
+      "unverified": [
+        "health value while heart lives (nominal)",
+        "damage on normal",
+        "observation range"
+      ]
+    },
+    "breeze": {
+      "display": "Breeze",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "DISPLACER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 30,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 24,
+        "requires_line_of_sight": true,
+        "persistence": "bounces_around_target"
+      },
+      "approach": {
+        "style": "erratic",
+        "preferred_range": 6,
+        "speed_attribute": 0.6,
+        "speed_relative": "faster_than_player_sprint",
+        "notes": "it leaps constantly and unpredictably rather than holding a line — a predicted intercept point is wrong by the time the bot arrives"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "wind_charge",
+        "range": 24,
+        "damage_normal": 1,
+        "effects": [
+          "knockback_high"
+        ],
+        "interval_ms": 1500
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "IMMUNE TO ARROWS — deflects them, so ranged answers are void",
+        "its wind charges do almost no damage but apply large KNOCKBACK: the threat is being thrown off a ledge or into another mob, not the hit itself",
+        "wind charges also trigger blocks — they open doors and flip levers, so it alters the base while fighting",
+        "trial chambers only"
+      ],
+      "exploitable": [
+        "1 damage a hit — a bot in an open flat area can simply absorb its entire offence",
+        "the danger is entirely POSITIONAL, so it is the clearest case in this file where 'where the fight happens' matters more than 'how the fight goes'"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "near-zero direct damage; it kills by relocating the bot into a worse situation"
+      },
+      "unverified": [
+        "health",
+        "knockback magnitude",
+        "charge interval"
+      ]
+    },
+    "blaze": {
+      "display": "Blaze",
+      "dimension": "nether",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "TURRET",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 20,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 48,
+        "requires_line_of_sight": true,
+        "persistence": "hovers_and_fires"
+      },
+      "approach": {
+        "style": "holds_distance",
+        "preferred_range": 8,
+        "speed_attribute": 0.23,
+        "speed_relative": "slower_than_player_walk"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "fireball",
+        "range": 16,
+        "damage_normal": 5,
+        "effects": [
+          "sets_on_fire"
+        ],
+        "interval_ms": 3000,
+        "notes": "fires in bursts of THREE with a wind-up during which it glows"
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": true,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "FLIES and hovers ABOVE the target, so it is frequently out of melee reach entirely",
+        "immune to fire and lava",
+        "damaged by water and by snowballs — the only common mob a snowball meaningfully hurts",
+        "the three-shot burst has a visible glowing wind-up, so the volley is telegraphed"
+      ],
+      "exploitable": [
+        "water damages it and the Nether has none unless the bot brings it",
+        "the wind-up telegraph is a reliable cover cue"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "fire damage stacks over time, it fights from an altitude the ground ladder cannot reach, and it spawns from a spawner in numbers"
+      },
+      "unverified": [
+        "burst interval",
+        "aggro range"
+      ]
+    },
+    "ghast": {
+      "display": "Ghast",
+      "dimension": "nether",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "TURRET",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 10,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 64,
+        "requires_line_of_sight": true,
+        "persistence": "drifts_and_fires_from_extreme_range"
+      },
+      "approach": {
+        "style": "holds_distance",
+        "preferred_range": 32,
+        "speed_attribute": 0.03,
+        "speed_relative": "drifts_slowly"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "explosive_fireball",
+        "range": 64,
+        "damage_normal": 17,
+        "effects": [
+          "explosion",
+          "terrain_damage"
+        ],
+        "interval_ms": 3000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": true,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "ONLY 10 HEALTH — enormous, terrifying, and the most fragile hostile in this file",
+        "its fireball can be DEFLECTED BACK by hitting it, which kills the ghast in one return — a mechanic no other mob offers",
+        "fires from up to 64 blocks, far beyond any range the bot can answer",
+        "the fireball destroys terrain, so it damages structures as well as the bot"
+      ],
+      "exploitable": [
+        "the deflect is a one-hit kill and requires no approach at all",
+        "10 health means a single arrow finishes it"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "unreachable and heavy-hitting, but folds instantly to one correct interaction — a large gap between naive and correct handling"
+      },
+      "unverified": [
+        "fireball damage",
+        "fire interval"
+      ]
+    },
+    "magma_cube": {
+      "display": "Magma Cube",
+      "dimension": "nether",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "SPLITTER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 16,
+      "armor": 12,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "hops_toward_target"
+      },
+      "approach": {
+        "style": "hops",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "size_dependent"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 6,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "SPLITS ON DEATH like a slime, so killing it multiplies the field",
+        "armoured, unlike a slime — it takes noticeably more hits for the same health",
+        "immune to fire and lava",
+        "jumps much higher than a slime, so vertical separation is weaker cover"
+      ],
+      "exploitable": [
+        "small cubes still damage, unlike small slimes — the ignore-the-small-ones tactic does NOT transfer"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "a slime that hurts, is armoured, and splits"
+      },
+      "unverified": [
+        "armor value",
+        "small cube damage"
+      ]
+    },
+    "hoglin": {
+      "display": "Hoglin",
+      "dimension": "nether",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "BRUISER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 40,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "charges_repeatedly"
+      },
+      "approach": {
+        "style": "charges",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 8,
+        "effects": [
+          "knockback_vertical"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "TOSSES the target into the air, which is fall damage on top of the hit and breaks any timed sequence",
+        "FLEES from warped fungus and from nether portals — it can be repelled without being fought",
+        "breeds and multiplies if left alone",
+        "converts to a zoglin in the Overworld"
+      ],
+      "exploitable": [
+        "warped fungus is a complete repellent, which is a non-combat counter",
+        "cannot follow across a portal"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "40 health and 8 damage plus displacement — but it has a hard repellent"
+      },
+      "unverified": [
+        "toss height",
+        "flee radius"
+      ]
+    },
+    "zoglin": {
+      "display": "Zoglin",
+      "dimension": "overworld",
+      "family": "undead",
+      "hostility": "hostile",
+      "group": "BRUISER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 40,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "always_hostile"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "attacks_everything_indiscriminately"
+      },
+      "approach": {
+        "style": "charges",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 8,
+        "effects": [
+          "knockback_vertical"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "a hoglin with the repellents removed — warped fungus does NOT work, and it never flees",
+        "attacks EVERY mob, not just the bot, so it may already be fighting something when found",
+        "does not burn in daylight despite being undead",
+        "never despawns"
+      ],
+      "exploitable": [
+        "its indiscriminate aggression means other mobs will damage it for free"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "a hoglin with no off-switch"
+      },
+      "unverified": []
+    },
+    "piglin": {
+      "display": "Piglin",
+      "dimension": "nether",
+      "family": "none",
+      "hostility": "neutral",
+      "group": "BRUISER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 16,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "player_action",
+          "ally_damaged"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "whole_group_aggros_together",
+        "notes": "provoked by OPENING A CHEST, BREAKING GOLD BLOCKS, or attacking one. Wearing any gold armour prevents aggro entirely. These are all things a mining/supply bot does routinely — the trigger is the bot's ordinary work, not a combat decision."
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.35,
+        "speed_relative": "faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "weapon": "golden_sword",
+        "range": 0,
+        "damage_normal": 8,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "attack_ranged": {
+        "kind": "projectile",
+        "weapon": "crossbow",
+        "range": 8,
+        "damage_normal": 5,
+        "condition": "roughly half of them spawn with a crossbow instead"
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": true,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "THE ENTIRE GROUP AGGROS TOGETHER — provoking one starts a fight with every piglin in range",
+        "GOLD ARMOUR IS A COMPLETE PREVENTION, which makes this a loadout decision rather than a combat one",
+        "barters gold ingots for supplies, so it has economic value while unprovoked"
+      ],
+      "exploitable": [
+        "the whole encounter is avoidable through equipment, and this is the strongest argument in this file for the tactic layer reading INVENTORY, not just position",
+        "16 health individually"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "trivially avoidable and catastrophic if provoked — the danger is entirely in the bot's non-combat behaviour"
+      },
+      "unverified": [
+        "group aggro radius"
+      ]
+    },
+    "piglin_brute": {
+      "display": "Piglin Brute",
+      "dimension": "nether",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "BRUISER",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 50,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "always_hostile"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_relentlessly"
+      },
+      "approach": {
+        "style": "charges",
+        "preferred_range": 0,
+        "speed_attribute": 0.35,
+        "speed_relative": "faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "weapon": "golden_axe",
+        "range": 0,
+        "damage_normal": 13,
+        "effects": [
+          "disables_shield"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": true,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "GOLD ARMOUR DOES NOT PACIFY IT, unlike a regular piglin — the loadout counter does not transfer",
+        "50 health with 13 damage a swing, and its axe disables shields",
+        "bastion remnants only, and it never despawns"
+      ],
+      "exploitable": [
+        "no ranged option"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "vindicator damage on double the health, with the shield option removed and no way to prevent the fight"
+      },
+      "unverified": [
+        "damage on normal"
+      ]
+    },
+    "zombified_piglin": {
+      "display": "Zombified Piglin",
+      "dimension": "nether",
+      "family": "undead",
+      "hostility": "neutral",
+      "group": "BRUISER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 20,
+      "armor": 2,
+      "aggro": {
+        "triggers": [
+          "damaged",
+          "ally_damaged"
+        ],
+        "range": 32,
+        "requires_line_of_sight": false,
+        "persistence": "entire_group_aggros_and_stays_aggroed",
+        "notes": "completely passive until hit. Hitting ONE aggros every zombified piglin within ~32 blocks, and line of sight is not required for the group to hear it."
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.23,
+        "speed_relative": "slower_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "weapon": "golden_sword",
+        "range": 0,
+        "damage_normal": 8,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "the group-aggro radius is LARGER than the bot's own scan radius, so the fight it starts is bigger than anything the scanner reported",
+        "immune to fire",
+        "a stray splash-damage hit or a misfired arrow is enough to trigger it"
+      ],
+      "exploitable": [
+        "NOT ATTACKING is the entire counter — this is the clearest case in this file where an engagement decision to swing is itself the mistake"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "harmless unless provoked; the provocation is instant, accidental, and irreversible across a radius bigger than the scan"
+      },
+      "unverified": [
+        "group aggro radius"
+      ]
+    },
+    "guardian": {
+      "display": "Guardian",
+      "dimension": "overworld",
+      "family": "aquatic",
+      "hostility": "hostile",
+      "group": "TURRET",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 30,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "charges_beam_while_visible"
+      },
+      "approach": {
+        "style": "holds_distance",
+        "preferred_range": 12,
+        "speed_attribute": 0.5,
+        "speed_relative": "much_faster_in_water"
+      },
+      "attack": {
+        "kind": "beam",
+        "range": 15,
+        "damage_normal": 6,
+        "effects": [],
+        "interval_ms": 3000,
+        "notes": "the beam CHARGES visibly for ~3 seconds before it fires, and breaking line of sight during the charge cancels it entirely"
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "THORNS — it extends spikes and damages anything that melees it while they are out, so attacking it is itself costly",
+        "far faster than the bot in water and nearly helpless out of it",
+        "the beam charge is the longest telegraph of any attack in this file"
+      ],
+      "exploitable": [
+        "the 3-second beam charge can be cancelled by cover, so its entire offence is defeatable by timing rather than by damage",
+        "it flops helplessly on land"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "fights in water where the bot cannot manoeuvre, and punishes melee directly"
+      },
+      "unverified": [
+        "thorns damage",
+        "beam charge time"
+      ]
+    },
+    "elder_guardian": {
+      "display": "Elder Guardian",
+      "dimension": "overworld",
+      "family": "aquatic",
+      "hostility": "hostile",
+      "group": "TURRET",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 80,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "charges_beam_while_visible"
+      },
+      "approach": {
+        "style": "holds_distance",
+        "preferred_range": 12,
+        "speed_attribute": 0.3,
+        "speed_relative": "faster_in_water"
+      },
+      "attack": {
+        "kind": "beam",
+        "range": 15,
+        "damage_normal": 8,
+        "effects": [],
+        "interval_ms": 3000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "inflicts MINING FATIGUE III on every player within 50 blocks, repeatedly — this cripples DIGGING, so it degrades the bot's mining work and its ability to build cover, not just its combat",
+        "thorns like a guardian",
+        "80 health"
+      ],
+      "exploitable": [
+        "mining fatigue can be cleared with milk",
+        "same beam-charge cancellation as a guardian"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "the only mob here whose main effect is on the bot's NON-combat capability, across a 50-block radius"
+      },
+      "unverified": [
+        "fatigue radius and reapply interval"
+      ]
+    },
+    "shulker": {
+      "display": "Shulker",
+      "dimension": "end",
+      "family": "none",
+      "hostility": "hostile",
+      "group": "TURRET",
+      "pack": {
+        "packs": true,
+        "reinforces": false
+      },
+      "health": 30,
+      "armor": 20,
+      "aggro": {
+        "triggers": [
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "fires_while_target_visible"
+      },
+      "approach": {
+        "style": "stationary",
+        "preferred_range": 8,
+        "speed_attribute": 0,
+        "speed_relative": "does_not_move"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "shulker_bullet",
+        "range": 16,
+        "damage_normal": 4,
+        "effects": [
+          "levitation_10s"
+        ],
+        "interval_ms": 2000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": true,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": false
+      },
+      "special": [
+        "its bullets HOME IN and follow the target around corners, so evasion by movement does not work",
+        "LEVITATION lifts the bot into the air and the fall afterward is the actual damage — an indirect kill mechanism nothing else here uses",
+        "armour 20 while its shell is CLOSED, dropping to 0 when open to fire: it is only vulnerable at the moment it attacks",
+        "teleports occasionally to a nearby surface"
+      ],
+      "exploitable": [
+        "the open-shell firing window is the only time it can be hurt, which makes this a pure timing fight",
+        "it cannot approach at all — disengaging by walking away always works"
+      ],
+      "threat": {
+        "tier": "high",
+        "why": "kills by fall damage rather than by hits, and is invulnerable except during its own attack"
+      },
+      "unverified": [
+        "closed-shell armor value",
+        "fire interval"
+      ]
+    },
+    "wither": {
+      "display": "Wither",
+      "dimension": "any",
+      "family": "undead",
+      "hostility": "boss",
+      "group": "UNWINNABLE",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 300,
+      "armor": 4,
+      "aggro": {
+        "triggers": [
+          "always_hostile"
+        ],
+        "range": 64,
+        "requires_line_of_sight": false,
+        "persistence": "hunts_everything_until_dead"
+      },
+      "approach": {
+        "style": "phases",
+        "preferred_range": 8,
+        "speed_attribute": 0.6,
+        "speed_relative": "faster_than_player_sprint"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "wither_skull",
+        "range": 32,
+        "damage_normal": 8,
+        "effects": [
+          "wither",
+          "terrain_damage"
+        ],
+        "interval_ms": 2000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": true,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": true,
+        "pathfinds": true
+      },
+      "special": [
+        "PLAYER-SUMMONED ONLY — it cannot be encountered by accident, so the correct tactic is simply never to build one",
+        "explodes on spawn and breaks through almost every block while fighting",
+        "regenerates health and gains armour below half health",
+        "attacks every mob as well as the player"
+      ],
+      "exploitable": [
+        "it does not exist unless the fleet creates it"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "not survivable with anything the fleet can currently build, and entirely optional"
+      },
+      "unverified": [
+        "all values — no realistic encounter path"
+      ]
+    },
+    "ender_dragon": {
+      "display": "Ender Dragon",
+      "dimension": "end",
+      "family": "none",
+      "hostility": "boss",
+      "group": "UNWINNABLE",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 200,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "always_hostile"
+        ],
+        "range": 64,
+        "requires_line_of_sight": false,
+        "persistence": "circles_and_strafes_the_arena"
+      },
+      "approach": {
+        "style": "swoops",
+        "preferred_range": 30,
+        "speed_attribute": 0.7,
+        "speed_relative": "much_faster_than_player_sprint"
+      },
+      "attack": {
+        "kind": "projectile",
+        "weapon": "dragon_breath",
+        "range": 16,
+        "damage_normal": 6,
+        "effects": [
+          "lingering_damage",
+          "knockback_high"
+        ],
+        "interval_ms": 4000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": true,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": true,
+        "pathfinds": true
+      },
+      "special": [
+        "HEALED CONTINUOUSLY BY END CRYSTALS — damage dealt to it is undone until every crystal is destroyed, so the first phase of the fight is not a combat task at all",
+        "immune to projectiles while perched, vulnerable only at the head",
+        "destroys most blocks it passes through"
+      ],
+      "exploitable": [
+        "the crystal phase is a targeting/navigation problem the existing systems could in principle solve before any combat happens"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "a multi-phase objective, not an engagement — listed for completeness only"
+      },
+      "unverified": [
+        "all values — far outside current capability"
+      ]
+    },
+    "iron_golem": {
+      "display": "Iron Golem",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "neutral",
+      "group": "JUGGERNAUT",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 100,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "damaged",
+          "player_action"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_until_dead_if_provoked",
+        "notes": "provoked by attacking it or by harming a villager. A village-adjacent base makes this a live risk from ordinary work."
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 15,
+        "effects": [
+          "knockback_vertical"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "100 health and up to ~21 damage a hit, plus it throws the target into the air",
+        "player-BUILDABLE — it is also the fleet's best base defence, so it appears on both sides of this file",
+        "does not despawn, does not heal (before repair with iron ingots)"
+      ],
+      "exploitable": [
+        "not provoking it is free",
+        "it cannot swim and cannot climb"
+      ],
+      "threat": {
+        "tier": "extreme",
+        "why": "one of the hardest hitters in the game, and the only entry here the fleet might build on purpose"
+      },
+      "unverified": [
+        "damage range on normal"
+      ]
+    },
+    "wolf": {
+      "display": "Wolf",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "neutral",
+      "group": "SWARM_CALLER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 8,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "damaged",
+          "ally_damaged"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "whole_pack_aggros_together",
+        "notes": "passive until struck. Hitting one turns the ENTIRE PACK hostile, and wolves spawn in groups of up to four."
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "faster_than_player_sprint_when_hostile"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 3,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "hostile wolves SPRINT and are faster than the bot — disengaging fails",
+        "tameable with bones, at which point they fight FOR the bot"
+      ],
+      "exploitable": [
+        "never striking one is a complete counter",
+        "8 health each"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "a self-inflicted pack fight; trivial per wolf and unescapable once started"
+      },
+      "unverified": [
+        "hostile sprint speed"
+      ]
+    },
+    "polar_bear": {
+      "display": "Polar Bear",
+      "dimension": "overworld",
+      "family": "none",
+      "hostility": "neutral",
+      "group": "BRUISER",
+      "pack": {
+        "packs": false,
+        "reinforces": false
+      },
+      "health": 30,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "damaged",
+          "proximity_los"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "pursues_if_provoked",
+        "notes": "hostile ON SIGHT if a cub is nearby, otherwise only when attacked"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.25,
+        "speed_relative": "comparable_to_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 6,
+        "effects": [],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": true,
+        "climbs": false,
+        "flies": false,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "the presence of a CUB changes it from neutral to hostile-on-sight, so the aggro rule depends on a nearby third entity"
+      ],
+      "exploitable": [
+        "cub detection makes its hostility predictable BEFORE the fight starts"
+      ],
+      "threat": {
+        "tier": "moderate",
+        "why": "the only entry whose hostility is decided by another entity in the scan"
+      },
+      "unverified": [
+        "cub detection radius"
+      ]
+    },
+    "bee": {
+      "display": "Bee",
+      "dimension": "overworld",
+      "family": "arthropod",
+      "hostility": "neutral",
+      "group": "SWARM_CALLER",
+      "pack": {
+        "packs": true,
+        "reinforces": true
+      },
+      "health": 10,
+      "armor": 0,
+      "aggro": {
+        "triggers": [
+          "damaged",
+          "ally_damaged",
+          "player_action"
+        ],
+        "range": 16,
+        "requires_line_of_sight": true,
+        "persistence": "whole_hive_aggros_together",
+        "notes": "provoked by attacking one OR by harvesting a hive without a campfire beneath it — a farming action, not a combat one"
+      },
+      "approach": {
+        "style": "closes",
+        "preferred_range": 0,
+        "speed_attribute": 0.3,
+        "speed_relative": "flies_faster_than_player_walk"
+      },
+      "attack": {
+        "kind": "melee",
+        "range": 0,
+        "damage_normal": 2,
+        "effects": [
+          "poison_10s"
+        ],
+        "interval_ms": 1000
+      },
+      "mobility": {
+        "swims": false,
+        "climbs": false,
+        "flies": true,
+        "teleports": false,
+        "opens_doors": false,
+        "breaks_doors": false,
+        "pathfinds": true
+      },
+      "special": [
+        "the whole hive aggros at once and they FLY, so ground cover does not help",
+        "a bee DIES after stinging, so the swarm is self-limiting",
+        "a campfire under the hive prevents aggro from harvesting entirely"
+      ],
+      "exploitable": [
+        "the campfire prevention makes this a build-order decision rather than a combat one",
+        "each bee stings once and dies"
+      ],
+      "threat": {
+        "tier": "low",
+        "why": "low damage and self-limiting, but triggered by ordinary farm work rather than by a fight"
+      },
+      "unverified": [
+        "poison duration"
+      ]
+    }
+  }
+}

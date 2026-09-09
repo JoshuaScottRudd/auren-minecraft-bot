@@ -1,0 +1,54 @@
+# Auren — what never belongs in the repository.
+#
+# WHY THIS FILE EXISTS AT ALL: everything below is written by RUNNING the bot, not by writing it.
+# A trace, a process id, a bot's memory of one world and an installed dependency tree are all facts
+# about one machine on one afternoon. Committing any of them publishes local state, makes every run
+# show up as a pending change, and — for anything under `player_memory/` — puts a real person's
+# Minecraft name and the coordinates of what they built into public history.
+#
+# The rule these all share: if the bot regenerates it, git does not carry it.
+
+# ── Dependencies ────────────────────────────────────────────────────────────────────────────────
+# `package.json` and `package-lock.json` are the declaration and they ARE tracked; `npm install`
+# reconstructs the tree from them exactly. The tree itself is ~440 MB of other people's code.
+node_modules/
+
+# ── Run records ─────────────────────────────────────────────────────────────────────────────────
+# Every bot replaces its own trace file the moment it starts, so no file here ever describes more
+# than one run — see the troubleshooting section of README.md. The folder is absent from a fresh
+# clone on purpose: `js_kernel/utils/record_homes.js` creates it on the first line the first bot
+# writes, so a placeholder committed to hold the directory open would be guarding nothing.
+fleet_logs/
+
+# Which processes are alive right now, by process id. True for minutes, on one machine.
+fleet_control_runtime.json
+
+# ── A bot's memory of one world ─────────────────────────────────────────────────────────────────
+# Buildspots, chest positions and inventories, keyed to the exact world that produced them. On any
+# other world these are coordinates pointing at nothing. The design data beside them
+# (`building_blueprints.json`, `crafting_blueprints.json`, `monster_tactics.json`) is authored
+# rather than sensed, and stays tracked — the patterns below are narrow so they cannot reach it.
+js_kernel/corporate_headquarters*.json
+js_kernel/find_buildingspot*.json
+
+# ── OTHER PEOPLE'S DATA — the one entry here that is about privacy rather than noise ────────────
+# One file per person a contractor has worked for: their Minecraft name, and every building and
+# workstation they own. Publishing it would publish them. Nothing sweeps these files, by design,
+# so the only thing standing between them and a public repository is this line.
+player_memory/
+
+# ── Credentials ─────────────────────────────────────────────────────────────────────────────────
+# No secret is hardcoded anywhere in this project; the bot reads what it needs from the environment
+# (`node start_bot.js --help` names every variable). This guards the habit of parking them in a file.
+.env
+.env.*
+*.pem
+*.key
+
+# ── Editor and OS droppings ─────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+npm-debug.log*

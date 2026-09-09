@@ -1,0 +1,476 @@
+{
+  "crafting_table": {
+    "requires": [
+      "inventory"
+    ],
+    "ingredients": {
+      "planks": 4
+    },
+    "sequence": [
+      {
+        "item": "crafting_table",
+        "from": "planks",
+        "makes": 1
+      }
+    ]
+  },
+  "furnace": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "furnace_material": 8
+    },
+    "sequence": [
+      {
+        "item": "furnace",
+        "from": "furnace_material",
+        "makes": 1
+      }
+    ]
+  },
+  "planks": {
+    "requires": [
+      "inventory"
+    ],
+    "ingredients": {
+      "logs": 1
+    },
+    "sequence": [
+      {
+        "item": "planks",
+        "from": "logs",
+        "makes": 4
+      }
+    ]
+  },
+  "stick": {
+    "requires": [
+      "inventory"
+    ],
+    "ingredients": {
+      "planks": 2
+    },
+    "sequence": [
+      {
+        "item": "stick",
+        "from": "planks",
+        "makes": 4
+      }
+    ]
+  },
+  "bread": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "wheat": 3
+    },
+    "sequence": [
+      {
+        "item": "bread",
+        "from": "wheat",
+        "makes": 1
+      }
+    ]
+  },
+  "charcoal": {
+    "requires": [
+      "furnace"
+    ],
+    "ingredients": {
+      "logs": 1
+    },
+    "sequence": [
+      {
+        "item": "charcoal",
+        "from": "logs",
+        "makes": 1
+      }
+    ]
+  },
+  "iron_ingot": {
+    "requires": [
+      "furnace"
+    ],
+    "ingredients": {
+      "raw_iron": 1
+    },
+    "sequence": [
+      {
+        "item": "iron_ingot",
+        "from": "raw_iron",
+        "makes": 1
+      }
+    ]
+  },
+  "stone_axe": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "cobblestone": 3,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "stone_axe",
+        "from": [
+          "cobblestone",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "stone_hoe": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "cobblestone": 2,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "stone_hoe",
+        "from": [
+          "cobblestone",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "stone_pickaxe": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "cobblestone": 3,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "stone_pickaxe",
+        "from": [
+          "cobblestone",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "stone_shovel": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "cobblestone": 1,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "stone_shovel",
+        "from": [
+          "cobblestone",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "stone_sword": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "cobblestone": 2,
+      "stick": 1
+    },
+    "sequence": [
+      {
+        "item": "stone_sword",
+        "from": [
+          "cobblestone",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "wooden_axe": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 3,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "wooden_axe",
+        "from": [
+          "planks",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "wooden_hoe": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 2,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "wooden_hoe",
+        "from": [
+          "planks",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "fence": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 4,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "fence",
+        "from": [
+          "planks",
+          "stick"
+        ],
+        "makes": 3
+      }
+    ]
+  },
+  "wooden_pickaxe": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 3,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "wooden_pickaxe",
+        "from": [
+          "planks",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "wooden_shovel": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 1,
+      "stick": 2
+    },
+    "sequence": [
+      {
+        "item": "wooden_shovel",
+        "from": [
+          "planks",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "wooden_sword": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 2,
+      "stick": 1
+    },
+    "sequence": [
+      {
+        "item": "wooden_sword",
+        "from": [
+          "planks",
+          "stick"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "ladder": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "stick": 7
+    },
+    "sequence": [
+      {
+        "item": "ladder",
+        "from": "stick",
+        "makes": 3
+      }
+    ]
+  },
+  "chest": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 8
+    },
+    "sequence": [
+      {
+        "item": "chest",
+        "from": "planks",
+        "makes": 1
+      }
+    ]
+  },
+  "stairs": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 6
+    },
+    "sequence": [
+      {
+        "item": "stairs",
+        "from": "planks",
+        "makes": 4
+      }
+    ]
+  },
+  "door": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 6
+    },
+    "sequence": [
+      {
+        "item": "door",
+        "from": "planks",
+        "makes": 3
+      }
+    ]
+  },
+  "torch": {
+    "requires": [
+      "inventory"
+    ],
+    "ingredients": {
+      "stick": 1,
+      "charcoal": 1
+    },
+    "sequence": [
+      {
+        "item": "torch",
+        "from": [
+          "stick",
+          "charcoal"
+        ],
+        "makes": 4
+      }
+    ]
+  },
+  "bucket": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "iron_ingot": 3
+    },
+    "sequence": [
+      {
+        "item": "bucket",
+        "from": [
+          "iron_ingot"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "shield": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 6,
+      "iron_ingot": 1
+    },
+    "sequence": [
+      {
+        "item": "shield",
+        "from": [
+          "planks",
+          "iron_ingot"
+        ],
+        "makes": 1
+      }
+    ]
+  },
+  "slab": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "planks": 3
+    },
+    "sequence": [
+      {
+        "item": "slab",
+        "from": "planks",
+        "makes": 6
+      }
+    ]
+  },
+  "composter": {
+    "requires": [
+      "crafting_table"
+    ],
+    "ingredients": {
+      "slab": 7
+    },
+    "sequence": [
+      {
+        "item": "composter",
+        "from": "slab",
+        "makes": 1
+      }
+    ]
+  },
+  "bone_meal": {
+    "requires": [
+      "inventory"
+    ],
+    "ingredients": {
+      "bone": 1
+    },
+    "sequence": [
+      {
+        "item": "bone_meal",
+        "from": "bone",
+        "makes": 3
+      }
+    ]
+  }
+}
