@@ -52,7 +52,7 @@ const argv = process.argv.slice(2);
 // here because this file was the one entry point that did not follow it. `OVERSEER_PORT` is read by
 // `foreman/overseer_door.js` to find the in-game door, so the variable already decided where half the
 // system looked while this half ignored it and bound 3001 regardless. A launcher stamping the
-// environment (`start_homestead_bots.js`, `start_contractor_bots.js`) was therefore silently overruled,
+// environment (`start_auren.js`) was therefore silently overruled,
 // and the symptom was an EADDRINUSE crash on a machine that already had an overseer (Law 16 — one fact,
 // one place it is read from).
 const ENV_PORT = process.env.OVERSEER_PORT;

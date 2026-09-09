@@ -43,43 +43,44 @@ the bot reads constantly. There is no smaller version of it. Nothing installs ou
 
 ---
 
-## The two ways to run it
+## How to run it
 
-There are exactly two, they mirror how I run it myself, and neither asks you to name anything.
-
-### Bots that ignore you and just build
+One command, and it mirrors how I run it myself. It asks you to name nothing.
 
 ```
-node start_homestead_bots.js
+node start_auren.js
 ```
 
-Two bots join your world and start working. They are **homesteaders** — they answer to nobody, so talking
-to them does nothing. They have no ear: the chat listener is not mounted at all. This is the one to run if
-you want to watch the thing work.
-
-### Bots that work for you
+That starts a **foreman** — a clerk that joins your world and waits. **No bots yet.** Walk to where you
+want them, and ask in chat:
 
 ```
-node start_contractor_bots.js
+foreman get contractor     a crew of 2 that works for you
+foreman get homesteader    a crew of 2 that answers to nobody
+foreman help               the words it knows
+foreman stop               send your contractors home
 ```
 
-This starts a **foreman** — a clerk that joins your world and waits. No bots yet. You hire them in chat:
+The crew is brought to **where you are standing** and starts working when it arrives. You place them by
+walking somewhere, which is the only part of this a person should have to decide.
 
-```
-foreman get      fetch your crew of 2 and bring them to you
-foreman help     the words it knows
-foreman stop     send your crew home
-```
+The one word chooses who they answer to, and it is the only difference:
 
-The bots it brings are **contractors**: they belong to you, they hear you, and they work what you ask for.
-Say a bot's name and then what you want.
+- **contractors** belong to you. They hear you in chat — say a bot's name and then what you want.
+- **homesteaders** answer to nobody. They have no ear at all: the chat listener is not mounted, so
+  talking to one does nothing. Run these if you want to watch the thing work on its own.
 
-**You hire contractors from inside the game, and that is the only way.** A contractor exists because
+**Everything is hired from inside the game, and that is the only way.** A contractor exists because
 somebody in the world asked for it — the owner is stamped into the bot at birth and every order is
-filtered on it. There is no terminal flag for it because there is no owner to name from a terminal.
+filtered on it. There is no terminal flag for that, because there is no owner to name from a terminal,
+and no coordinate to type because you are standing on it.
 
-Both commands take `--host` and `--port` if your server is not on `localhost:25565`. **Ctrl-C stops
-everything they started.** That is the whole interface.
+The command takes `--host` and `--port` if your server is not on `localhost:25565`. **Ctrl-C stops
+everything, including the bots the foreman fetched.** That is the whole interface.
+
+> A homesteader answers to nobody, and that includes you: `foreman stop` will not reach one. Ctrl-C is
+> what ends them. The homestead is the world's rather than any one player's, so it tops up to a crew of
+> two and a second person asking gets told it already exists.
 
 ---
 
@@ -115,8 +116,8 @@ path. A trace tells me in thirty seconds what would cost you an evening.
 
 | | |
 |---|---|
-| `start_homestead_bots.js` · `start_contractor_bots.js` | the two ways in |
-| `start_bot.js` · `start_overseer.js` | one bot, or the referee, on their own — what the two above are built from |
+| `start_auren.js` | the one way in — the desk and the referee |
+| `start_bot.js` · `start_overseer.js` | one bot, or the referee, on their own — what the above is built from |
 | `master_core.js` | what a bot runs once it has been told who it is |
 | `Thinking_fragments/` | the deciding — planners, judges, and the config you'd edit to retune it |
 | `action_fragments.js/` | the doing — one file per verb |

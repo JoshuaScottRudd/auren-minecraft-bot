@@ -1,6 +1,6 @@
 // child_fleet — RAISE A SET OF PROCESSES AND TAKE THEM ALL DOWN TOGETHER (Law 8).
 //
-// WHY IT EXISTS: `start_homestead_bots.js` and `start_contractor_bots.js` both start several long-lived
+// WHY IT EXISTS: `start_auren.js` starts several long-lived
 // processes and both must end them when the person presses Ctrl-C. That is one capability, so it has one
 // implementation (Law 16). Written as a module rather than copied into both launchers because the thing
 // that rots is teardown — the copy that gets a fix and the copy that does not are indistinguishable until

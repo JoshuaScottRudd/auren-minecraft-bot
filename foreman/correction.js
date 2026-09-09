@@ -216,11 +216,43 @@ const noBotsOut = (said) => refuse({
   code: 'no_bots_out',
   said,
   because: 'you have no bots out',
-  instead: 'say "foreman get" and I\'ll fetch you one.',
+  instead: `say "${PREFIX} get contractor" and I'll fetch you a crew.`,
+});
+
+// THE HOMESTEAD IS ALREADY STAFFED. The mirror of `crewFull`, and it is a separate refusal rather than a
+// flag on that one because the two differ in the only part that matters: what the person does next.
+// `crewFull` sends them to `stop`, which is theirs to say. Nobody can dismiss a homesteader from inside
+// the world — that is what the species means, not a gap — so pointing there would be teaching a word that
+// will not work (Law 25: the answer has to match the question asked).
+//
+// A HOMESTEAD IS THE WORLD'S, NOT A PERSON'S, which is why this counts everything rather than the
+// asker's. Two homesteaders is the homestead; a second person asking for one is asking for the same
+// thing, and gets told it already exists rather than given a second copy of it.
+const homesteadFull = (said, names, limit) => refuse({
+  code: 'homestead_full',
+  said,
+  because: `the homestead already has ${names.join(' and ')}${limit ? ` — and ${limit} is a crew` : ''}`,
+  instead: `they answer to nobody, so say "${PREFIX} get contractor" for a crew that answers to you.`,
+});
+
+// `get` WITH NO SPECIES, OR WITH A WORD THAT IS NOT ONE. The one correction on the busiest verb, so it
+// spends its whole budget on the difference a person is actually choosing between rather than on naming
+// the two words again — the help page already lists the forms, and a refusal that only repeats the page
+// teaches nothing the page did not (Law 13's third category: refuse AND teach).
+//
+// THE DIFFERENCE IS STATED AS WHO THEY OBEY, because that is the half a person cannot change afterwards
+// and the half they will get wrong. Everything else about the two is identical by design — same door,
+// same crew size, both brought to where you stand, both working on arrival.
+const getNeedsASpecies = (said) => refuse({
+  code: 'get_needs_a_species',
+  said,
+  because: 'I need to know who they answer to',
+  instead: `"${PREFIX} get contractor" works for you — "${PREFIX} get homesteader" ignores you and builds.`,
 });
 
 module.exports = {
   refuse, allow, render,
   notOnTheList, cannotObtain, askByFamily, wrongFormat, buildingTakesNoNumber,
-  goodNeedsANumber, noPlanForThat, alreadyUnderway, crewFull, noBotsOut,
+  goodNeedsANumber, noPlanForThat, alreadyUnderway, crewFull, noBotsOut, getNeedsASpecies,
+  homesteadFull,
 };

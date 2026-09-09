@@ -32,7 +32,7 @@
 // `fleet_control` goes through it. A second spawn path here would be a second place a bot can be born
 // wrong. See `startBot()` below for what that inherited and what it did not.
 //
-// Run:  node start_contractor_bots.js        (raises the overseer and this desk together)
+// Run:  node start_auren.js        (raises the overseer and this desk together)
 
 const path = require('path');
 const { spawn } = require('child_process');
@@ -72,7 +72,7 @@ const record = require('./foreman_record');
 // ── WHERE THE THIRD-PARTY PACKAGES LIVE IS ASKED, NEVER ASSUMED ──────────────────────────────────
 // The desk used to inherit a working `NODE_PATH` because `fleet_control` stamped one before spawning it,
 // so the require below resolved without this line and nothing revealed the dependency. `foreman.js` is
-// now started by `start_contractor_bots.js` as well, which stamps no path — and the first live run under
+// now started by `start_auren.js` as well, which stamps no path — and the first live run under
 // that launcher died here with `Cannot find module 'mineflayer'`, having brought the overseer up first
 // so the failure looked like a foreman fault rather than a resolution one.
 //
@@ -239,7 +239,17 @@ const BOT_LAUNCH_GRACE_MS = 3000;
 // Without this, Ctrl-C on the desk leaves a crew running under roster names nothing can hand out again.
 const fetched = [];
 
-function startBot(botId, owner) {
+// `species` is 'contractor' or 'homesteader'; `owner` is the asker for a contractor and '' for a
+// homesteader, which `bot_mandate` requires rather than merely tolerates — it refuses a homesteader
+// carrying an owner, so the empty string is the mandate and not a missing field.
+//
+// BOTH SPECIES ARE BORN STARTED WHEN THE DESK FETCHES THEM, and `BOT_AUTOSTART` is what says so for the
+// one that does not get it from its species. A contractor is already born started by constitution; a
+// homesteader waits for an operator's `start`, and being fetched by a person standing in the world is
+// that decision arriving through the only door the shipped layer has. See
+// `bot_mandate.beginsWorkAtBirth` for why this is a launch fact rather than a species one — a
+// homesteader raised any other way still waits.
+function startBot(botId, species, owner) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(BOT_DIR, 'start_bot.js')], {
       cwd: BOT_DIR,
@@ -247,7 +257,7 @@ function startBot(botId, owner) {
       // non-human caller: an absent flag falls back to the variable it would have set, so this passes
       // through whole. BOT_ID is overridden explicitly — this process carries `foreman` in it for its
       // own record, and inheriting that would file the bot's log under the desk.
-      env: { ...process.env, BOT_ID: botId, BOT_MODE: 'contractor', BOT_OWNER: owner },
+      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: '1' },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -296,7 +306,7 @@ process.on('SIGTERM', () => { releaseFetched(); process.exit(0); });
 // THE VOCABULARY LIVES IN ITS OWN FILE, because the guarantee attached to it has to RUN. This file
 // creates its mineflayer client at module scope, so the load sweep cannot open it — a Law 13 throw
 // written here would fire for the first time in front of a human. See foreman_vocabulary.js.
-const { INGAME_VERBS, CREW_SIZE, helpLines, parseRequest, parseCancel,
+const { INGAME_VERBS, CREW_SIZE, SPECIES, helpLines, parseRequest, parseCancel,
   pluralForms, describeAge, describeProgress, describeCrew } = require('./foreman_vocabulary');
 
 // ── THERE IS NO FUZZY MATCHER, AND THERE MUST NOT BE ONE (Architect 2026-08-30) ─────────────────────
@@ -472,6 +482,16 @@ async function handle(from, text, reply) {
     // THE COUNT IS ASKED OF THE FLEET, NEVER TALLIED HERE. A counter kept in this process would be
     // wrong the first time the operator stopped one from the console and every time the foreman
     // restarted (Invariant B — re-sense, never remember).
+    // ── WHICH SPECIES, SAID OUT LOUD OR NOT AT ALL ───────────────────────────────────────────────────
+    // (Architect 2026-09-09.) Read before the fleet is queried because it costs nothing and a person who
+    // typed the wrong word should not wait on a socket to be told so.
+    const species = (arg || '').toLowerCase();
+    if (!SPECIES.includes(species)) {
+      correct(correction.getNeedsASpecies(`${FOREMAN_PREFIX} get${arg ? ` ${arg}` : ''}`));
+      return;
+    }
+    const wantsContractors = species === 'contractor';
+
     const state = await door.query();
     if (!state.ok) {
       trouble(from, 'fleet_unreachable', "can't check what you have right now — try again in a moment.",
@@ -489,9 +509,28 @@ async function handle(from, text, reply) {
     // still not negotiable and there is still no request that produces a third — `get` now means *bring me
     // up to a crew*, which is the same sentence for somebody with none and the repair for somebody with
     // one. Nothing new is offered: the only reachable outcomes remain 0 and CREW_SIZE.
-    const mine = state.bots.filter(b => b.owner === from);
+    // ── WHAT COUNTS AS "ALREADY HAVE" DIFFERS BY SPECIES, AND THE DIFFERENCE IS THE SPECIES ──────────
+    // A CONTRACTOR CREW BELONGS TO A PERSON, so it is counted against the asker — unchanged.
+    //
+    // A HOMESTEAD BELONGS TO THE WORLD. A homesteader has no owner by constitution (`bot_mandate` refuses
+    // one that carries an owner), so there is no per-person tally to keep and inventing one would mean
+    // storing a "who fetched this" fact the species is defined by not having. Counting every ownerless
+    // body answers the question the crew rule is actually asking — *is the homestead staffed* — using
+    // only what the fleet already reports (Invariant B: re-sense, never remember).
+    //
+    // The consequence is deliberate and is stated to the person rather than hidden: a second player who
+    // says `get homesteader` is told the homestead exists instead of being handed a second one. Two bots
+    // sharing the work IS the homestead; two more would be a different world, not a fuller one.
+    // One predicate, used twice — for the tally here and for recognising each body as it registers below.
+    // Two spellings of "is this one of the ones I am fetching" is how the second one drifts (Law 16).
+    const isOurs = (b) => (wantsContractors ? b.owner === from : !b.owner);
+    const mine = state.bots.filter(isOurs);
     if (mine.length >= CREW_SIZE) {
-      correct(correction.crewFull(`${FOREMAN_PREFIX} get`, mine.map(b => b.id), CREW_SIZE));
+      const said = `${FOREMAN_PREFIX} get ${species}`;
+      const names = mine.map(b => b.id);
+      correct(wantsContractors
+        ? correction.crewFull(said, names, CREW_SIZE)
+        : correction.homesteadFull(said, names, CREW_SIZE));
       return;
     }
     const needed = CREW_SIZE - mine.length;
@@ -515,8 +554,13 @@ async function handle(from, text, reply) {
     }
     const crew = free.slice(0, needed);
 
+    // WHAT THEY ARE GETTING IS SAID WHILE THEY WAIT, not after. The two species look identical from here
+    // — same names, same arrival, both walking to where the asker stands — and the difference only shows
+    // itself the first time somebody talks to a homesteader and nothing happens. Saying it now is what
+    // makes that silence a thing they chose rather than a thing that looks broken (Law 25).
+    const forWhom = wantsContractors ? 'for you' : 'for the homestead — they won\'t answer you';
     reply(needed === CREW_SIZE
-      ? `getting ${crew.join(' and ')} for you...`
+      ? `getting ${crew.join(' and ')} ${forWhom}...`
       : `you have ${mine.map(b => b.id).join(' and ')} — getting ${crew.join(' and ')} to finish the crew...`);
     // THE OWNER IS STAMPED AT EACH LAUNCH, which is what makes it un-forgeable later: it becomes an
     // environment fact of that process, the bot declares it on register, and no message anywhere can
@@ -556,7 +600,7 @@ async function handle(from, text, reply) {
     for (let i = 0; i < crew.length; i++) {
       const target = crew[i];
       if (i > 0) await new Promise(r => setTimeout(r, CREW_LAUNCH_GAP_MS));
-      const r = await startBot(target, from);
+      const r = await startBot(target, species, wantsContractors ? from : '');
       said.push(firstMeaningfulLine(r.out) || `${target}: the launcher exited ${r.code}`);
 
       // POLLED, NEVER SLEPT-THEN-CHECKED: a body that registers in four seconds is brought over in four
@@ -567,7 +611,7 @@ async function handle(from, text, reply) {
         const state2 = await door.query();
         if (!state2.ok) { reach = state2.error; break; }
         reach = null;
-        if (state2.bots.some(b => b.id === target && b.owner === from)) { seen = true; break; }
+        if (state2.bots.some(b => b.id === target && isOurs(b))) { seen = true; break; }
         if (Date.now() >= deadline) break;
         await new Promise(r2 => setTimeout(r2, CREW_ARRIVAL_POLL_MS));
       }
@@ -602,9 +646,15 @@ async function handle(from, text, reply) {
     }
 
     if (standing.length >= CREW_SIZE) {
+      // "YOURS" IS A CLAIM ABOUT OWNERSHIP AND IT HAS TO BE TRUE. Said to somebody who asked for
+      // homesteaders it is the exact opposite of the fact — they belong to nobody, and the line that
+      // announces their arrival is the last place a person is told otherwise. Caught on the first live
+      // run of `get homesteader`, which reported *"IrisBot and VesperBot are yours"* about two bodies
+      // that will not answer to them (Law 25).
+      const whose = wantsContractors ? 'yours' : 'the homestead\'s';
       reply(stranded.length
-        ? `${standing.join(' and ')} are yours and working — but I could not bring ${stranded.join(' and ')} to you. say "${FOREMAN_PREFIX} where" to find them.`
-        : `${standing.join(' and ')} are yours, here, and working.`);
+        ? `${standing.join(' and ')} are ${whose} and working — but I could not bring ${stranded.join(' and ')} to you. say "${FOREMAN_PREFIX} where" to find them.`
+        : `${standing.join(' and ')} are ${whose}, here, and working.`);
       return;
     }
     // THE SHORT CASE SAYS WHAT THEY HAVE AND WHAT TO DO — AND NOT ONE WORD OF MACHINE DETAIL.
@@ -1062,7 +1112,11 @@ bot.once('spawn', () => {
     if (greeted.has(name)) return;
     greeted.add(name);
     record.said(name, 'greeting');
-    ch.reply(bot, name, `hello ${name} — say "${FOREMAN_PREFIX} help" for commands, "${FOREMAN_PREFIX} get" for bots`);
+    // THE GREETING NAMES A COMMAND THAT WORKS. It offered `foreman get` until 2026-09-09, which stopped
+    // being a command the day `get` began taking a species — the first thing a new arrival was told to
+    // say would have come straight back as a correction. The greeting is the one line everybody reads, so
+    // a stale form here is worse than none (Law 25).
+    ch.reply(bot, name, `hello ${name} — say "${FOREMAN_PREFIX} help" for commands, "${FOREMAN_PREFIX} get contractor" for bots`);
   });
 
   // ── A CREW BELONGS TO A PERSON, SO IT LEAVES WITH THEM ──────────────────────────────────────────

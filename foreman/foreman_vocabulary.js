@@ -39,6 +39,25 @@ const { INGAME_VERBS } = require('@overseer/message_schema');
 // One is not a small crew and three is not a large one; both are a different thing wearing the name.
 const CREW_SIZE = 2;
 
+// ── WHICH SPECIES A `get` HANDS OUT, NAMED BY THE PERSON AND NEVER DEFAULTED ────────────────────────
+// (Architect 2026-09-09: *"the player will have to type foreman get contractor and foreman get
+// homesteader… make identical start methods."*)
+//
+// THE TWO ARE ONE DOOR WITH ONE WORD OF DIFFERENCE, and that is the whole ask. Both are fetched by a
+// person standing in the world, both are brought to where that person stands, both begin working on
+// arrival. What the word chooses is who the bodies then answer to — and because that is the one thing a
+// human cannot change afterwards, it is the one thing they have to say out loud.
+//
+// THERE IS NO DEFAULT, deliberately (Law 13: absent is a fault, never a value). Defaulting to contractor
+// would hand somebody who typed `get` a crew that obeys them when they may have wanted the opposite, and
+// defaulting to homesteader would hand them two bodies that ignore every word they say next. Both are a
+// wrong answer that still runs, so a bare `get` is corrected instead — see `correction.getNeedsASpecies`.
+//
+// Taken from the config that already defines the species rather than spelled again here: a second copy of
+// a vocabulary is what `OPERATOR_VERBS`' own header records dying silently in the middle (Law 16).
+const { BOT_MODES } = require('@thinking/architect_config');
+const SPECIES = Object.freeze([BOT_MODES.CONTRACTOR, BOT_MODES.HOMESTEADER]);
+
 // ── THE HELP PAGE IS A LIST OF WORDS, AND THAT IS THE WHOLE SPECIFICATION ───────────────────────────
 // Three cuts, each ordered after he read the page in the world, and the third one is the shape:
 //   2026-08-31  *"foreman help is terrible… its way too wordy. nobody is going to read that."*   33 → 15
@@ -135,6 +154,13 @@ const VERBS = Object.freeze([
 function helpLines() {
   return [
     VERBS.join(', '),
+    // ── THE ONE VERB THAT TAKES A WORD, SHOWN IN THE FORM THAT WORKS ────────────────────────────────
+    // `get` is the only verb here that is incomplete on its own, so the list above names a word a person
+    // cannot successfully say. That is the hole the page exists to close, and it is the same hole the
+    // 2026-09-05 cut found at the top of the page — the verb everybody comes for being the one they
+    // cannot act on. Written as the two literal commands rather than `get <species>`, because a
+    // placeholder is a thing to decode and these are things to type.
+    `${SPECIES.map(s => `get ${s}`).join('  or  ')}`,
     // ── THE ONE LINE THAT IS NOT A COMMAND NAME, AND WHY IT SURVIVED "WORDS ONLY" ───────────────────
     // `wipe` is the only word here that destroys something and cannot be undone, and its own name argues
     // against itself — it sounds like tidying up. Law 25: the asker can only set a criterion from what
@@ -155,7 +181,13 @@ function helpLines() {
 // halves of the page — the authored lines and the ones derived from INGAME_VERBS — are visible at once,
 // so it is the only place the total can be known.
 const CHAT_WINDOW_LINES = 10;
-const HELP_CEILING = 3;   // the words, the wipe caution, and one spare — deliberately far under the window
+// the words, the two `get` forms, the wipe caution, and one spare — deliberately far under the window.
+// RAISED FROM 3 TO 4 on 2026-09-09 when `get` began taking a species, and raised rather than quietly
+// spent: the spare exists so a real page can grow, and a ceiling that is edged up without saying why is
+// how this page went to eleven the first time. The line added is a COMMAND FORM, which is what this page
+// is a list of — the check is still aimed at the thing it was built to catch, which is a gloss coming
+// back dressed as a line.
+const HELP_CEILING = 4;
 (function assertHelpPageHolds() {
   const lines = helpLines();
   if (lines.length > HELP_CEILING) {
@@ -437,7 +469,7 @@ module.exports = {
   // VERB_HELP and VERB_HELP_CONTINUED are gone (2026-09-05) — they described per-verb glosses the page no
   // longer renders. `VERBS` is what replaced them: the list itself, exported so the page and the door can
   // be checked against each other rather than kept in step by hand.
-  INGAME_VERBS, VERBS, CREW_SIZE, helpLines,
+  INGAME_VERBS, VERBS, CREW_SIZE, SPECIES, helpLines,
   parseRequest, parseCancel, pluralForms,
   describeAge, describeProgress, describeCrew,
 };

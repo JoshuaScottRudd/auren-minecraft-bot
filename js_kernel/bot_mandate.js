@@ -164,24 +164,24 @@ function isHomesteader() { return currentMode() === BOT_MODES.HOMESTEADER; }
 // A CONTRACTOR ALWAYS DOES, by constitution — being fetched is what starting means for it, and
 // master_core's own header states why that gap was closed rather than policed.
 //
-// A HOMESTEADER DOES WHEN THE LAUNCH SAID SO, and that clause exists because of a hole found live on
-// 2026-09-09. The species rule was "a homesteader waits for the operator's `start`", which is coherent
+// A HOMESTEADER DOES WHEN WHOEVER RAISED IT SAID SO, and that clause exists because of a hole found live
+// on 2026-09-09. The species rule was "a homesteader waits for the operator's `start`", which is coherent
 // only where the operator has something to send it with. The Architect has `fleet_control`; that is
 // WORKSHOP equipment and does not ship. So in the extract the verb had exactly one remaining sender —
-// typing `start` at master_core's readline — and a launcher that raises a CREW cannot use it: those
-// children share one inherited stdin, so the line lands on whichever process happens to read first.
-// Two homesteaders were raised against a live server and sat at eight trace lines each — joined,
-// registered, and permanently idle, because nothing in the shipped layer could reach them.
+// typing `start` at master_core's readline — and anything raising a CREW cannot use it: those children
+// share one inherited stdin, so the line lands on whichever process happens to read first. Two
+// homesteaders were raised against a live server and sat at eight trace lines each — joined, registered,
+// and permanently idle, because nothing in the shipped layer could reach them.
 //
-// THE ANSWER IS THE CONTRACTOR'S ANSWER, not a second mechanism (Law 16). The same injector fires at
-// the same point in the same sequence; only the question of who asked for it differs. Running
-// `start_homestead_bots.js` IS the operator deciding the fleet is ready — there is no moment between
-// that command and wanting the bots to work — so the launcher stamps the decision it already made
-// rather than sending a verb afterwards to police the gap it would otherwise have opened (Law 27).
+// THE ANSWER IS THE CONTRACTOR'S ANSWER, not a second mechanism (Law 16). The same injector fires at the
+// same point in the same sequence; only the question of who asked differs. **The foreman is what asks**,
+// for both species — a person walked somewhere, said `get homesteader`, and that is the decision
+// arriving. So the desk stamps a fact it already knows rather than sending a verb afterwards to police
+// the gap it would otherwise have opened (Law 27).
 //
 // A BARE `start_bot.js` HOMESTEADER STILL WAITS, and deliberately. One bot from a terminal owns that
 // terminal's stdin, so `start` at the readline works and is the right shape for looking a body over
-// before it does anything. The flag is what distinguishes the two, which is why this is a launch fact
+// before it does anything. `--work` is what distinguishes the two, which is why this is a launch fact
 // and not a species one.
 function beginsWorkAtBirth() { return isContractor() || readMandate().autostart; }
 
