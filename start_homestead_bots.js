@@ -117,6 +117,12 @@ const port = given.port || '25565';
       AUREN_SERVER_HOST: host,
       AUREN_SERVER_PORT: port,
       OVERSEER_URL: `ws://localhost:${OVERSEER_PORT}`,
+      // RUNNING THIS SCRIPT IS THE DECISION TO START THEM. A homesteader otherwise stands and waits for
+      // an operator's `start`, which in a crew of two has no sender: `stdio` is inherited, so a line
+      // typed at this terminal reaches whichever child reads it first. Stamped at birth instead — see
+      // `bot_mandate.beginsWorkAtBirth` for the live run that found this and why the fix is the
+      // contractor's own mechanism rather than a second one.
+      BOT_AUTOSTART: '1',
       // A homesteader answers to nobody, and `bot_mandate` refuses one carrying an owner rather than
       // ignoring it. Inherited environment is the only way one could arrive here, so it is cleared
       // rather than trusted (Law 13 — the pairing cannot be got wrong if it cannot be spawned wrong).

@@ -69,6 +69,20 @@ moduleAlias.addAliases({
 process.env.BOT_ID = process.env.BOT_ID || 'foreman';
 const record = require('./foreman_record');
 
+// ── WHERE THE THIRD-PARTY PACKAGES LIVE IS ASKED, NEVER ASSUMED ──────────────────────────────────
+// The desk used to inherit a working `NODE_PATH` because `fleet_control` stamped one before spawning it,
+// so the require below resolved without this line and nothing revealed the dependency. `foreman.js` is
+// now started by `start_contractor_bots.js` as well, which stamps no path — and the first live run under
+// that launcher died here with `Cannot find module 'mineflayer'`, having brought the overseer up first
+// so the failure looked like a foreman fault rather than a resolution one.
+//
+// It is the same call `start_bot.js` makes for the same reason, and on a published copy it is a no-op:
+// `npm install` puts the packages in `node_modules` beside this tree and Node finds them unaided. It
+// matters on the Architect's machines, where they sit in a sibling directory — which is exactly the case
+// a launcher-inherited path was quietly covering (Law 2 — a unit completes its own verb and leaves
+// nothing to be arranged for it).
+require('@utils/node_module_homes').bootstrapModulePath();
+
 const mineflayer = require('mineflayer');
 const { FOREMAN_NAME, FOREMAN_PREFIX, FOREMAN_CHANNEL, BOT_SENIORITY,
         SERVER_ENDPOINT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');

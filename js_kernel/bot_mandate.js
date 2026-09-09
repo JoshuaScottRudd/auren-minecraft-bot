@@ -136,7 +136,17 @@ function readMandate(env = process.env) {
     );
   }
 
-  mandate = Object.freeze({ botId: String(botId).trim(), mode, owner: owner || null });
+  // ── WHETHER THIS BODY BEGINS WORKING THE MOMENT IT SPAWNS, settled at birth like the rest ────────
+  // A LAUNCH FACT, so it is frozen here beside the species rather than read from env at the moment it
+  // is consulted. Re-reading it later would let a bot's own runtime decide whether it had been told to
+  // work, which is the same mid-life mutation the mode freeze exists to forbid.
+  //
+  // It answers ONE question — see beginsWorkAtBirth for who asks it and why a homesteader needs asking
+  // at all. Only a homesteader consults this value: a contractor is born started by constitution, so
+  // the flag on one says nothing the species has not already said.
+  const autostart = String(env.BOT_AUTOSTART === undefined ? '' : env.BOT_AUTOSTART).trim() === '1';
+
+  mandate = Object.freeze({ botId: String(botId).trim(), mode, owner: owner || null, autostart });
   return mandate;
 }
 
@@ -147,6 +157,33 @@ function currentMode() { return readMandate().mode; }
 function currentOwner() { return readMandate().owner; }
 function isContractor() { return currentMode() === BOT_MODES.CONTRACTOR; }
 function isHomesteader() { return currentMode() === BOT_MODES.HOMESTEADER; }
+
+// beginsWorkAtBirth — does this body inject its own start signal on spawn, or stand there waiting to be
+// told? Asked once, by master_core, at the end of the spawn sequence.
+//
+// A CONTRACTOR ALWAYS DOES, by constitution — being fetched is what starting means for it, and
+// master_core's own header states why that gap was closed rather than policed.
+//
+// A HOMESTEADER DOES WHEN THE LAUNCH SAID SO, and that clause exists because of a hole found live on
+// 2026-09-09. The species rule was "a homesteader waits for the operator's `start`", which is coherent
+// only where the operator has something to send it with. The Architect has `fleet_control`; that is
+// WORKSHOP equipment and does not ship. So in the extract the verb had exactly one remaining sender —
+// typing `start` at master_core's readline — and a launcher that raises a CREW cannot use it: those
+// children share one inherited stdin, so the line lands on whichever process happens to read first.
+// Two homesteaders were raised against a live server and sat at eight trace lines each — joined,
+// registered, and permanently idle, because nothing in the shipped layer could reach them.
+//
+// THE ANSWER IS THE CONTRACTOR'S ANSWER, not a second mechanism (Law 16). The same injector fires at
+// the same point in the same sequence; only the question of who asked for it differs. Running
+// `start_homestead_bots.js` IS the operator deciding the fleet is ready — there is no moment between
+// that command and wanting the bots to work — so the launcher stamps the decision it already made
+// rather than sending a verb afterwards to police the gap it would otherwise have opened (Law 27).
+//
+// A BARE `start_bot.js` HOMESTEADER STILL WAITS, and deliberately. One bot from a terminal owns that
+// terminal's stdin, so `start` at the readline works and is the right shape for looking a body over
+// before it does anything. The flag is what distinguishes the two, which is why this is a launch fact
+// and not a species one.
+function beginsWorkAtBirth() { return isContractor() || readMandate().autostart; }
 
 // stationOwnerKey — WHOSE SHELF THIS IS, in the one form the station map indexes by: a contractor
 // stamps the human it belongs to, a homesteader stamps the commons every homesteader shares.
@@ -401,6 +438,7 @@ module.exports = {
   buildingRoomKey,
   isContractor,
   isHomesteader,
+  beginsWorkAtBirth,
   stationOwnerKey,
   homeBlueprint,
   mountsHumanChannels,

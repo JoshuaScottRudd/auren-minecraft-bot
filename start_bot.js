@@ -54,6 +54,7 @@ const FLAGS = [
   { flag: 'owner',    env: 'BOT_OWNER',                def: null,        help: 'your Minecraft name — REQUIRED for contractor, forbidden for homesteader' },
   { flag: 'version',  env: 'AUREN_MINECRAFT_VERSION',  def: null,        help: "the server's Minecraft version (default: 1.21.5, set in architect_config)" },
   { flag: 'overseer', env: 'OVERSEER_URL',             def: null,        help: 'ws://host:port of a running overseer — omit it and the bot runs alone' },
+  { flag: 'work',     env: 'BOT_AUTOSTART',            def: null,        help: "pass 1 and a homesteader starts working on spawn instead of waiting for you to type 'start'" },
 ];
 
 function usage() {

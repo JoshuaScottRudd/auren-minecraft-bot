@@ -342,18 +342,23 @@ bot.once('spawn', () => {
   // acts. Defining a contractor as a body that is already working closes the gap instead: there is no
   // un-started contractor to wait for because none can be constructed.
   //
-  // A HOMESTEADER IS UNTOUCHED and still waits for the operator's `start`. The two species differ by what
-  // a contractor ADDS (this file's own doctrine): a homesteader is started when the operator decides the
-  // fleet is ready, whereas a contractor exists BECAUSE a person asked for one — being fetched is what
-  // starting means for it, and there is no moment in its life when standing idle is the right state.
+  // A HOMESTEADER IS STARTED WHEN THE OPERATOR DECIDES THE FLEET IS READY, and the two species differ
+  // by WHO decides rather than by what happens: a contractor exists BECAUSE a person asked for one, so
+  // being fetched is what starting means for it and there is no moment in its life when standing idle
+  // is the right state.
+  //
+  // Which of those a body is, is a question for the mandate and not for this file — `beginsWorkAtBirth`
+  // owns it, and its header carries the 2026-09-09 live finding that a crew launcher must stamp the
+  // decision at birth because the shipped layer has no second sender for the verb.
   //
   // AFTER THE SEATS AND THE OVERSEER LINK, deliberately. The planning recursion reads the job board and
   // claims through the overseer, so injecting before `connect` would run the first plan cycle against a
   // bot with no peer arbitration — every claim granted locally, which is exactly the split-brain the
   // planning token exists to prevent (Law 4).
-  if (botMandate.isContractor()) {
+  if (botMandate.beginsWorkAtBirth()) {
     require('@action/start_injector.js').inject();
-    console.log('🚀 Contractor — born started. Autonomous start signal injected.');
+    console.log(`🚀 ${botMandate.isContractor() ? 'Contractor — born started' : 'Homesteader — launched to work'}.`
+      + ' Autonomous start signal injected.');
   }
 
   const rl = readline.createInterface({
