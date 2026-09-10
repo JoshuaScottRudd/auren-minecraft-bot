@@ -36,6 +36,21 @@
 
 'use strict';
 
+// ── THE ALIAS TABLE, REGISTERED HERE BECAUSE THIS PROCESS NOW LOADS SHIPPED BOT CODE (2026-09-10) ────
+// This launcher used to require exactly one relative module and needed no aliases. Proving the server
+// console before opening the desk changed that: `rcon_link` → `external_library_guard` → `watcher`, and
+// when watcher forwards a line it reaches `overseer_link`, which requires `@kernel/`, `@overseer/` and
+// `@utils/`. Without the table those throw, and the shape of the failure is the argument for fixing it
+// here — the refusal message still printed correctly, with a `[watcher:SELF-FAULT] Cannot find module
+// '@kernel/watcher'` stack trace stapled to the front of it, on a stranger's very first run. Same one
+// line and the same reasoning as `overseer/overseer_server.js`; `master_core` and `foreman` register it
+// too, so this is the entry-point convention rather than a new mechanism (Law 16).
+//
+// `path.resolve(__dirname)` rather than a bare `module-alias/register`: that walks up from the PACKAGE'S
+// install directory, which is not this one. Called once in this process — the map corrupts if it is
+// rebuilt in place twice (the reasoning is in `Auren_Workshop/workshop_paths.js`).
+require('module-alias')(require('path').resolve(__dirname));
+
 const fleet = require('./js_kernel/utils/child_fleet');
 
 // NOT A FLAG, and that is the line his instruction draws: *"im not liking how they have to keep track of
@@ -43,20 +58,41 @@ const fleet = require('./js_kernel/utils/child_fleet');
 // for a machine that already runs an overseer permanently — his does — and is invisible to everyone else.
 const OVERSEER_PORT = Number(process.env.OVERSEER_PORT) || 3001;
 
+// ── THE CONSOLE PASSWORD IS A FLAG BECAUSE THE FLEET IS TOLD, NEVER GUESSES (2026-09-10) ────────────
+// Placing a crew where a person stands needs a server console, and the only console a plain client can
+// reach is RCON. The fleet used to find the password by walking up to a `MinecraftServer/` folder beside
+// the repo — true for the Architect's own machine and for nobody else's, and the read simply threw on a
+// download. Same shape as `--host`: whoever points the fleet at a world also tells it how to speak to
+// that world's console. The environment variables stay the path a non-human caller uses (`start_bot.js`
+// documents that convention and the foreman relies on it); these flags are how a PERSON says it.
 const FLAGS = [
   { flag: 'host', def: 'localhost', help: 'server address the foreman connects to' },
   { flag: 'port', def: '25565', help: 'server port' },
+  { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', help: "your server's rcon.password — how the crew gets brought to you" },
+  { flag: 'rcon-port', env: 'AUREN_RCON_PORT', help: "your server's rcon.port  (default: 25575)" },
 ];
 
 function usage() {
   console.log(`
   Start Auren: the desk you hire bots from, and the referee that keeps them apart.
 
-    node start_auren.js [--host <address>] [--port <n>]
+    node start_auren.js --rcon-password <your server's rcon password>
 
-    --host <address>   server address the foreman connects to  (default: localhost)
-    --port <n>         server port  (default: 25565)
-    --help             this text
+    --host <address>        server address the foreman connects to  (default: localhost)
+    --port <n>              server port  (default: 25565)
+    --rcon-password <pw>    your server's rcon.password — REQUIRED, see below
+    --rcon-port <n>         your server's rcon.port  (default: 25575)
+    --help                  this text
+
+  Your server needs a console, and these two lines in server.properties turn it on:
+
+      enable-rcon=true
+      rcon.password=<pick anything>
+
+  Then pass that same password with --rcon-password. This is how a bot gets
+  brought to where you are standing, which is the only place it will start
+  working from. Without it nothing can be placed, so nothing starts — and this
+  script says so at once rather than leaving you with a bot standing still.
 
   What happens:
     A foreman joins your world. No bots start yet. Walk to where you want them
@@ -98,7 +134,38 @@ for (let i = 0; i < argv.length; i++) {
 const host = given.host || 'localhost';
 const port = given.port || '25565';
 
+// STAMPED INTO THIS PROCESS, not added to the child `env` literal below, and that is deliberate:
+// `child_fleet.start` spreads `process.env` underneath whatever it is handed, so one assignment here
+// reaches the overseer, the foreman, and every bot the foreman later spawns — and the probe below then
+// reads the exact value the crew will use rather than a second copy of it (Law 16). A flag left off
+// leaves the variable untouched, so a machine that already exports it is unchanged.
+if (given['rcon-password'] !== undefined) process.env.AUREN_RCON_PASSWORD = given['rcon-password'];
+if (given['rcon-port'] !== undefined) process.env.AUREN_RCON_PORT = given['rcon-port'];
+
 (async () => {
+  // ── THE CONSOLE IS PROVED BEFORE THE DESK OPENS (Law 13, default-stopped) ─────────────────────────
+  // Every crew this desk will ever fetch has to be put where a person is standing, and since 2026-09-10 a
+  // body refuses to plan until it has confirmed it is there. So a fleet that cannot reach the server
+  // console cannot raise a working bot at all — and the failure without this check is the worst shape
+  // available: the desk opens, greets the player, accepts `foreman get`, launches two processes, and each
+  // one stands still. Four steps of apparent success and nothing to read.
+  //
+  // ASKED ONCE, HERE, because this is the one moment the answer is cheap and the person is still at the
+  // keyboard expecting to configure something. The reason comes back raw from `rcon_link.probe` and the
+  // sentence a person acts on is composed here, where the flag names actually live (Law 25).
+  const reach = await require('./js_kernel/utils/rcon_link').probe();
+  if (!reach.ok) {
+    die(`Auren cannot reach your server's console, so it could not bring a crew to you — and a bot that\n`
+      + `  cannot be placed does not start. Nothing was launched.\n\n`
+      + `  What the console said: ${reach.reason}\n\n`
+      + `  Two lines in your server's server.properties turn it on:\n\n`
+      + `      enable-rcon=true\n`
+      + `      rcon.password=<pick anything>\n\n`
+      + `  Restart the server, then start Auren with that same password:\n\n`
+      + `      node start_auren.js --rcon-password <that password>\n\n`
+      + `  If your rcon.port is not 25575, pass --rcon-port too.`);
+  }
+
   console.log(`\n  Auren — the desk is opening on ${host}:${port}`
     + `\n  when the foreman has joined, walk where you want your bots and type:`
     + `\n      foreman get contractor     works for you`

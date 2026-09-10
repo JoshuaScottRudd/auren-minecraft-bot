@@ -30,7 +30,6 @@ module.exports = {
     if (signalType !== TAG) return;
 
     const bot = global.bot;
-    const signalBus = require('@kernel/signal_bus');
     const targetItem = payload.objective;
     const quantity = Math.max(1, Number(payload.quantity) || 1);
 
@@ -88,6 +87,6 @@ module.exports = {
     // live signal (Law 4).
     const drop = await require('@api/inventory_swapper').dropOffHaul(bot);
     if (drop?.abandoned) return;
-    routeToJudge(signalBus, TAG, { ...payload });
+    routeToJudge(TAG, { ...payload });
   })
 };

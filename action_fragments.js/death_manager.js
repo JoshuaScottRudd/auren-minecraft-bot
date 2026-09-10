@@ -282,12 +282,11 @@ module.exports = {
     const bot = global.bot;
     if (!bot) throw new Error(`[${TAG}] CODING VIOLATION: global.bot is not set before death recovery ran.`);
 
-    const signalBus = require('@kernel/signal_bus');
     const finish = (readable) => {
       watcher.summary(TAG, readable);
       const capsule = payload[TAG] || (payload[TAG] = {});
       capsule.readable = readable;
-      return routeToJudge(signalBus, TAG, { ...payload, readable });
+      return routeToJudge(TAG, { ...payload, readable });
     };
 
     // ── ACT 1: SPAWN ────────────────────────────────────────────────────────────────────────────────

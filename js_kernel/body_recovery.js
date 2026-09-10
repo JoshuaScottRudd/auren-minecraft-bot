@@ -61,6 +61,29 @@ const VERIFY_POLL_MS = 100;
 // block still fails.
 const ARRIVAL_TOLERANCE = 2.0;
 
+// ── THE PLACEMENT WINDOW, and why it is a second pair of numbers rather than a knob on the first ─────
+// Act 2 measures a body against a CELL that cannot move. Act 2c measures it against a PERSON, and the
+// two differ in both directions at once, so one pair of numbers cannot serve both without being wrong
+// for one of them:
+//   · WIDER TOLERANCE. `tp <bot> <player>` lands the body on the player's own block, but a person keeps
+//     walking while it arrives. The question this act answers is "is it standing with them", not "is it
+//     on their exact block", and 2.0 would report failure on a placement that worked because the human
+//     took two steps. Still tight enough that the world-spawn case — the failure this act exists to
+//     catch, tens or hundreds of blocks out — cannot pass.
+//   · LONGER WAIT. Act 2 waits for a position packet. This also waits for the player's ENTITY to appear
+//     in the bot's own player table, which needs the chunk they are standing in to load first.
+const PLAYER_ARRIVAL_TOLERANCE = 4.0;
+const PLAYER_ARRIVAL_WAIT_MS = 10000;
+
+// A NAME THAT IS NOT A NAME IS A SELECTOR. Minecraft reads `@a`, `@e` and friends as targets, so an
+// unvalidated name reaching `tp` could teleport every entity on the server to one place. Vanilla
+// usernames are 3-16 of [A-Za-z0-9_] and nothing else, so the check is exact rather than a denylist of
+// the selectors known today (Law 27 — constitute what a name IS; do not police the list of things it
+// must not be). ONE SPELLING, at module scope: both acts below address a player by name, and two copies
+// of this pattern would be two answers to "what is a username" the first time either was touched
+// (Law 16).
+const MINECRAFT_USERNAME = /^[A-Za-z0-9_]{3,16}$/;
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // isDead(bot) — the ONE predicate. Imported by job_board's planner as well as by the acts below, so the
@@ -204,14 +227,11 @@ async function teleportToPlayer(botName, playerName) {
   if (!botName || !playerName) {
     throw new Error(`[${TAG}] CODING VIOLATION: teleportToPlayer needs both names — got bot='${botName}' player='${playerName}'.`);
   }
-  // A NAME THAT IS NOT A NAME IS A SELECTOR. Minecraft reads `@a`, `@e` and friends as targets, so an
-  // unvalidated name reaching this command could teleport every entity on the server to one place, or a
-  // bot into a target it was never meant to reach. Vanilla usernames are 3-16 of [A-Za-z0-9_] and nothing
-  // else, so the check is exact rather than a denylist of the selectors known today (Law 27 — constitute
-  // what a name IS; do not police the list of things it must not be).
-  const NAME = /^[A-Za-z0-9_]{3,16}$/;
+  // Both names go through the ONE username pattern at module scope — see MINECRAFT_USERNAME for why a
+  // selector reaching `tp` is the fault being prevented, and why the check is a definition rather than a
+  // denylist.
   for (const [label, value] of [['bot', botName], ['player', playerName]]) {
-    if (!NAME.test(value)) {
+    if (!MINECRAFT_USERNAME.test(value)) {
       throw new Error(`[${TAG}] CODING VIOLATION: teleportToPlayer was handed a ${label} name that is not a `
         + `Minecraft username: '${value}'. A selector reaching \`tp\` moves bodies nobody named.`);
     }
@@ -221,6 +241,83 @@ async function teleportToPlayer(botName, playerName) {
     () => require('./utils/rcon_link').once([`tp ${botName} ${playerName}`]));
   if (!sent.ok) return { sent: false, error: `rcon: ${sent.reason}` };
   return { sent: true, error: null };
+}
+
+// ── ACT 2c ───────────────────────────────────────────────────────────────────────────────────────────
+// arriveAtPlayer(bot, playerName) → { arrived, error, distance }
+//
+// THE ASK (Architect 2026-09-10, after a run where two homesteaders surveyed the world spawn and hard-
+// stopped): *"the teleport needs to happen before they scan homebase… teleport is a part of the start
+// process and the start command should not run until its been confirmed that teleport is completed fully
+// and the bot is near the player then it gives a start command."*
+//
+// ── WHAT WENT WRONG, MEASURED ────────────────────────────────────────────────────────────────────────
+// The desk's `get` launched a body, waited for it to REGISTER, then teleported it to the asker. The body
+// meanwhile ran its own spawn sequence and injected its start signal, and `lock_all_buildspots` surveyed
+// from wherever the server had put it. Three runs on 2026-09-10 timed the two: the survey ran at
+// 10:41:54.842 and the teleport landed at 10:41:55 — the base layout was decided 0.2s before the body was
+// moved. All three runs returned the IDENTICAL survey (water 32, candidates 6, meshes 0) with the asker
+// standing 130 blocks away in the third, which is the proof that the position it surveyed was never the
+// person's. The whole promise of `get` — *walk where you want them* — was being decided at world spawn.
+//
+// ── WHY IT IS THE THIRD ADDRESS FORM AND NOT A FOURTH ROUTE (Law 16) ─────────────────────────────────
+// `teleportToPlayer`'s own header named this exact function before it existed: *"If arrival ever has to
+// be guaranteed, this moves into the contractor's own spawn path, where the body has a handle on itself
+// and can verify the way `teleportTo` does."* That is what this is, and the two halves stay where they
+// each belong — the RCON command is `teleportToPlayer`'s, unchanged and still the one sender, and the
+// VERIFICATION is here because only the process holding the client can do it. Act 2 measures a body
+// against a cell; Act 2b sends a body to a person and says only that the server took the command; this
+// composes them into the answer a caller actually needs before it acts.
+//
+// ── IT REPORTS `arrived`, AND THAT WORD IS EARNED RATHER THAN CLAIMED ────────────────────────────────
+// The distance is read off the bot's OWN entity and the PLAYER'S entity, both out of the live client, so
+// the verdict is measured against the world and never against "the tp returned cleanly" (Law 25 — the
+// same discipline Acts 1 and 2 hold). A player whose entity never appears is NOT arrival: the body could
+// be anywhere, and saying so is the honest verdict rather than assuming the command worked.
+//
+// NO WALK FALLBACK, for `teleportTo`'s reason exactly — a second route that silently does the primary's
+// job, reached when nobody is watching. A placement that cannot happen is reported and the caller decides.
+async function arriveAtPlayer(bot, playerName) {
+  if (!bot || !bot.entity) {
+    throw new Error(`[${TAG}] CODING VIOLATION: arriveAtPlayer needs a live bot handle — verification is the whole point of this act, and there is nothing to verify with.`);
+  }
+  const botName = bot.username || process.env.BOT_ID;
+  if (!botName) {
+    throw new Error(`[${TAG}] CODING VIOLATION: arriveAtPlayer has no username — the bot handle carries none and BOT_ID is unset.`);
+  }
+  // A MALFORMED PLACEMENT NAME IS OPERATOR INPUT, NOT A CODING FAULT, so it is answered rather than
+  // thrown: it arrives from `--near` or `BOT_START_NEAR`, which a person types. Checked HERE so it never
+  // reaches Act 2b's coding-violation throw, whose audience is a programmer and whose blast radius is an
+  // unhandled rejection on the start path (Law 25 — the message belongs to whoever can act on it).
+  if (!MINECRAFT_USERNAME.test(String(playerName || ''))) {
+    return { arrived: false, distance: null, error: `'${playerName}' is not a Minecraft username, so there is nobody to be placed beside` };
+  }
+
+  const sent = await teleportToPlayer(botName, playerName);
+  if (!sent.sent) return { arrived: false, distance: null, error: sent.error };
+
+  // POLLED, NEVER SLEPT-THEN-CHECKED: a placement that lands in 300ms is confirmed in 300ms, and a fixed
+  // wait would make every success cost the worst case (the same reason the desk's crew loop polls).
+  let lastSeen = null;
+  for (const end = Date.now() + PLAYER_ARRIVAL_WAIT_MS; Date.now() < end;) {
+    const them = bot.players && bot.players[playerName] && bot.players[playerName].entity;
+    const us = bot.entity && bot.entity.position;
+    if (them && them.position && us) {
+      lastSeen = us.distanceTo(them.position);
+      if (lastSeen <= PLAYER_ARRIVAL_TOLERANCE) return { arrived: true, distance: lastSeen, error: null };
+    }
+    await sleep(VERIFY_POLL_MS);
+  }
+  // TWO DIFFERENT FAILURES, SAID DIFFERENTLY, because the reader acts on them differently (Law 25): a
+  // player the client never saw is a name that is not in this world, and a distance that stayed large is
+  // a teleport the server accepted and did not perform.
+  return {
+    arrived: false,
+    distance: lastSeen,
+    error: lastSeen === null
+      ? `'${playerName}' never appeared in this body's player table within ${PLAYER_ARRIVAL_WAIT_MS}ms — nobody by that name is in the world where this body can see them`
+      : `still ${lastSeen.toFixed(1)} blocks from ${playerName} after ${PLAYER_ARRIVAL_WAIT_MS}ms (needs ${PLAYER_ARRIVAL_TOLERANCE}) — the server took the tp and the body did not land there`,
+  };
 }
 
 // anchorZeroPoint(blueprintName, buildCenter) → the world cell of anchor 0's FLOOR, or null.
@@ -237,6 +334,6 @@ function anchorZeroPoint(blueprintName, buildCenter) {
 }
 
 module.exports = {
-  isDead, awaitKnownHealth, reviveBody, teleportTo, teleportToPlayer, anchorZeroPoint,
+  isDead, awaitKnownHealth, reviveBody, teleportTo, teleportToPlayer, arriveAtPlayer, anchorZeroPoint,
   ARRIVAL_TOLERANCE, HEALTH_WAIT_MS, RESPAWN_WAIT_MS, TELEPORT_WAIT_MS,
 };

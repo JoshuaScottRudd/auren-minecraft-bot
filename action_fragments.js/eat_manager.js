@@ -32,7 +32,6 @@ const TAG = 'eat_manager';
 module.exports = {
   receive: watcher.track(TAG, function (signalType, payload = {}) {
     if (signalType !== TAG) return;
-    const signalBus = require('@kernel/signal_bus');
     const bot = global.bot;
     const from = payload?.from || 'unknown';
 
@@ -49,7 +48,7 @@ module.exports = {
     if (!verdict.needs_to_eat) {
       const readable = `${TAG}: verified full — food ${verdict.food}/20. Safe → release.`;
       watcher.summary(TAG, readable);
-      return routeToJudge(signalBus, TAG, { [TAG]: { success: true, food: verdict.food }, readable });
+      return routeToJudge(TAG, { [TAG]: { success: true, food: verdict.food }, readable });
     }
 
     // STAND DOWN (two-tier): should-eat but NOT at the must-eat floor AND no food is
@@ -60,7 +59,7 @@ module.exports = {
     if (!verdict.must_eat && !hasAccessibleFood(bot)) {
       const readable = `${TAG}: hungry (food ${verdict.food}/20) but no food reachable yet — standing down; bot works while the farms produce.`;
       watcher.summary(TAG, readable);
-      return routeToJudge(signalBus, TAG, { [TAG]: { success: true, food: verdict.food, stood_down: true }, readable });
+      return routeToJudge(TAG, { [TAG]: { success: true, food: verdict.food, stood_down: true }, readable });
     }
 
     // WORK: food is reachable (or the bot is at the must-eat floor) → dispatch the executor to feed the bot
@@ -68,6 +67,6 @@ module.exports = {
     // executor's outcome back here to verify (the loop closes on the next re-sense above).
     const readable = `${TAG}: hungry (food ${verdict.food}/20) from=${from} → eat_executor.`;
     watcher.summary(TAG, readable);
-    return routeSignal(signalBus, TAG, 'eat_executor', { ...payload, manager: TAG, readable });
+    return routeSignal(TAG, 'eat_executor', { ...payload, manager: TAG, readable });
   }),
 };

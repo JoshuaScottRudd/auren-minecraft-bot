@@ -55,7 +55,19 @@ const stoneProspectExecutor = require('@action/stone_prospect_executor.js');
 const eatExecutor         = require('@action/eat_executor.js');
 
 // ── Admin ───────────────────────────────────────────────────────────────────
-const startInjector        = require('@action/start_injector.js');
+// start_injector is NOT registered: it has no `receive` and nothing routes to it. Its two callers —
+// master_core (on the `start` operator verb) and operator_commands — call `.inject()` directly, so it is
+// a LIBRARY in the same sense as compost_executor and land_prep above. It carried a registry entry from
+// 2026-06 until 2026-09-10 anyway, which made it a name the bus would accept and then drop on the floor
+// (Law 8, orphaned message) had anything ever routed to it.
+//
+// NO SECOND ASSERT WAS ADDED FOR IT, and the reasoning is the point. A check for "every entry has a
+// receive" passes two of the Architect's three gates for a guard — it is necessary (this file carried a
+// real violation for three months) and it is deterministic (one `typeof` over the exported map). It
+// fails the third: the damage is bounded and self-announcing. The bus already warns
+// `No valid receiver found for '<name>'` and the trace names the target, so the failure costs one
+// look at a trace rather than a silent wrong answer. Compare the catch-shape gate, where the failure is
+// an error swallowed forever with nothing written anywhere. Delete the entry; do not build the machine.
 const recursiveJudge       = require('@action/recursive_judge.js');
 // Live single-fragment isolation harness (manual). Registered so the bus can dispatch a
 // fragment-under-test's rerouted return signal (to:'fragment_tester') back to its receive.
@@ -109,7 +121,6 @@ module.exports = {
   eat_executor:     eatExecutor,
 
   // Admin
-  start_injector:        startInjector,
   recursive_judge:       recursiveJudge,
   fragment_tester:       fragmentTester,
 

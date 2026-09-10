@@ -81,6 +81,7 @@ const INGAME_DOOR_PORT = PORT + INGAME_DOOR_PORT_OFFSET;
 // its head, and there is nothing to cap for — `fleet_control up` clears the story files at every run, so
 // growth is bounded by one run's length (a 39-minute soak wrote 1.5 MB).
 const COMBINED_LOG_FILE = require('../js_kernel/utils/record_homes').traceFile('overseer');
+const { guardExternalSync } = require('@utils/external_library_guard');
 const COMBINED_FLUSH_MS = 1000;   // matches the bots' cadence; see watcher.js for why it is not 40
 let _unwritten = [];
 let _combinedWriteScheduled = false;
@@ -93,13 +94,18 @@ function persistCombined(line) {
     _combinedWriteScheduled = false;
     const chunk = _unwritten;
     _unwritten = [];
-    try {
+    // `fs.appendFile` is a THIRD-PARTY call and can throw synchronously before its callback ever runs
+    // (a bad path, EMFILE). Both failure routes put the lines back rather than dropping them. The
+    // hand-written `try` this replaces was silent, so a persistently failing append looked identical
+    // to a working one (found 2026-09-10, when the catch-shape gate was first allowed to see this file).
+    const appended = guardExternalSync('overseer_server', 'fs.appendFile(combined trace)', () => {
       fs.appendFile(COMBINED_LOG_FILE, chunk.map(l => JSON.stringify(l)).join('\n') + '\n', (err) => {
         // Put the lines BACK on a failed append rather than dropping them — the next flush retries.
         // Unshifted, so a retry cannot re-order the story it is trying to preserve.
         if (err) _unwritten = chunk.concat(_unwritten);
       });
-    } catch (_) { _unwritten = chunk.concat(_unwritten); }
+    });
+    if (!appended.ok) _unwritten = chunk.concat(_unwritten);
   }, COMBINED_FLUSH_MS);
   if (t.unref) t.unref();
 }

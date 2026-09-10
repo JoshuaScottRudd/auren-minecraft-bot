@@ -87,11 +87,11 @@ const mineflayer = require('mineflayer');
 const { FOREMAN_NAME, FOREMAN_PREFIX, FOREMAN_CHANNEL, BOT_SENIORITY,
         SERVER_ENDPOINT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const channel = require('./foreman_channel');
-// THE ONE TELEPORT, in its address-a-person form. The desk brings a new crew to whoever hired it, and it
-// reaches for the fleet's existing implementation rather than opening its own rcon session — a second
-// `tp` spelled here would be the second route Law 16 exists to prevent, and it is the kind that only
-// diverges once somebody fixes a bug in one of them.
-const recovery = require('@kernel/body_recovery');
+// THE DESK NO LONGER TELEPORTS ANYTHING, and its `body_recovery` require went with the act (2026-09-10).
+// It used to bring each new body to whoever hired it; the measurement that moved that act into the body's
+// own start path is in the launch loop, and the reason it could not simply be delayed here is that this
+// process holds no handle on the body it was moving, so it could never confirm an arrival. What travels
+// to the crew now is the asker's NAME, in `BOT_START_NEAR`.
 
 // HOW LONG A CREW GETS TO APPEAR IN THE OVERSEER'S REGISTRY after its processes are launched. Matched to
 // `fleet_control.waitForBotsOnline`'s own 90s rather than picked, because it is the same wait for the same
@@ -249,7 +249,13 @@ const fetched = [];
 // that decision arriving through the only door the shipped layer has. See
 // `bot_mandate.beginsWorkAtBirth` for why this is a launch fact rather than a species one — a
 // homesteader raised any other way still waits.
-function startBot(botId, species, owner) {
+// ── AND BOTH ARE PLACED BY THE PERSON WHO ASKED, WHICH IS NOW PART OF THE MANDATE (2026-09-10) ──────
+// `BOT_START_NEAR` carries the asker to the body, and the body puts itself beside them and CONFIRMS it
+// before it plans anything (`start_injector`'s placement gate). The desk no longer teleports the crew
+// itself — see the launch loop for the measurement that moved the act, and why one owner of it is the
+// whole point (Law 16). It is stamped for both species: a homesteader has no owner to derive it from,
+// and a contractor's owner is the same person anyway, so passing it always is one rule rather than two.
+function startBot(botId, species, owner, placeBeside) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(BOT_DIR, 'start_bot.js')], {
       cwd: BOT_DIR,
@@ -257,7 +263,7 @@ function startBot(botId, species, owner) {
       // non-human caller: an absent flag falls back to the variable it would have set, so this passes
       // through whole. BOT_ID is overridden explicitly — this process carries `foreman` in it for its
       // own record, and inheriting that would file the bot's log under the desk.
-      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: '1' },
+      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: '1', BOT_START_NEAR: placeBeside },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -595,12 +601,11 @@ async function handle(from, text, reply) {
     // transient, and a silent retry turns a diagnosable fault into an intermittent one.
     const said = [];
     const standing = [];
-    const stranded = [];
     let reach = null;                       // the last fleet error, when the registry could not be read
     for (let i = 0; i < crew.length; i++) {
       const target = crew[i];
       if (i > 0) await new Promise(r => setTimeout(r, CREW_LAUNCH_GAP_MS));
-      const r = await startBot(target, species, wantsContractors ? from : '');
+      const r = await startBot(target, species, wantsContractors ? from : '', from);
       said.push(firstMeaningfulLine(r.out) || `${target}: the launcher exited ${r.code}`);
 
       // POLLED, NEVER SLEPT-THEN-CHECKED: a body that registers in four seconds is brought over in four
@@ -618,13 +623,19 @@ async function handle(from, text, reply) {
       if (!seen) { log(`${target} did not register within ${BODY_ARRIVAL_WAIT_MS}ms for ${from}`); continue; }
       standing.push(target);
 
-      // A contractor connects at the world spawn point, which is specifically not next to whoever hired
-      // it — so a body that spawned perfectly two hundred blocks away has, from the only viewpoint that
-      // matters, not arrived. Issued only after the registry confirms the body, because a `tp` aimed at a
-      // client still connecting is dropped by the server in silence. A failed teleport does not fail the
-      // `get`: the bot is theirs and working either way, so it is reported rather than treated as absence.
-      const tp = await recovery.teleportToPlayer(target, from);
-      if (!tp.sent) { stranded.push(target); log(`tp ${target} -> ${from} failed: ${tp.error}`); }
+      // ── THE TELEPORT USED TO BE HERE, AND MOVING IT IS THE 2026-09-10 FIX ──────────────────────────
+      // This loop teleported each body the moment the registry confirmed it. That was too late, and the
+      // gap was never visible from the desk: a body runs its own spawn sequence in its own process and
+      // injects its start signal there, so the survey that decides where the base goes had already run.
+      // Timed across three runs — survey at 10:41:54.842, this teleport landing at 10:41:55 — and all
+      // three produced the identical world-spawn survey with the asker 130 blocks away.
+      //
+      // A wait here would not have fixed it, and that is why the act MOVED rather than gaining a poll:
+      // the desk cannot know when a body has finished placing itself because it holds no handle on it,
+      // which is the same asymmetry `body_recovery`'s header describes. The body does hold one. So the
+      // body places itself and confirms it (`body_recovery.arriveAtPlayer`, gated in `start_injector`),
+      // the asker travels in `BOT_START_NEAR`, and there is exactly one place a crew is put where its
+      // person is standing (Law 16).
     }
     log(`get crew ${crew.join(', ')} for ${from} -> ${said.join(' | ')}`
         + ` | stood: ${standing.join(', ') || 'none'}`);
@@ -651,10 +662,16 @@ async function handle(from, text, reply) {
       // announces their arrival is the last place a person is told otherwise. Caught on the first live
       // run of `get homesteader`, which reported *"IrisBot and VesperBot are yours"* about two bodies
       // that will not answer to them (Law 25).
+      //
+      // "HERE" IS NO LONGER THIS DESK'S CLAIM TO MAKE, and the branch that used to hedge it is gone with
+      // the teleport (2026-09-10). The desk once teleported each body and reported which ones it could
+      // not bring; now each body places itself beside the asker and refuses to work until it has
+      // confirmed it, so a bot that is WORKING is a bot that is standing here — the two facts became one
+      // and there is no longer a state where they disagree (Law 27: constitute the fact rather than
+      // report on the gap). A body that could not be placed does not start, says so on its own trace, and
+      // shows up here as a short crew through the branch below.
       const whose = wantsContractors ? 'yours' : 'the homestead\'s';
-      reply(stranded.length
-        ? `${standing.join(' and ')} are ${whose} and working — but I could not bring ${stranded.join(' and ')} to you. say "${FOREMAN_PREFIX} where" to find them.`
-        : `${standing.join(' and ')} are ${whose}, here, and working.`);
+      reply(`${standing.join(' and ')} are ${whose}, here, and working.`);
       return;
     }
     // THE SHORT CASE SAYS WHAT THEY HAVE AND WHAT TO DO — AND NOT ONE WORD OF MACHINE DETAIL.

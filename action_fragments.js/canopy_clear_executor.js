@@ -50,8 +50,7 @@ async function _routeIdle(reason) {
   if (verdict === false) return;
   watcher.summary(TAG, reason);
   require('@thinking/dispatcher.js').clearMagnet();
-  const signalBus = require('@kernel/signal_bus');
-  routeSignal(signalBus, TAG, 'idle_park', { readable: `${TAG}: ${reason} → idle_park` });
+  routeSignal(TAG, 'idle_park', { readable: `${TAG}: ${reason} → idle_park` });
 }
 
 module.exports = {
@@ -91,12 +90,11 @@ module.exports = {
       const readable = `${TAG}: cleared ${result.species}${at}, mined ${result.minedCount}`;
       portableJudge.done(TAG);   // a felled tree is progress — the concession ledger starts over
       watcher.summary(TAG, readable);
-      const signalBus = require('@kernel/signal_bus');
       const capsule = payload[TAG] || (payload[TAG] = {});
       capsule.success = true;
       capsule.readable = readable;
       payload.readable = readable;
-      return routeToJudge(signalBus, TAG, { ...payload, readable });
+      return routeToJudge(TAG, { ...payload, readable });
     }
 
     // No clearable tree in range → concede (the gate stops posting once the ring is truly clear; a

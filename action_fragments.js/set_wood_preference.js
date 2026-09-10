@@ -137,7 +137,6 @@ module.exports = {
   woodPreferenceSet,
   receive: watcher.track(TAG, async function (signalType, payload) {
     if (signalType !== TAG) return; // strict contract
-    const signalBus = require('@kernel/signal_bus');
 
     const result = await run(global.bot);
 
@@ -145,14 +144,14 @@ module.exports = {
       // Soft-fail to the judge: the preference stays unset, the board re-posts, and the next attempt scans
       // from wherever the bot has moved to. Never a false success (Law 25) — a bot that saw no trees has
       // not set a preference, and the readable says so.
-      routeToJudge(signalBus, TAG, {
+      routeToJudge(TAG, {
         ...payload,
         result: 'wood_preference_pending', success: false,
         readable: `${TAG}: no preference set (${result.reason}) — retry`,
       });
       return;
     }
-    routeToJudge(signalBus, TAG, {
+    routeToJudge(TAG, {
       ...payload,
       result: 'wood_preference_set', success: true,
       set_wood_preference: { species: result.species },

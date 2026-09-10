@@ -24,7 +24,6 @@ module.exports = {
     receive: watcher.track(TAG, async function (signalType, payload) {
         if (signalType !== TAG) return;
 
-        const signalBus = require('@kernel/signal_bus');
         const bot = global.bot;
         if (!bot) throw new Error(`[${TAG}] CODING VIOLATION: global.bot not set.`);
 
@@ -47,7 +46,7 @@ module.exports = {
                 scanned_at:    new Date().toISOString(),
             });
             watcher.summary(TAG, `Current biome '${result.current_biome}' (rank ${result.current_rank}) — no alternative biome detected near (${refX},${refY},${refZ}); holding position this cycle.`);
-            return routeToJudge(signalBus, TAG, {
+            return routeToJudge(TAG, {
                 ...payload,
                 success: true,
                 readable: `${TAG}: none_detected`,
@@ -73,7 +72,7 @@ module.exports = {
         watcher.summary(TAG, `🏞️ [${result.mode}] heading toward '${result.target_biome}'${forItemText} — arrived near (${result.arrived_at?.x},${result.arrived_at?.y},${result.arrived_at?.z}).`);
 
         const forItemSuffix = result.for_item ? `_for_${result.for_item}` : '';
-        routeToJudge(signalBus, TAG, {
+        routeToJudge(TAG, {
             ...payload,
             success: true,
             readable: `${TAG}: ${result.mode}_toward_${result.target_biome}${forItemSuffix}`,

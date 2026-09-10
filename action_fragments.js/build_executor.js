@@ -235,7 +235,6 @@ module.exports = {
     if (signalType !== 'build_executor') return;
 
     const bot = global.bot;
-    const signalBus = require('@kernel/signal_bus');
     const blueprintName = payload?.blueprint_name || 'headframe';
     const roomKey = payload?.conference_room_key || blueprintName;
 
@@ -817,6 +816,6 @@ module.exports = {
     capsule.recursion_alert = true;
     capsule.drop_collector = finalDrops;
 
-    routeToJudge(signalBus, 'build_executor', { ...payload, readable: capsule.readable });
+    routeToJudge('build_executor', { ...payload, readable: capsule.readable });
   })
 };

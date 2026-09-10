@@ -389,8 +389,7 @@ async function _transferRetrieve(bot, win, item, target) {
 
 function _abandon(reason) {
     watcher.warn(TAG, `Abandoning caller — ${reason}`);
-    const signalBus = require('@kernel/signal_bus');
-    routeToJudge(signalBus, TAG, { result: TAG, success: false, readable: `${TAG}: ${reason}` });
+    routeToJudge(TAG, { result: TAG, success: false, readable: `${TAG}: ${reason}` });
 }
 
 // Queue in line at a peer-locked chest: walk there first (the wait happens AT

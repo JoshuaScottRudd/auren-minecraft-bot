@@ -82,7 +82,6 @@ function stillDark(bot, standPos, floorPos) {
 }
 
 function routeJudge(payload, success, result, readable, metrics) {
-  const signalBus = require('@kernel/signal_bus');
   const capsule = payload[TAG] || (payload[TAG] = {});
   capsule.success = success;
   capsule.result = result;
@@ -90,7 +89,7 @@ function routeJudge(payload, success, result, readable, metrics) {
   capsule.readable = readable;
   capsule.recursion_alert = true;
   payload.readable = readable;
-  routeToJudge(signalBus, TAG, { ...payload, readable });
+  routeToJudge(TAG, { ...payload, readable });
 }
 
 module.exports = {

@@ -133,17 +133,16 @@ async function eatUntilFull(bot) {
 // Route the eat outcome to the judge with the manager stamp preserved (payload.manager === 'eat_manager');
 // the judge hands this back to eat_manager to VERIFY (Invariant B). Capsule keyed by own name so the judge
 // reads THIS fragment's outcome, never a peer's accumulated one (Invariant D).
-function _routeJudge(signalBus, payload, success, readable) {
+function _routeJudge(payload, success, readable) {
   payload[TAG] = { success, food: global.bot?.food, recursion_alert: true };
   payload.readable = readable;
   watcher.summary(TAG, readable);
-  routeToJudge(signalBus, TAG, { ...payload, readable });
+  routeToJudge(TAG, { ...payload, readable });
 }
 
 module.exports = {
   receive: watcher.track(TAG, async function (signalType, payload = {}) {
     if (signalType !== TAG) return;
-    const signalBus = require('@kernel/signal_bus');
     const bot = global.bot;
 
     if (!bot || typeof bot.food !== 'number') {
@@ -153,7 +152,7 @@ module.exports = {
     // 1) Eat what's in the pocket.
     let result = await eatUntilFull(bot);
     if (result.full) {
-      return _routeJudge(signalBus, payload, true, `${TAG}: ate ${result.ate} from pocket — food ${result.foodBefore}→${result.foodAfter}/20 (full)`);
+      return _routeJudge(payload, true, `${TAG}: ate ${result.ate} from pocket — food ${result.foodBefore}→${result.foodAfter}/20 (full)`);
     }
 
     // 2) Pocket dry, still hungry → withdraw food from storage if any exists, then eat again.
@@ -172,7 +171,7 @@ module.exports = {
         : plan.short > 0 ? `(storage was ${plan.short} hunger point(s) short of a full meal — ate what there was)`
         : '(still hungry — storage thinning)';
       const menu = Object.entries(plan.byItem).map(([n, c]) => `${c}x ${n}`).join(', ') || 'nothing on the shelf';
-      return _routeJudge(signalBus, payload, result.full || result.ate > 0,
+      return _routeJudge(payload, result.full || result.ate > 0,
         `${TAG}: asked storage for ${menu} to close ${HUNGER_FULL - before} point(s), ate ${result.ate}`
         + ` — food ${before}→${result.foodAfter}/20 ${tail}`);
     }
@@ -190,7 +189,7 @@ module.exports = {
         `system fault requiring inspection, not a world condition to replan around.`
       );
     }
-    return _routeJudge(signalBus, payload, true,
+    return _routeJudge(payload, true,
       `${TAG}: no food reachable yet (food ${bot.food}/20, above must-eat floor ${HUNGER_MUST_EAT_THRESHOLD}) ` +
       `— deferring; bot works while the farms produce (Law 17 two-tier).`);
   }),

@@ -102,9 +102,9 @@ function hasMiningLight(bot) {
 // Release back to recursive_judge (as a manager → the judge routes to job_board for a replan). This
 // is the plain release used for pre-dispatch gate failures, where the bot has not descended. The
 // batch-END release (after real mining) goes through _exitMine, which surfaces and dumps first.
-function _release(signalBus, reason) {
+function _release(reason) {
     watcher.summary(TAG, `Releasing: ${reason}`);
-    routeToJudge(signalBus, TAG, { readable: `${TAG}: ${reason}` });
+    routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
 }
 
 // Re-dispatch the executor for the NEXT pass of the SAME batch: the manager
@@ -113,8 +113,8 @@ function _release(signalBus, reason) {
 // the round trip through recursive_judge — so this only bumps the pass counter and re-stamps the
 // manager. NOT called on the first dispatch (that path routes to the shaft head first); mid-batch the
 // bot is already deep and must stay there.
-function _redispatch(signalBus, payload, passesCompleted, readable) {
-    routeSignal(signalBus, TAG, 'mining_executor', {
+function _redispatch(payload, passesCompleted, readable) {
+    routeSignal(TAG, 'mining_executor', {
         ...payload,
         manager: TAG,
         mining_pass: passesCompleted,
@@ -135,7 +135,7 @@ function _redispatch(signalBus, payload, passesCompleted, readable) {
 // two differ: on a fresh claim the bot has not descended (plain _release), mid-batch it is deep and must
 // surface and dump first (_exitMine). Releasing in here would have picked one and been wrong half the
 // time. Side effects of a failed selection (markCellBlocked) stay here — they belong to the selection.
-async function _selectAndDispatchCell(signalBus, payload, bot, miningPass) {
+async function _selectAndDispatchCell(payload, bot, miningPass) {
     const N = MINING_PASSES_PER_DISPATCH;
     // Selection loop with object locking: a peer-held cell is neither complete nor blocked — it is
     // someone else's object right now (lock the object, not the bot). Skip it and take the next nearest;
@@ -174,7 +174,7 @@ async function _selectAndDispatchCell(signalBus, payload, bot, miningPass) {
 
         const cell = candidate;
         watcher.summary(TAG, `Dispatching mining_executor for cell ${cell.id} @ (${cell.anchor.x},${cell.anchor.y},${cell.anchor.z}) — cell ${miningPass + 1}/${N} of this trip.`);
-        routeSignal(signalBus, TAG, 'mining_executor', {
+        routeSignal(TAG, 'mining_executor', {
             ...payload,
             manager: TAG,
             mining_pass: miningPass,
@@ -190,7 +190,7 @@ async function _selectAndDispatchCell(signalBus, payload, bot, miningPass) {
 // zero-extra-travel offload) and so whatever job runs next starts from the surface, never from deep in
 // the shaft. dumpExcess is a no-op when nothing is over-keep, so the surface walk is the load-bearing
 // step; the dump rides along. Reuses the ONE dump primitive (Law 16), the same call dump_executor makes.
-async function _exitMine(signalBus, bot, site, reason) {
+async function _exitMine(bot, site, reason) {
     const back = await _returnToHeadframe(bot);
     if (!back.skipped && !back.arrived) {
         // Caved/blocked access out is environmental (Law 13): log and release from where we are rather
@@ -204,7 +204,7 @@ async function _exitMine(signalBus, bot, site, reason) {
     // same guard applies: skip the release when the dump abandons.
     const dumped = await dumpExcess(bot);
     if (dumped?.abandoned) return;
-    _release(signalBus, reason);
+    _release(reason);
 }
 
 // Enter the mine THROUGH the headframe, never by digging straight down. Before the executor takes
@@ -278,21 +278,20 @@ module.exports = {
     hasMiningLight,
     receive: watcher.track(TAG, async function (signalType, payload) {
         if (signalType !== TAG) return;
-        const signalBus = require('@kernel/signal_bus');
         const overseerLink = require('@kernel/overseer_link');
 
         const botId = process.env.BOT_ID || 'default';
         const magnet = hq.readBoardroomChair(botId, {})?.magnet;
 
         if (!magnet || !magnet.what) {
-            _release(signalBus, 'no active magnet');
+            _release('no active magnet');
             return;
         }
 
         // Verify shaft site is locked
         const site = hq.readBuildingChair('headframe', 'set_buildspot');
         if (!site?.build_center || !site?.staircase) {
-            _release(signalBus, 'staircase site not locked — building must find headframe first');
+            _release('staircase site not locked — building must find headframe first');
             return;
         }
 
@@ -333,8 +332,8 @@ module.exports = {
                     else { const seg = integrity.first_incomplete; reason = `segment pass ${passesCompleted}/${N} done — next: y=${seg?.world_position?.y || '?'}`; }
                 } else if (!complete) { complete = true; reason = 'bot not ready after pass'; }
 
-                if (complete || capReached) { await _exitMine(signalBus, bot, site, reason); return; }
-                _redispatch(signalBus, payload, passesCompleted, `${TAG}: dig_shaft pass ${passesCompleted + 1}/${N} → mining_executor`);
+                if (complete || capReached) { await _exitMine(bot, site, reason); return; }
+                _redispatch(payload, passesCompleted, `${TAG}: dig_shaft pass ${passesCompleted + 1}/${N} → mining_executor`);
                 return;
             }
 
@@ -353,7 +352,7 @@ module.exports = {
             if (jobWhat === 'dig_cell') {
                 const cell = payload.dig_cell;
                 const capsule = payload.mining_executor || {};
-                if (!cell || !cell.id) { await _exitMine(signalBus, bot, site, 'dig_cell return: no cell on payload'); return; }
+                if (!cell || !cell.id) { await _exitMine(bot, site, 'dig_cell return: no cell on payload'); return; }
 
                 // maintenance:true = this dispatch was repairing an already-complete cell (a damaged
                 // built cell surfaced by selectMaintenanceCell), not carving a new one. It stays
@@ -377,15 +376,15 @@ module.exports = {
                     // selectable, does the bot surface — and _exitMine dumps at the chests on the way
                     // out, which is why mining needs no dump JOB competing for the bot.
                     if (!capReached) {
-                        const next = await _selectAndDispatchCell(signalBus, payload, bot, passesCompleted);
+                        const next = await _selectAndDispatchCell(payload, bot, passesCompleted);
                         if (next.dispatched) {
                             watcher.summary(TAG, `${reason} — continuing this trip at cell ${next.cell.id}.`);
                             return;
                         }
-                        await _exitMine(signalBus, bot, site, `${reason}; ${next.reason}`);
+                        await _exitMine(bot, site, `${reason}; ${next.reason}`);
                         return;
                     }
-                    await _exitMine(signalBus, bot, site, `${reason} — batch cap (${N}) reached`);
+                    await _exitMine(bot, site, `${reason} — batch cap (${N}) reached`);
                     return;
                 }
 
@@ -401,7 +400,7 @@ module.exports = {
                     const stuck = maintenance ? 'maint_stuck' : 'stuck';
                     miningCellGraph.markCellBlocked(cell.id, stuck);
                     watcher.warn(TAG, `cell ${cell.id} ${maintenance ? 'repair ' : ''}stuck — ${remaining} step(s) unreachable after a no-progress pass; blocked (${stuck}) for inspection.`);
-                    await _exitMine(signalBus, bot, site, `cell ${cell.id} ${stuck} (${remaining} unreachable) — blocked`);
+                    await _exitMine(bot, site, `cell ${cell.id} ${stuck} (${remaining} unreachable) — blocked`);
                     return;
                 }
 
@@ -409,10 +408,10 @@ module.exports = {
                 // (job_board may re-select it later for another batch; progress is recorded, so it resumes).
                 if (capReached) {
                     overseerLink.releaseClaim(`cell:${cell.id}`);
-                    await _exitMine(signalBus, bot, site, `cell ${cell.id} ${maintenance ? 'repairing' : 'progressed'} — batch cap (${N}) reached, ${remaining} step(s) left`);
+                    await _exitMine(bot, site, `cell ${cell.id} ${maintenance ? 'repairing' : 'progressed'} — batch cap (${N}) reached, ${remaining} step(s) left`);
                     return;
                 }
-                _redispatch(signalBus, payload, passesCompleted, `${TAG}: dig_cell ${cell.id} re-pass ${passesCompleted + 1}/${N} (${remaining} left) → mining_executor`);
+                _redispatch(payload, passesCompleted, `${TAG}: dig_cell ${cell.id} re-pass ${passesCompleted + 1}/${N} (${remaining} left) → mining_executor`);
                 return;
             }
 
@@ -426,8 +425,8 @@ module.exports = {
             const done = BATCH_BLOCKED_EXITS.has(er)
                 || er === 'objective_met' || er === 'deficiency_met' || er === 'shaft_complete' || er === 'no_work' || er === 'no_steps';
             const reason = `${jobWhat} pass ${passesCompleted}/${N}: ${er || 'complete'}`;
-            if (done || capReached) { await _exitMine(signalBus, bot, site, reason); return; }
-            _redispatch(signalBus, payload, passesCompleted, `${TAG}: mine ${jobWhat} re-pass ${passesCompleted + 1}/${N} → mining_executor`);
+            if (done || capReached) { await _exitMine(bot, site, reason); return; }
+            _redispatch(payload, passesCompleted, `${TAG}: mine ${jobWhat} re-pass ${passesCompleted + 1}/${N} → mining_executor`);
             return;
         }
 
@@ -440,7 +439,7 @@ module.exports = {
         // tiers will produce a fresh pickaxe (Law 13: environmental shortage, soft-fail).
         const pick = hasPickaxe(global.bot);
         if (!pick.ok) {
-            _release(signalBus, `mining blocked: ${pick.reason} — need a pickaxe before digging`);
+            _release(`mining blocked: ${pick.reason} — need a pickaxe before digging`);
             return;
         }
 
@@ -449,7 +448,7 @@ module.exports = {
         // unblocks it (Law 13: environmental shortage, soft-fail).
         const light = hasMiningLight(global.bot);
         if (!light.ok) {
-            _release(signalBus, `mining blocked: ${light.reason} — no descent without torches`);
+            _release(`mining blocked: ${light.reason} — no descent without torches`);
             return;
         }
 
@@ -459,7 +458,7 @@ module.exports = {
         // the executor dig straight down from a bad position.
         const head = await _routeToShaftHead(global.bot);
         if (!head.arrived) {
-            _release(signalBus, 'headframe access unreachable — cannot enter the mine via the shaft head');
+            _release('headframe access unreachable — cannot enter the mine via the shaft head');
             return;
         }
 
@@ -469,13 +468,13 @@ module.exports = {
             if (bot && bot.blockAt) {
                 const integrity = miningIntegrity.scan(bot);
                 if (integrity.all_segments_complete) {
-                    _release(signalBus, 'shaft complete');
+                    _release('shaft complete');
                     return;
                 }
             }
 
             watcher.summary(TAG, 'Dispatching mining_executor for dig_shaft');
-            routeSignal(signalBus, TAG, 'mining_executor', {
+            routeSignal(TAG, 'mining_executor', {
                 ...payload,
                 manager: TAG,
                 mining_pass: 0,   // batch pass counter — first pass of a fresh surface trip
@@ -490,18 +489,18 @@ module.exports = {
         // recursive_judge-return branch above marks it complete + registers neighbours.
         if (jobWhat === 'dig_cell') {
             const bot = global.bot;
-            if (!bot || !bot.blockAt) { _release(signalBus, 'dig_cell: bot not ready'); return; }
+            if (!bot || !bot.blockAt) { _release('dig_cell: bot not ready'); return; }
 
             // Pass 0 — the first cell of a fresh surface trip. The bot has not descended yet, so a
             // failed selection takes the plain release rather than _exitMine's surface-and-dump.
-            const picked = await _selectAndDispatchCell(signalBus, payload, bot, 0);
-            if (!picked.dispatched) _release(signalBus, picked.reason);
+            const picked = await _selectAndDispatchCell(payload, bot, 0);
+            if (!picked.dispatched) _release(picked.reason);
             return;
         }
 
         // ── mine_material: dispatch mining_executor for a specific item ──
         watcher.summary(TAG, `Dispatching mining_executor for ${magnet.hold_goal || 1}x ${jobWhat}`);
-        routeSignal(signalBus, TAG, 'mining_executor', {
+        routeSignal(TAG, 'mining_executor', {
             ...payload,
             manager: TAG,
             mining_pass: 0,   // batch pass counter — first pass of a fresh surface trip

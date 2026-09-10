@@ -111,13 +111,12 @@ function _fillerHeld(bot) {
 // this haul is nine blocks the fleet is waiting to spend on a craft, and it sits under the
 // cobblestone row's keep — banking it would walk it to a chest and then need it withdrawn again.
 async function _routeResult(payload, success, readable) {
-    const signalBus = require('@kernel/signal_bus');
     if (success) portableJudge.done(TAG);
     const capsule = payload[TAG] || (payload[TAG] = {});
     capsule.success = success;
     capsule.readable = readable;
     payload.readable = readable;
-    return routeToJudge(signalBus, TAG, { ...payload });
+    return routeToJudge(TAG, { ...payload });
 }
 
 // Concede rather than soft-fail when the trip is FUTILE from here — no column in range, or the
@@ -130,8 +129,7 @@ async function _routeIdle(payload, reason) {
     if (verdict === false) return;   // portable_judge already routed — a second signal would break Law 4
     watcher.summary(TAG, reason);
     require('@thinking/dispatcher.js').clearMagnet();
-    const signalBus = require('@kernel/signal_bus');
-    routeSignal(signalBus, TAG, 'idle_park', { readable: `${TAG}: ${reason} → idle_park` });
+    routeSignal(TAG, 'idle_park', { readable: `${TAG}: ${reason} → idle_park` });
 }
 
 // Seal the shaft from the inside, one placement per block of depth, until the body is back above the

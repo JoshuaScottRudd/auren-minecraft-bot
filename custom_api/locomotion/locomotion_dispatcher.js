@@ -43,6 +43,12 @@
 // is the judge's internal ruling and never needs to be known here.
 // ---------------------------------------------------------------------------
 const watcher = require('@kernel/watcher');
+// The bus at MODULE SCOPE, which it could not be before 2026-09-10: the load cycle through
+// fragment_registry forced this require inside a function in every routing file. This is one of the
+// six FORWARDING routers — it calls route() with an upstream author's own from/to rather than building
+// an envelope, so it cannot use signal_utils' helpers (they stamp `from` = the caller and would rewrite
+// authorship). Every other fragment now has no contact with the bus at all.
+const signalBus = require('@kernel/signal_bus');
 
 // ---------------------------------------------------------------------------
 // SECTION 2: Configuration constants
@@ -172,8 +178,7 @@ function dispatchChain(request) {
     `🚪 ${request.verb} → ${goalText}, entering ladder at '${nextRung}' (attempt ${request.attempt}, invocation #${request.invocationId}).`
   );
 
-  const signalBus = require('@kernel/signal_bus'); // lazy: avoids circular load via fragment_registry
-  signalBus.route(payload.from, payload.to, payload);
+  signalBus.route(payload.to, payload);
 }
 
 // ---------------------------------------------------------------------------

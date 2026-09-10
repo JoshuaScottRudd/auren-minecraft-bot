@@ -486,7 +486,7 @@ module.exports = {
         // duplicated a recovery the overseer already owns (Law 16), and it had to be written as a catch
         // around our own code to do it.
         _sweep();
-        routeSignal(require('@kernel/signal_bus'), TAG, 'dispatcher', {});
+        routeSignal(TAG, 'dispatcher', {});
     },
     INVENTORY_WHITELIST,
 };

@@ -22,7 +22,20 @@
 // The job moved to `signal_sequencer`, called by recursive_judge: it stamps a monotonic id on the chain
 // and throws when a stale one comes back. Live state belongs to whoever owns the scope, never here.
 
-const registry = require('@kernel/fragment_registry');
+// THE REGISTRY IS REQUIRED INSIDE route(), NOT HERE, AND THAT IS THE WHOLE OF THE CYCLE FIX.
+//
+// This module used to hold `const registry = require('@kernel/fragment_registry')` at module scope, and
+// the registry eagerly requires all 30 fragments — so every fragment that wanted to route had a load-time
+// path back to itself: fragment -> signal_bus -> fragment_registry -> fragment. CommonJS resolves that by
+// handing out a HALF-BUILT module, and because both files assign `module.exports = {…}` (a replacement,
+// not a mutation), whoever lost the race kept a reference to an object that was then thrown away. Measured
+// 2026-09-10: with a module-scope bus require added to a fragment, Node warns about the circular dependency
+// and that fragment's registry entry reads `receive: undefined` for the life of the process — silently
+// unroutable, with preflight green throughout.
+//
+// Deferring it to call time removes the only load-time edge. By the first route() the registry is long
+// since loaded and this is a cache hit, so the cost is one map lookup per call. Nothing else about routing
+// moved: see architect_scratchpad.md §5 for what this file does and why none of it is redundant.
 const watcher = require('@kernel/watcher');
 const sequencer = require('@kernel/signal_sequencer');
 
@@ -40,7 +53,20 @@ const sequencer = require('@kernel/signal_sequencer');
 // Nothing clears it but a process restart (Law 13: default stopped).
 let stoppedAnnounced = false;
 
-function route(source, target, payload = {}) {
+// ── `source` WAS RETIRED 2026-09-10, AND THE REASON IT LASTED IS WORTH ONE PARAGRAPH ─────────────
+// The signature was `route(source, target, payload)` and **the body never referenced `source` once.**
+// Nine call sites filled it in; every one of them passed `payload.from`, the same value already stamped
+// into the envelope by `signal_utils` and the only sender identity anything downstream reads.
+//
+// It survived because it read as the sender half of a delivery — an argument named `source` next to one
+// named `target` describes a contract the code does not have, and no session ever needed to open the
+// body to believe it. That is the failure mode a dead parameter has: not a bug, a false statement about
+// what the function needs, sitting where it is most likely to be believed.
+//
+// A THIRD ARGUMENT WOULD NOT HAVE MATTERED IF THE BUS VERIFIED IT. It does not. The one check here
+// compares `payload.task` against `target` — a typo check between two things the CALLER supplies —
+// so a sender name handed in separately could never have been anything but a claim about itself.
+function route(target, payload = {}) {
   const halt = sequencer.isTripped();
   if (halt) {
     // Announced ONCE. After a trip every fragment in flight tries to route and each would print, burying
@@ -59,6 +85,7 @@ function route(source, target, payload = {}) {
     return;
   }
 
+  const registry = require('@kernel/fragment_registry');
   const fragment = registry[target];
   if (!fragment || typeof fragment.receive !== 'function') {
     watcher.warn('signal_bus', `No valid receiver found for '${target}'`);

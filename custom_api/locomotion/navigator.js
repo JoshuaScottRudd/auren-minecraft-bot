@@ -33,6 +33,12 @@ const { sleep, BLOCK_REACH } = require('@utils/fragment_utils');
 // whole reasoning is in its header; a call a primitive already paid for costs nothing here.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { computeAStar, drainSearchCensus, pathStillWalkable, keyOf, straightLine, classifyFloorInline, isScaffoldBlock, COST_HIGH, COST_PLACE, PROTECTED_VOXEL_DETOUR_BUDGET, FLOW_DETOUR_BUDGET, LAVA_FLOW_DETOUR_BUDGET } = require('@utils/pathfinding_utils');
+// The bus at MODULE SCOPE, which it could not be before 2026-09-10: the load cycle through
+// fragment_registry forced this require inside a function in every routing file. This is one of the
+// six FORWARDING routers — it calls route() with an upstream author's own from/to rather than building
+// an envelope, so it cannot use signal_utils' helpers (they stamp `from` = the caller and would rewrite
+// authorship). Every other fragment now has no contact with the bus at all.
+const signalBus = require('@kernel/signal_bus');
 
 // ---------------------------------------------------------------------------
 // SECTION 2: Constants
@@ -868,8 +874,7 @@ function forwardToJudge(payload, success, distNow, reason) {
     readable: success ? `navigator: success ${capsule.verb}_reached` : `navigator: fail ${reason}`,
     locomotion: capsule
   };
-  const signalBus = require('@kernel/signal_bus');
-  signalBus.route(out.from, out.to, out);
+  signalBus.route(out.to, out);
 }
 
 // DELETED 2026-08-15: `haltForEmergency(payload)` — an emergency exit that drained the census, raised an
@@ -889,12 +894,13 @@ function forwardToJudge(payload, success, distNow, reason) {
 // correctly?" oracle for the throttle/uncap fix: point it from an anchor at a deep cell stand and read
 // whether the plan descends the staircase then walks the corridor (correct) or carves a diagonal
 // shortcut to a dead-end (the old budget-partial bug). Reuses the real pathfinder (Law 16); the only
-// authored input is the standpoint, matching the virtual_playground governor (READ, don't simulate).
+// authored input is the standpoint — READ, DON'T SIMULATE, the rule that anything Minecraft decides is
+// read and only the operator's choices are authored.
 //   standCoord {x,y,z} — the work-stand (feet cell); goal floor is y-1, exactly as STEP 2 derives it.
 //   opts.startCoord {x,y,z} — AUTHORED standpoint (bot feet) to plan FROM; defaults to the bot's real
 //     feet. Lets the oracle plan "as if standing at the anchor" while the observer body sits wherever it
 //     spawned (only voxel reads need the chunks resident; the start is data, not the body's location) —
-//     the playground governor: author the standpoint, READ the voxels.
+//     the same rule again: author the standpoint, READ the voxels.
 //   returns { result, trace: string[] } — result is computeAStar's raw return (path, cost, partial, …).
 async function planRouteForTest(bot, standCoord, opts = {}) {
   if (!bot?.entity?.position && !opts.startCoord) throw new Error('[navigator] planRouteForTest: no bot loaded and no startCoord.');

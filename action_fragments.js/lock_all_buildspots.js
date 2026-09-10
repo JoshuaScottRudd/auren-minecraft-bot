@@ -405,20 +405,19 @@ module.exports = {
   baseLayoutComplete,
   receive: watcher.track(TAG, async function (signalType, payload) {
     if (signalType !== TAG) return; // strict contract
-    const signalBus = require('@kernel/signal_bus');
     const bot = global.bot;
 
     const result = await run(bot, { dryRun: false });
 
     if (result.transient) {
-      routeToJudge(signalBus, TAG, {
+      routeToJudge(TAG, {
         ...payload,
         result: 'base_layout_pending', success: false,
         readable: `${TAG}: world not loaded yet — retry base-layout lock`,
       });
       return;
     }
-    routeToJudge(signalBus, TAG, {
+    routeToJudge(TAG, {
       ...payload,
       result: 'base_layout_locked', success: true,
       lock_all_buildspots: { locked: result.locked },

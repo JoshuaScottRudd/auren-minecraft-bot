@@ -175,8 +175,12 @@ module.exports = {
         // measure the recovery — and the code never implemented the exclusion. Excluding it is also the
         // wrong trade while a shelter is what the run is testing: a bot that died is a bot that was
         // outside at nightfall, which is the FAILURE the run exists to detect, and the twenty minutes
-        // after it are a corpse's twenty minutes. The recovery path has its own bench
-        // (virtual_playground/scenario_respawn_recovery), so nothing is lost by ending here.
+        // after it are a corpse's twenty minutes. Ending the run costs nothing that was being measured.
+        // (This line used to add that the recovery path had its own bench,
+        // `virtual_playground/scenario_respawn_recovery`. That bench was deleted whole on 2026-09-10 —
+        // `Auren_Workshop/README.md` — so recovery is now covered by a live run and nothing else. It
+        // does not change the trade here; it does mean the claim "nothing is lost" was resting on a
+        // second thing that no longer exists.)
         //
         // Turn it on while a FEATURE IS BEING BUILT, which is the case it exists for: a run asking
         // "does this new chain work at all" learns nothing from the twenty minutes after it threw, and

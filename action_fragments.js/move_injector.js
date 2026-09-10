@@ -99,8 +99,7 @@ module.exports = {
         `${result ? `${result.attempts} attempt(s), reason '${result.reason || 'unknown'}'` : 'no verdict returned'}`;
     watcher.summary(TAG, `move test complete: ${outcome}.`);
 
-    const signalBus = require('@kernel/signal_bus');
-    routeToJudge(signalBus, TAG, {
+    routeToJudge(TAG, {
       test: true,                    // halt, no replan — a move test never enters the planning recursion
       readable: `${TAG}: move (${start.x},${start.y},${start.z}) → (${goal.x},${goal.y},${goal.z}) — ${outcome}`,
       move_injector: {

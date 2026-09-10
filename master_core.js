@@ -221,31 +221,28 @@ bot.once('spawn', () => {
   // minecraft-data's 1.21.5 schema declares `["option","vec3f"]` is unverified, and these numbers are
   // the evidence that would settle it.
   const EXPLOSION_KNOCKBACK_MAX_BPT = 10;
+  // UNGUARDED, and the two `try` blocks that used to be here were deleted 2026-09-10 when preflight's
+  // catch-shape gate was first allowed to see this file. VALIDATION is the correct form and it is already
+  // here: `if (!kb) return`, `Number.isFinite`, and the physical bound. Nothing left inside can throw
+  // except our own arithmetic, and our own code throwing is a defect that must travel to reportCrash
+  // (Law 13: default stopped). The old comment said losing the process was worse than losing knockback —
+  // but a clamping bug that keeps the bot alive and silently wrong is the expensive shape, not the crash.
   bot._client.prependListener('explosion', (explosion) => {
-    try {
-      const kb = explosion.playerKnockback;
-      if (!kb) return;
-      delete explosion.playerKnockback;      // FIRST — a return below must still leave the branch disarmed
-      const finite = Number.isFinite(kb.x) && Number.isFinite(kb.y) && Number.isFinite(kb.z);
-      const sane = finite && Math.max(Math.abs(kb.x), Math.abs(kb.y), Math.abs(kb.z)) <= EXPLOSION_KNOCKBACK_MAX_BPT;
-      if (sane) {
-        explosion.playerMotionX = kb.x;
-        explosion.playerMotionY = kb.y;
-        explosion.playerMotionZ = kb.z;
-      } else {
-        require('@kernel/watcher').warn('master_core',
-          `explosion knockback REJECTED at the boundary: {x:${kb.x}, y:${kb.y}, z:${kb.z}} — ` +
-          `${finite ? `beyond the ${EXPLOSION_KNOCKBACK_MAX_BPT} b/tick physical bound` : 'not finite'}. ` +
-          'Blast shove dropped, physics left sane, bot alive. These numbers are the evidence for whether ' +
-          "the server's packet matches minecraft-data's vec3f schema — record them.");
-      }
-    } catch (e) {
-      // Reported, never swallowed (Law 16). Losing blast knockback is survivable; losing the process
-      // is not, and the bot's own health/death handling is what should decide the outcome.
-      try {
-        require('@kernel/watcher').warn('master_core',
-          `explosion translator threw (${e.message}) — knockback not applied, bot alive.`);
-      } catch (_) {}
+    const kb = explosion.playerKnockback;
+    if (!kb) return;
+    delete explosion.playerKnockback;        // FIRST — a return below must still leave the branch disarmed
+    const finite = Number.isFinite(kb.x) && Number.isFinite(kb.y) && Number.isFinite(kb.z);
+    const sane = finite && Math.max(Math.abs(kb.x), Math.abs(kb.y), Math.abs(kb.z)) <= EXPLOSION_KNOCKBACK_MAX_BPT;
+    if (sane) {
+      explosion.playerMotionX = kb.x;
+      explosion.playerMotionY = kb.y;
+      explosion.playerMotionZ = kb.z;
+    } else {
+      require('@kernel/watcher').warn('master_core',
+        `explosion knockback REJECTED at the boundary: {x:${kb.x}, y:${kb.y}, z:${kb.z}} — ` +
+        `${finite ? `beyond the ${EXPLOSION_KNOCKBACK_MAX_BPT} b/tick physical bound` : 'not finite'}. ` +
+        'Blast shove dropped, physics left sane, bot alive. These numbers are the evidence for whether ' +
+        "the server's packet matches minecraft-data's vec3f schema — record them.");
     }
   });
 
@@ -323,7 +320,7 @@ bot.once('spawn', () => {
   // own ghost claim is skipped by both the connected-check and the self-check. Absent-holder and
   // reborn-holder are two different failures; that one owns the first, this owns the second.
   // Not a second release pathway (Law 16) — same clearMagnet(), a boundary it did not reach.
-  try { require('@thinking/dispatcher.js').clearMagnet(botId); } catch (_) {}
+  require('@thinking/dispatcher.js').clearMagnet(botId);
 
   overseerLink.connect(overseerUrl, botId);
   overseerLink.startBodyCellPublisher(bot);
@@ -355,10 +352,22 @@ bot.once('spawn', () => {
   // claims through the overseer, so injecting before `connect` would run the first plan cycle against a
   // bot with no peer arbitration — every claim granted locally, which is exactly the split-brain the
   // planning token exists to prevent (Law 4).
+  // ── ANNOUNCED FROM THE OUTCOME, NOT FROM THE CALL (2026-09-10) ──────────────────────────────────
+  // `inject()` is async and now carries a gate that can legitimately refuse — a body must be standing
+  // with the person who raised it before it plans. This line used to print beside the call rather than
+  // after it, so a refused start still announced itself as launched. Chained rather than awaited because
+  // this handler is `spawn`'s synchronous listener: making it async would turn every synchronous throw in
+  // the rest of the sequence into an unhandled rejection, which is a wider change than the report needs.
   if (botMandate.beginsWorkAtBirth()) {
-    require('@action/start_injector.js').inject();
-    console.log(`🚀 ${botMandate.isContractor() ? 'Contractor — born started' : 'Homesteader — launched to work'}.`
-      + ' Autonomous start signal injected.');
+    require('@action/start_injector.js').inject().then((r) => {
+      if (r && r.started) {
+        console.log(`🚀 ${botMandate.isContractor() ? 'Contractor — born started' : 'Homesteader — launched to work'}.`
+          + ' Autonomous start signal injected.');
+      } else {
+        console.log(`⛔ ${botMandate.currentMode()} did not start — ${(r && r.why) || 'the start injector refused and said nothing'}.`
+          + ' Nothing was surveyed and nothing was locked; the trace carries the detail.');
+      }
+    });
   }
 
   const rl = readline.createInterface({
@@ -410,11 +419,12 @@ bot.once('spawn', () => {
         console.log('🛡️ Sentry mode armed — threat scan only, isolated from the planning recursion.');
         break;
       case 'see':
-        try {
-          runPerceptionFragmentTester(args[1]);
-        } catch (e) {
-          console.error('❌ see command failed:', e.message);
-        }
+        // UNGUARDED ON PURPOSE. perception_fragment_tester already answers every human-input case with a
+        // correction (Law 13) — no argument, `list`, an unknown function name — and its header says the
+        // call itself is deliberately unguarded because *"a catch here reduced a real stack to one message
+        // line — it hid the answer the operator ran the verb to get"*. The catch that used to be here did
+        // exactly that to it from one caller out.
+        runPerceptionFragmentTester(args[1]);
         break;
       case 'teleport': {
         const [x, y, z] = args.slice(1, 4).map(Number);
@@ -441,20 +451,36 @@ bot.on('error', (err) => {
   console.error('❌ Bot Error:', err);
 });
 
+// ── shutdownFlush — THE THREE THINGS A DYING PROCESS OWES THE DISK, IN ONE PLACE ─────────────────
+// Called from `end` (the world connection dropped) and from reportCrash (a signal died outside the
+// judge). Both paths used to carry their own copy of these three calls, each line wrapped in its own
+// `try { … } catch (_) {}` — six silent swallows across two sites, which is Law 16's duplication and
+// Law 13's silence in the same six lines.
+//
+// UNGUARDED, and the ordering cost is accepted deliberately: if `clearMagnet` throws, the two flushes
+// below it do not run. That is the correct trade. A throw here is a defect in our own shutdown path, and
+// the alternative — swallow it and keep going — is a process that appears to have flushed cleanly and
+// did not, which is the failure nobody ever discovers. `durable_write` is what makes a half-finished
+// flush survivable; a `catch (_) {}` is what makes a broken one invisible.
+function shutdownFlush() {
+  require('@thinking/dispatcher.js').clearMagnet();
+  require('@kernel/watcher').flushNow();
+  require('@kernel/corporate_headquarters').flushNow();
+}
+
 bot.on('end', (reason) => {
   // Emit a LOUD error first: a disconnect halts the signal loop mid-flight (any in-progress
   // fragment just stops), which is exactly as serious as a judge-kill and must be as visible.
   // The overseer websocket is separate from the Minecraft connection, so this still forwards to
   // the aggregated trace even when the game connection is what dropped — no more silent death
   // where the last navigator loop appears to run forever with no ❌ (the 'Timed out' case).
-  try {
-    require('@kernel/watcher').error('master_core',
-      `⛔ Bot disconnected${reason ? ` (${reason})` : ''} — signal loop halted, world connection lost.`);
-  } catch (_) { console.error('❌ Bot disconnected:', reason); }
+  // The watcher cannot throw out of itself — every catch inside it reports through `_selfFault()` or
+  // rethrows, and preflight proves that separately — so the console fallback that used to sit on this
+  // call was guarding against a case the watcher's own gate already forbids.
+  require('@kernel/watcher').error('master_core',
+    `⛔ Bot disconnected${reason ? ` (${reason})` : ''} — signal loop halted, world connection lost.`);
   console.log(`⚠️ Bot disconnected${reason ? ` (${reason})` : ''}.`);
-  try { require('@thinking/dispatcher.js').clearMagnet(); } catch (_) {}
-  try { require('@kernel/watcher').flushNow(); } catch (_) {}
-  try { require('@kernel/corporate_headquarters').flushNow(); } catch (_) {}
+  shutdownFlush();
 
   // ── AND THEN IT ENDS. MEASURED 2026-09-03, and this is the most expensive bug found on the public
   // server so far (architect_bugsquashing.md round 225).
@@ -493,13 +519,9 @@ bot.on('end', (reason) => {
 // context, so a signal death is always visible and inspectable (Law 5, Law 13).
 function reportCrash(kind, err) {
   const detail = (err && (err.stack || err.message)) || String(err);
-  try {
-    require('@kernel/watcher').error('master_core',
-      `⛔ ${kind} — signal died OUTSIDE the judge (coding violation): ${detail}`);
-  } catch (_) { console.error(`❌ ${kind}:`, err); }
-  try { require('@thinking/dispatcher.js').clearMagnet(); } catch (_) {}
-  try { require('@kernel/watcher').flushNow(); } catch (_) {}
-  try { require('@kernel/corporate_headquarters').flushNow(); } catch (_) {}
+  require('@kernel/watcher').error('master_core',
+    `⛔ ${kind} — signal died OUTSIDE the judge (coding violation): ${detail}`);
+  shutdownFlush();
 }
 
 process.on('uncaughtException', (err)   => reportCrash('Uncaught exception', err));

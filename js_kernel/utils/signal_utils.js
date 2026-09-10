@@ -38,9 +38,28 @@
 'use strict';
 
 const sequencer = require('@kernel/signal_sequencer');
+// THE BUS IS HELD HERE, ONCE, INSTEAD OF BEING PASSED IN AT EVERY CALL SITE (Architect 2026-09-10).
+//
+// Both helpers used to take `signalBus` as their first parameter, and 62 call sites across 38 files each
+// carried it. That was never dependency injection — it was the load cycle showing through: a fragment could
+// not require the bus at module scope, so it required it inside a function and threaded it in. Measured
+// before the change: all 62 sites passed the real bus, and nothing in Auren_Workshop referenced signal_bus,
+// signalBus or routeSignal at all, so no test seam depended on the parameter.
+//
+// With the cycle gone (see signal_bus.js's header) this require is legal at module scope, and 32 fragments
+// now have no contact with the bus whatever — they name a target STRING and nothing else, which is what a
+// caller of passive middleware should know (Law 3). The 6 forwarding routers still require the bus
+// directly, because they call route() with an upstream author's from/to rather than building an envelope.
+//
+// IF A TEST SEAM IS EVER WANTED, it is one setter on this module — not a parameter on 62 call sites.
+const signalBus = require('@kernel/signal_bus');
 
-function routeSignal(signalBus, from, target, fields = {}) {
-  return signalBus.route(from, target, {
+function routeSignal(from, target, fields = {}) {
+  // `from` is stamped INTO the envelope and is not handed to the bus separately — the bus took a sender
+  // argument until 2026-09-10 and never read it (signal_bus.js header). The envelope's `from` is the one
+  // sender identity in the system: the judge reads it, the trail appends it, and there is now no second
+  // place for it to disagree with itself.
+  return signalBus.route(target, {
     ...fields,
     from,
     to: target,
@@ -49,8 +68,8 @@ function routeSignal(signalBus, from, target, fields = {}) {
   });
 }
 
-function routeToJudge(signalBus, from, fields = {}) {
-  return routeSignal(signalBus, from, 'recursive_judge', fields);
+function routeToJudge(from, fields = {}) {
+  return routeSignal(from, 'recursive_judge', fields);
 }
 
 module.exports = { routeSignal, routeToJudge };

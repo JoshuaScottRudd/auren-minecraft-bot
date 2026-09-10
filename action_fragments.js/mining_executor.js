@@ -202,7 +202,6 @@ module.exports = {
     if (signalType !== 'mining_executor') return;
 
     const bot = global.bot;
-    const signalBus = require('@kernel/signal_bus');
     const hq = require('@kernel/corporate_headquarters');
 
     async function centerOnBlock() {
@@ -544,7 +543,7 @@ module.exports = {
       watcher.summary('mining_executor', `CELL DONE: ${cellSeg.id} exit=${exitReason} dig=${r.digOk} place=${r.placeOk} fail=${r.digFail + r.placeFail} remaining=${postRemaining}.`);
       // No dumpExcess here (Architect, 2026-07-04): offloading is a job_board job now
       // (inventory_dump), fired only when the pocket is nearly full — mine longer, dump once.
-      return routeToJudge(signalBus, 'mining_executor', { ...payload, readable: capsule.readable });
+      return routeToJudge('mining_executor', { ...payload, readable: capsule.readable });
     }
 
     // markSegmentBuilt — register a shaft segment in HQ as fully excavated (Law 6:
@@ -715,6 +714,6 @@ module.exports = {
       // (inventory_dump), fired only when the pocket is nearly full — mine longer, dump once.
     }
 
-    routeToJudge(signalBus, 'mining_executor', { ...payload, readable: capsule.readable });
+    routeToJudge('mining_executor', { ...payload, readable: capsule.readable });
   })
 };

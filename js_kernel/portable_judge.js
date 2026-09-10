@@ -189,7 +189,6 @@ async function checkpoint(executor, readable, mode = 'strict') {
 // routes to job_board for replan. The caller receives `false` from checkpoint()
 // and must stop its loop without routing (portable_judge already routed).
 async function _escalate(executor, reason, mode, detail) {
-  const signalBus = require('@kernel/signal_bus');
 
   let effectiveMode = mode;
   if (mode === 'forgiving') {
@@ -207,7 +206,7 @@ async function _escalate(executor, reason, mode, detail) {
 
   delete executors[executor];
 
-  routeToJudge(signalBus, 'portable_judge', {
+  routeToJudge('portable_judge', {
     readable: `portable_judge: ${reason} in ${executor} — ${detail}`,
     portable_judge_verdict: { executor, mode: effectiveMode, reason },
   });

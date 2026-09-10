@@ -26,7 +26,7 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 // The teardown primitive, required once the module moved into a SWEPT layer (2026-09-08). See `once()`.
-const { withCleanup } = require('./external_library_guard');
+const { withCleanup, guardExternal } = require('./external_library_guard');
 
 // Where server.properties lives relative to this file. One definition — both former copies computed
 // their own path and a repo re-layout would have broken them at different times.
@@ -231,8 +231,37 @@ async function entityPos(name, opts = {}) {
   return { x: Math.floor(Number(m[1])), y: Math.floor(Number(m[2])), z: Math.floor(Number(m[3])) };
 }
 
+// ── probe(opts) → { ok, reason } — IS THIS LINK USABLE AT ALL, ASKED WITHOUT THROWING ──────────────
+//
+// THE ASK (Architect 2026-09-10): *"you fix the RCON as needed to run on a strangers computer."*
+//
+// WHY IT HAS TO EXIST SEPARATELY FROM `once()`. Every other entry here answers "do this thing", and each
+// fails in its own caller's context, late, one body at a time. The question a person needs answered is
+// different and comes earlier: *can this fleet place a crew at all on this machine.* Since 2026-09-10 the
+// answer decides whether ANY bot can start — a body refuses to plan until it has confirmed it is standing
+// with the person who raised it (`body_recovery.arriveAtPlayer`) — so a fleet with no reachable console is
+// not degraded, it is inert. Discovered on a real download: vanilla ships `enable-rcon=false`, and the
+// properties file the fallback reads does not exist beside an extract at all.
+//
+// IT REPORTS RATHER THAN THROWS, and that is the whole point of a separate verb. `credentials()` throws on
+// a missing properties file and on rcon being switched off, which is right for a caller mid-teleport and
+// useless to a launcher deciding whether to open the desk. The throw is converted here, once, through the
+// boundary guard — the fs read and the socket are both outside code (Law 16: one pathway to the outside).
+//
+// THE REASON IS RAW ON PURPOSE, AND THIS IS NOT AN OVERSIGHT. It says what the machine found; it does not
+// say `pass --rcon-password`, because this module has no idea a command line exists. The instruction
+// belongs to the layer that owns the vocabulary a person types — `start_auren.js` composes it from this
+// reason (Law 25: the message is written by whoever can name the fix, in the words its reader uses).
+//
+// `list` is the command because it is the cheapest one every server answers and it changes nothing. A
+// probe with a side effect would be a test that alters what it measures.
+async function probe(opts = {}) {
+  const r = await guardExternal('rcon_link', 'rcon probe (list)', () => once(['list'], opts));
+  return r.ok ? { ok: true, reason: null } : { ok: false, reason: r.reason };
+}
+
 // `credentials` is exported so an `open()` caller can reach the same rule `once()` uses. The benches and
 // probes in this directory keep calling `readServerProperties()` directly and that is CORRECT rather than
 // an oversight: a bench needs a dev world it drives itself, so being pointed at a foreign server by a
 // stray environment variable would be a bench measuring something nobody asked about.
-module.exports = { readServerProperties, credentials, open, once, entityPos, SERVER_PROPERTIES };
+module.exports = { readServerProperties, credentials, open, once, probe, entityPos, SERVER_PROPERTIES };

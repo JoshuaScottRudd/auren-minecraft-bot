@@ -297,7 +297,7 @@ function _emptyBoardReason() {
 // footprint and arms the 10s re-check heartbeat so a bot that ran out of work wakes back up when a
 // peer frees a job (instead of sitting idle forever). Routing to a park fragment (not a bare
 // return) is what lets the bot both get out of the way AND schedule its own re-entry.
-function _goIdle(signalBus, botId, reason, cause) {
+function _goIdle(botId, reason, cause) {
     // One log decision for the whole pass. At the 1s heartbeat this runs about
     // once a second; posting the reason every time is Law 5 noise. The verdict is carried to idle_park
     // so both lines of one pass appear together or not at all — see idle_scheduler's gate for why the
@@ -320,7 +320,7 @@ function _goIdle(signalBus, botId, reason, cause) {
     // pacing window (Law 16 — one owner per decision), and the two cadences answer to different readers.
     require('@kernel/bot_voice').goneIdle();
     clearMagnet(botId);
-    routeSignal(signalBus, TAG, 'idle_park', {
+    routeSignal(TAG, 'idle_park', {
         readable: `${TAG}: ${reason} → idle_park`,
         log_idle_line: !!post,
         // The park states WHICH still-fleet this is. The dispatcher owns the decision and keeps the
@@ -332,7 +332,6 @@ function _goIdle(signalBus, botId, reason, cause) {
 }
 
 function _run() {
-    const signalBus = require('@kernel/signal_bus');
     const botId = _getBotId();
     // A real plan cycle is running — clear any pending idle heartbeat so it can't fire a second
     // signal on top of this one (Law 4). idle_park re-arms it if we end up idle again.
@@ -351,7 +350,7 @@ function _run() {
 
     if (jobs.length === 0) {
         const verdict = _emptyBoardReason();
-        _goIdle(signalBus, botId, verdict.reason, verdict.cause);
+        _goIdle(botId, verdict.reason, verdict.cause);
         return;
     }
 
@@ -383,7 +382,7 @@ function _run() {
         : ` (magnet passed over ${passedOverCount}: ${[...passedOver].map(([why, n]) => `${n}× ${why}`).join('; ')})`;
 
     if (attracted.length === 0) {
-        _goIdle(signalBus, botId, `Nothing on the board this species may claim${magnetNote}`, 'none_for_species');
+        _goIdle(botId, `Nothing on the board this species may claim${magnetNote}`, 'none_for_species');
         return;
     }
 
@@ -392,7 +391,7 @@ function _run() {
         .filter(j => j.scope === 'local' || !claimed.has(j.id));
 
     if (available.length === 0) {
-        _goIdle(signalBus, botId, `All jobs this magnet attracts are claimed by other bots — idle.${magnetNote}`, 'claimed_by_peers');
+        _goIdle(botId, `All jobs this magnet attracts are claimed by other bots — idle.${magnetNote}`, 'claimed_by_peers');
         return;
     }
 
@@ -463,7 +462,7 @@ function _run() {
     require('@utils/external_library_guard')
         .guardExternalSync(TAG, 'overseer sendUpdate', () => require('@kernel/overseer_link').sendUpdate());
 
-    routeSignal(signalBus, TAG, managerName, {
+    routeSignal(TAG, managerName, {
         job,
         readable: `${TAG}: [${jobRanking.describeBand(job)}] ${job.type}/${job.what} → ${managerName}`,
     });

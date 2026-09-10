@@ -108,8 +108,8 @@ function selectFuel(bot, preferred) {
   return null;
 }
 
-function _route(signalBus, success, reason, extra = {}) {
-  routeToJudge(signalBus, TAG, {
+function _route(success, reason, extra = {}) {
+  routeToJudge(TAG, {
     readable: `${TAG}: ${reason}`,
     [TAG]: { success, ...extra },
   });
@@ -117,9 +117,9 @@ function _route(signalBus, success, reason, extra = {}) {
 
 // Abandonment (Law 15): locomotion could not deliver the bot to the furnace. Drop this line;
 // the furnace state is untouched (load: nothing written yet; collect: order stays for next sweep).
-function _abandon(signalBus, reason) {
+function _abandon(reason) {
   watcher.warn(TAG, `Abandoning — ${reason}`);
-  _route(signalBus, false, reason);
+  _route(false, reason);
 }
 
 // _reach — go and stand where this furnace is meant to be worked from.
@@ -160,7 +160,6 @@ function _registeredChestIds() {
 module.exports = {
   receive: watcher.track(TAG, async function (signalType, payload) {
     if (signalType !== TAG) return;
-    const signalBus = require('@kernel/signal_bus');
     const bot = global.bot;
 
     const job = payload.job || {};
@@ -213,7 +212,7 @@ module.exports = {
 
     const pos = new Vec3(where.x, where.y, where.z);
     if (!(await _reach(bot, pos))) {
-      _abandon(signalBus, `locomotion could not reach furnace at (${where.x},${where.y},${where.z})`);
+      _abandon(`locomotion could not reach furnace at (${where.x},${where.y},${where.z})`);
       return;
     }
     const block = bot.blockAt(pos);
@@ -222,17 +221,17 @@ module.exports = {
       // entry (Law 6 self-heal) and soft-fail so job_board re-plans from fresh world state.
       watcher.warn(TAG, `furnace gone at (${where.x},${where.y},${where.z}) — removing stale entry`);
       stationRegistry.removeStation(stationId);
-      _route(signalBus, false, `furnace gone at station ${stationId}`);
+      _route(false, `furnace gone at station ${stationId}`);
       return;
     }
 
     // ── LOAD ────────────────────────────────────────────────────────────────
     if (action === 'load') {
       const inputItem = resolveHeldItem(bot, job.input);
-      if (!inputItem) { _route(signalBus, false, `no ${job.input} on hand to smelt ${job.order}`); return; }
+      if (!inputItem) { _route(false, `no ${job.input} on hand to smelt ${job.order}`); return; }
 
       const fuel = selectFuel(bot, job.fuel);   // throws on logs-only
-      if (!fuel) { _route(signalBus, false, `no fuel on hand to smelt ${job.order}`); return; }
+      if (!fuel) { _route(false, `no fuel on hand to smelt ${job.order}`); return; }
 
       // Batch size bounded by input held, deficit, and fuel capacity (one open, walk away).
       const yieldPer = FUEL_SMELT_YIELD[fuel.pref] || 1;
@@ -271,12 +270,12 @@ module.exports = {
         // Distinguish the two desync outcomes so next run's trace says which one bit: the window
         // never surfaced an item the bot holds (true desync, waited the full timeout).
         watcher.warn(TAG, `furnace window never surfaced ${inputItem.name} (held ${inputItem.count}) after ${desyncWaitedMs}ms — releasing to replan`);
-        _route(signalBus, false, `furnace window desync: ${inputItem.name} not visible after ${desyncWaitedMs}ms`);
+        _route(false, `furnace window desync: ${inputItem.name} not visible after ${desyncWaitedMs}ms`);
         return;
       }
       if (!loaded.ok) {
         watcher.warn(TAG, `WINDOW furnace-load @ ${stationId} — the window session FAILED after ${Date.now() - openT0}ms`);
-        _route(signalBus, false, `furnace load failed: ${loaded.reason}`);
+        _route(false, `furnace load failed: ${loaded.reason}`);
         return;
       }
 
@@ -289,7 +288,7 @@ module.exports = {
       // with the ABSENCE of the old "Can't find … in slots" warn) is direct proof the sync-race fix
       // fired and caught the lag; a persistent 0 means the race isn't happening on this setup.
       watcher.summary(TAG, `WINDOW furnace-load @ ${stationId}: ${qty}x ${job.order} — openFurnace OK in ${openMs}ms (input=${inputItem.name}, fuel=${fuel.item.name}, window_settle=${loadSettleMs}ms) — leaving`);
-      _route(signalBus, true, `loaded ${qty}x ${job.order} at furnace ${stationId}`, { order: job.order, qty });
+      _route(true, `loaded ${qty}x ${job.order} at furnace ${stationId}`, { order: job.order, qty });
       return;
     }
 
@@ -325,7 +324,7 @@ module.exports = {
       });
       if (!collected.ok) {
         watcher.warn(TAG, `WINDOW furnace-collect @ ${stationId} — the window session FAILED after ${Date.now() - openT0}ms`);
-        _route(signalBus, false, `furnace collect failed: ${collected.reason}`);
+        _route(false, `furnace collect failed: ${collected.reason}`);
         return;
       }
 
@@ -358,7 +357,7 @@ module.exports = {
       }
 
       watcher.summary(TAG, `WINDOW furnace-collect @ ${stationId}: ${taken}x ${job.order} — openFurnace OK in ${openMs}ms — order cleared, surplus banked`);
-      _route(signalBus, true, `collected ${taken}x ${job.order} from furnace ${stationId}`, { order: job.order, taken });
+      _route(true, `collected ${taken}x ${job.order} from furnace ${stationId}`, { order: job.order, taken });
       return;
     }
 

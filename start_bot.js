@@ -52,9 +52,16 @@ const FLAGS = [
   { flag: 'name',     env: 'BOT_ID',                   def: 'AurenBot',  help: "the bot's name in the world" },
   { flag: 'mode',     env: 'BOT_MODE',                 def: 'homesteader', help: 'homesteader | contractor' },
   { flag: 'owner',    env: 'BOT_OWNER',                def: null,        help: 'your Minecraft name — REQUIRED for contractor, forbidden for homesteader' },
+  { flag: 'near',     env: 'BOT_START_NEAR',           def: null,        help: 'a player in the world — the bot is teleported to them and confirmed there before it starts working (a contractor uses its owner when this is absent)' },
   { flag: 'version',  env: 'AUREN_MINECRAFT_VERSION',  def: null,        help: "the server's Minecraft version (default: 1.21.5, set in architect_config)" },
   { flag: 'overseer', env: 'OVERSEER_URL',             def: null,        help: 'ws://host:port of a running overseer — omit it and the bot runs alone' },
   { flag: 'work',     env: 'BOT_AUTOSTART',            def: null,        help: "pass 1 and a homesteader starts working on spawn instead of waiting for you to type 'start'" },
+  // Needed only when this bot has somebody to be placed beside (`--near`, or a contractor's owner):
+  // reaching a server console is what a teleport costs. `start_auren.js` carries the same two flags and
+  // proves the link before it opens the desk; here they are simply passed through, because a bot launched
+  // by hand may legitimately have nobody to stand with and then never asks for a console at all.
+  { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', def: null,        help: "your server's rcon.password — required to place this bot beside a player" },
+  { flag: 'rcon-port',     env: 'AUREN_RCON_PORT',     def: null,        help: "your server's rcon.port  (default: 25575)" },
 ];
 
 function usage() {

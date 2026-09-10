@@ -33,6 +33,17 @@ Two verbs, and they are the whole argument: **AI as the developer, not the pilot
   further you drift the more likely the bot reaches for a block that got renamed. **Bedrock will not work.**
 - **Offline mode, or a real account for the bot.** By default it logs in without authenticating, which a
   server accepts only when `online-mode=false` in `server.properties`.
+- **The server console switched on** — two more lines in the same `server.properties`:
+
+  ```
+  enable-rcon=true
+  rcon.password=pick-anything
+  ```
+
+  **This is not optional and here is why.** A bot starts working from where *you* are standing, and
+  getting it there means one `tp` issued through the server's own console. A bot that cannot be placed
+  does not start at all — so without these two lines you would get a bot standing still and nothing to
+  read. `start_auren.js` checks the console before it opens and tells you if it cannot reach it.
 
 ```
 npm install
@@ -45,10 +56,11 @@ the bot reads constantly. There is no smaller version of it. Nothing installs ou
 
 ## How to run it
 
-One command, and it mirrors how I run it myself. It asks you to name nothing.
+One command, and it mirrors how I run it myself. The only thing it asks you to name is the console
+password you just set.
 
 ```
-node start_auren.js
+node start_auren.js --rcon-password pick-anything
 ```
 
 That starts a **foreman** — a clerk that joins your world and waits. **No bots yet.** Walk to where you
@@ -106,6 +118,12 @@ path. A trace tells me in thirty seconds what would cost you an evening.
   `online-mode=false`, or give the bot a paid account.
 - **`Cannot find module 'mineflayer'`** — `npm install` wasn't run, or was run in the wrong folder.
 - **"something is already using port 3001"** — an overseer is still running from last time. Close it.
+- **"Auren cannot reach your server's console"** — `enable-rcon=true` and `rcon.password=` are not both
+  set in `server.properties`, the server was not restarted after setting them, or the password you passed
+  to `--rcon-password` is not the one in the file. Nothing launched, so there is nothing to clean up.
+- **A bot says it did not start because it is not standing with you** — it was raised, it could not be
+  brought to you, and it refused to plan a base somewhere you did not choose. Usually the console
+  password: see the line above.
 - **Joins and stands still** — check the trace. A bot on ground it can't work (no wood, spawn-protected)
   will re-plan and get the same answer.
 - **Version mismatch** — pass `--version 1.21.5` to match your server exactly.
@@ -126,6 +144,7 @@ path. A trace tells me in thirty seconds what would cost you an evening.
 | `custom_api/` | the layer between the bot's vocabulary and Minecraft's |
 | `overseer/` · `foreman/` | job arbitration, and the desk you hire from |
 | `Auren_Structural_Laws.md` | the rules all of it obeys |
+| `MECHANISM_REGISTRY.md` | every named mechanism, one line each — the index to read before assuming a thing isn't already here |
 
 ---
 

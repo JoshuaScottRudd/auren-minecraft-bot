@@ -83,7 +83,6 @@ const PUNCH_CONFIG = {
 // here covers all three gather paths (seed, tree, punch) â€” the alternative was three call sites of the
 // same call, which is the redundancy Law 16 exists to refuse.
 async function routeResult(payload, success, readable) {
-  const signalBus = require('@kernel/signal_bus');
   // `abandoned` = the drop-off already routed a signal to the judge (Law 15), so this line is dead and
   // must not route a second one (Law 4). Returning here is the abandonment, not a swallowed error.
   const drop = await require('@api/inventory_swapper').dropOffHaul(global.bot);
@@ -97,7 +96,7 @@ async function routeResult(payload, success, readable) {
   capsule.success = success;
   capsule.readable = readable;
   payload.readable = readable;
-  routeToJudge(signalBus, TAG, { ...payload });
+  routeToJudge(TAG, { ...payload });
 }
 
 async function routeFail(payload, reason) {
@@ -138,8 +137,7 @@ async function routeIdle(payload, reason) {
   if (verdict === false) return;   // portable_judge routed â€” the loop is being broken upstream
   watcher.summary(TAG, reason);
   require('@thinking/dispatcher.js').clearMagnet();
-  const signalBus = require('@kernel/signal_bus');
-  routeSignal(signalBus, TAG, 'idle_park', { readable: `${TAG}: ${reason} â†’ idle_park` });
+  routeSignal(TAG, 'idle_park', { readable: `${TAG}: ${reason} â†’ idle_park` });
 }
 
 // -- Log source ladder ------------------------------------------------------

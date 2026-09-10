@@ -82,9 +82,6 @@
 'use strict';
 
 const watcher = require('@kernel/watcher');
-// signal_bus is required INSIDE the functions below, never at load: the bus requires fragment_registry,
-// which requires this file, so a top-level require resolves to a half-built module and `route` is
-// undefined at call time. Every routing fragment in the graph takes it lazily for this reason.
 const { routeSignal, routeToJudge } = require('@utils/signal_utils');
 const { sleep } = require('@utils/fragment_utils');
 const { battleStations } = require('@api/battle_stations');
@@ -150,8 +147,7 @@ module.exports = {
     // a wave that measured nothing — the mob never fought the bot (Law 25). A wave the watch was not
     // holding must be REFUSED, not scored.
     crewLog.post(TAG, 'sentry', { state: 'armed' });
-    const signalBus = require('@kernel/signal_bus');
-    routeSignal(signalBus, 'operator_commands', TAG, {
+    routeSignal('operator_commands', TAG, {
       test: true,                       // halt, no replan — this watch never enters the planning recursion
       readable: `${TAG}: watch armed — holding the signal until a monster aggros or the watch is stopped`,
     });
@@ -349,8 +345,7 @@ module.exports = {
         ? `the body DIED — the trial ends here, no respawn from this fragment (${deaths} death(s) this watch)`
         : 'stopped by operator, no battle';
 
-    const signalBus = require('@kernel/signal_bus');
-    routeToJudge(signalBus, TAG, {
+    routeToJudge(TAG, {
       test: true,                       // stay out of the planning recursion — no replan, no job_board
       // …but come back here, re-armed for the next wave — UNLESS the body died, which is the trial's
       // terminal condition: no respawn from this fragment. A death that also retired a mob still lands

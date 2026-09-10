@@ -155,7 +155,6 @@ async function stepOutOfFootprint(bot, integrity) {
 module.exports = {
   receive: watcher.track(TAG, async (signalType, payload) => {
     if (signalType !== TAG) return;
-    const signalBus = require('@kernel/signal_bus');
     const bot = global.bot;
 
     const blueprintName = payload?.blueprint_name || 'headframe';
@@ -188,7 +187,7 @@ module.exports = {
       if (hasDigSteps) await clearReachableObstructions(bot, integrity, blueprintName, roomKey, anchorIndex);
       const readable = `${TAG}: no materials needed — forwarding to build_executor`;
       watcher.summary(TAG, readable);
-      routeSignal(signalBus, TAG, 'build_executor', { ...payload, readable });
+      routeSignal(TAG, 'build_executor', { ...payload, readable });
       return;
     }
 
@@ -358,7 +357,7 @@ module.exports = {
       if (shortNoted.length) {
         const list = shortNoted.join(', ');
         watcher.warn(TAG, `Staging chest short of ${list}. Deferring to recursive_judge for restock + replan.`);
-        routeToJudge(signalBus, TAG, {
+        routeToJudge(TAG, {
           ...payload,
           result: 'materials_not_staged', success: false,
           readable: `${TAG}: anchor not fully staged — short ${list} -> recursive_judge`,
@@ -417,7 +416,7 @@ module.exports = {
       const list = Object.entries(craftShort).map(([r, n]) => `${r}:${n}`).join(', ');
       watcher.warn(TAG, `Ingredients missing for ${Object.keys(craftNeed).join(', ')} — short ${list}. ` +
         `Crafting nothing; deferring to recursive_judge so job_board posts the order.`);
-      routeToJudge(signalBus, TAG, {
+      routeToJudge(TAG, {
         ...payload,
         result: 'materials_not_staged', success: false,
         readable: `${TAG}: cannot craft ${Object.keys(craftNeed).join(', ')} — short ${list} -> recursive_judge`,
@@ -460,7 +459,7 @@ module.exports = {
     watcher.summary(TAG, 'Material preparation complete — routing to build_executor');
 
     // ── ACT: route to build_executor with materials ready ───────────
-    routeSignal(signalBus, TAG, 'build_executor', {
+    routeSignal(TAG, 'build_executor', {
       ...payload,
       readable: `${TAG}: materials ready → build_executor`,
     });

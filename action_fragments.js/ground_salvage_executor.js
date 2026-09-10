@@ -95,7 +95,6 @@ module.exports = {
     const bot = global.bot;
     if (!bot) throw new Error(`[${TAG}] CODING VIOLATION: global.bot is not set before ground salvage ran.`);
 
-    const signalBus = require('@kernel/signal_bus');
     // Drop the pile off before handing back — offloading is a step at the end of every producing verb now,
     // not a job (job_board SECTION 4.5). Salvage is the seat that most needs it: this verb exists to scoop
     // up what a DEATH scattered, so it is the one place a bot reliably ends holding a couple of hundred
@@ -111,7 +110,7 @@ module.exports = {
       // signals in one scope (Law 4).
       const drop = await require('@api/inventory_swapper').dropOffHaul(bot);
       if (drop?.abandoned) return;
-      return routeToJudge(signalBus, TAG, { ...payload, readable });
+      return routeToJudge(TAG, { ...payload, readable });
     };
 
     // The dispatcher routes the whole job object, so the drop identity rides on payload.job rather than

@@ -42,7 +42,6 @@ module.exports = {
   receive: watcher.track('blueprint_paster', function (signalType, payload) {
     if (signalType !== 'blueprint_paster') return;
 
-    const signalBus = require('@kernel/signal_bus');
     const tag = 'blueprint_paster';
 
     // ── Validate blueprint_name ───────────────────────────────────────────────
@@ -61,7 +60,7 @@ module.exports = {
     const existingPaster = hq.readBuildingChair(blueprintName, 'blueprint_paster');
     if (existingPaster !== null && existingPaster !== undefined) {
       watcher.summary(tag, `ℹ️ Blueprint already confirmed for "${blueprintName}". Skipping. -> recursive_judge`);
-      routeToJudge(signalBus, tag, {
+      routeToJudge(tag, {
         ...payload,
         result: 'already_pasted', success: true,
         blueprint_paster: { blueprint: blueprintName, skipped: true },
@@ -101,7 +100,7 @@ module.exports = {
       watcher.summary(tag, `Mining staircase from center (${shaftSite.startX},${shaftSite.surfaceY},${shaftSite.startZ}). ${miningResult.staircase_segments.length} copy(ies), ${miningResult.total_voxels} voxels.`);
     }
 
-    routeToJudge(signalBus, tag, {
+    routeToJudge(tag, {
       ...payload,
       result: 'blueprint_confirmed', success: true,
       blueprint_paster: { blueprint: blueprintName, total_voxels: voxelCount },

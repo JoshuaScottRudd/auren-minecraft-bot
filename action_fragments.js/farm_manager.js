@@ -37,9 +37,9 @@ const { FARM_BLUEPRINT_NAME } = require('@thinking/architect_config');
 
 const TAG = 'farm_manager';
 
-function _release(signalBus, reason) {
+function _release(reason) {
   watcher.summary(TAG, `Releasing: ${reason}`);
-  routeToJudge(signalBus, TAG, { readable: `${TAG}: ${reason}` });
+  routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
 }
 
 // The nearest unserviced plot to the bot's current position — greedy in-cluster ordering so the visit walks
@@ -57,12 +57,11 @@ function _nearest(plots, pos) {
 module.exports = {
   receive: watcher.track(TAG, async function (signalType, payload = {}) {
     if (signalType !== TAG) return;
-    const signalBus = require('@kernel/signal_bus');
     const bot = global.bot;
 
     const botId = process.env.BOT_ID || 'default';
     const magnet = hq.readBoardroomChair(botId, {})?.magnet;
-    if (!magnet || !magnet.what) return _release(signalBus, 'no active magnet');
+    if (!magnet || !magnet.what) return _release('no active magnet');
 
     // Sense the whole cluster once up front — decides whether to prep and whether there is anything to do.
     // NOT GUARDED, AND THE GUARD'S REMOVAL IS THE POINT. scanCluster is ours, and it already absorbs every
@@ -75,8 +74,8 @@ module.exports = {
     // (Law 13: default stopped; Law 16: catch is never the expected pathway).
     const cluster = farmingIntegrity.scanCluster(bot);
 
-    if (!cluster.located)       return _release(signalBus, 'no farm plot located yet — base-layout lock pending');
-    if (!cluster.any_actionable) return _release(signalBus, `cluster idle (${cluster.plot_count} plots, none actionable)`);
+    if (!cluster.located)       return _release('no farm plot located yet — base-layout lock pending');
+    if (!cluster.any_actionable) return _release(`cluster idle (${cluster.plot_count} plots, none actionable)`);
 
     // ── PREP ONCE for the whole visit ── If any actionable plot needs building or planting, pull a hoe +
     // seeds for every plantable plot BEFORE the loop, so the bot never walks home to resupply mid-cluster
@@ -131,12 +130,12 @@ module.exports = {
     // while the world refused every action → the cluster is stuck (sited into terrain it cannot work);
     // report success:false so recursive_judge counts a real fault instead of reading fabricated no-ops as a
     // healthy loop and killing the bot. Nothing serviceable after prep → benign release.
-    if (visited === 0) return _release(signalBus, 'cluster had no serviceable plot after prep');
+    if (visited === 0) return _release('cluster had no serviceable plot after prep');
     const success = workedTotal > 0;
     const readable = `${TAG}: cluster visit serviced ${visited} plot(s) — worked=${workedTotal} refused=${refusedTotal}`
       + (success ? '' : ' [STUCK — nothing worked]');
     watcher.summary(TAG, readable);
-    return routeToJudge(signalBus, TAG, {
+    return routeToJudge(TAG, {
       ...payload,
       [TAG]: { success, worked: workedTotal, refused: refusedTotal, visited },
       success, readable,

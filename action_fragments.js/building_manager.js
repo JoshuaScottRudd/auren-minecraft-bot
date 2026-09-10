@@ -77,21 +77,20 @@ const RECIPES = {
 // job_board job (inventory_dump), fired only when the pocket is nearly full — a second offload route
 // here would be a redundant pathway (Law 16). Keeping build byproducts in pocket between passes is
 // fine — even preferable, since the next pass has the materials on hand rather than re-gathering.
-function _release(signalBus, reason) {
+function _release(reason) {
     watcher.summary(TAG, `Releasing: ${reason}`);
-    routeToJudge(signalBus, TAG, { readable: `${TAG}: ${reason}` });
+    routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
 }
 
 module.exports = {
     receive: watcher.track(TAG, async function (signalType, payload) {
         if (signalType !== TAG) return;
-        const signalBus = require('@kernel/signal_bus');
 
         const botId = process.env.BOT_ID || 'default';
         const magnet = hq.readBoardroomChair(botId, {})?.magnet;
 
         if (!magnet || !magnet.what) {
-            _release(signalBus, 'no active magnet');
+            _release('no active magnet');
             return;
         }
 
@@ -99,7 +98,7 @@ module.exports = {
         const recipe = RECIPES[jobKey];
 
         if (!recipe) {
-            _release(signalBus, `no recipe for '${jobKey}'`);
+            _release(`no recipe for '${jobKey}'`);
             return;
         }
 
@@ -118,8 +117,7 @@ module.exports = {
             const integrity = buildingIntegrity.scan(
                 global.bot, recipe.blueprint_name, recipe.blueprint_name, { quiet: true });
             if (integrity?.all_complete) {
-                _release(signalBus,
-                    `'${jobKey}' structure already complete — nothing to build`);
+                _release(`'${jobKey}' structure already complete — nothing to build`);
                 return;
             }
 
@@ -142,8 +140,7 @@ module.exports = {
                 const owesWork = !!st && (st.dig_count > 0 || st.unloaded_count > 0 ||
                     Object.entries(st.materials_needed).some(([k, c]) => c > 0 && blocksCompletion(k, c, OPTIONAL_BUILD_MATERIALS, isAvailable)));
                 if (!owesWork) {
-                    _release(signalBus,
-                        `'${jobKey}' anchor ${magnet.anchor_index} has no gating work left — replanning for the next anchor`);
+                    _release(`'${jobKey}' anchor ${magnet.anchor_index} has no gating work left — replanning for the next anchor`);
                     return;
                 }
             }
@@ -158,8 +155,7 @@ module.exports = {
             const shortfall = anchorRawShortfall(integrity, magnet.anchor_index, recipe.blueprint_name);
             if (Object.keys(shortfall).length > 0) {
                 const shortList = Object.entries(shortfall).map(([k, v]) => `${k}:${v}`).join(', ');
-                _release(signalBus,
-                    `'${jobKey}' anchor ${magnet.anchor_index ?? 'whole'} not materials-staged ` +
+                _release(`'${jobKey}' anchor ${magnet.anchor_index ?? 'whole'} not materials-staged ` +
                     `(short ${shortList}) — replanning so job_board posts the supply job`);
                 return;
             }
@@ -174,6 +170,6 @@ module.exports = {
         if (magnet.anchor_index != null) next.anchor_index = magnet.anchor_index;
 
         watcher.summary(TAG, `Dispatching ${recipe.fragment} for '${jobKey}'`);
-        routeSignal(signalBus, TAG, recipe.fragment, next);
+        routeSignal(TAG, recipe.fragment, next);
     }),
 };

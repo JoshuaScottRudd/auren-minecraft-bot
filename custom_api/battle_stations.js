@@ -404,8 +404,7 @@ function armDeathWatch(bot) {
         'instead of waiting for a gate that is not coming; the frozen caller is discarded (Law 15) and the ' +
         'board dispatches respawn_executor. Without this the bot stays down for the rest of the run and keeps ' +
         'every chest lock its magnet holds.');
-      const signalBus = require('@kernel/signal_bus');
-      routeToJudge(signalBus, 'battle_stations', {
+      routeToJudge('battle_stations', {
         readable: 'battle_stations: bot died and no gate ran — watchdog replanning from current state',
       });
     }, DEATH_GATE_GRACE_MS);
@@ -570,8 +569,7 @@ function releaseJobClaim(source) {
 }
 
 function abandonToJudge(readable) {
-  const signalBus = require('@kernel/signal_bus');
-  routeToJudge(signalBus, 'battle_stations', { readable });
+  routeToJudge('battle_stations', { readable });
   return new Promise(() => {});
 }
 

@@ -1032,8 +1032,7 @@ async function craftWithSequence(bot, sequence, ctx) {
 
 function _abandon(reason) {
   watcher.warn(TAG, `Abandoning caller — ${reason}`);
-  const signalBus = require('@kernel/signal_bus');
-  routeToJudge(signalBus, TAG, { result: TAG, success: false, readable: `${TAG}: ${reason}` });
+  routeToJudge(TAG, { result: TAG, success: false, readable: `${TAG}: ${reason}` });
 }
 
 // ---------------------------------------------------------------------------

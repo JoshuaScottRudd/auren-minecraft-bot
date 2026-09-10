@@ -38,6 +38,12 @@
 const watcher = require('@kernel/watcher');
 const portableJudge = require('@kernel/portable_judge');
 const sequencer = require('@kernel/signal_sequencer');
+// The bus at MODULE SCOPE, which it could not be before 2026-09-10: the load cycle through
+// fragment_registry forced this require inside a function in every routing file. This is one of the
+// six FORWARDING routers — it calls route() with an upstream author's own from/to rather than building
+// an envelope, so it cannot use signal_utils' helpers (they stamp `from` = the caller and would rewrite
+// authorship). Every other fragment now has no contact with the bus at all.
+const signalBus = require('@kernel/signal_bus');
 
 // ---------------------------------------------------------------------------
 // SECTION 2: Configuration Constants
@@ -246,7 +252,6 @@ async function handleSignal(signalType, signal) {
   // If it's still active, an executor was interrupted — flash and clear.
   portableJudge.reset();
 
-  const signalBus = require('@kernel/signal_bus');
   const payload = signal || {};
   const readable = payload?.readable;
   const from = payload?.from;
@@ -330,7 +335,7 @@ async function handleSignal(signalType, signal) {
   const outboundId = sequencer.examine(payload);
   const depart = (outPayload) => {
     const stamped = sequencer.stamp(outPayload, outboundId);
-    return signalBus.route(stamped.from, stamped.to, stamped);
+    return signalBus.route(stamped.to, stamped);
   };
 
   // Portable judge delegation: child judge detected a stall/oscillation inside

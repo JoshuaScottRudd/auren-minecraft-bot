@@ -34,6 +34,12 @@
  */
 
 const watcher = require('@kernel/watcher');
+// The bus at MODULE SCOPE, which it could not be before 2026-09-10: the load cycle through
+// fragment_registry forced this require inside a function in every routing file. This is one of the
+// six FORWARDING routers — it calls route() with an upstream author's own from/to rather than building
+// an envelope, so it cannot use signal_utils' helpers (they stamp `from` = the caller and would rewrite
+// authorship). Every other fragment now has no contact with the bus at all.
+const signalBus = require('@kernel/signal_bus');
 
 // ── EDIT THESE PER TEST ─────────────────────────────────────────────────────
 const TARGET  = 'find_buildingspot';       // signal name of the fragment under test
@@ -51,11 +57,10 @@ module.exports = {
   // Fires one test signal into the fragment under test — called directly from the
   // master_core `test_fragment` verb as a one-shot manual trigger, never self-invoked.
   inject() {
-    const signalBus = require('@kernel/signal_bus');
     const payload = { from: 'fragment_tester', to: TARGET, task: TARGET, ...PAYLOAD };
     watcher.summary('fragment_tester',
       `→ Injecting test signal into '${TARGET}'. Confirm '${TARGET}' is temporarily rerouted to reply 'to: fragment_tester'.`);
-    signalBus.route('fragment_tester', TARGET, payload);
+    signalBus.route(TARGET, payload);
   },
 
   // Intercepts the fragment's output signal (routed here by the step-2 reroute) and logs

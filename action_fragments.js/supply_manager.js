@@ -309,8 +309,8 @@ function _invSnapshot(topItem, byItem, inventory) {
 // SECTION 5 — Executor dispatch helpers (no watcher — summary covers it)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function _dispatchCraft(signalBus, payload, step) {
-    routeSignal(signalBus, TAG, 'craft_executor', {
+function _dispatchCraft(payload, step) {
+    routeSignal(TAG, 'craft_executor', {
         ...payload,
         manager:   TAG,
         objective: step.item,
@@ -349,11 +349,11 @@ const GATHER_EXECUTORS = new Set(['harvest_executor', 'stone_prospect_executor']
 
 // Returns true if the cap was reached and a replan-release was issued (caller returns
 // immediately). Otherwise records one more trip on the streak and lets the caller gather.
-function _gatherCapReached(signalBus, botId, boardroom, magnet, note) {
+function _gatherCapReached(botId, boardroom, magnet, note) {
     const streak = magnet.gather_streak || 0;
     if (streak >= MAX_GATHER_STREAK) {
         watcher.summary(TAG, `${note} | gathered ${streak}x in a row — yielding to brain for replan`);
-        _releaseJob(signalBus, `gathered ${streak}x in a row for ${magnet.what} (still short of ${magnet.hold_goal}) — replan`);
+        _releaseJob(`gathered ${streak}x in a row for ${magnet.what} (still short of ${magnet.hold_goal}) — replan`);
         return true;
     }
     magnet.gather_streak = streak + 1;
@@ -377,7 +377,7 @@ function _gatherCapReached(signalBus, botId, boardroom, magnet, note) {
 // ACCOMPLISH what it is handed. Do not reintroduce a refusal at this door — a board mistake then costs
 // one night trip and a possible death, which is bounded and has a rank-1 recovery, where the loop it
 // replaces is unbounded.
-function _dispatchGather(signalBus, payload, root) {
+function _dispatchGather(payload, root) {
     if (underground_items.has(root.item)) {
         throw new Error(
             `[supply_manager] CODING VIOLATION (Law 13): dispatched to gather ` +
@@ -394,7 +394,7 @@ function _dispatchGather(signalBus, payload, root) {
     // never a second route — the decomposition, the shortfall, and the gate above are all shared
     // (Law 16). See fragment_utils.stone_prospect_items for what belongs on this side.
     if (stone_prospect_items.has(root.item)) {
-        routeSignal(signalBus, TAG, 'stone_prospect_executor', {
+        routeSignal(TAG, 'stone_prospect_executor', {
             ...payload,
             manager:   TAG,
             objective: [root.item],
@@ -403,7 +403,7 @@ function _dispatchGather(signalBus, payload, root) {
         });
         return;
     }
-    routeSignal(signalBus, TAG, 'harvest_executor', {
+    routeSignal(TAG, 'harvest_executor', {
         ...payload,
         manager:   TAG,
         objective: [root.item],
@@ -429,12 +429,12 @@ function _dispatchGather(signalBus, payload, root) {
 // through the gate that either clears the trip or ranks something else first — the environmental
 // failure travels, and nothing is invented on the way (Law 13, Law 25: report the shortfall, never
 // substitute a route around it).
-function _fallBackToHarvest(signalBus, payload, item, amount, note) {
+function _fallBackToHarvest(payload, item, amount, note) {
     if (underground_items.has(item)) {
-        _releaseJob(signalBus, `${note} — "${item}" is underground and only job_board may authorize that trip; returning to the board to replan`);
+        _releaseJob(`${note} — "${item}" is underground and only job_board may authorize that trip; returning to the board to replan`);
         return;
     }
-    _dispatchGather(signalBus, payload, { item, need: amount, have: 0 });
+    _dispatchGather(payload, { item, need: amount, have: 0 });
 }
 
 // Consecutive-withdraw ceiling — THE JUDGE FOR THE CONTINUATION LOOP BELOW (Law 11: every loop needs
@@ -479,7 +479,7 @@ const MAX_WITHDRAW_STREAK = 4;
 // fragment calling ITSELF is not action-to-action messaging, and no signal is routed, so no second signal
 // exists (Law 4) and no chain is re-entered (Law 12). watcher.track holds no per-call state, so the trace
 // nests the continuation under the step that caused it.
-async function _withdrawFromChest(signalBus, payload, item, amount) {
+async function _withdrawFromChest(payload, item, amount) {
     const inventorySwapper = require('@api/inventory_swapper');
     const bot = global.bot;
     const result = await inventorySwapper.retrieveItems(bot, item, amount);
@@ -493,7 +493,7 @@ async function _withdrawFromChest(signalBus, payload, item, amount) {
         // Chest emptied between scan and withdrawal — recover through the one door
         // that may open here (see _fallBackToHarvest).
         watcher.warn(TAG, `withdraw moved nothing for ${item} — falling back to harvest`);
-        _fallBackToHarvest(signalBus, payload, item, amount, 'withdraw moved nothing');
+        _fallBackToHarvest(payload, item, amount, 'withdraw moved nothing');
         return;
     }
     const botId = process.env.BOT_ID || 'default';
@@ -502,7 +502,7 @@ async function _withdrawFromChest(signalBus, payload, item, amount) {
     const streak = (magnet?.withdraw_streak || 0) + 1;
 
     if (!magnet || streak > MAX_WITHDRAW_STREAK) {
-        _releaseJob(signalBus, `withdrew ${result.transferred}x ${item} from storage (${streak - 1} withdraws in a row — replan)`);
+        _releaseJob(`withdrew ${result.transferred}x ${item} from storage (${streak - 1} withdraws in a row — replan)`);
         return;
     }
 
@@ -521,9 +521,9 @@ async function _withdrawFromChest(signalBus, payload, item, amount) {
 // true; Law 16: a route that cannot produce its own outcome). A storage deficit closes only by material
 // entering the fleet.
 
-function _dispatchDelivery(signalBus, payload, magnet) {
+function _dispatchDelivery(payload, magnet) {
     const stationId = `${magnet.where.x}|${magnet.where.y}|${magnet.where.z}`;
-    routeSignal(signalBus, TAG, 'delivery_executor', {
+    routeSignal(TAG, 'delivery_executor', {
         ...payload,
         manager:    TAG,
         objective:  magnet.what,
@@ -533,8 +533,8 @@ function _dispatchDelivery(signalBus, payload, magnet) {
     });
 }
 
-function _dispatchExplore(signalBus, payload) {
-    routeSignal(signalBus, TAG, 'exploration_executor', {
+function _dispatchExplore(payload) {
+    routeSignal(TAG, 'exploration_executor', {
         ...payload,
         manager:  TAG,
         readable: `${TAG}: seeking suitable biome`,
@@ -545,8 +545,8 @@ function _dispatchExplore(signalBus, payload) {
 // job now (inventory_dump), fired only when the pocket is nearly full. This also removes the old
 // dump=false special-casing — the withdraw path used it to avoid re-dumping just-pulled material,
 // but with no release-time dump at all there is nothing to special-case (Law 16 — one dump pathway).
-function _releaseJob(signalBus, reason) {
-    routeToJudge(signalBus, TAG, { readable: `${TAG}: ${reason}` });
+function _releaseJob(reason) {
+    routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -562,7 +562,6 @@ function _releaseJob(signalBus, reason) {
 module.exports = {
     receive: watcher.track(TAG, function (signalType, payload) {
         if (signalType !== TAG) return;
-        const signalBus = require('@kernel/signal_bus');
         const from = payload?.from || 'unknown';
 
         const botId = process.env.BOT_ID || 'default';
@@ -571,7 +570,7 @@ module.exports = {
 
         if (!magnet || !magnet.what) {
             watcher.summary(TAG, `from=${from} | no active magnet | RELEASE`);
-            _releaseJob(signalBus, 'no active magnet — nothing to do');
+            _releaseJob('no active magnet — nothing to do');
             return;
         }
 
@@ -597,7 +596,7 @@ module.exports = {
         if (magnet.action === 'deliver' && payload.executor === 'delivery_executor') {
             const sid = `${magnet.where.x}|${magnet.where.y}|${magnet.where.z}`;
             watcher.summary(TAG, `${targetItem} (${holdGoal}) from=${from} | deliver complete to ${magnet.destination} (${sid}) | RELEASE`);
-            _releaseJob(signalBus, `deliver done for ${targetItem}`);
+            _releaseJob(`deliver done for ${targetItem}`);
             return;
         }
 
@@ -637,9 +636,9 @@ module.exports = {
         if (pocketBlocked && have >= holdGoal) {
             const isHarvestableRoot = !underground_items.has(targetItem) && !byItem[targetItem];
             if (isHarvestableRoot) {
-                if (_gatherCapReached(signalBus, botId, boardroom, magnet, `${targetItem} (have ${have}/${holdGoal})`)) return;
+                if (_gatherCapReached(botId, boardroom, magnet, `${targetItem} (have ${have}/${holdGoal})`)) return;
                 watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → harvest first (chest supply from trees, not inventory) | ${snap}`);
-                _dispatchGather(signalBus, payload, { item: targetItem, need: holdGoal, have });
+                _dispatchGather(payload, { item: targetItem, need: holdGoal, have });
                 return;
             }
             watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | pocket is NOT fulfillment for a storage request — creating fresh | ${snap}`);
@@ -702,11 +701,11 @@ module.exports = {
             if (magnet.destination && magnet.where) {
                 const sid = `${magnet.where.x}|${magnet.where.y}|${magnet.where.z}`;
                 watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | COMPLETE → deliver to ${magnet.destination} (${sid})`);
-                _dispatchDelivery(signalBus, payload, magnet);
+                _dispatchDelivery(payload, magnet);
                 return;
             }
             watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | COMPLETE | RELEASE`);
-            _releaseJob(signalBus, `completed ${targetItem} (have ${have}/${holdGoal})`);
+            _releaseJob(`completed ${targetItem} (have ${have}/${holdGoal})`);
             return;
         }
 
@@ -729,7 +728,7 @@ module.exports = {
             if (deficit > 0 && inChest > 0) {
                 const pull = Math.min(inChest, deficit);
                 watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → withdraw ${pull}x ${targetItem} from chest (chest has ${inChest}, harvest covers any remainder) | ${snap}`);
-                _withdrawFromChest(signalBus, payload, targetItem, pull);
+                _withdrawFromChest(payload, targetItem, pull);
                 return;
             }
         }
@@ -738,7 +737,7 @@ module.exports = {
         const craftStep = _planOneCraftStep(targetItem, have, creationGoal, byItem, inventory);
         if (craftStep) {
             watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → craft ${craftStep.quantity}x ${craftStep.item} (have ${craftStep.have}) | ${snap}`);
-            _dispatchCraft(signalBus, payload, craftStep);
+            _dispatchCraft(payload, craftStep);
             return;
         }
 
@@ -779,7 +778,7 @@ module.exports = {
                     if (inChest > 0) {
                         const pull = Math.min(inChest, shortfall);
                         watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → withdraw ${pull}x ${root.item} from chest (chest has ${inChest}, harvest covers any remainder) | ${snap}`);
-                        _withdrawFromChest(signalBus, payload, root.item, pull);
+                        _withdrawFromChest(payload, root.item, pull);
                         return;
                     }
                 }
@@ -802,10 +801,10 @@ module.exports = {
                 // would reach harvest_executor's wild-punch path and halt the bot on repeated identical
                 // scans for a crop that only its own chain can make.
                 if (_isChainProduct(root.item, byItem)) continue;
-                if (_gatherCapReached(signalBus, botId, boardroom, magnet, `${targetItem} (have ${have}/${holdGoal})`)) return;
+                if (_gatherCapReached(botId, boardroom, magnet, `${targetItem} (have ${have}/${holdGoal})`)) return;
                 const allRoots = missingRoots.map(r => `${r.item}:${r.need}`).join(',');
                 watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → gather ${root.need}x ${root.item} (have ${root.have}) | roots=[${allRoots}] | ${snap}`);
-                _dispatchGather(signalBus, payload, root);
+                _dispatchGather(payload, root);
                 return;
             }
         }
@@ -825,7 +824,7 @@ module.exports = {
         const bp = byItem[targetItem];
         if (!bp && have < holdGoal && !_isChainProduct(targetItem, byItem)) {
             watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | no blueprint → EXPLORE | ${snap}`);
-            _dispatchExplore(signalBus, payload);
+            _dispatchExplore(payload);
             return;
         }
 

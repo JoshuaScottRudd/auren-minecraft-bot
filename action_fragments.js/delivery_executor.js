@@ -18,7 +18,6 @@ module.exports = {
     receive: watcher.track(TAG, async function (signalType, payload) {
         if (signalType !== TAG) return;
 
-        const signalBus = require('@kernel/signal_bus');
         const bot       = global.bot;
         const item      = payload.objective;
         const quantity  = payload.quantity || 64;
@@ -57,7 +56,7 @@ module.exports = {
         const reason = `${action === 'retrieve' ? 'retrieved' : 'delivered'} ${transferred}x ${item} (station ${stationId})`;
         watcher.summary(TAG, `✅ ${reason}`);
 
-        routeToJudge(signalBus, TAG, {
+        routeToJudge(TAG, {
             manager:  payload.manager || null,
             readable: `${TAG}: ${reason}`,
             [TAG]:    { success: true, transferred, item, station_id: stationId, action },

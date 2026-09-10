@@ -146,7 +146,24 @@ function readMandate(env = process.env) {
   // the flag on one says nothing the species has not already said.
   const autostart = String(env.BOT_AUTOSTART === undefined ? '' : env.BOT_AUTOSTART).trim() === '1';
 
-  mandate = Object.freeze({ botId: String(botId).trim(), mode, owner: owner || null, autostart });
+  // ── WHICH PERSON THIS BODY MUST BE STANDING BESIDE BEFORE IT WORKS (Architect 2026-09-10) ────────
+  // *"the system now uses a player as the starting point. both homesteader and contractors must
+  // teleport to a player."*
+  //
+  // A BIRTH FACT LIKE THE REST, frozen here rather than read from env when consulted, for the mode
+  // freeze's reason: a body that could re-read this later could decide mid-life that it had been
+  // placed. `start_injector` is the one consumer — see `startNearPlayer` for the gate it feeds.
+  //
+  // A CONTRACTOR FALLS BACK TO ITS OWNER, and that is a DERIVATION rather than a defaulted field
+  // (Law 13): the owner is by constitution the person who asked for this body, so it is the same fact
+  // already in hand under another name. Requiring the desk to spell it twice would be two answers to
+  // "who is this crew standing with", and they would part company the first time either was touched
+  // (Law 16). A homesteader has no owner to fall back to, so an unplaced one is genuinely unplaced.
+  const rawNear = env.BOT_START_NEAR;
+  const nearGiven = rawNear === undefined || rawNear === null ? '' : String(rawNear).trim();
+  const startNear = nearGiven || (mode === BOT_MODES.CONTRACTOR ? owner : '');
+
+  mandate = Object.freeze({ botId: String(botId).trim(), mode, owner: owner || null, autostart, startNear: startNear || null });
   return mandate;
 }
 
@@ -184,6 +201,21 @@ function isHomesteader() { return currentMode() === BOT_MODES.HOMESTEADER; }
 // before it does anything. `--work` is what distinguishes the two, which is why this is a launch fact
 // and not a species one.
 function beginsWorkAtBirth() { return isContractor() || readMandate().autostart; }
+
+// startNearPlayer — the player this body must be standing beside before it begins working, or null when
+// nobody placed it. Asked once, by `start_injector`, as the first act of every start.
+//
+// THE PAIR TO `beginsWorkAtBirth`, and the two answer different halves of one question: that one says
+// WHETHER this body starts on its own, this one says WHERE it must be standing when it does. A body is
+// raised by a person who walked somewhere, so the placement is the person — not a coordinate, which is
+// the whole reason `get` takes no arguments (Architect 2026-09-09: *"you place them by walking
+// somewhere"*).
+//
+// NULL IS THE ANSWER, NOT A MISSING VALUE. It means nobody named a placement, which is exactly the
+// hand-launched `start_bot.js` case that `beginsWorkAtBirth`'s header describes — one body, one
+// terminal, looked over before it does anything. `start_injector` starts such a body where it stands;
+// what it must never do is invent a person to walk it to (Law 13).
+function startNearPlayer() { return readMandate().startNear; }
 
 // stationOwnerKey — WHOSE SHELF THIS IS, in the one form the station map indexes by: a contractor
 // stamps the human it belongs to, a homesteader stamps the commons every homesteader shares.
@@ -439,6 +471,7 @@ module.exports = {
   isContractor,
   isHomesteader,
   beginsWorkAtBirth,
+  startNearPlayer,
   stationOwnerKey,
   homeBlueprint,
   mountsHumanChannels,

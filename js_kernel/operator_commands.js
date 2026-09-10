@@ -38,8 +38,13 @@ async function execute(verb, args = {}, origin) {
       // The dispatcher cancels it too, but that only fires once a plan cycle actually reaches it —
       // this closes the window between the start signal and the first dispatch.
       require('@action/await_aggro.js').stop();      // one occupant per scope (Law 4)
-      require('@action/start_injector.js').inject();
-      watcher.summary('operator_commands', 'start — injected autonomous start signal.');
+      // AWAITED, AND REPORTED FROM THE OUTCOME (2026-09-10). The injector carries a placement gate that
+      // can refuse — a body must be standing with the person who raised it before it plans — so a line
+      // printed beside the call would tell an operator their verb had taken effect when it had not
+      // (Law 25). This is the operator's own verb, so the answer belongs to whoever typed it.
+      const started = await require('@action/start_injector.js').inject();
+      if (started && started.started) watcher.summary('operator_commands', 'start — injected autonomous start signal.');
+      else watcher.error('operator_commands', `start — REFUSED, nothing was started: ${(started && started.why) || 'the start injector refused and said nothing'}.`);
       return;
     }
     case 'sentry': {

@@ -86,11 +86,10 @@ function arm() {
     if (Date.now() - _lastBoardScanAt < BOARD_RESCAN_MS) { arm(); return; }
     _lastBoardScanAt = Date.now();
 
-    const signalBus = require('@kernel/signal_bus');
     // No manager stamp → recursive_judge treats this as "no active task" and routes to job_board
     // for a fresh plan cycle (same entry as start_injector). The #N makes each heartbeat's readable
     // distinct so the judge's identical-outcome kill never trips on the heartbeat itself.
-    routeToJudge(signalBus, 'idle_scheduler', {
+    routeToJudge('idle_scheduler', {
       readable: `idle_scheduler: idle re-check #${++_checkNumber} — re-planning from fresh world state`,
       idle_scheduler: { success: true },
     });

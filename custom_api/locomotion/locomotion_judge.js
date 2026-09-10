@@ -50,6 +50,12 @@
 // ---------------------------------------------------------------------------
 const watcher = require('@kernel/watcher');
 const portableJudge = require('@kernel/portable_judge');
+// The bus at MODULE SCOPE, which it could not be before 2026-09-10: the load cycle through
+// fragment_registry forced this require inside a function in every routing file. This is one of the
+// six FORWARDING routers — it calls route() with an upstream author's own from/to rather than building
+// an envelope, so it cannot use signal_utils' helpers (they stamp `from` = the caller and would rewrite
+// authorship). Every other fragment now has no contact with the bus at all.
+const signalBus = require('@kernel/signal_bus');
 
 // ---------------------------------------------------------------------------
 // SECTION 2: Retry budget
@@ -142,7 +148,6 @@ module.exports = {
     // fresh caller request, so it must not tick the counter.
     const key = goalKey(capsule);
 
-    const signalBus = require('@kernel/signal_bus'); // lazy: avoids circular load via fragment_registry
 
     // -----------------------------------------------------------------------
     // SUCCESS: verdict to the dispatcher, which resolves the caller's promise.
@@ -166,7 +171,7 @@ module.exports = {
           selected_target: capsule.selected_target || null
         }
       };
-      return signalBus.route(out.from, out.to, out);
+      return signalBus.route(out.to, out);
     }
 
     // -----------------------------------------------------------------------
@@ -197,7 +202,8 @@ module.exports = {
           attempt: nextAttempt,
           verb: capsule.verb,
           coordinate: capsule.coordinate ?? null,
-          require_los: capsule.require_los ?? false,
+          require_los: capsule.require_los ?? false,
+
           required_side: capsule.required_side ?? null,
           min_y: capsule.min_y ?? null,
           exact: capsule.exact ?? false,
@@ -206,7 +212,7 @@ module.exports = {
           candidates_kind: capsule.candidates_kind ?? null
         }
       };
-      return signalBus.route(out.from, out.to, out);
+      return signalBus.route(out.to, out);
     }
 
     // -----------------------------------------------------------------------
@@ -231,6 +237,6 @@ module.exports = {
         reason: 'give_up'
       }
     };
-    return signalBus.route(out.from, out.to, out);
+    return signalBus.route(out.to, out);
   }),
 };
