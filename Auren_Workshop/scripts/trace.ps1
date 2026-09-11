@@ -1,8 +1,8 @@
 # trace_monitor entry point — the inspection twin of start_fleet.ps1. Its only job is to run
-# trace_monitor.js under a node the current machine actually has: bare `node` is on PATH at home
-# but not on the work machine (portable node), so `node trace_monitor.js` dies "node not recognized"
-# there. This resolves the same portable -> node_env2 -> PATH chain every other entry point uses
-# (runbook §2) and forwards every flag through untouched, so all runbook §6 queries work verbatim:
+# trace_monitor.js under a node the current machine actually has: bare `node` is not on PATH on every
+# machine, so `node trace_monitor.js` can die "node not recognized". This resolves node the way every
+# other entry point does (_node.ps1: PATH first, then the Architect's workstation file - runbook §2) and
+# forwards every flag through untouched, so all runbook §6 queries work verbatim:
 #   .\Auren_Workshop\scripts\trace.ps1                       # digest + anomalies
 #   .\Auren_Workshop\scripts\trace.ps1 --story --bot=AurenBot
 #   .\Auren_Workshop\scripts\trace.ps1 --around="1m 1s" --lines=50
@@ -11,9 +11,13 @@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $workshopDir    = Split-Path -Parent $scriptDir
 # The lens stack moved into the bot on 2026-09-10 (Architect: troubleshooting ships, recording does
-# not), so this resolves one level further out than the workshop it lives in.
-$repoDir   = Split-Path -Parent $workshopDir
-$traceMon  = Join-Path $repoDir 'Auren_Bot\monitoring\trace_monitor.js'
+# not), and the WORKSHOP moved inside the bot in the same pass — so the parent of the workshop IS the
+# bot root, and the path is joined from there. It named 'Auren_Bot\monitoring' under that parent for a
+# day, which resolved to Auren_Bot\Auren_Bot\monitoring and made this entry point throw MODULE_NOT_FOUND
+# on every invocation. Counting levels is what broke; the bot root is the only anchor named here, and it
+# stays correct inside the extract, where no repo root exists to count to.
+$botDir    = Split-Path -Parent $workshopDir
+$traceMon  = Join-Path $botDir 'monitoring\trace_monitor.js'
 
 . "$PSScriptRoot\_node.ps1"   # the one node resolver (Law 16)
 $node = Get-AurenNode

@@ -69,8 +69,8 @@
 // Run (server must be UP; the foreman, the overseer and every bot are raised BY this probe and taken
 // down with it — Law 8. A foreman already on duty is REUSED and left standing, so this can be pointed
 // at a live contractor bench instead of only at an empty server):
-//   node_portable\node-*\node.exe Auren_Workshop\tools\foreman_probe.js --phase=1
-//   node_portable\node-*\node.exe Auren_Workshop\tools\foreman_probe.js --phase=2
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\foreman_probe.js --phase=1
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\foreman_probe.js --phase=2
 //
 // THE RUN IS CUT IN TWO BY WHAT CAN ANSWER A QUESTION, not by subject — see THE PHASE below the
 // requires for the full statement and for what phase 1 is not allowed to claim. In short: phase 1

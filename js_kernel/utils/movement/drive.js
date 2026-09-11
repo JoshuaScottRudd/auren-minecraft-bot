@@ -148,12 +148,29 @@ const SPRINT_RELEASE_MARGIN = 0.3;
 //   for the new behaviour. That is what makes the live A/B one argument instead of one branch.
 // opts.sprint (default FALSE) — hand this function the SPRINT control for the run. See the header block
 //   above for why it cannot stay with the caller.
+// opts.stallMs (default RUN_STALL_MS) — how long zero progress is tolerated before the run gives up.
+//   Pass `null` to WAIVE the stall verdict entirely, for the one caller whose step legitimately makes no
+//   ground while it works.
+//
+// ── WHY A WAIVER EXISTS AT ALL, AND WHY IT IS NOT A DEFAULT (Architect 2026-09-11) ─────────────────
+// The stall guard assumes zero progress means something is wrong. That holds for every edge type but
+// one: a DOOR. A shut door has a solid bounding box, so a body walking into it makes exactly no ground
+// until the survival reflex opens it — zero progress is that step's normal working state, not its
+// failure. Before the walkers were consolidated (c7ee49a, 2026-08-01) the door step ran its own loop
+// with no progress check and simply pushed for its full 3,000 ms, which is the budget the reflex's
+// server round-trip needs; the consolidation silently cut that to 400 ms and the door has been snagging
+// ever since (bugsquashing §20.1). The waiver restores the old patience for that ONE caller without
+// giving it to the rest, because everywhere else the guard is what stops a wedged body burning its
+// whole timeout. The run is still bounded — `timeoutMs` always applies.
 async function driveRun(bot, cells, opts = {}) {
   const r2 = (n) => (typeof n === 'number' && isFinite(n) ? Math.round(n * 100) / 100 : null);
   const nothing = (reason, crossed) => ({ arrived: false, crossed, reason, prejumps: 0, outOfBand: 0, sprintDrops: 0, ms: 0, dist: 0, path: 0, spd: 0, peak: 0, sprintMs: 0, stuckMs: 0, jumps: [] });
   if (!Array.isArray(cells) || !cells.length) return nothing('empty_run', 0);
   const strictFinal = opts.strictFinal !== false;
   const timeoutMs = opts.timeoutMs || Math.max(1500, cells.length * 900);
+  // `undefined` means "not asked for" and takes the default; `null` is the explicit waiver. They are
+  // distinguished rather than collapsed, so a caller cannot waive the guard by forgetting the option.
+  const stallMs = opts.stallMs === undefined ? RUN_STALL_MS : opts.stallMs;
   const t0 = Date.now();
   let idx = 0, prejumps = 0, jumpHeld = false, outOfBand = 0, sprintDrops = 0;
   // Starts null rather than false so the first pass always writes the control, instead of assuming the
@@ -365,7 +382,9 @@ async function driveRun(bot, cells, opts = {}) {
         // exactly where the Architect reported the symptom. stuckMs carries the evidence out regardless
         // of which clock expires first, and the ARM owns the escalation (see rush.js).
         stuckMs = Date.now() - lastProgressAt;
-        if (stuckMs > RUN_STALL_MS) return out('stalled');
+        // stuckMs is still MEASURED under a waiver — the telemetry is the evidence either way, and a
+        // door that takes 900 ms to open should be readable afterwards. Only the verdict is waived.
+        if (stallMs != null && stuckMs > stallMs) return out('stalled');
       }
       await sleep(RUN_POLL_MS);
     }

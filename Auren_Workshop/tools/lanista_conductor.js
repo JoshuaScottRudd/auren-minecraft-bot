@@ -135,7 +135,7 @@ function banner(t) { console.log(`\n${'─'.repeat(78)}\n${stamp()}  ${t}\n${'�
 const nodePathEnv = () => require(paths.bot('js_kernel/utils/node_module_homes')).nodePathValue();
 
 function snapshotDir(world, snap) {
-  return path.join(REPO_ROOT, 'MinecraftServer', 'world_snapshots', world, snap);
+  return path.join(require(paths.bot('js_kernel/utils/workstation')).needServerDir(), 'world_snapshots', world, snap);
 }
 
 // ── What the ladder's exit code MEANS ───────────────────────────────────────────────────────────────
@@ -311,7 +311,7 @@ function main() {
     const upArgs = [FLEET, 'test', 'arena', '--count=1', `--world=${world}`, `--snapshot=${snap}`, `--port=${port}`];
     // NODE_PATH TRAVELS WITH THIS SPAWN TOO. It used to be set only on the ladder spawn below, on the
     // reading that fleet_control is launched from the repo root and resolves its own modules — which is
-    // true on the workstation whose `node_env2/node_modules` is populated and false on the other one.
+    // true on a machine whose module home sits beside the repo and false on one that does not.
     // fleet_control requires monitoring/combat_lens ← combat_ledger, and that chain fails to resolve
     // without NODE_PATH set. Two spawns of the same tree needing the same resolution path is one fact,
     // not two, so both read `nodePathEnv()` (Law 16).

@@ -27,7 +27,7 @@
 //   5 STATIC BASELINE     the same trials with a quiet world, so phase 4 has something to be compared to
 //
 // Usage (server must be running):
-//   NODE_PATH=... node_env2/node.exe Auren_Workshop/tools/voxel_reader_stress_bench.js --dist=64 --nodes=30000 --repeat=6
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\voxel_reader_stress_bench.js --dist=64 --nodes=30000 --repeat=6
 
 const path = require('path');
 const paths = require('../workshop_paths');

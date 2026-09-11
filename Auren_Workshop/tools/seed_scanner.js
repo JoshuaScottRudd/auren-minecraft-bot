@@ -98,7 +98,7 @@ const BOT_DIR = paths.BOT_ROOT;
 // `workshop_paths` already answers — the second copy is exactly the defect that file was written to end,
 // and it survived the 2026-09-10 move only because the arithmetic happened to still be right.
 const REPO_ROOT = paths.REPO_ROOT;
-const SERVER_DIR = path.join(REPO_ROOT, 'MinecraftServer');
+const SERVER_DIR = require(paths.bot('js_kernel/utils/workstation')).needServerDir();
 const SNAPSHOT_DIR = path.join(SERVER_DIR, 'world_snapshots');
 const DEV_PROPS = path.join(SERVER_DIR, 'server.properties');
 const FLEET = path.join(BOT_DIR, 'fleet_control.js');

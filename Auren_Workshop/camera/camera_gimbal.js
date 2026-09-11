@@ -45,8 +45,8 @@
 // The walk itself is ./sightline, shared with the scout, because a rig that CUTS on one definition of
 // "blocked" while the seeker PLACES on another is a rig that argues with itself (Law 16).
 //
-// Module resolution + graceful degradation mirror camera_scout: mineflayer lives in the sibling
-// node_env2/node_modules, and if the require or the connection fails this returns { available:false } so the
+// Module resolution + graceful degradation mirror camera_scout: mineflayer lives in whichever module home
+// node_module_homes names for this machine, and if the require or the connection fails this returns { available:false } so the
 // rig falls back to the old frozen-aim tripod. Filming must survive a missing gimbal.
 
 'use strict';

@@ -43,6 +43,7 @@ const { spawn, spawnSync, execFileSync } = require('child_process');
 const paths = require('./workshop_paths');
 paths.registerAliases();
 const rcon = require(paths.bot('js_kernel/utils/rcon_link'));
+const workstation = require(paths.bot('js_kernel/utils/workstation'));
 // The one owner of "open a visible console window" — this runner's children are watched through it.
 const consoleWindow = require(paths.bot('js_kernel/utils/console_window'));
 
@@ -127,9 +128,17 @@ function validate(c) {
   // knowable before anything moved (Law 13). Measured on this workstation: `world_snapshots/` did not
   // exist at all, so the shipped default named a baseline that was never here.
   if (c.world === 'fresh' && typeof c.snapshot === 'string' && typeof c.worldName === 'string') {
-    const home = paths.repo('MinecraftServer', 'world_snapshots', c.worldName);
-    const asDir = path.join(home, c.snapshot);
-    if (!fs.existsSync(asDir) && !fs.existsSync(`${asDir}.zip`)) {
+    // The server folder is the workstation resolver's answer — AUREN_SERVER_DIR, then the Architect's
+    // workstation file (Law 16) — and a fresh world with no server folder to roll it back in is refused
+    // here, by name, for the same reason as a missing snapshot.
+    const server = workstation.findServerDir();
+    const home = server.dir && path.join(server.dir, 'world_snapshots', c.worldName);
+    const asDir = home && path.join(home, c.snapshot);
+    if (!home) {
+      wrong.push(`world: 'fresh' rolls a world back, and there is no server folder to roll it back in.`);
+      wrong.push(`  tried: ${server.tried.join(', ')}`);
+      wrong.push(`  Set AUREN_SERVER_DIR to the folder that holds your server's server.properties.`);
+    } else if (!fs.existsSync(asDir) && !fs.existsSync(`${asDir}.zip`)) {
       const have = fs.existsSync(home) ? fs.readdirSync(home) : [];
       wrong.push(`snapshot: there is no '${c.snapshot}' to roll back to. Looked in ${home}`);
       wrong.push(have.length ? `  What is there: ${have.join(', ')}` : `  That folder holds no snapshots at all.`);
@@ -170,7 +179,11 @@ validate(CONFIG);
 // asked for by name, through the environment, and refused if absent.
 const OWNS_THE_SERVER = CONFIG.server === 'local';
 
-const PROPS_FILE = paths.repo('MinecraftServer', 'server.properties');
+// The server folder is the workstation resolver's answer (AUREN_SERVER_DIR, then the Architect's
+// workstation file). Null when neither names one — which only matters for `server: 'local'`, and the mint
+// below refuses by name when it does.
+const SERVER_FOLDER = workstation.findServerDir().dir;
+const PROPS_FILE = SERVER_FOLDER ? path.join(SERVER_FOLDER, 'server.properties') : null;
 
 // WHAT THE FILE SAYS RIGHT NOW, which is the password of the server that is RUNNING right now.
 // That equivalence is the whole discipline of the two functions below and it is only true while the mint
@@ -197,8 +210,9 @@ function mintLocalConsolePassword() {
   // does not need to be: it authenticates this script to a loopback port on a world it just created.
   const token = `auren-${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 6)}`;
   if (!fs.existsSync(PROPS_FILE)) {
-    refuse([`server: 'local' but there is no MinecraftServer/server.properties to configure.`,
-            `  This script starts the world it tests, so it needs the server it is starting.`]);
+    refuse([`server: 'local' but there is no server folder with a server.properties to configure.`,
+            `  This script starts the world it tests, so it needs the server it is starting.`,
+            `  Set AUREN_SERVER_DIR to the folder that holds your server's server.properties.`]);
   }
   const before = fs.readFileSync(PROPS_FILE, 'utf8');
   const after = /^rcon\.password=.*$/m.test(before)

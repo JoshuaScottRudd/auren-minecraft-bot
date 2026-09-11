@@ -92,7 +92,7 @@ function computeSnapshot(files) {
 
   const structItems = structNames.map(name => {
     const s = structuresRaw[name];
-    // Room keys carry an owner (`headframe|Joshua`); the label shows the structure, the key stays the id.
+    // Room keys carry an owner (`headframe|Architect`); the label shows the structure, the key stays the id.
     const displayName = name.includes('|') ? name.slice(0, name.lastIndexOf('|')) : name;
     const it = integrityOf(s);
     const vox = s.blueprint_paster && s.blueprint_paster.total_voxels;

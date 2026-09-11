@@ -23,7 +23,7 @@
 // drops the inventory).
 //
 // Run (fleet/server must be UP):
-//   NODE_PATH=MinecraftServer/node_modules node_env2/node.exe Auren_Workshop/tools/water_pillar_probe.js
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\water_pillar_probe.js
 //   env knobs: PROBE_TESTS (default 3), PROBE_RADIUS (default 48), PROBE_NAME (default testbot)
 
 const path = require('path');
@@ -57,7 +57,7 @@ const SEA_LEVEL = 62;
 const MAX_DOWN = Math.max(1, Math.floor(BLOCK_REACH));   // reachable fill depth (~4)
 const BLOCK = 'cobblestone';
 
-const SERVER_DIR = paths.repo('MinecraftServer');
+const SERVER_DIR = require(paths.bot('js_kernel/utils/workstation')).needServerDir();
 
 function log(...a) { console.log('[water_pillar_probe]', ...a); }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));

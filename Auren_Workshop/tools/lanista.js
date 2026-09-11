@@ -1502,8 +1502,8 @@ async function openArena({ quiet = false } = {}) {
     log: (lvl, m) => log('scout', m),
   });
   if (!scout.available) {
-    return { ok: false, why: `mineflayer unavailable to the scout (${scout.reason}). Run with NODE_PATH pointed at a modules dir, e.g.\n`
-      + '  NODE_PATH=node_env2/node_modules node_env2/node.exe Auren_Workshop/tools/lanista.js --bot=AurenBot' };
+    return { ok: false, why: `mineflayer unavailable to the scout (${scout.reason}). Install the bot's packages, from Auren_Bot\\:\n`
+      + '  .\\Auren_Workshop\\scripts\\npm.ps1 install' };
   }
   if (!await waitForScout(scout)) { scout.end(); return { ok: false, why: 'the scout never spawned — is the server up?' }; }
 

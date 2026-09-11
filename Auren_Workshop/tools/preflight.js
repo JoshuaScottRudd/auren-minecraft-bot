@@ -27,10 +27,11 @@ brain end-to-end. Real-world behaviour (pathfinding, timing, block interaction)
 is still confirmed only by an actual `master_core.js` run against a live world.
 This test proves the graph *loads and wires up*, not that it *behaves*.
 
-Why it needs a bootstrap: mineflayer/vec3/prismarine live in the sibling
-`node_env2/node_modules` (the live launcher points NODE_PATH there), not in
-Auren_Bot/node_modules. We replicate that resolution here so the whole graph can
-load exactly as it does at runtime, then register module-alias for the @-aliases.
+Why it needs a bootstrap: mineflayer/vec3/prismarine live in whichever module
+homes js_kernel/utils/node_module_homes names for this machine (Auren_Bot/node_modules
+first, then the Architect's workstation file). We replicate that resolution here so
+the whole graph can load exactly as it does at runtime, then register module-alias
+for the @-aliases.
 
 Four passes, all live and all built on ONE walk of the tree:
   1  every file the walk finds is require()d          (bad requires, renamed exports, syntax)
@@ -100,7 +101,7 @@ const { spawnSync } = require('child_process');
 // fixed that and introduced a worse one on a second call — see the WHY block in `workshop_paths.js`.
 const paths = require('../workshop_paths');
 if (!paths.bootstrapModules().length) {
-  console.error('WARN: no module dir (node_env2 / MinecraftServer / Auren_Bot) found; vec3/mineflayer may not resolve.');
+  console.error('WARN: no node_modules found - run npm install in Auren_Bot/ first; vec3/mineflayer may not resolve.');
 }
 paths.registerAliases();
 
@@ -941,6 +942,7 @@ if (_hasSessions) {
 const PRIVATE_DOMAINS = [
   'Cognitive_documents', 'Documentation', 'Privacy', 'Sessions',
   'Long_term_memory', 'MinecraftServer', 'Public_server', 'Cutting_room', 'Scratch_tools',
+  'Architect_workstation',
 ];
 const PRIVATE_REQUIRE = new RegExp(
   String.raw`require\s*\(\s*['"\`][^'"\`]*(?:` + PRIVATE_DOMAINS.join('|') + String.raw`)[\\/]`, 'g');

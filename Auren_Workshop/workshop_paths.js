@@ -55,11 +55,13 @@ const path = require('path');
 // touches every path in the repository.
 //
 // `repo()` NOW POINTS AT SOMEBODY ELSE'S PARENT DIRECTORY ON A STRANGER'S MACHINE, and that is fine
-// because of what it is used for: `MinecraftServer/` (the Architect's own world and its snapshots) and
-// `Sessions/` (the AI-developer session layer). Both are absent from a download by design, both are
-// asked for through an existence check, and `preflight`'s shipped-tree pass refuses any `require` that
-// reaches private ground — so a wrong answer from `repo()` can only ever be a missing-directory
-// refusal that names itself, never a silent load-time failure.
+// because of what it is used for: `Sessions/` (the AI-developer session layer) and the Architect's other
+// private folders. All are absent from a download by design, all are asked for through an existence
+// check, and `preflight`'s shipped-tree pass refuses any `require` that reaches private ground — so a
+// wrong answer from `repo()` can only ever be a missing-directory refusal that names itself, never a
+// silent load-time failure. THE MINECRAFT SERVER FOLDER, JAVA AND THE MODULE HOMES ARE NOT reached
+// through `repo()` (2026-09-11): they are `js_kernel/utils/workstation.js`'s answers, which try the
+// stranger's way first and the Architect's workstation file second.
 const WORKSHOP_ROOT = __dirname;
 const BOT_ROOT = path.resolve(__dirname, '..');
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -67,8 +69,8 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..');
 // bot(...parts) — a path inside the SHIPPED bot. The one crossing point of the split boundary.
 function bot(...parts) { return path.join(BOT_ROOT, ...parts); }
 
-// repo(...parts) — a path inside the repository root: MinecraftServer, node_env2, Sessions, Privacy,
-// Cutting_room. Everything that is neither the bot nor the workshop.
+// repo(...parts) — a path inside the repository root: Sessions, Privacy, Cutting_room. Everything that is
+// neither the bot nor the workshop, except what `js_kernel/utils/workstation.js` answers.
 function repo(...parts) { return path.join(REPO_ROOT, ...parts); }
 
 // workshop(...parts) — a path inside the workshop itself. Present so a tool spawning a sibling tool

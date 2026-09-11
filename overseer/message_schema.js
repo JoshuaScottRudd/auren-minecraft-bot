@@ -107,11 +107,11 @@ const VALID_TYPES = new Set([
 // its raw map and its owner-gated `mine`.
 const BUILDING_ROOM_SEPARATOR = '|';
 
-// roomKeyName(key) → the structure half: `contractor_house|Joshua` → `contractor_house`.
+// roomKeyName(key) → the structure half: `contractor_house|Architect` → `contractor_house`.
 //
 // EVERY CONSUMER THAT RESOLVES A KEY TO A BLUEPRINT MUST GO THROUGH HERE. getExistingFootprints and
 // getAllProtectedBlocks both resolve a room key to a blueprint name as
-// `entry.blueprint_paster.building_name || key`, and that fallback hands `contractor_house|Joshua` to
+// `entry.blueprint_paster.building_name || key`, and that fallback hands `contractor_house|Architect` to
 // blueprintRegistry, which throws on a name no blueprint has. The chair is written by set_buildspot in
 // the same call as the key, so the fallback should never fire — but a fallback that is wrong when it
 // fires is a trap rather than a fallback (Law 13).

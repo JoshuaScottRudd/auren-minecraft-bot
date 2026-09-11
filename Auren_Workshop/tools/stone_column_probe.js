@@ -36,7 +36,7 @@
 // what natural ground looks like to this reader).
 //
 // Run (server must be UP — `fleet_control.js server-start` is the entire prerequisite):
-//   NODE_PATH=MinecraftServer/node_modules <node> Auren_Workshop/tools/stone_column_probe.js
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\stone_column_probe.js
 //   env knobs: PROBE_SAMPLES (default 8) · PROBE_SPREAD blocks between samples (default 220)
 //              PROBE_AT="x,z;x,z" samples those exact columns instead of the ring (aim at terrain
 //                        the ring never lands on — ocean, desert, a mountain face)

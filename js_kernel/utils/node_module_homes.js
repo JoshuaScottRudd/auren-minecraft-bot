@@ -1,10 +1,10 @@
 // node_module_homes — the ONE answer to "where do the third-party node modules live on THIS machine".
 //
 // mineflayer, vec3, prismarine-*, ws and module-alias are not checked in beside the code that uses them.
-// They live in a `node_modules` that is in a DIFFERENT PLACE on each of the Architect's two workstations:
-// `node_env2/` on the primary, `MinecraftServer/` on the secondary (the portable-node setup). Nothing in
-// Node resolves that by itself, so every entry point that touches a live client has to put the right
-// directory on NODE_PATH before its first require.
+// A stranger's copy has them in `Auren_Bot/node_modules`, put there by `npm install`. The Architect's
+// machines have more homes than that — the ones his workstation file lists — and nothing in Node finds
+// those by itself, so every entry point that touches a live client puts the list on NODE_PATH before its
+// first require.
 //
 // ── WHY IT IS A FILE ────────────────────────────────────────────────────────────────────────────────
 // It was copied, not shared — FOUR implementations of one question, and they had drifted apart:
@@ -22,10 +22,12 @@
 // That is Law 16's delete-test failing in the direction nobody checks: the redundant copies were not
 // dead, they were each quietly doing the job the canonical one did worse.
 //
-// ── THE ORDER IS NOT ARBITRARY ──────────────────────────────────────────────────────────────────────
-// node_env2 first because it is the purpose-built environment for the fleet; the server's own
-// node_modules is a co-tenant that happens to carry the same packages, and Auren_Bot's is the last
-// resort. A machine with several of them gets the fleet's own copy, not whichever the server installed.
+// ── THE ORDER IS THE WORKSTATION RULE (Architect 2026-09-11) ────────────────────────────────────────
+// *"if run then check stranger way, if fail then architect way."* The bot's own node_modules comes first
+// — it is the stranger's home, and the one every require inside Auren_Bot/ reaches by walking up anyway —
+// and the homes listed in `../Architect_workstation/workstation.json` follow, read through
+// `workstation.js`, the one JS reader of that file. On a stranger's machine the list is one entry long.
+// His folder names are written in that file and nowhere in this one.
 //
 // ── IT NEVER THROWS AND NEVER DEFAULTS ──────────────────────────────────────────────────────────────
 // A machine with none of them is a real state (a laptop with no game installed running a lens), and the
@@ -38,26 +40,14 @@
 
 const path = require('path');
 const fs = require('fs');
+const { architectPaths } = require('./workstation');
 
-const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
 const BOT_ROOT = path.resolve(__dirname, '..', '..');
 
-// Every place a node_modules has ever been found on either workstation, in priority order. A new machine
-// layout is one entry here, not a fifth copy of the loop.
+// Every home this machine may have, in priority order: the stranger's first, then his.
 const CANDIDATE_HOMES = [
-  path.join(PROJECT_ROOT, 'node_env2', 'node_modules'),
-  path.join(PROJECT_ROOT, 'MinecraftServer', 'node_modules'),
   path.join(BOT_ROOT, 'node_modules'),
-  // Cutting_room's own install, added 2026-09-09 when the video toolchain's DECLARATION moved out of
-  // Auren_Bot/package.json to the code that actually requires it. The bot requires neither ffmpeg-static
-  // nor ffprobe-static — they are 414 MB, and declaring them in the published package.json made every
-  // stranger download a video encoder for a Minecraft bot. Last in priority because it carries exactly
-  // one domain's packages; the three above are general homes.
-  //
-  // A path outside the bot is not a leak of the workshop into shipped code — `moduleHomes()` filters by
-  // existsSync, and the two entries above it already name directories no published copy has either. On a
-  // stranger's machine this list collapses to the bot's own node_modules, which is the whole point.
-  path.join(PROJECT_ROOT, 'Cutting_room', 'node_modules'),
+  ...architectPaths('node_modules'),
 ];
 
 // moduleHomes() — the candidates that actually exist here, in priority order. Read fresh on every call

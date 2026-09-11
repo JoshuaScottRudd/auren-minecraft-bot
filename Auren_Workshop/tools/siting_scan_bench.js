@@ -25,8 +25,8 @@
 // therefore LONGER than either number here; the RATIO is the finding.
 //
 // Usage (server must be running):
-//   NODE_PATH=MinecraftServer/node_modules node_portable/node-v22.13.1-win-x64/node.exe \
-//     Auren_Workshop/tools/siting_scan_bench.js --radius=48 --size=11 --height=5
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) `
+//     Auren_Workshop\tools\siting_scan_bench.js --radius=48 --size=11 --height=5
 
 const path = require('path');
 require('../workshop_paths').registerAliases();

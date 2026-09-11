@@ -80,7 +80,7 @@ paths.registerAliases();
 const recovery = require('@kernel/body_recovery');
 
 const REPO_ROOT = paths.REPO_ROOT;
-const SERVER_DIR = path.join(REPO_ROOT, 'MinecraftServer');
+const SERVER_DIR = require(paths.bot('js_kernel/utils/workstation')).needServerDir();
 const HQ_DIR = paths.bot('js_kernel');
 
 const TAG = 'fleet_revive';

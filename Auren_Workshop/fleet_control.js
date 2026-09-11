@@ -68,7 +68,6 @@ const { spawnSync } = require('child_process');
 const paths = require('./workshop_paths');
 const BOT_DIR = paths.BOT_ROOT;
 const PROJECT_ROOT = paths.REPO_ROOT;
-const SERVER_DIR = path.join(PROJECT_ROOT, 'MinecraftServer');
 const RUNTIME_FILE = path.join(BOT_DIR, 'fleet_control_runtime.json');
 // ROSTER derives from the canonical BOT_SENIORITY table — ordered by seniority so ROSTER[0] is the
 // eldest. Adding a bot is ONE edit in architect_config.js, not here (Law 16, single source of truth).
@@ -110,27 +109,14 @@ const positional = args.filter(a => !a.startsWith('--')).slice(1);
 // Defined after `opt` because it reads the CLI.
 const WORLD = opt('world', null);
 
-// ── Executable resolution (same chain the launch scripts use) ───────────────
-// JS twin of scripts/_node.ps1 (the PS entry points can't call into JS, so each language keeps one
-// resolver). The portable leg globs node_portable/node-*/node.exe rather than pinning a version, so a
-// node upgrade needs no edit. Chain: node_portable (work) -> node_env2 (home) -> the running node.
-function findNode() {
-  const portableDir = path.join(PROJECT_ROOT, 'node_portable');
-  if (fs.existsSync(portableDir)) {
-    for (const entry of fs.readdirSync(portableDir)) {
-      const exe = path.join(portableDir, entry, 'node.exe');
-      if (fs.existsSync(exe)) return exe;
-    }
-  }
-  const env2 = path.join(PROJECT_ROOT, 'node_env2', 'node.exe');
-  if (fs.existsSync(env2)) return env2;
-  return process.execPath;
-}
-
-function findJava() {
-  const local = path.join(PROJECT_ROOT, 'jdk-25.0.3+9', 'bin', 'java.exe');
-  return fs.existsSync(local) ? local : 'java';   // PATH java (home machine)
-}
+// ── Executables and the server folder ────────────────────────────────────────
+// Node: every child runs on `process.execPath`, the interpreter already running this file. It was
+// resolved once, by whoever started us (a stranger's `node`, or scripts/_node.ps1 on his machines), and
+// asking again could only produce a second answer (Law 16). Java and the server folder are the workstation
+// resolver's answers — the stranger's way first, then the Architect's workstation file — asked at the
+// moment they are needed, so a command that touches neither never pays for either.
+const workstation = require(paths.bot('js_kernel/utils/workstation'));
+function serverDir() { return workstation.needServerDir(); }
 
 // Both module-home questions now go to @utils/node_module_homes rather than to two lists maintained
 // here. They had already drifted — nodePathEnv knew two homes and requireWs knew three, so a machine
@@ -278,7 +264,7 @@ function fleetConsole() {
 // ── RCON (minimal client — only what a graceful 'stop' needs) ────────────────
 function serverProperties() {
   const props = {};
-  for (const line of fs.readFileSync(path.join(SERVER_DIR, 'server.properties'), 'utf8').split(/\r?\n/)) {
+  for (const line of fs.readFileSync(path.join(serverDir(), 'server.properties'), 'utf8').split(/\r?\n/)) {
     const i = line.indexOf('=');
     if (i > 0 && !line.startsWith('#')) props[line.slice(0, i)] = line.slice(i + 1);
   }
@@ -296,7 +282,7 @@ function effectiveWorld() { return WORLD || currentLevelName(); }
 // the folder itself is untouched — an unknown name just makes Minecraft generate a fresh world of that
 // name on start, which is how a NEW test world is born.
 function setServerProperty(key, value) {
-  const file = path.join(SERVER_DIR, 'server.properties');
+  const file = path.join(serverDir(), 'server.properties');
   const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
   const re = new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=`);
   let found = false;
@@ -627,9 +613,9 @@ async function serverStart() {
   //
   // 4 GB on a 32 GB machine, and Xms == Xmx because an equal pair removes heap-resize pauses — the
   // stall being fixed is a pause, so a setting that adds pauses of its own is the wrong shape. This
-  // number ships with the bot, so a stranger's one-button run gets it too; `MinecraftServer/rollback.ps1`
+  // number ships with the bot, so a stranger's one-button run gets it too; `scripts/world_rollback.ps1`
   // already documented `-Xmx2G -Xms1G` in its own example, so 1 GB was low even by this repo's account.
-  launch('server', findJava(), ['-Xmx4G', '-Xms4G', '-jar', 'server.jar', 'nogui'], SERVER_DIR, {});
+  launch('server', workstation.needJava(), ['-Xmx4G', '-Xms4G', '-jar', 'server.jar', 'nogui'], serverDir(), {});
   const up = await waitFor(`server port ${SERVER_PORT}`, () => probePort(SERVER_PORT), 120000, 2000);
   if (up) {
     console.log('server: up.');
@@ -697,10 +683,10 @@ async function snapshot() {
   }
   const name = opt('name', null);
   const psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', path.join(SERVER_DIR, 'rollback.ps1'),
-    '-Action', 'snapshot', '-World', effectiveWorld()];
+    '-File', paths.workshop('scripts', 'world_rollback.ps1'),
+    '-Action', 'snapshot', '-Root', serverDir(), '-World', effectiveWorld()];
   if (name) psArgs.push('-Name', name);
-  const r = spawnSync('powershell', psArgs, { cwd: SERVER_DIR, encoding: 'utf8' });
+  const r = spawnSync('powershell', psArgs, { cwd: serverDir(), encoding: 'utf8' });
   process.stdout.write(r.stdout || '');
   process.stderr.write(r.stderr || '');
   const ok = r.status === 0;
@@ -714,7 +700,7 @@ async function overseerStart() {
     console.log(`overseer: already listening on ${port} — reusing it.`);
     return true;
   }
-  launch('overseer', findNode(), [path.join('overseer', 'overseer_server.js'), String(port)], BOT_DIR,
+  launch('overseer', process.execPath, [path.join('overseer', 'overseer_server.js'), String(port)], BOT_DIR,
     { NODE_PATH: nodePathEnv() });
   const up = await waitFor(`overseer port ${port}`, () => probePort(port), 20000, 500);
   if (up) console.log('overseer: up.');
@@ -753,8 +739,8 @@ async function observerStart() {
 // (2026-09-08). This comment used to read "THE ONE LAUNCHER of master_core.js in the whole tree, and it
 // stays that way" — which was true while this file was the only way anybody could start a bot, and stopped
 // being sustainable the moment a public copy needed one too. `fleet_control` cannot be that launcher for a
-// stranger: it resolves a PROJECT_ROOT above the bot, expects `MinecraftServer/`, `node_env2/` and a JDK
-// beside it, manages a roster of eight, and spawns minimized PowerShell windows. Writing a second entry
+// stranger: it starts a Minecraft server of its own, manages a roster of eight, and spawns minimized
+// PowerShell windows. Writing a second entry
 // point beside it would have left two places that stamp a mandate and require master_core — the exact
 // duplication the old comment forbade, drifting apart the first time one of them learned something.
 //
@@ -897,7 +883,7 @@ async function botStart(botId, mode = TERMINAL_SPAWN_MODE, owner = null) {
   // The species is STAMPED here rather than defaulted at the reader, and that is the whole Law 13
   // point: a default inside bot_mandate would turn a mis-wired launcher into a plausible-looking bot,
   // while a stamp here turns it into a boot-time throw that names the launcher which forgot.
-  launch(botId, findNode(), ['start_bot.js'], BOT_DIR, {
+  launch(botId, process.execPath, ['start_bot.js'], BOT_DIR, {
     NODE_PATH: nodePathEnv(),
     BOT_ID: botId,
     BOT_MODE: mode,
@@ -963,7 +949,7 @@ async function foremanStart() {
   const already = rt.foreman && pidAlive(rt.foreman);
   if (already) console.log(`foreman: process already running (pid ${rt.foreman.pid}) — confirming it is actually in the world.`);
   else {
-    launch('foreman', findNode(), [path.join('foreman', 'foreman.js')], BOT_DIR, {
+    launch('foreman', process.execPath, [path.join('foreman', 'foreman.js')], BOT_DIR, {
       NODE_PATH: nodePathEnv(),
       OVERSEER_URL: `ws://localhost:${port}`,
     });
@@ -1724,9 +1710,9 @@ async function repair() {
 // a second launcher to keep in step, which is exactly how `--bot` came to be silently dropped.
 async function snapshotRestore(world, snap) {
   const psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', path.join(SERVER_DIR, 'rollback.ps1'),
-    '-Action', 'restore', '-World', world, '-Name', snap, '-Force'];
-  const r = spawnSync('powershell', psArgs, { cwd: SERVER_DIR, encoding: 'utf8' });
+    '-File', paths.workshop('scripts', 'world_rollback.ps1'),
+    '-Action', 'restore', '-Root', serverDir(), '-World', world, '-Name', snap, '-Force'];
+  const r = spawnSync('powershell', psArgs, { cwd: serverDir(), encoding: 'utf8' });
   process.stdout.write(r.stdout || '');
   process.stderr.write(r.stderr || '');
   if (r.status !== 0) { console.error("run: restore of '" + snap + "' failed (rollback.ps1 exited " + r.status + ').'); return false; }
@@ -2096,7 +2082,7 @@ function runScript(name, argv) {
 // It is NBT and there is no rcon verb that will answer this: `data get` reaches entities, blocks and
 // storage, never the level. That is why this parses the file instead of asking the running server.
 async function worldSpawn(worldName) {
-  const file = path.join(SERVER_DIR, worldName, 'level.dat');
+  const file = path.join(serverDir(), worldName, 'level.dat');
   if (!fs.existsSync(file)) return null;
   const nbt = moduleHomes.requireFromHomes('prismarine-nbt');
   const parsed = (await nbt.parse(fs.readFileSync(file))).parsed.value.Data.value;

@@ -11,7 +11,9 @@
 const Vec3 = require('vec3');
 const watcher = require('@kernel/watcher');
 const { sleep } = require('@utils/fragment_utils');
-const { guardExternal, guardExternalSync, withCleanup } = require('@utils/external_library_guard');
+// guardExternal (the async form) left with microCenter's lookAt calls — nothing in this file awaits a
+// library boundary any more; the sync guard and withCleanup are still both in use.
+const { guardExternalSync, withCleanup } = require('@utils/external_library_guard');
 
 // ── SECTION 4: Core Motion Primitives ──
 
@@ -233,10 +235,7 @@ async function microCenter(bot, opts = {}) {
     const dx = (anchorX + 0.5) - pos.x;
     const dz = (anchorZ + 0.5) - pos.z;
     const dist = Math.hypot(dx, dz);
-    if (dist < CENTER_EPS) {
-      await guardExternal('motion_primitives', 'lookAt centre anchor', () => bot.lookAt(new Vec3(anchorX + 0.5, pos.y + 0.2, anchorZ + 0.5), true));
-      return true;
-    }
+    if (dist < CENTER_EPS) return true;
     let tapMs;
     if (dist > 0.9)       tapMs = BASE_TAP_MS;
     else if (dist > 0.6)  tapMs = BASE_TAP_MS * 0.7;
@@ -246,10 +245,19 @@ async function microCenter(bot, opts = {}) {
     if (dist > prevDist + 0.02) tapMs = Math.max(15, tapMs * 0.4);
     prevDist = dist;
     tapMs = Math.max(12, Math.min(tapMs, BASE_TAP_MS));
-    await guardExternal('motion_primitives', 'lookAt centre anchor', () => bot.lookAt(new Vec3(anchorX + 0.5, pos.y + 0.2, anchorZ + 0.5), true));
-    bot.setControlState('forward', true);
-    await sleep(tapMs);
-    bot.setControlState('forward', false);
+    // ── THE LEGS STEER; THE TORSO IS LEFT ALONE (Architect 2026-09-11) ──────────────────────────────
+    // This used to `lookAt` the anchor and press `forward` — turn the whole body toward the centre,
+    // then walk at it. That made centring a SECOND WRITER OF THE YAW, which is the exact overload the
+    // driver/gunner split exists to abolish (see this file's §"headingKeys" header): whoever was aiming
+    // the body found it spun by a positioning call it never asked for. It also made the correction
+    // visibly clumsy — a body that pirouettes to shuffle 8 cm sideways.
+    //
+    // pressHeading is the already-built answer and takes no facing parameter AT ALL, so this cannot
+    // regress: it reads whatever yaw the body is holding and picks from forward/back/left/right the
+    // nearest of eight to the world direction asked for. The bot now strafes to centre while still
+    // facing wherever it was pointed. Nothing about the convergence loop changes — same epsilon, same
+    // tapering taps, same overshoot damping — only how the tap is delivered.
+    await pressHeading(bot, { x: dx, z: dz }, tapMs);
     await sleep(SETTLE_SLEEP);
   }
   watcher.warn('motion_primitives', `microCenter ⛔ max_iters anchor=(${anchorX},${anchorY},${anchorZ})`);

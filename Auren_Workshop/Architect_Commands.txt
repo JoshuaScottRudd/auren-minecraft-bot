@@ -149,17 +149,6 @@
 
 
 ================================================================================
-  THE PUBLIC SERVER
-================================================================================
-
-  .\online.ps1
-  .\offline.ps1
-  node Public_server/joinable.js
-  .\Public_server\rollback.ps1 -Take <name>
-  .\Public_server\rollback.ps1 <name>
-
-
-================================================================================
   THE LOCAL WORLD
 ================================================================================
 
@@ -169,11 +158,11 @@
   Join at localhost, Java 1.21.5.
 
 --------------------------------------------------------------------------------
-  SNAPSHOTS  (from MinecraftServer\)
+  SNAPSHOTS  (the engine is told which server folder with -Root)
 --------------------------------------------------------------------------------
-  .\rollback.ps1 -Action list    -World 'sub_agent_01'
-  .\rollback.ps1 -Action snapshot -World 'sub_agent_01' -Name <name>
-  .\rollback.ps1 -Action restore  -World 'sub_agent_01' -Name <name> -Force
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action list    -World 'sub_agent_01'
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action snapshot -World 'sub_agent_01' -Name <name>
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action restore  -World 'sub_agent_01' -Name <name> -Force
 
 
 ================================================================================

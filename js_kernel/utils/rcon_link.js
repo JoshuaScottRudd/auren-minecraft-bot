@@ -28,27 +28,27 @@ const path = require('path');
 // The teardown primitive, required once the module moved into a SWEPT layer (2026-09-08). See `once()`.
 const { withCleanup, guardExternal } = require('./external_library_guard');
 
-// Where server.properties lives relative to this file. One definition — both former copies computed
-// their own path and a repo re-layout would have broken them at different times.
+// Where server.properties lives is the workstation resolver's answer — AUREN_SERVER_DIR, then the
+// Architect's workstation file — asked at the moment of reading, never computed at load (Law 16: one
+// answer to "which server folder" in the tree).
 //
-// MOVED 2026-09-08 from `tools/` to here, which is why this walks up three rather than two. The move is
-// the split plan's one inward step: three SHIPPED bot files require this module (`body_recovery`,
-// `death_manager`, `report_to_owner`), so leaving the tree's only RCON implementation under `tools/` —
-// which is going to the workshop — was the single edge that would have blocked the whole separation. It
-// is bot infrastructure that happened to be filed with the benches.
+// MOVED 2026-09-08 from `tools/` to here. The move is the split plan's one inward step: three SHIPPED bot
+// files require this module (`body_recovery`, `death_manager`, `report_to_owner`), so leaving the tree's
+// only RCON implementation under `tools/` — which is going to the workshop — was the single edge that
+// would have blocked the whole separation. It is bot infrastructure that happened to be filed with the
+// benches.
 //
-// THE PATH IT COMPUTES DOES NOT EXIST FOR ANYBODY BUT THE ARCHITECT, and that is fine rather than broken.
-// `MinecraftServer/` is his own server directory beside the repo; it does not travel in the extract. A
-// stranger never reaches this constant, because `credentials()` below reads `AUREN_RCON_PASSWORD` /
+// A STRANGER USUALLY NEVER REACHES THE FILE, because `credentials()` below reads `AUREN_RCON_PASSWORD` /
 // `AUREN_RCON_PORT` first and only falls back to a properties file when no environment says otherwise —
-// the same "the fleet is TOLD whose world this is" shape as `SERVER_ENDPOINT`. The fallback is for the one
-// case where the fleet launched the world itself, which is his case and only his.
-const SERVER_PROPERTIES = path.resolve(__dirname, '..', '..', '..', 'MinecraftServer', 'server.properties');
+// the same "the fleet is TOLD whose world this is" shape as `SERVER_ENDPOINT`. The fallback is for the
+// case where the fleet launched the world itself.
+const workstation = require('./workstation');
+function serverPropertiesFile() { return path.join(workstation.needServerDir(), 'server.properties'); }
 
 // readServerProperties → { port, password, level }. Throws when RCON is disabled: a link that "succeeded" with
 // a default port against a server that never opened one would fail later, somewhere less legible
 // (Law 13 — prove safe to continue). Never hardcodes either value (Law 6 — one source of truth).
-function readServerProperties(file = SERVER_PROPERTIES) {
+function readServerProperties(file = serverPropertiesFile()) {
   const props = {};
   for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
     const m = line.match(/^([^#=]+)=(.*)$/);
@@ -264,4 +264,4 @@ async function probe(opts = {}) {
 // probes in this directory keep calling `readServerProperties()` directly and that is CORRECT rather than
 // an oversight: a bench needs a dev world it drives itself, so being pointed at a foreign server by a
 // stray environment variable would be a bench measuring something nobody asked about.
-module.exports = { readServerProperties, credentials, open, once, probe, entityPos, SERVER_PROPERTIES };
+module.exports = { readServerProperties, credentials, open, once, probe, entityPos };

@@ -8,9 +8,8 @@
 //
 // ── WHY IT EXISTS AT ALL ───────────────────────────────────────────────────────────────────────────────
 // `fleet_control.js` used to be the only thing in this tree that could start a bot, and it is not a
-// launcher — it is a repo-layout tool. It resolves a PROJECT_ROOT above the bot and expects siblings
-// (`MinecraftServer/`, `node_env2/`, `node_portable/`, a JDK), starts the Architect's own world, manages a
-// roster of eight, writes a PID registry, and spawns minimized PowerShell windows. Every one of those is
+// launcher — it is a fleet tool. It starts a Minecraft server of its own, manages a roster of eight,
+// writes a PID registry, and spawns minimized PowerShell windows. Every one of those is
 // correct for him and impossible for anybody else. Carving it away for a public copy would have left the
 // shipped layer with no way to start at all, which is why this file is written BEFORE anything moves.
 //

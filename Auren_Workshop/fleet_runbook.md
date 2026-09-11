@@ -35,26 +35,36 @@ console.** Find them in Task Manager or through `status`. Each process's output 
 
 ---
 
-## 2. Machine differences — the node chain resolves itself; server config does not
+## 2. Machine differences — the toolchain resolves itself; server config does not
 
-| | Home (primary) | Work | Bot runner / server box (§2b) |
-|---|---|---|---|
-| machine | Ryzen 7 7700X, 31 GB | — | **i7-4790, 32 GB, `DESKTOP-RNLN7UR`** |
-| node.exe | `node_env2/node.exe` (v22.17.1) | `node_portable/node-v22.13.1-win-x64/node.exe` | `node_portable/node-v22.23.2-win-x64/node.exe` |
-| node_modules | `node_env2/node_modules` | `MinecraftServer/node_modules` | `MinecraftServer/node_modules` + `Auren_Bot/node_modules` |
-| java | PATH | PATH | `jdk-25.0.3+9/` (Temurin) — the literal path `fleet_control.js` looks for |
+**Every lookup tries the ordinary install first, and only then one exact file above the bot**
+(2026-09-11: *"if run then check stranger way, if fail then architect way"*):
 
-**Resolve the toolchain through these two, every time.** A bare `node`/`npm` may find a toolchain
-belonging to something else, and it fails silently:
+| what | first | only if that fails |
+|---|---|---|
+| node | `node` on `PATH`, at least `engines.node` in `package.json` | the exact paths in `../Architect_workstation/workstation.json` |
+| npm | the npm inside whichever node was picked | — |
+| java | `java` on `PATH`, Java 21 or newer (Minecraft 1.20.5+ refuses anything older) | the same file's `java` list |
+| the Minecraft server folder | `AUREN_SERVER_DIR` — a folder holding `server.properties` | the same file's `server` list |
+| node_modules | `Auren_Bot/node_modules` | the same file's `node_modules` list |
+
+On a downloaded copy the second column does not exist, so a machine with Node and Java installed the
+ordinary way needs nothing else, and a local server is one environment variable. The file above the bot is
+opened by its exact name; nothing above the bot is ever searched.
+
+**Resolve node through these, every time.** A bare `node`/`npm` in a script works on one machine and not
+the next:
 
 ```
 . .\Auren_Workshop\scripts\_node.ps1 ; Get-AurenNode      # -> node.exe for THIS machine
 .\Auren_Workshop\scripts\npm.ps1 <args>                   # npm, resolved; prints which one it picked
-cd Auren_Bot; .\scripts\npm.ps1 install              # the bot's declared packages
+.\Auren_Workshop\scripts\npm.ps1 install                  # from Auren_Bot\ : the bot's declared packages
 ```
 
-`fleet_control.js`, `run.js` and `preflight.js` try portable → node_env2 → PATH, and put both
-`node_env2/node_modules` and `MinecraftServer/node_modules` on `NODE_PATH`. The `@`-aliases (`@kernel`,
+Node is resolved once, by `scripts/_node.ps1`; everything JS starts after that runs on `process.execPath`.
+Java and the server folder are `js_kernel/utils/workstation.js` — from PowerShell,
+`& (Get-AurenNode) js_kernel\utils\workstation.js java|server` prints the answer or the refusal. The
+module homes go on `NODE_PATH` through `js_kernel/utils/node_module_homes`. The `@`-aliases (`@kernel`,
 `@perception`, …) come from `Auren_Bot/package.json` `_moduleAliases`, registered against `Auren_Bot/`
 explicitly.
 
@@ -69,16 +79,39 @@ shells out to a bare `node`. Prepend the resolved node for that one invocation:
 The resolver RUNS each candidate rather than testing for the file: a distribution's `npm.cmd` can exist
 as a stub after `npm install` pruned `node_modules/npm` as extraneous. Its refusal names the repair.
 
-**On `DESKTOP-RNLN7UR` a bare `node` also works** — that box's user PATH holds
-`C:\Auren_Minecraft\node_portable\node-v22.23.2-win-x64`, the same directory `Get-AurenNode` returns and
-the only `node.exe` on the machine. **Scripts, documents and instructions still use the resolver**: PATH
-is per-machine state git does not carry, so a `node` line works on one workstation and fails on the other.
+**Scripts, documents and instructions use the resolver even where a bare `node` happens to work**: PATH
+is per-machine state git does not carry, so a `node` line works on one machine and fails on the next.
 
-### 2a-pre. Putting Paper on a workstation's dev world (do this on every machine)
+### 2a-pre. The dev world runs VANILLA. Paper is the public server's, and the two stay apart
 
-The public server runs Paper. Paper changes entity activation ranges, mob spawning and chunk behaviour —
-the layer a pathfinding bot sits on — so test what you run (Law 16). `MinecraftServer/` is gitignored, so
-each machine converts itself:
+**RULING 2026-09-11, delegated by the Architect** (*"only make paper native if its backwards compatible…
+if theres a set of problems that happen with paper and specific problems that happen without paper then
+we keep it seperate"*). **This section previously said the opposite — "put Paper on every machine's dev
+world" — and that instruction is withdrawn.** Its reason ("test what you run") was written when the
+public server was the only target; the 2026-09-10 open-source ruling made a stranger's vanilla server an
+equal first-class one, and that is the fact that moves the answer. Full reasoning and the measurements:
+`architect_bugsquashing.md` §1 (volume 46).
+
+**Each flavour has its own problem set, which is the case his test says keeps them apart.** Vanilla-only:
+a 12,797 ms tick stall from vanilla chunk handling, measured 2026-09-11, which timed out a whole fleet.
+Paper-only: entity activation ranges, mob spawning and chunk behaviour — the layer a pathfinding bot sits
+on, and a vanilla user never meets it. Paper also does **not** fix the disconnect it would be adopted
+for: the 30-second keep-alive lives in vanilla's packet handler and Paper 1.21.5 exposes no key for it.
+
+**THE INVARIANT THAT ACTUALLY BUYS COMPATIBILITY — NO BOT CODE MAY BRANCH ON SERVER FLAVOUR.** The fleet
+is a mineflayer client speaking the vanilla protocol and holds zero references to Paper, Spigot, Bukkit or
+activation ranges. That is what makes it run anywhere, by construction rather than by testing, and it is
+the thing to protect. A jar choice is not what keeps the bot portable; never writing `if (isPaper)` is.
+
+**Which world is which** (runbook §3h): `MinecraftServer/` is the LOCAL dev world every soak uses — keep
+it **vanilla**, because it is the harsher substrate and the lower common denominator, and testing on the
+harsher while shipping to the more forgiving is the safe direction. `Public_server/runtime/backend/` is
+the PUBLIC world and stays **Paper** (plus GrimAC, CoreProtect, LuckPerms, SkinsRestorer — so Paper alone
+was never the whole ship target anyway).
+
+**Converting a dev world to Paper is now an OPT-IN parity check, not a setup step** — worth doing
+deliberately when the question is *"does this behave the same under Paper?"*, and worth reverting after.
+`MinecraftServer/` is gitignored, so each machine does it for itself:
 
 ```
 # newest 1.21.5 build; EVERY 1.21.5 Paper build is channel ALPHA, so pick the highest id, not STABLE
@@ -129,77 +162,7 @@ working.**
 
 ---
 
-## 2b. The dedicated bot runner — bringing a third machine up
-
-A machine whose only job is holding bot processes against a world that lives somewhere else.
-
-**Measured capacity on this box** (`public_server_plan.md` §9):
-
-> **11.5% of one core and 248 MB per bot. Server ≈ 40% of one core flat + ~1.9% per client.**
-> **8 humans / 16 bots sustained; 10 / 20 is the hard ceiling — the server's single-threaded main tick
-> hits it first, not the box.** Without the server here, ~12 humans / 24 bots.
-
-RAM is nowhere near binding (16 bots + server ≈ 5.5 GB of 32). **Re-measure after pre-generating the
-world** — the 40% constant was taken on terrain generating as the bots walked into it.
-
-**Install, in order:**
-
-1. **OS settings first.** Never sleep, never hibernate, automatic restart for updates OFF.
-2. **Tailscale**, signed into the same tailnet. This is how the box reaches the rented server, how a
-   session elsewhere reaches this one, and what the gate plugin's allowlist keys on.
-3. **OpenSSH Server** (a Windows optional feature).
-4. **Node**, the repo cloned, then `cd Auren_Bot; .\scripts\npm.ps1 install`. **Add this box to §2's
-   table** — the next cold-start session reads that table first.
-5. **A JDK at `jdk-25.0.3+9/` in the repo root**, and four npm trees: `MinecraftServer/` (mineflayer
-   lives there), `Auren_Bot/`, and `Auren_Workshop/tools/vendor/`.
-6. **The server jar and its properties — the step that blocks bring-up.** `MinecraftServer/` is
-   gitignored whole, so a new box has no `server.properties`, and `fleet_control server-start` dies on
-   `ENOENT`: it asserts settings into that file and can correct one but never create one. Let the binary
-   write its own defaults:
-   ```
-   # 1.21.5, SHA1-checked against Mojang's manifest, into MinecraftServer/server.jar
-   #    then, from MinecraftServer/ :
-   'eula=true' > eula.txt
-   & ..\jdk-25.0.3+9\bin\java.exe -Xmx1024M -jar server.jar nogui   # writes server.properties, generates a world (~9 s), then stop it
-   ```
-   Then set the four values that are decisions: `online-mode=false` (the bots hold no Mojang accounts),
-   `enable-rcon=true` **and a non-empty `rcon.password`** (RCON is how the fleet stops the server cleanly
-   and applies every gamerule), and `level-name=sub_agent_01`. `fleet_control` asserts the rest.
-7. **Git identity and the commit hook.** `session_sync` fails at the commit step without the first
-   (`Author identity unknown`, *after* taking the trunk lock). `preflight` prints the second when missing:
-   ```
-   git config user.name "<your name>" ; git config user.email "<your email>"
-   git config core.hooksPath Sessions/hooks     # without it, hand `git commit` is NOT refused
-   ```
-8. **Nothing else.** Bots are headless; a game client belongs on the Architect's desktop.
-
-**Verify before believing it works:**
-
-```
-. .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\tools\preflight.js
-& $n Auren_Workshop\tools\bot_cost_probe.js --seconds=300
-```
-
-### Measuring this box's real ceiling
-
-The fleet is embarrassingly parallel — one single-threaded process per bot. **Paper's main tick is
-single-threaded, so the world is capped by ONE core** however many the machine has. Raise the bot count
-in steps and watch the **server's** `% of 1 core`:
-
-```
-node Auren_Workshop/fleet_control.js up --count=8            # 2, then 4, then 8, then 12 …
-node Auren_Workshop/fleet_control.js verb start
-. .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode
-& $n Auren_Workshop\tools\bot_cost_probe.js --seconds=300 --note="8 bots"
-```
-
-**Stop at the run where the server passes roughly 70% of a single core** — past that the tick has no
-headroom for spikes. That bot count divided by two is the humans this machine holds, and it sets
-`capacity.maxWhitelisted` in `Public_server/whitelist/`.
-
-**To grow the box, buy single-core speed.** More cores help the fleet and do nothing for the world.
-
-### Pointing the fleet at a world on another machine
+## 2b. Pointing the fleet at a world on another machine
 
 `SERVER_ENDPOINT` in `Thinking_fragments/architect_config.js` is the single source (Law 16). **Override
 it by environment** — an edit travels through git and is wrong everywhere but one machine:
@@ -450,73 +413,16 @@ gets a snapshot copy of `Auren_Bot/` with no history, the day a build works.
 
 ---
 
-## 3g. `server start` and `server rollback` — the live server's vocabulary
+## 3h. The local server — a world on this machine, for testing
 
-> *"the server start according to this start method is always a continue start. its never a standard wipe.
-> i will ask you to wipe servers and memory. that is one command to rollback servers without starting…
-> now rollback is a seperate command in isolation and server start is always a continue test thats on all
-> the time."* — Architect, 2026-09-05
-
-| | `server start` | `server rollback` |
-|---|---|---|
-| command | `.\online.ps1` (its opposite is `.\offline.ps1`) | `.\Public_server\rollback.ps1 [name]` |
-| what the word means | an OUTSIDE person can complete the Discord funnel and join — proved from outside | n/a |
-| restore world snapshot | **never**, by construction | **yes** — that is the whole command |
-| wipe HQ (bot memory) | **never** | **yes** — always with the world |
-| starts things | **yes** — world, proxy, join gate, overseer, foreman, watchman | **no.** Roll back, look, then `start` |
-| bots | **none** — on order, via `foreman get` | n/a |
-| idempotent | **yes** — safe at any time, in any state | no; it asks for the word ROLLBACK first |
-
-**`server start` is exactly a continue**: it carries the world *and* the HQ forward, and those two are
-one decision — HQ holds coordinates for a particular world. `wipeMemory()` in `fleet_control.js` is the
-single implementation of that wipe (`fleet_control.js memory-wipe`), shared by `run --restore` and the
-public server's rollback.
-
-**Snapshots first.** `.\Public_server\rollback.ps1 -Take [name]` takes the server down, copies the world,
-and brings it back — including when the copy failed, because a failed backup must never be also an
-outage. `MinecraftServer/rollback.ps1` is the one rollback engine for both servers (it grew a `-Root`).
-
-**Neither command may certify itself** (Law 25). `online` ends by running `node Public_server/joinable.js`,
-which walks the eight steps a stranger walks and ends **outside the machine** — a Minecraft status ping to
-the public hostname whose reply must look like this server rather than TCPShield's edge placeholder. The
-word ONLINE prints only on all eight; otherwise it names the shut step and its fix and leaves everything
-running. `offline` sweeps every process whose executable, command line or working directory is inside the
-repository, then measures again and names any survivor. Run the walk alone any time with
-`node Public_server/joinable.js` (`--local` skips the two checks that leave the machine, and is
-explicitly not a certification).
-
-**There are exactly two operator commands and rollback is not one of them** (Architect: *"you are allowed
-exactly 2 scripts. either up or down… thats why we reperated the rollback so that can be done outside of
-those 2 commands"*). `.\online.ps1` and `.\offline.ps1` ask nothing and destroy nothing, which is what
-lets them run with no confirmation. `rollback.ps1` is the one command that erases and the one that asks.
-
----
-
-## 3h. The two servers — dedicated and local
-
-| | **DEDICATED SERVER** | **LOCAL SERVER** |
-|---|---|---|
-| What it is | the public world strangers join | this machine's world, for testing |
-| Who reaches it | anyone whitelisted through Discord | this box only |
-| Brought up by | `.\online.ps1` (repo root) | `node Auren_Workshop/fleet_control.js local` |
-| Taken down by | `.\offline.ps1` (repo root) | `node Auren_Workshop/fleet_control.js down` |
-| Proxy · join gate · warden | **yes** — Velocity, AurenGate, the watchman | none |
-| The 8-step joinable check | **yes** — ONLINE means it passed | no |
-| Address | the public one, through TCPShield | `localhost` |
-| Standing bots | **zero** — on order, via `foreman get` | **zero**, the same |
-| Lives in | `Public_server/` | `MinecraftServer/`, the fleet's dev world |
-
-**The pair exists for downtime.** Work on the local one while the dedicated one stays up; restart the
-dedicated one when the change is ready to ship. Nothing in the `local` path reads, writes, stops or
-points at anything in `Public_server/`.
-
-**`local` prints no ONLINE.** `joinable.js` is the definition of that word and its eight steps end
-outside the machine; on a world only this box can reach, every step is meaningless or cannot fail.
+`local` brings up this machine's own world with the overseer and the foreman and **no bots**; `down`
+takes it away again. Address `localhost`, Java 1.21.5, world folder under `MinecraftServer/`. It prints
+no ONLINE — that word belongs to a server strangers can reach, and on a world only this machine can reach
+every step of that check is meaningless or cannot fail.
 
 **The hazard, and the guard.** `AUREN_SERVER_HOST`/`PORT` override where every body connects, and
-`fleet_control` hands children `{...process.env}` — so a shell pointed at the public proxy earlier would
-start a world on this box and send the bots, the foreman and every contractor into the **dedicated**
-world. **`local` forces the endpoint to `localhost` before launching anything** and says so out loud when
+`fleet_control` hands children `{...process.env}` — so a shell pointed at some other server earlier would
+start a world on this machine and send the bots, the foreman and every contractor into **that** world. **`local` forces the endpoint to `localhost` before launching anything** and says so out loud when
 it overrode something.
 
 ```
@@ -527,7 +433,7 @@ node Auren_Workshop/fleet_control.js down                   # world + overseer +
 
 Then join in Minecraft at **`localhost`** (Java **1.21.5**) and say `foreman get` in ordinary chat.
 
-**It comes up with zero bots on purpose**, exactly like the dedicated server: the thing under test is
+**It comes up with zero bots on purpose**, exactly like a public server: the thing under test is
 `foreman get`, the path a real arrival walks. `-Count N` is for the other kind of test, where
 homesteaders are the subject.
 

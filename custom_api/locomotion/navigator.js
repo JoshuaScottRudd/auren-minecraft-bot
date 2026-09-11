@@ -32,7 +32,7 @@ const { sleep, BLOCK_REACH } = require('@utils/fragment_utils');
 // carry the same gate, plus the engaging/escaping bypass so combat's own arms cannot re-enter it. The
 // whole reasoning is in its header; a call a primitive already paid for costs nothing here.
 const { combatCheckpoint } = require('@api/battle_stations');
-const { computeAStar, drainSearchCensus, pathStillWalkable, keyOf, straightLine, classifyFloorInline, isScaffoldBlock, COST_HIGH, COST_PLACE, PROTECTED_VOXEL_DETOUR_BUDGET, FLOW_DETOUR_BUDGET, LAVA_FLOW_DETOUR_BUDGET } = require('@utils/pathfinding_utils');
+const { computeAStar, drainSearchCensus, pathStillWalkable, keyOf, straightLine, classifyFloorInline, isScaffoldBlock, isDoorBlock, COST_HIGH, COST_PLACE, PROTECTED_VOXEL_DETOUR_BUDGET, FLOW_DETOUR_BUDGET, LAVA_FLOW_DETOUR_BUDGET } = require('@utils/pathfinding_utils');
 // The bus at MODULE SCOPE, which it could not be before 2026-09-10: the load cycle through
 // fragment_registry forced this require inside a function in every routing file. This is one of the
 // six FORWARDING routers — it calls route() with an upstream author's own from/to rather than building
@@ -253,7 +253,7 @@ function edgeHistogram(path) {
 const buildingIntegrity = require('@perception/building_integrity');
 const miningIntegrity   = require('@perception/mining_integrity');
 const miningCellGraph   = require('@perception/mining_cell_graph');
-const { guardExternal, withCleanup } = require('@utils/external_library_guard');
+const { guardExternal, guardExternalSync, withCleanup } = require('@utils/external_library_guard');
 
 // ── No peer movement de-confliction (Law 19) ─────────────────────────────────
 // There is deliberately NO bot↔bot movement de-confliction here. mineflayer clients have no
@@ -522,7 +522,10 @@ function chooseBuildBlock(bot) {
 // "careful" walker beside a "smooth" walker is two routes to the same capability, and they would drift
 // the first time only one of them got a fix.
 async function stepToFeet(bot, feetCell, opts = {}) {
-  const r = await driveRun(bot, [feetCell], { timeoutMs: opts.timeoutMs || 1500, strictFinal: true });
+  // opts.stallMs is passed STRAIGHT THROUGH, including `null` — that is the door step's stall waiver
+  // (drive.js explains why one caller gets it). `undefined` stays undefined so driveRun applies its own
+  // default; this must not coalesce, or every caller would silently inherit the waiver.
+  const r = await driveRun(bot, [feetCell], { timeoutMs: opts.timeoutMs || 1500, strictFinal: true, stallMs: opts.stallMs });
   return r.arrived || (bot.entity.onGround && bot.entity.position.floored().equals(feetCell));
 }
 
@@ -728,38 +731,108 @@ async function digThroughStep(bot, dir) {
 // isNotSafeSurface is the single shared hazard gate (Law 16) — it flags water, lava, fire, cactus,
 // etc., and (Law 13) reads a null/unloaded block as unsafe. It checks feet-1, feet-2, and the four
 // sides; nothing deeper (the next block down is the NEXT step's landing, re-sensed then — Invariant B).
+// describeDoor — a door cell's name and open/shut state, as one phrase for a trace line.
+//
+// WHY THIS LIVES HERE AND NOT WITH THE OPENER. `survival_instincts.doorHandlerTick` is what opens and
+// closes doors, and it has done since it was written — its own history shows exactly one change, the
+// commit that created it. It is declared ATOMIC in its header ("No watcher, no signal_bus, no file
+// I/O"), so it cannot say whether it fired, and honouring that contract is why the witness sits on
+// this side of the seam instead. The predicate comes from pathfinding_utils rather than a third copy
+// of the door-name list — the same one the route search mints the edge with, so the reader and the
+// planner cannot disagree about what a door is (Law 16).
+function describeDoor(bot, cell) {
+  const block = bot.blockAt(cell);
+  if (!block) return 'unloaded';
+  if (!isDoorBlock(block)) return `${block.name} (not a door)`;
+  const props = guardExternalSync('navigator', 'read door properties', () => block.getProperties?.());
+  if (!props.ok || !props.value) return `${block.name} (properties unreadable)`;
+  return `${block.name} ${String(props.value.open) === 'true' ? 'OPEN' : 'shut'}`;
+}
+
+// How long the body is given to fall its one block before the drop is measured. NAMED, because it is
+// the prime suspect in bugsquashing §19.3 and a magic 250 is not something a successor can weigh: a
+// one-block fall is roughly 6 server ticks, so this budget and the thing it measures are the same order
+// of magnitude, and every failure on record was the FIRST step of a fresh column — the one step taken
+// from a standing start, where no prior fall is already in progress. Changing it is a behaviour change
+// and is NOT what this instrumentation does; the line below reports enough to decide whether to.
+const DIG_SETTLE_MS = 250;
+
 async function digDownStep(bot) {
   const feet = bot.entity.position.floored();
 
+  // ── EVERY REFUSAL NAMES ITSELF (2026-09-11, bugsquashing §19.3) ─────────────────────────────────
+  // All four gates below were bare `return false`, while descendColumn's caller comment claimed
+  // "digDownStep already reports WHICH gate refused". It did not, and that gap is what made a stalled
+  // descent unreadable: nothing in the trace could separate a safety gate refusing from a dig that ran
+  // and did not drop. They report at SUMMARY level, not warn — a gate refusing is the guard WORKING
+  // (Law 17), and a warn here would wake the watch through warn-repeat on a bot behaving correctly.
+  const refuse = (gate, detail) => {
+    watcher.summary('navigator', `Dig-down refused at (${feet.x},${feet.y},${feet.z}) — gate ${gate}: ${detail}.`);
+    return false;
+  };
+
   // (a) feet cell safe to dig from (not submerged in a liquid).
   const feetBlock = bot.blockAt(feet);
-  if (feetBlock && (feetBlock.name === 'water' || feetBlock.name === 'flowing_water' || feetBlock.name === 'lava' || feetBlock.name === 'flowing_lava')) return false;
+  if (feetBlock && (feetBlock.name === 'water' || feetBlock.name === 'flowing_water' || feetBlock.name === 'lava' || feetBlock.name === 'flowing_lava')) {
+    return refuse('a (feet submerged)', `feet cell holds ${feetBlock.name}`);
+  }
 
   // (b) the block we dig: a real solid, never a hazard.
   const floorPos = new Vec3(feet.x, feet.y - 1, feet.z);
   const floorBlock = bot.blockAt(floorPos);
-  if (!floorBlock || floorBlock.name === 'air' || floorBlock.boundingBox === 'empty') return false;
-  if (isNotSafeSurface(floorBlock)) return false;
+  if (!floorBlock || floorBlock.name === 'air' || floorBlock.boundingBox === 'empty') {
+    return refuse('b (nothing solid to dig)', `block below is ${floorBlock ? floorBlock.name : 'unloaded'}`);
+  }
+  if (isNotSafeSurface(floorBlock)) return refuse('b (hazard below)', `block below is ${floorBlock.name}`);
 
   // (c) the landing one below must be a safe solid — one-block drop, never into air or lava.
   const landingBlock = bot.blockAt(new Vec3(feet.x, feet.y - 2, feet.z));
-  if (!landingBlock || landingBlock.name === 'air' || landingBlock.boundingBox === 'empty') return false;
-  if (isNotSafeSurface(landingBlock)) return false;
+  if (!landingBlock || landingBlock.name === 'air' || landingBlock.boundingBox === 'empty') {
+    return refuse('c (no landing)', `two below is ${landingBlock ? landingBlock.name : 'unloaded'} — the drop would be more than one block`);
+  }
+  if (isNotSafeSurface(landingBlock)) return refuse('c (hazard landing)', `two below is ${landingBlock.name}`);
 
   // (d) no side floods/burns the hole — liquid or hazard at the wall, at hole level or feet level.
   for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
-    if (isNotSafeSurface(bot.blockAt(new Vec3(floorPos.x + dx, floorPos.y, floorPos.z + dz)))) return false;
-    if (isNotSafeSurface(bot.blockAt(new Vec3(floorPos.x + dx, floorPos.y + 1, floorPos.z + dz)))) return false;
+    const sideLow = bot.blockAt(new Vec3(floorPos.x + dx, floorPos.y, floorPos.z + dz));
+    if (isNotSafeSurface(sideLow)) {
+      return refuse('d (wall at hole level)', `(${floorPos.x + dx},${floorPos.y},${floorPos.z + dz}) is ${sideLow ? sideLow.name : 'unloaded'}`);
+    }
+    const sideHigh = bot.blockAt(new Vec3(floorPos.x + dx, floorPos.y + 1, floorPos.z + dz));
+    if (isNotSafeSurface(sideHigh)) {
+      return refuse('d (wall at feet level)', `(${floorPos.x + dx},${floorPos.y + 1},${floorPos.z + dz}) is ${sideHigh ? sideHigh.name : 'unloaded'}`);
+    }
   }
 
   await performDig(bot, floorBlock.position, floorBlock, 'navigator');   // one dig route (Law 16)
-  await sleep(250);
+  await sleep(DIG_SETTLE_MS);
 
   const final = bot.entity.position.floored();
   const dropped = final.y < feet.y;
-  if (dropped) watcher.summary('navigator', `Dug down to (${final.x},${final.y},${final.z}).`);
-  else watcher.warn('navigator', `Dig-down: expected to drop from y=${feet.y}, still at y=${final.y}.`);
-  return dropped;
+  if (dropped) { watcher.summary('navigator', `Dug down to (${final.x},${final.y},${final.z}).`); return true; }
+
+  // ── A NON-DROP HAS THREE CAUSES AND THE CALLER CANNOT TELL THEM APART ───────────────────────────
+  // Measured 2026-09-11 across four occurrences, and the first reading already eliminated two of
+  // them: the block is GONE every time, and the body is onGround=true at a whole-number y with the
+  // resting velocity (-0.078). So the dig lands, and the body is NOT still falling — it is being
+  // HELD UP by something, which can only be a neighbouring column catching a hitbox that overhangs
+  // this cell. That is why the offset from the cell centre is reported: a body is 0.6 wide (±0.3)
+  // and driveRun's strict arrival tolerance is 0.4, so a legal arrival can leave 0.2 of the hitbox
+  // across the boundary and standing on the neighbour. Read-only — nothing here recentres, waits
+  // longer or retries; recentring is a behaviour change and the Architect's call (§19.3).
+  const floorNow = bot.blockAt(floorPos);
+  const wentAway = !floorNow || floorNow.name === 'air' || floorNow.boundingBox === 'empty';
+  const vy = bot.entity.velocity && typeof bot.entity.velocity.y === 'number' ? bot.entity.velocity.y.toFixed(3) : 'unknown';
+  const p = bot.entity.position;
+  const offX = p.x - (feet.x + 0.5), offZ = p.z - (feet.z + 0.5);
+  watcher.warn('navigator',
+    `Dig-down: expected to drop from y=${feet.y}, still at y=${final.y}. ` +
+    `Target (${floorPos.x},${floorPos.y},${floorPos.z}) was ${floorBlock.name} and is now ` +
+    `${floorNow ? floorNow.name : 'unloaded'} — ${wentAway ? 'DUG, the block went' : 'STILL THERE, the dig did not land'}. ` +
+    `body (${p.x.toFixed(3)},${p.y.toFixed(3)},${p.z.toFixed(3)}), off-centre dx=${offX.toFixed(3)} dz=${offZ.toFixed(3)} ` +
+    `(|off|+0.3 over 0.5 means the hitbox overhangs and a neighbour is holding it up), ` +
+    `onGround=${bot.entity.onGround}, velocityY=${vy}, measured ${DIG_SETTLE_MS}ms after the dig returned.`);
+  return false;
 }
 
 // swimStep: move the bot to a water-surface position. Works for land→water entry,
@@ -1375,7 +1448,41 @@ async function runNavigation(payload) {
       case 'climb_down':  ok = await stairDownStep(bot, dir); break;
       case 'door': {
         const feetTarget = step.pos.offset(0, 1, 0);
-        ok = await stepToFeet(bot, feetTarget, { timeoutMs: 3000 });
+        // ── THIS STEP DOES NOT OPEN THE DOOR, AND THAT IS THE DESIGN ────────────────────────────────
+        // The opener is survival_instincts.doorHandlerTick, a physicsTick reflex that fires when the
+        // body walks up to a shut door holding 'forward'. So this is a plain walk through a cell that
+        // is SOLID until the reflex acts, and a failure here has three indistinguishable causes: the
+        // reflex never fired, it fired too late for this step's budget, or the door was open all along
+        // and the walk failed on its own. The reflex reports nothing by contract, so read the door
+        // either side of the walk and let the trace name which one (2026-09-11, bugsquashing §19.2).
+        // The door sits midway between the body and the far cell: the edge is minted two cells out so
+        // the body never halts inside the door block, which makes dir exactly ±2 on one axis.
+        const doorCell = new Vec3(curFloor.x + dir.x / 2, curFloor.y + 1, curFloor.z + dir.z / 2);
+        const doorBefore = describeDoor(bot, doorCell);
+        // ── LINE UP FIRST, THEN GO THROUGH (Architect 2026-09-11) ──────────────────────────────────
+        // *"it snags on the door every time… upon every entry the bot snags on the door either too far
+        // left or right."* The door opens well before the body arrives, so the snag is not the opening
+        // — it is the APPROACH. A doorway is a one-block gap and the body is 0.6 wide, leaving 0.2 of
+        // clearance a side; driveRun's arrival tolerance is 0.4, so a body that arrived legally can be
+        // half a door-frame off and catches the jamb every time.
+        //
+        // Centring on the cell the body already stands in IS aligning with the door: the approach cell
+        // and the door cell differ only along the direction of travel, so they share the cross-axis
+        // coordinate, and the centre of one is on the centre-line of the other. That is why this
+        // centres HERE rather than trying to centre on the door block itself, which is a cell the body
+        // may not stand in.
+        //
+        // It runs before the walk, never during — descending into a doorway mid-stride is what the
+        // snag already is. microCenter now strafes without turning the body (motion_primitives), so
+        // lining up costs no facing the walk would then have to undo.
+        await microCenter(bot, { eps: 0.06 });
+        ok = await stepToFeet(bot, feetTarget, { timeoutMs: 3000, stallMs: null });
+        if (!ok) {
+          watcher.warn('navigator',
+            `Door step failed through (${doorCell.x},${doorCell.y},${doorCell.z}): was ${doorBefore}, ` +
+            `now ${describeDoor(bot, doorCell)}, forward=${!!(bot.controlState && bot.controlState.forward)}. ` +
+            `Still shut means the reflex never opened it; OPEN means it did and the 3000ms budget ran out anyway.`);
+        }
         break;
       }
       case 'dig_through': ok = await digThroughStep(bot, dir); break;

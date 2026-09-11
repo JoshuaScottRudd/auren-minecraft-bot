@@ -506,6 +506,26 @@ async function descendColumn({ x, z, toFeetY }) {
     return { arrived: false, y: start.y, dug: 0, reason: 'not_on_column' };
   }
 
+  // ── CENTRE ON THE COLUMN BEFORE THE FIRST CUT (Architect 2026-09-11) ─────────────────────────────
+  // MEASURED, not supposed. Four descents on 2026-09-11 dug the block underfoot and did not fall:
+  // instrumentation showed the target block GONE, the body onGround at a whole-number y with the
+  // resting velocity — so the dig landed and the body was not mid-air, it was being HELD UP. The only
+  // thing that can hold it is a neighbouring column catching a hitbox that overhangs this cell. The
+  // body is 0.6 wide (±0.3) and the walk that delivered it here resolves within 0.4 of centre, so a
+  // legal arrival leaves up to 0.2 of the hitbox over the boundary — ample support in a world where
+  // any part of the box over a solid block grounds the entity (bugsquashing §20.2).
+  //
+  // This does NOT violate the no-lateral-movement rule below. That rule forbids leaving the column
+  // once the shaft is open; this runs BEFORE the first dig and moves the body within the very cell it
+  // was already standing in, which is what makes the column it is about to open the column that was
+  // scanned. Non-fatal by design: a refusal to centre is worth knowing about but is not worth
+  // abandoning a scanned column over, and the descent's own gates still hold underneath.
+  const { microCenter } = require('@utils/movement/motion_primitives');
+  if (!await microCenter(bot, { eps: 0.06 })) {
+    watcher.warn('locomotion_dispatcher',
+      `⛏ descendColumn could not centre on column (${x},${z}) before opening it — descending anyway; an overhanging hitbox may be caught by a neighbour and refuse to drop.`);
+  }
+
   // The budget is the drop itself plus a small slack, so it cannot outlive the shaft it is digging. It
   // is a BACKSTOP, not the terminator — the stall check below is what normally ends this.
   const budget = Math.max(0, start.y - toFeetY) + 4;
@@ -525,9 +545,14 @@ async function descendColumn({ x, z, toFeetY }) {
     await digDownStep(bot);
     const after = bot.entity.position.floored();
     if (after.y >= before.y) {
-      // digDownStep already reports WHICH gate refused; this names the consequence for the caller.
+      // `dug` COUNTS OBSERVED DROPS, NOT SWINGS, and saying "0 dig(s)" invited the reading that no
+      // block was ever struck — which is false in at least one recorded case, where the retry of this
+      // same column measured exactly one block shallower (bugsquashing §19.3). The count is named for
+      // what it actually is, and the WHY now genuinely lives one line above: digDownStep reports the
+      // gate that refused, or — when no gate refused — whether the block went and what the body was
+      // doing when the drop was measured. That claim was made here before it was true.
       watcher.warn('locomotion_dispatcher',
-        `⛏ descendColumn stalled at y=${after.y} (wanted ${toFeetY}) after ${dug} dig(s) — the next step down was refused.`);
+        `⛏ descendColumn stalled at y=${after.y} (wanted ${toFeetY}) after ${dug} observed drop(s) — the next step down did not drop the body. The navigator line above this one says why.`);
       return { arrived: false, y: after.y, dug, reason: 'step_refused' };
     }
     dug++;

@@ -103,7 +103,7 @@ for (const d of MODULE_DIRS) module.paths.unshift(d);
 const mineflayer = moduleHomes.requireFromHomes('mineflayer');
 
 const TAG = 'proxy_human';
-const SERVER_DIR = paths.repo('MinecraftServer');
+const SERVER_DIR = require(paths.bot('js_kernel/utils/workstation')).needServerDir();
 
 const args = process.argv.slice(2);
 const has = k => args.includes(`--${k}`);

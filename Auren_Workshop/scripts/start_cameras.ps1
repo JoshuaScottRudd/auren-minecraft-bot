@@ -114,8 +114,9 @@ param(
 
 # THREE HOPS TO THE REPO ROOT, not two (2026-09-10): the workshop moved inside the bot, so
 # scripts -> Auren_Workshop -> Auren_Bot -> repo root. `tools\PrismLauncher` (the 1.1 GB camera crew)
-# and `MinecraftServer\` are the Architect's own equipment at the repo root; looked for under
-# `Auren_Bot/` this script would decide Prism was not installed and offer to download it again.
+# is the Architect's own equipment at the repo root; looked for under `Auren_Bot/` this script would
+# decide Prism was not installed and offer to download it again. The server folder is NOT computed here:
+# it is the workstation resolver's answer, asked once node is resolved below.
 $scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $workshopDir  = Split-Path -Parent $scriptDir
 $botRoot      = Split-Path -Parent $workshopDir
@@ -123,7 +124,6 @@ $repoRoot     = Split-Path -Parent $botRoot
 $toolsDir     = Join-Path $repoRoot 'tools'
 $prismDir     = Join-Path $toolsDir 'PrismLauncher'
 $prismExe     = Join-Path $prismDir 'prismlauncher.exe'
-$serverDir    = Join-Path $repoRoot 'MinecraftServer'
 $fleetControl = Join-Path $workshopDir 'fleet_control.js'
 
 # ---- -Down: reap what this script raises, and nothing else -----------------------------------
@@ -172,6 +172,8 @@ if ($Down) {
 # the only edit, and this list follows automatically.
 . "$PSScriptRoot\_node.ps1"   # the one node resolver (Law 16)
 $node = Get-AurenNode
+# The server folder whose latest.log is read below - the workstation resolver's answer (Law 16).
+$serverDir = & $node (Join-Path $botRoot 'js_kernel\utils\workstation.js') server
 
 # Roster in seniority order — Cam_<Bot> windows map 1:1 onto these names.
 $Roster = @(((& $node $fleetControl roster) | Select-Object -Last 1).Trim() -split ',')

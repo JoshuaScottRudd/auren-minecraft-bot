@@ -34,7 +34,7 @@
 // would send the order desk's geometry the wrong way with nothing downstream able to catch it.
 //
 // Run (server must be UP; bots need not be):
-//   node_portable\node-*\node.exe Auren_Workshop\tools\sign_probe.js
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\sign_probe.js
 //   env knobs: PROBE_NAME (default SignProbe), PROBE_HOST, PROBE_PORT, PROBE_VERSION
 
 const path = require('path');

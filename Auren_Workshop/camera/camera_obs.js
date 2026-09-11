@@ -1078,15 +1078,15 @@ const MICCHECK_SECONDS = 8;
 const SILENCE_DB = -90;
 
 function resolveFfmpeg() {
-  // The same two places edit_renderer looks, in the same order, and for the same reason: `ffmpeg-static`
-  // puts a real binary inside node_modules (the one install method that works on a box where nothing
-  // may be installed at the root), and a hand-dropped tools/ffmpeg/bin is honoured so a machine that
-  // already has one is not made to re-download. Resolved here rather than imported from Cutting_room:
-  // the dependency runs one way — the editor reads the bot, never the reverse.
+  // A hand-dropped tools/ffmpeg/bin first, so a machine that already has one is not made to re-download;
+  // then `ffmpeg-static` in any of this machine's module homes — it puts a real binary inside node_modules,
+  // the one install method that works on a box where nothing may be installed at the root. The homes are
+  // the bot's one resolver's answer (Law 16), so no machine's folder names are written here. Resolved here
+  // rather than imported from Cutting_room: the dependency runs one way — the editor reads the bot.
   const candidates = [
     path.join(PROJECT_ROOT, 'tools', 'ffmpeg', 'bin', 'ffmpeg.exe'),
-    path.join(PROJECT_ROOT, 'node_env2', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
-    path.join(PROJECT_ROOT, 'MinecraftServer', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
+    ...require(paths.bot('js_kernel/utils/node_module_homes')).moduleHomes()
+      .map(home => path.join(home, 'ffmpeg-static', 'ffmpeg.exe')),
   ];
   for (const c of candidates) if (fs.existsSync(c)) return c;
   return null;

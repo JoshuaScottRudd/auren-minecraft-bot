@@ -857,6 +857,39 @@ function digest(lines) {
   return out;
 }
 
+// The ONE-LINE status the quiet watch shows between flags (Architect 2026-09-11: *"this is super noisy.
+// explain what this is and remove it or shorten it"*).
+//
+// It used to be digest()'s per-bot header lines joined end to end: summary counts nobody reads live, the
+// merge-derived clock, and — for every unit with its own watcher file but no line in the merge (the desk,
+// the stand-in player) — that unit's latest story, URL-encoded. Three hundred characters, wider than any
+// terminal, and `\r\x1b[2K` clears only the row the cursor is on, so every tick left the wrapped remainder
+// on screen and the "live field" became a scroll of fragments.
+//
+// This line carries what the field is FOR and nothing else: is each crew bot alive (its OWN file's age,
+// the ground truth readBotHeartbeats exists for), and is it piling up faults. The full header is still
+// one `trace.ps1` away — digest() is unchanged and still owns that.
+//
+// ONLY THE ROSTER'S BOTS. The stand-in player writes into the same merge and stands still by design, so it
+// read as a permanently SILENT unit on every tick. The roster (`architect_config.BOT_SENIORITY`, which
+// requires nothing) is the one list of who a crew bot can be.
+function watchStatus(lines, elapsedMin) {
+  const roster = require(require('./lens_paths').bot('Thinking_fragments/architect_config.js')).BOT_SENIORITY;
+  const bots = computeBotStats(lines);
+  const hb = readBotHeartbeats();
+  const ago = s => (s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`);
+  const parts = [];
+  for (const [bot, b] of bots) {
+    if (!(bot in roster)) continue;
+    if (b.haltedAt !== null) { parts.push(`${bot} HALTED`); continue; }
+    const h = hb.get(bot);
+    const alive = !h ? `last ${relativeTime(b.lastRel)}`
+      : h.ageSec <= SILENCE_GAP_SEC ? `${ago(h.ageSec)} ago` : `SILENT ${ago(h.ageSec)}`;
+    parts.push(`${bot} ${alive}, ${b.w} warn, ${b.e} err`);
+  }
+  return `[watch ${Math.floor(elapsedMin)}m] quiet · ${parts.length ? parts.join(' · ') : 'no bot lines yet'}`;
+}
+
 // Every warning in the latest run, deduped by bot+text with a repeat count and first-seen time.
 // The flag signatures only surface a warn if it repeats/bursts; this lists ALL of them so a
 // single one-off warn (which never flags) is still visible when the Architect checks the trace.
@@ -1406,13 +1439,14 @@ function runWatch() {
         }
       }
     } else {
-      // Quiet: refresh the all-bots status field. TTY overwrites in place every tick; a file
-      // appends at most once a minute. `digest` emits one non-indented line per bot (plus indented
-      // build/mine detail lines we drop for the compact field) — join them so every bot shows.
-      const perBot = digest(lines).filter(l => !l.startsWith(' '));
-      const status = `[watch ${Math.floor(elapsedMin)}m] quiet · ${perBot.length ? perBot.join('  ·  ') : 'no bot lines yet'}`;
+      // Quiet: refresh the all-bots status field (watchStatus). TTY overwrites in place every tick; a
+      // file appends at most once a minute. On a TTY it is CUT TO THE TERMINAL'S WIDTH, because the
+      // overwrite clears only the row the cursor is on — a line that wraps leaves its tail behind.
+      const status = watchStatus(lines, elapsedMin);
       if (TTY) {
-        process.stdout.write('\r\x1b[2K' + status);
+        const width = process.stdout.columns || 0;
+        const fit = width && status.length >= width ? `${status.slice(0, width - 2)}…` : status;
+        process.stdout.write('\r\x1b[2K' + fit);
         liveLine = true;
       } else if (Date.now() - lastHeartbeat >= 60000) {
         lastHeartbeat = Date.now();

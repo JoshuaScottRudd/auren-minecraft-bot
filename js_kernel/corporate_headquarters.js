@@ -129,7 +129,7 @@ function _logColdStart() {
   const keys = Object.keys(_cache).filter(k => k !== 'schema' && k !== 'updated_at');
   _w.summary('corporate_headquarters', `Loaded HQ into memory from ${HQ_PATH} — ${keys.length} sections: [${keys.join(', ')}]`);
 
-  // EVERY LOCKED CENTRE, NOT 'headframe'. The room's keys carry an owner (`headframe|Joshua`), so the
+  // EVERY LOCKED CENTRE, NOT 'headframe'. The room's keys carry an owner (`headframe|Architect`), so the
   // literal lookup that stood here matched nothing after the owner axis landed and the line silently
   // stopped printing — the failure mode of a hardcoded key, reported here rather than left to be noticed.
   // Loading is also exactly when a reader wants to see how many bases this file remembers.

@@ -36,8 +36,8 @@
 // the SEARCH, not a dispatch cycle, and it licenses the flags classify for A*'s floor question ONLY.
 //
 // Usage (server must be running):
-//   NODE_PATH=MinecraftServer/node_modules node_env2/node.exe \
-//     Auren_Workshop/tools/astar_reader_v2_bench.js --dist=180 --nodes=200000 --repeat=3
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) `
+//     Auren_Workshop\tools\astar_reader_v2_bench.js --dist=180 --nodes=200000 --repeat=3
 //   …--no-mutate   skip phase 1 (only when rcon is unavailable; the run is then WEAKER evidence)
 
 const path = require('path');

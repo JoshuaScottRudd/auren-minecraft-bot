@@ -26,7 +26,7 @@
 // chat, this probe would be manufacturing its own positive result.
 //
 // Run (server must be UP; fleet bots need not be):
-//   node_portable\node-*\node.exe Auren_Workshop\tools\chat_probe.js
+//   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\chat_probe.js
 //   env knobs: PROBE_HOST, PROBE_PORT, PROBE_VERSION
 
 const path = require('path');

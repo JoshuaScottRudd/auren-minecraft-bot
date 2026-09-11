@@ -1,31 +1,34 @@
-# npm, through the one resolver — THE WAY TO RUN NPM IN THIS REPO.
+# npm, through the one node resolver - THE WAY TO RUN NPM IN THIS REPO.
 #
-#   .\Auren_Workshop\scripts\npm.ps1 --version                 # which npm did it pick
-#   cd Auren_Bot; ..\Auren_Workshop\scripts\npm.ps1 install    # the bot's declared packages
-#   cd node_env2; ..\Auren_Workshop\scripts\npm.ps1 install    # the portable runtime's own
+#   .\Auren_Workshop\scripts\npm.ps1 --version     # which npm did it pick (run from Auren_Bot\)
+#   .\Auren_Workshop\scripts\npm.ps1 install       # the bot's declared packages
 #
-# WHY THIS EXISTS WHEN `npm` IS OFTEN ON PATH. It is on PATH on one machine and not the other, and where
-# it is on PATH it may be an npm belonging to something else entirely — an unrecorded dependency on a
-# directory this repo does not own and cannot see move. Same argument that put node behind Get-AurenNode:
-# which toolchain runs is one answer for this machine, resolved in one place (Law 16), never guessed at
-# the call site. The resolver prefers the repo's own copy, so PATH is the last resort rather than the
-# default.
+# NPM IS NOT RESOLVED ON ITS OWN. It is the npm that ships inside the node Get-AurenNode picked -
+# <node folder>\node_modules\npm\bin\npm-cli.js, run by that same node.exe. That is true of an installed
+# Node (C:\Program Files\nodejs\) and of an unpacked one alike, and it is exactly how run.js runs its own
+# install (Law 16: one answer to "which toolchain", so the node and the npm can never come from two
+# different places).
 #
-# WHY IT PRINTS WHAT IT PICKED. The chain has three legs and they are not interchangeable — a machine
-# quietly running PATH's npm because its own is broken looks identical to one running its own, right up
-# until the borrowed one moves (Invariant C: the decision has to be readable after the fact).
+# IF THAT FILE IS MISSING, the node folder lost its npm to a prune: `npm install` run INSIDE a node
+# distribution folder removes node_modules\npm as extraneous unless npm is listed in that folder's own
+# package.json. Repair from inside that folder with `npm install npm@<version>` using any npm that works,
+# which lists it so a later prune cannot take it.
 #
-# ARGS FORWARD UNTOUCHED and the working directory is the caller's, because this is npm and not a
-# wrapper around one command — inventing a different contract than the tool it launches is variance
-# nobody asked for (Law 19). So the manifest is chosen by cd'ing to it, as with npm anywhere else.
-# `--prefix` looks like the tidier answer and is not: it moves where packages are WRITTEN while
-# package.json keeps being read from the current directory, so from the repo root it fails on a root
-# manifest that does not exist. No flag relocates both.
+# ARGS FORWARD UNTOUCHED and the working directory is the caller's, because this is npm and not a wrapper
+# around one command (Law 19). The manifest is chosen by cd'ing to it, as with npm anywhere else.
+#
+# Plain ASCII on purpose - see the note at the top of _node.ps1.
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . "$scriptDir\_node.ps1"
-$npm = Get-AurenNpm
+$node = Get-AurenNode
+$npmCli = Join-Path (Split-Path -Parent $node) 'node_modules\npm\bin\npm-cli.js'
+if (-not (Test-Path -LiteralPath $npmCli)) {
+    Write-Host "The node at $node carries no npm ($npmCli is missing)."
+    Write-Host '  That node folder lost its npm to a prune - see the header of this script for the repair.'
+    exit 1
+}
 
-Write-Host "npm: $npm" -ForegroundColor DarkGray
-& $npm @args
+Write-Host "npm: $npmCli (run by $node)" -ForegroundColor DarkGray
+& $node $npmCli @args
 exit $LASTEXITCODE
