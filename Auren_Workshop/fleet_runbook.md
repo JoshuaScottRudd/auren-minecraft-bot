@@ -5,7 +5,8 @@
 >
 > **Procedure lives here. Reasoning and current state live in
 > `Documentation/Refurbishing planning/architect_bugsquashing.md`** (Law 14, Law 29). Every command the
-> Architect copies to a terminal is in `Auren_Workshop/Architect_Commands.txt`.
+> Architect copies to a terminal is in `Auren_Workshop/COMMANDS.txt` (everything that ships) and
+> `Architect_Commands.txt` at the repo root (the layer above, which does not ship).
 
 ---
 
@@ -31,7 +32,9 @@ console.** Find them in Task Manager or through `status`. Each process's output 
 `fleet_logs/*.log`, and releases the arena tapes.
 
 `fleet_control.js` is the single implementation of launch + command + teardown.
-`Auren_Workshop/run.js` is the one way a RUN is started, and it composes those verbs (§3).
+`Auren_Workshop/run.js` is the one way a RUN is started, and it composes those verbs (§3). Starting the
+SERVER is a different verb with a different owner — `Auren_Workshop/host_and_run.js`, which runs `run.js`
+after it (§3a). `run.js` asks the world whether it is there and never asks who started it (Law 1).
 
 ---
 
@@ -109,21 +112,23 @@ harsher while shipping to the more forgiving is the safe direction. `Public_serv
 the PUBLIC world and stays **Paper** (plus GrimAC, CoreProtect, LuckPerms, SkinsRestorer — so Paper alone
 was never the whole ship target anyway).
 
-**Converting a dev world to Paper is now an OPT-IN parity check, not a setup step** — worth doing
-deliberately when the question is *"does this behave the same under Paper?"*, and worth reverting after.
-`MinecraftServer/` is gitignored, so each machine does it for itself:
+**Converting a dev world to Paper is an OPT-IN parity check, not a setup step** — worth doing deliberately
+when the question is *"does this behave the same under Paper?"*, and worth reverting after. Server folders
+never travel through git, so each machine does this for itself. `$S` below is YOUR server folder — whatever
+`AUREN_SERVER_DIR` names, which `node js_kernel/utils/workstation.js server` will print:
 
 ```
+$S = & node js_kernel\utils\workstation.js server
 # newest 1.21.5 build; EVERY 1.21.5 Paper build is channel ALPHA, so pick the highest id, not STABLE
 $b = Invoke-RestMethod 'https://fill.papermc.io/v3/projects/paper/versions/1.21.5/builds' -Headers @{'User-Agent'='auren'}
 $dl = ($b | Sort-Object id -Descending | Select-Object -First 1).downloads.'server:default'
-Copy-Item MinecraftServer\server.jar MinecraftServer\server-vanilla.jar        # keep the way back
-Invoke-WebRequest $dl.url -OutFile MinecraftServer\server.jar
+Copy-Item "$S\server.jar" "$S\server-vanilla.jar"        # keep the way back
+Invoke-WebRequest $dl.url -OutFile "$S\server.jar"
 ```
 
 `fleet_control.js` launches `server.jar` by filename, so reverting is a `Copy-Item` back. Paper's extra
-configs land inside the already-ignored `MinecraftServer/`. PaperMC's v2 API is sunset — use v3 as above;
-its builds array is descending and the artifact key is `server:default`.
+configs land inside that same folder. PaperMC's v2 API is sunset — use v3 as above; its builds array is
+descending and the artifact key is `server:default`.
 
 ### 2a. `MinecraftServer/` is gitignored — server config does not travel
 
@@ -164,8 +169,18 @@ working.**
 
 ## 2b. Pointing the fleet at a world on another machine
 
-`SERVER_ENDPOINT` in `Thinking_fragments/architect_config.js` is the single source (Law 16). **Override
-it by environment** — an edit travels through git and is wrong everywhere but one machine:
+**`Auren_Bot/your_server.js` is the single source** (Law 16, 2026-09-11). `SERVER_ENDPOINT` in
+`Thinking_fragments/architect_config.js` is a re-export of it and nothing else, so the two can never
+disagree; every body, the foreman, the camera rig, the seed scanner and `run.js` all land on that one
+file. It is also the one page a downloader is expected to open, which is why it sits at the top of the bot
+rather than inside a fragment.
+
+Its defaults are `localhost:25565` and console port `25575` — a server on this machine, started and left
+alone. **Nothing probes, scans or falls back to a second address.** When nothing answers, `run.js` stops
+and prints that file and the field to change, which is the whole reason a fixed default is safe.
+
+**Override it by environment for a run that points elsewhere** — an edit travels through git and is wrong
+everywhere but one machine:
 
 ```
 $env:AUREN_SERVER_HOST = '100.x.y.z'      # the server's TAILNET address
@@ -276,51 +291,98 @@ he has now is `5584697676702229955`.**
 
 ```
 1.  edit    Auren_Workshop/run_config.js          every choice the run has
-2.  run     . .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\run.js
+2.  start   your Minecraft server
+3.  run     . .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\run.js
+
+    ...or, on a machine that hosts the world, steps 2 and 3 in one pass:
+            & $n Auren_Workshop\host_and_run.js
 ```
 
 `run.js` takes **no flags**. A flag would be a second place to say what the page already says, and the
 two would disagree the first time anyone used both (Law 16). The page is read once, before the world
 moves, and the run then performs itself start to teardown with nothing to steer.
 
-### 3a. What is on the page
+### 3a. TWO VERBS, AND `run.js` IS THE ONE EVERYBODY SHARES (Architect 2026-09-11, Law 1)
+
+> *"i have a script that autostarts the server, then when its the bots turn to connect its a seperate piece
+> that only cares if the server is there not if the script runs correctly? so law 1. isolated verb… i want
+> an architect and a user start to be identical. my commands should overlay ontop of strangers commands and
+> there should be a clear seperation between what is architect and what is user."*
+
+| verb | file | what it owns |
+|---|---|---|
+| **run a crew** | `run.js` | join a world that is there · sweep records · clear memory · desk · person · crew · soak · watch · film · read the record · reap the fleet |
+| **host a world** | `host_and_run.js` | stop the server · roll back to a snapshot · mint a console password · start the server · **run `run.js`** · stop the server |
+
+**`host_and_run.js` spawns `run.js` as a child process.** That is what makes "his run is identical to a
+stranger's run" structural rather than a promise: there is one copy of the run, it takes no argument from
+the host, and it cannot be told a host is standing behind it. The only thing crossing the boundary is the
+environment — the same one a stranger fills in by hand.
+
+**The hand-off is STATE, never a claim.** `host_and_run.js` does not tell `run.js` "the server is up"; it
+starts the server and gets out of the way, and `run.js` then asks the world. If the JVM died in between,
+`run.js` fails with the same message a stranger gets for forgetting to start theirs — which is correct,
+because "my script reported success" is not evidence a server is accepting connections (Law 25).
+
+`host_and_run.js` refuses on a machine with no server folder and points at `run.js` instead. A download
+therefore never tries to start anything.
+
+### 3b. What is on the page — the `run` block, read by `run.js`
 
 | field | permitted values | what it decides |
 |---|---|---|
-| `world` | `fresh` · `continue` · `as-is` | roll back to the snapshot and forget everything · carry the world AND the bots' memory forward · touch neither |
-| `snapshot` | a snapshot name | what `fresh` rolls back to |
-| `worldName` | the server's world folder | what it restores INTO |
+| `memory` | `clear` · `keep` | the bots start knowing nothing · they remember what they knew. **This is the bots' own files, not the world** |
 | `clock` | `dawn` · `day` · `held` | sunrise and let it run · pin midday and FREEZE the cycle · leave it alone |
 | `person` | a Minecraft name | who joins and asks for the crew |
-| `standing` | `spawn` · `"<x> <y> <z>"` | where that person stands — **which is where the base gets sited** |
+| `standing` | `biome` · `spawn` · `"<x> <y> <z>"` | where that person stands — **which is where the base gets sited**. `biome` is the default: the fleet's own scanner picks a patch clear of the spawn square |
 | `crew` | `homesteader` · `contractor` | answers to nobody · yours, and hears you |
 | `soak` | minutes | how long it is left to work |
 | `watch` | `true` · `false` | a wake-on-error watch that ENDS the run when something fires · soak blind |
 | `wake` | `error` · `halt` · `death` | which signatures wake it. Nothing else can — his rule, as a value |
 | `stream` | fragment tags | live commentary while watching. `[]` for silence |
 | `record` | `off` · `cameras` · `film` | nothing · cameras only · cameras plus OBS writing files |
-| `teardown` | `down` · `leave-up` | reap everything · leave it standing for you to poke at |
-| `server` | `local` · `already-up` | this script owns the world · a world is up and it will not touch its lifecycle |
-| `host` `port` `rconPassword` `rconPort` | | which world, and how to reach its console |
-| `downloadRoot` | a path outside the repo | where the stranger download is built |
+| `teardown` | `down` · `leave-up` | reap the fleet · leave it standing for you to poke at. **The world is left running either way** |
+
+### 3c. The `hosting` block, read by `host_and_run.js` ONLY
+
+`run.js` cannot see this object at all — it destructures `{ run }` off the page and never touches the rest.
+
+| field | permitted values | what it decides |
+|---|---|---|
+| `world` | `fresh` · `continue` | roll the world back to `snapshot` before starting it · start it exactly as the last run left it |
+| `snapshot` | a snapshot name | what `fresh` rolls back to |
+| `worldName` | the server's world folder | what it restores INTO |
+
+**Six names are NOT on this page** and typing any of them is refused by name rather than read and ignored:
+
+- `server` — the whole question of who starts the world. There is no such question now; the verb you ran is the answer.
+- `host`, `port`, `rconPort`, `rconPassword` — in `Auren_Bot/your_server.js` (§2b). One page for the address, read by everything, not just by `run.js`. A hosted run is handed a freshly minted console password through the environment and never sees one on any page.
+- `downloadRoot` — went with the stranger-download copy when the workshop moved inside the bot: the tree in place IS the shipped tree now.
 
 **Every field is a whitelist.** A value that is not on its list is refused BY NAME before the server is
 touched, an unknown key is an error rather than something ignored, and nothing is defaulted for you
 (Law 13). A typo in a key would otherwise read as "left at its default" and the run would quietly not be
 the run that was asked for.
 
-### 3b. Two rules the page enforces before anything moves
+### 3d. What each verb refuses before anything moves
 
-- **`world: 'fresh'` requires `server: 'local'`.** A snapshot cannot be restored under a running server —
-  world files mid-write are not a world, and `rollback.ps1` refuses for that reason. Asking for both is
-  asking for two things that cannot happen, and the honest moment to say so is before a rollback has
-  half-happened to a world that was serving players.
-- **`world: 'fresh'` requires the snapshot to EXIST.** Checked against
-  `MinecraftServer/world_snapshots/<worldName>/` up front, because the alternative is discovering it
-  after the world has already been taken down. If it is missing, the refusal names what IS there and the
-  one command that makes the current world the baseline.
+**`run.js` has no cross-field rules at all, and that absence is the shape of the split rather than a gap.**
+Its only one was "a fresh world cannot be rolled back under a running server" — a fact about who owns the
+server folder, which is now a fact about the other verb. Every field on the `run` block is independent of
+every other, which is what a page belonging to ONE verb looks like.
 
-### 3c. The bots arrive the way a stranger's bots arrive, and there is no other door
+**`host_and_run.js` refuses two things, both before it stops anything:**
+
+- **No server folder on this machine.** It names what was tried (`AUREN_SERVER_DIR`, then
+  `workstation.json`'s `server` list) and points at `run.js` instead. A download therefore never tries to
+  start a world it has no folder for.
+- **`hosting.world: 'fresh'` with no such snapshot.** Checked against
+  `<server folder>/world_snapshots/<worldName>/` up front, because the alternative is discovering it after
+  the world has already been taken down — which leaves the machine worse off than it started, for a fault
+  that was knowable before anything moved. The refusal names what IS there and the one command that makes
+  the current world the baseline.
+
+### 3e. The bots arrive the way a stranger's bots arrive, and there is no other door
 
 > *"the process is a players joins their server, they start up the bots. starting up the bots only bring
 > up foreman and overseer. in either case. a human must then call foreman get homesteader or foreman get
@@ -344,30 +406,33 @@ Every run does this, in this order:
 which is a door nobody who downloads this has. If the desk refuses, the run has failed — there is
 nothing to fall back to, deliberately. *"i dont want to test in a way that a public user wont be using."*
 
-**Why the download lives OUTSIDE the repository:** node resolves `node_modules` by walking UP the
-directory tree, so a copy inside the tree satisfies itself from the repo's own install and proves
-nothing. `downloadRoot` is a sibling of the repo, not a child.
+**THE DOWNLOAD COPY IS GONE (2026-09-10) and the two paragraphs that stood here with it.** They explained
+why the copy lived outside the repository (`node_modules` resolves by walking UP, so a copy inside the tree
+satisfies itself from the repo's own install and proves nothing) and what was carried across a rebuild.
+Since the workshop moved inside the bot, **the tree in place IS the shipped tree** — there is nothing to
+copy and nothing to carry. `run.js`'s `clearMemory()` header holds the three faults the copy cost.
 
-**What is carried across rebuilds, and nothing else is:** `node_modules` always (460 MB the lockfile
-pins exactly), and on `world: 'continue'` ONLY, the bots' `corporate_headquarters.<bot>.json` files and
-`player_memory/`. Those are untracked runtime state, so wiping the folder wipes the very thing a continue
-exists to preserve — which is why the world and what the bots know about it are one field and not two.
+**What survives from that second paragraph is one fact worth keeping:** the bots'
+`corporate_headquarters.<bot>.json` files and `player_memory/` are untracked runtime state and are the two
+halves of what a bot knows, so they move together. That is `run.memory: 'clear' | 'keep'` — one field
+covering both, never two that could disagree. It is deliberately NOT tied to `hosting.world` any more: a
+stranger can want a clean-slate crew on their own untouched world (2026-09-11).
 
-### 3d. Where the old verbs went
+### 3f. Where the old verbs went
 
 Nothing was lost; each was one frozen combination of the settings above.
 
 | what you used to run | what to set now |
 |---|---|
-| `test standard` | `world: 'fresh'`, `soak: 15` |
-| `test continue` | `world: 'continue'` |
-| `test scan` | `soak: 1` |
-| `test record` | `record: 'film'` |
-| `test spawnzone` | `standing: "<coords inside the square>"` |
+| `test standard` | `hosting.world: 'fresh'`, `run.memory: 'clear'`, `run.soak: 15` |
+| `test continue` | `hosting.world: 'continue'`, `run.memory: 'keep'` |
+| `test scan` | `run.soak: 1` |
+| `test record` | `run.record: 'film'` |
+| `test spawnzone` | `run.standing: "<coords inside the square>"` |
 | the two foreman tests | the desk comes up in every run before any crew is asked for |
-| the two let's-play runs | `record: 'cameras'`, `teardown: 'leave-up'` |
-| `test arena` | `lanista` still owns the arena — it reads `worldName`/`snapshot` off the page |
-| the conductors' soak / capture / triage | `soak`, `record`, `watch` |
+| the two let's-play runs | `run.record: 'cameras'`, `run.teardown: 'leave-up'` |
+| `test arena` | `lanista` still owns the arena — it reads `hosting.worldName`/`.snapshot` off the page |
+| the conductors' soak / capture / triage | `run.soak`, `run.record`, `run.watch` |
 | `run <profile>` / `runbook` | the page IS the profile; there is only one |
 | `stranger_bench` | this is it — the method became the plumbing |
 
@@ -377,7 +442,7 @@ Nothing was lost; each was one frozen combination of the settings above.
 Each of them started a fleet, and each carried its own bring-up order — which is how this repository came
 to hold three separate answers to *"is the world restored before or after the bots come down"*.
 
-### 3e. The plumbing that stayed, and why
+### 3g. The plumbing that stayed, and why
 
 > *"i still want the same type of plumbing. a configurable start that is deterministic."*
 
@@ -395,7 +460,7 @@ node Auren_Workshop/fleet_control.js status | server-start | server-stop | snaps
 --restore` profile, so a rollback was only reachable by asking for a whole authored run. `run.js` needs
 the rollback without the bring-up welded to it.
 
-### 3f. Publishing is a CONVERSATION, not a step in the run
+### 3h. Publishing is a CONVERSATION, not a step in the run
 
 > *"its not a determinitic process. we test a feature and then once its working you remind me to post it
 > to public. its a manual process because it has to survive code changes. were never testing the same

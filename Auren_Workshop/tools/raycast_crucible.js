@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/raycast_crucible.js');
 // tool: raycast_crucible — put a LIVE body in the world and audit every claim its sight makes.
 //
 // WHY IT EXISTS (Architect 2026-08-06): "i keep losing monster fights due to not engaging the monster

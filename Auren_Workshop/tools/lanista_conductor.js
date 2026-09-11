@@ -69,6 +69,7 @@
 //             1 a step failed, the run is unproven.
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/lanista_conductor.js');
 
 const fs = require('fs');
 const path = require('path');
@@ -83,8 +84,10 @@ const scenarios = require('./lanista_scenario');
 // `run.js`. The two fields are the same two facts under their new names, and reading them from the page
 // a person edits means the arena and an ordinary run cannot end up pointed at different worlds — which
 // is what a second copy of this constant would guarantee the first time one of them was updated.
-const runConfig = require('../run_config.js');
-const BENCH_WORLD = { world: runConfig.worldName, snapshot: runConfig.snapshot };
+// The `hosting` block, because rolling a world back is a hosting job — the same block `host_and_run.js`
+// reads, so this bench and a run can never disagree about which world it is (2026-09-11, Law 16).
+const { hosting } = require('../run_config.js');
+const BENCH_WORLD = { world: hosting.worldName, snapshot: hosting.snapshot };
 // The filming overlay — the same word, the same crew, the same closer as a conducted soak. It attaches
 // here for free because it knows nothing about what a run does: it raises lenses between a bring-up and
 // the work, and reaps them before the fleet goes. See its header.

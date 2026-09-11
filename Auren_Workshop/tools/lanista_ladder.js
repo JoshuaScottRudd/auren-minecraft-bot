@@ -63,6 +63,7 @@
 //             1 could not run at all (no scout / no rcon / no bot / a malformed scenario).
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/lanista_ladder.js');
 
 const path = require('path');
 const { spawnSync } = require('child_process');

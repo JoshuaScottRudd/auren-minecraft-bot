@@ -296,6 +296,15 @@ async function run(bot, opts = {}) {
       // rather than condemn a seed whose river hasn't loaded yet.
       transient = true;
       report.push(`${FARM_BLUEPRINT_NAME}: no water in the loaded area yet (frontier at radius ${scan.scanRadius}) — retry.`);
+    } else if (scan.unloadedShore > 0) {
+      // WATER WAS SEEN, BUT THE LAKE RUNS INTO GROUND NOT STREAMED IN YET (2026-09-11). The flood reads an
+      // unloaded cell as "not water", so a lake cut off by the streaming edge looks like a small one, and the
+      // branch below condemned it. Run seven: 23 water cells and 1 candidate at 0m 7s — Law 13, run over —
+      // and 26s later the same scan on the same lake found 67 cells and 10 plots. What is not sensed is not
+      // known (Invariant B), so this is the same soft retry as the no-water case above.
+      transient = true;
+      report.push(`${FARM_BLUEPRINT_NAME}: water seen (${scan.waterCells} cells) but its shore runs into ` +
+        `${scan.unloadedShore} unloaded cell(s) — the lake has not all arrived yet; retry.`);
     } else {
       // Water was seen but no hydratable, stand-paired, penalty-free plot fit — OR the whole loaded area is
       // genuinely water-less. Either way the phase-1 field has no anchor: Law 13, lock nothing (below).

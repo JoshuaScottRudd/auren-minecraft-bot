@@ -87,8 +87,18 @@ somebody in the world asked for it — the owner is stamped into the bot at birt
 filtered on it. There is no terminal flag for that, because there is no owner to name from a terminal,
 and no coordinate to type because you are standing on it.
 
-The command takes `--host` and `--port` if your server is not on `localhost:25565`. **Ctrl-C stops
-everything, including the bots the foreman fetched.** That is the whole interface.
+**If your server is not on `localhost:25565`, there is one file to edit: `your_server.js`,** at the top
+level beside this README. It holds the address, the port, and the server console's port and password, and
+everything in this project reads it — the bots, the foreman, the camera rig, the tools. Nothing probes for
+a server or falls back to a second address: if nothing answers where that file says, the run stops and
+prints that file and the exact field to change. (`--host` and `--port` still work on the command above when
+you want to point one run somewhere else without editing anything.)
+
+**You start your Minecraft server and you stop it. The bots only join it.** Nothing here will start,
+stop or reconfigure a world it did not create. Every part of this project that touches a world asks it one
+question — *are you there* — and gets the answer by speaking to the server, never by being told.
+
+**Ctrl-C stops everything, including the bots the foreman fetched.** That is the whole interface.
 
 > A homesteader answers to nobody, and that includes you: `foreman stop` will not reach one. Ctrl-C is
 > what ends them. The homestead is the world's rather than any one player's, so it tops up to a crew of
@@ -107,26 +117,21 @@ fleet_logs/traces/watcher_<botname>.jsonl
 One line per event, plain JSON, English sentences inside. **A bot replaces its own trace every time it
 starts**, so a restart destroys the evidence — copy the file before you try again.
 
-**Don't read it by hand — there is a reader, and it ships.** A trace is tens of thousands of lines by
-design, because a program answers questions about it:
+**Send it to me — that is the fastest route to a fix and it costs you one copy-paste.** Open an issue,
+attach the file, say what you expected to happen. A trace tells me in thirty seconds what would cost you
+an evening, and it is the single most useful thing anybody can hand me.
+
+**If you would rather read it yourself, you can — it is your machine and the readers are in your
+download.** They are not on this page because reading a trace is a different job from running a bot, and
+mixing the two is how a one-command project turns into a manual. One command hands you the whole
+workbench:
 
 ```
-node monitoring/trace_monitor.js                       # what went wrong, and the lines around it
-node monitoring/trace_monitor.js --story               # every job as plan → what it did → verdict
-node monitoring/trace_monitor.js --jobs                # where the time went
-node monitoring/trace_monitor.js --inventory           # where every item is, and every move
-node monitoring/trace_monitor.js --progress            # is it progressing, or looping
-node monitoring/trace_monitor.js --watch               # live, while it runs
+node developer_mode.js on
 ```
 
-Read-only, no server needed, and it works on a trace you copied somewhere else — pass the file as the
-first argument. `monitoring/LENSES.md` lists every question it answers and the flag that answers it;
-`monitoring/README.md` says what each file is. Three flags (`--camera`, `--witness`, `--machine-load`)
-read a camera stack that is not part of this download and will tell you so.
-
-**If the reader can't answer your question, that is a defect in the reader** — say so in an issue. And
-**sending me the trace is still the best thing you can do**: open an issue, attach it, say what you
-expected. A trace tells me in thirty seconds what would cost you an evening.
+It prints what it turned on and where to start. Nothing above this line changes: the bots run exactly the
+same either way, and `node developer_mode.js off` puts it back.
 
 **Common ones:**
 
@@ -140,9 +145,8 @@ expected. A trace tells me in thirty seconds what would cost you an evening.
 - **A bot says it did not start because it is not standing with you** — it was raised, it could not be
   brought to you, and it refused to plan a base somewhere you did not choose. Usually the console
   password: see the line above.
-- **Joins and stands still** — run `node monitoring/trace_monitor.js --story`, which shows the job board
-  it was offered and what it did with the job it picked. A bot on ground it can't work (no wood, spawn-protected)
-  will re-plan and get the same answer.
+- **Joins and stands still** — usually ground it cannot work: no wood in reach, or spawn-protected. It
+  re-plans and gets the same answer. The trace says which, and so will I if you send it.
 - **Version mismatch** — pass `--version 1.21.5` to match your server exactly.
 
 ---
@@ -152,6 +156,8 @@ expected. A trace tells me in thirty seconds what would cost you an evening.
 | | |
 |---|---|
 | `start_auren.js` | the one way in — the desk and the referee |
+| `your_server.js` | where your server is. The only file you might need to edit |
+| `developer_mode.js` | the door to the workbench, if you ever want it. Off until you say otherwise |
 | `start_bot.js` · `start_overseer.js` | one bot, or the referee, on their own — what the above is built from |
 | `master_core.js` | what a bot runs once it has been told who it is |
 | `Thinking_fragments/` | the deciding — planners, judges, and the config you'd edit to retune it |
@@ -160,37 +166,52 @@ expected. A trace tells me in thirty seconds what would cost you an evening.
 | `js_kernel/` | shared machinery: state store, trace writer, calculators |
 | `custom_api/` | the layer between the bot's vocabulary and Minecraft's |
 | `overseer/` · `foreman/` | job arbitration, and the desk you hire from |
-| `monitoring/` | the readers — `trace_monitor.js` and its lenses. Nothing the bot runs depends on this folder; it only reads what a run wrote |
-| `Auren_Workshop/` | **my own equipment, and you have all of it** — see the section below |
+| `monitoring/` | the readers of what a run wrote. Behind the door; nothing the bot runs depends on it |
+| `Auren_Workshop/` | my own equipment, all of it, behind the door — see the section below |
 | `Auren_Structural_Laws.md` | the rules all of it obeys |
 | `MECHANISM_REGISTRY.md` | every named mechanism, one line each — the index to read before assuming a thing isn't already here |
 
 ---
 
-## If you want the whole stack
+## If you want to work on it — the developer door
 
-**One command runs this thing, and nothing is hidden behind it.** `Auren_Workshop/` is the equipment I
-build the bot with, and it is in your download unchanged. You never need to open it; if you want to, it is
-all there.
-
-I tried keeping it back and it made the project worse rather than safer. There were two ways to run the
-fleet — mine and yours — so every fault arrived twice, and I could not point my own instruments at what a
-downloader actually had. **The tools have to live with the bot in order to read the bot**, so they do.
+**Everything I use to build this thing is in your download, and one command turns it on.**
 
 ```
-node Auren_Workshop/tools/preflight.js          the one test: does the tree still load, and hold its own rules
-node Auren_Workshop/run.js                      a whole scripted run — fresh world, a crew, a soak, read at the end
-node Auren_Workshop/fleet_control.js status     what is up right now
+node developer_mode.js on
 ```
 
-`Auren_Workshop/run.js` is the run I use myself, and it is configured on one page — `run_config.js`, every
-choice in one place, edited before anything starts. `Auren_Workshop/README.md` is the map of the folder;
-`fleet_runbook.md` is the long-form operating manual for the parts of it that drive a live server.
+Until you run that, none of it will start. Every tool, bench, lens, camera and scripted run asks one
+question first — *is this a workbench?* — and an ordinary copy answers no and says so in a sentence. That
+is not a licence check and there is nothing to unlock: it is a marker file on your disk, you own it, and
+`node developer_mode.js off` removes it.
 
-**Two honest warnings.** The benches under `tools/` connect real clients and send real console commands —
-they drive a world rather than reading a record, so run them against a world you do not mind disturbing.
-And the camera stack expects an installation you almost certainly do not have; the three lenses that read
-its records will tell you so in one sentence rather than failing.
+**Why a door rather than a smaller download.** I tried keeping the tools back and it made the project
+worse rather than safer. There were two ways to run the fleet — mine and yours — so every fault arrived
+twice, and I could not point my own instruments at what a downloader actually had. **The tools have to
+live with the bot in order to read the bot.** But shipping a thing and putting it in front of somebody are
+different acts: a person who wants two bots to build a house should meet two commands, not a soak harness
+and a combat arena. So all of it ships, and none of it is offered until you ask.
+
+**And there is one door, not two.** I open it on my own machines with that exact command and there is no
+other way in — no check for whose computer this is, no path that only I walk. When you open it you are
+standing where I stand, running the same files I run.
+
+What appears: the scripted runs, the readers that turn a trace into an answer, the benches that drive a
+live world, the camera stack. The command prints the list and tells you where to start —
+`Auren_Workshop/README.md` is the map of the folder and `Auren_Workshop/COMMANDS.txt` is every command on
+one page.
+
+**Two honest warnings for once you are inside.** The benches under `tools/` connect real clients and send
+real console commands — they drive a world rather than reading a record, so point them at a world you do
+not mind disturbing. And the camera stack expects an installation you almost certainly do not have; the
+lenses that read its records say so in one sentence rather than failing.
+
+**The one thing I have that you do not** is that my machine hosts the world, so I start and stop it in the
+same pass with `Auren_Workshop/host_and_run.js` — which rolls the world back to a snapshot, starts the
+server, and then runs `Auren_Workshop/run.js` **unchanged, as a child process**. That is the entire
+difference between my run and yours: a separate file laid on top, never a branch inside the shared one. On
+a machine without a server folder it refuses and points at `run.js`.
 
 ---
 

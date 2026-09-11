@@ -1,0 +1,159 @@
+================================================================================
+  AUREN COMMANDS — every command this bot has, on one page
+================================================================================
+
+  Run these from the Auren_Bot folder. Everything named here ships with the
+  bot, so every line on this page works in your copy.
+
+
+--------------------------------------------------------------------------------
+  FIRST — OPEN THE DOOR. NOTHING ON THIS PAGE RUNS UNTIL YOU DO.
+--------------------------------------------------------------------------------
+
+      node developer_mode.js on
+
+  One command, once per machine, and it stays. Every tool, bench, lens, camera
+  and scripted run below asks one question before it does anything: is this a
+  workbench? An ordinary copy answers no and says so in a sentence.
+
+  It is a marker file on your own disk. Nothing is unlocked, nothing phones
+  anywhere, and "node developer_mode.js off" removes it. The bots run exactly
+  the same either way -- no bot process reads this setting at all.
+
+      node developer_mode.js        what it is, and what is behind it
+      node developer_mode.js off    close it again
+
+
+================================================================================
+  START A RUN
+================================================================================
+
+  1. Edit    Auren_Bot\Auren_Workshop\run_config.js
+  2. Run     node Auren_Workshop/host_and_run.js
+
+  That is the whole thing. There are no flags, no profiles and no second script.
+  Everything a run can be told is on that page, read once before anything moves.
+
+--------------------------------------------------------------------------------
+  THE TWO COMMANDS, AND WHICH ONE YOU WANT
+--------------------------------------------------------------------------------
+  node Auren_Workshop/host_and_run.js     starts the world, runs it, stops the world
+  node Auren_Workshop/run.js              runs it on a world that is ALREADY up
+
+  host_and_run is yours because this machine holds the server folder. It rolls the
+  world back to the snapshot, starts it, then runs run.js UNCHANGED — the same file
+  a stranger runs — and stops the world afterwards.
+
+  Use run.js on its own when the world is already up and you want to leave it up.
+
+--------------------------------------------------------------------------------
+  THE PAGE — Auren_Bot\Auren_Workshop\run_config.js
+--------------------------------------------------------------------------------
+  run:                                  the run itself; everybody's, including yours
+    memory     clear | keep             do the bots remember the last run
+    clock      dawn | day | held        sunrise / pinned midday / leave it
+    person     a name                   who joins and asks for the crew
+    standing   biome | spawn | "x y z"  where they stand = where the base gets built
+    crew       homesteader | contractor answers to nobody / hears you in chat
+    soak       minutes                  how long it works before teardown
+    watch      true | false             end the run the moment something errors
+    wake       error, halt, death       what is allowed to wake the watch
+    stream     fragment tags            live commentary, [] for silence
+    record     off | cameras | film     cameras and OBS
+    teardown   down | leave-up          reap the fleet / leave it for you to poke at
+
+  hosting:                              only host_and_run.js reads this
+    world      fresh | continue         roll the world back / carry it forward
+    snapshot   a snapshot name          what fresh rolls back to
+    worldName  the world folder         what it restores INTO
+
+  WHERE YOUR SERVER IS:  Auren_Bot\your_server.js   (address, port, console)
+
+
+================================================================================
+  END A RUN
+================================================================================
+
+  node Auren_Workshop/fleet_control.js down             # EVERYTHING — recording, cameras, world
+  node Auren_Workshop/fleet_control.js takeover         # kill switch
+
+  down stops the recording if one is running, wraps the take, closes the cameras
+  and takes the world down. Nothing else to remember. If no recording was on it
+  says so and moves on.
+
+
+================================================================================
+  WHILE A RUN IS UP
+================================================================================
+
+  node Auren_Workshop/fleet_control.js status
+  node Auren_Workshop/fleet_control.js server-start
+  node Auren_Workshop/fleet_control.js server-stop
+  node Auren_Workshop/fleet_control.js memory-wipe
+  node Auren_Workshop/fleet_control.js verb respawn
+  node Auren_Workshop/fleet_control.js repair
+
+
+================================================================================
+  FILMING
+================================================================================
+
+  .\Auren_Workshop\scripts\camera_obs.ps1 status
+  .\Auren_Workshop\scripts\camera_obs.ps1 miccheck      # 8 seconds, measures, deletes
+  node Auren_Workshop/tools/record_overlay.js status
+
+  Your own flying camera:   architect.enable: true
+  Your playing seat:        host.playerName, host.micDevice
+  Both live in:             Auren_Workshop\camera\camera_configure.js
+
+  Never minimize a camera window.
+
+
+================================================================================
+  EDITING A TAKE
+================================================================================
+
+  Filming is above and it ships. EDITING is a separate tool that does not.
+
+  A take is a self-describing folder — captures, traces, take.json, clips/ —
+  so cut it with whatever editor you already use. Nothing about the footage
+  needs a particular one to be readable.
+
+  Where a take lands:   footage\<date_time>\
+
+
+================================================================================
+  THE LOCAL WORLD
+================================================================================
+
+  node Auren_Workshop/fleet_control.js local          # world + desk, no bots
+  node Auren_Workshop/fleet_control.js bots-up        # ...plus the roster
+
+  Join at localhost, Java 1.21.5.
+
+--------------------------------------------------------------------------------
+  SNAPSHOTS  (the engine is told which server folder with -Root)
+--------------------------------------------------------------------------------
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action list    -World 'sub_agent_01'
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action snapshot -World 'sub_agent_01' -Name <name>
+  .\Auren_Workshop\scripts\world_rollback.ps1 -Root <server folder> -Action restore  -World 'sub_agent_01' -Name <name> -Force
+
+
+================================================================================
+  ODDS AND ENDS
+================================================================================
+
+  node Auren_Workshop/tools/seed_scanner.js scan --tries=14
+  node Auren_Workshop/tools/preflight.js
+
+
+================================================================================
+  ASK INSTEAD OF READING
+================================================================================
+
+  Reading a run          monitoring\LENSES.md
+  Runs and the fleet     Auren_Workshop\fleet_runbook.md
+  Filming                Auren_Workshop\camera_runbook.md
+  Every tool, and why    Auren_Workshop\tools\README.md
+  Where your server is   your_server.js
+  The laws               Auren_Structural_Laws.md

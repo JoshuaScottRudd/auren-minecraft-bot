@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/chat_probe.js');
 // tool: chat_probe — the LIVE observation that settles whether a bot can HEAR a human in 1.21.5,
 // which is the single fact the whole in-game control program rests on. Vol. 52 §18 resolved the
 // doorman's shape on lifecycle grounds and then recorded the hole underneath it plainly:

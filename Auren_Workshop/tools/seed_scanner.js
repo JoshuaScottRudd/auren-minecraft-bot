@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/seed_scanner.js');
 // tool: seed_scanner — roll world seeds until the ground the bots land on is the ground he asked for,
 // and keep a permanent note of what every seed turned out to be.
 //

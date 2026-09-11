@@ -151,4 +151,7 @@ function getState() {
 module.exports = {
   scanBiomes,
   getState,
+  // The one biome read, exported for a caller asking about ONE spot (2026-09-11: proxy_human asks "is the
+  // cell a person would stand on in an acceptable biome?"), so that caller does not grow a second reader.
+  getBiomeName,
 };

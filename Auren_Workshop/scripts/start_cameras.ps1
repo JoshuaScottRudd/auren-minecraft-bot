@@ -60,6 +60,11 @@ param(
     [switch]$Down                 # reap the crew this script raises (Law 8) - see the -Down section
 )
 
+# THE DOOR, FIRST - this script launches Minecraft clients, so nothing above it may act. It sits below
+# `param` only because PowerShell requires that block first; `param` declares and runs nothing.
+. "$PSScriptRoot\_developer_door.ps1"
+Assert-DeveloperMode 'Auren_Workshop/scripts/start_cameras.ps1'
+
 # ---- -Bots and -Add: raising a camera for a bot that did not exist when the run started -------
 #
 # WHY THIS SCRIPT NEEDED A SECOND SHAPE. It was written for a crew whose size is known before the

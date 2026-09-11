@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/stone_column_probe.js');
 // tool: stone_column_probe — drive stone_column_scanner against a LIVE world and audit its verdict
 //       independently, before the verb that acts on it is ever raised in autonomy.
 //

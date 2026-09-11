@@ -24,6 +24,7 @@
 // "moving" clip). --json prints the raw segment list; default prints the human breakdown.
 
 'use strict';
+require('../js_kernel/utils/developer_door').enter('monitoring/motion_classifier.js');
 
 const path = require('path');
 const { readTrace, segmentRuns, buildEpisodes, jobToken } = require('./trace_read.js');

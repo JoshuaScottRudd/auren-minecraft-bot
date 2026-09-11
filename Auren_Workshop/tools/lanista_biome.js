@@ -65,6 +65,7 @@
 //   node lanista_biome.js --biome=plains                 one name, exactly as before
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/lanista_biome.js');
 
 const {
   SCOUT_NAME, SITING,

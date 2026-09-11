@@ -65,6 +65,7 @@
 // that quietly films some bots and never says which (Law 25).
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/camera_warden.js');
 
 const fs = require('fs');
 const path = require('path');

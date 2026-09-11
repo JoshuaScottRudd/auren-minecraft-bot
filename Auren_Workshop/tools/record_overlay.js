@@ -10,10 +10,13 @@
 // A rung × overlay table is N + 2 declarations; a rung-per-combination is 2N, and the second copy is the
 // one that ages (Law 16).
 //
-//   node tools/test_conductor.js    record                 a run authored `film: 'record'` — cameras + OBS
-//   node tools/test_conductor.js    watch                  a run authored `film: 'watch'`  — cameras, nothing written
+//   run_config.js  run.record: 'film'                      a run with cameras + OBS writing files
+//   run_config.js  run.record: 'cameras'                    cameras only, nothing written
 //   node tools/lanista_conductor.js ladder record          the combat bench, which still takes the word
-//   node tools/record_overlay.js    stop                   THE closer, whichever conductor raised it
+//   node tools/record_overlay.js    stop                   THE closer, whichever caller raised it
+//
+// The two `test_conductor.js record|watch` lines that stood here named a script deleted on 2026-09-10;
+// filming is a field on the run page now, not a verb (2026-09-11).
 //
 // ── WHAT IT ADDS TO A RUN, IN THIS ORDER (every step an existing owner) ─────────────────────────────
 //   start_cameras.ps1 -Framing              N bot cameras + director + titler (+ the eye on --architect)
@@ -84,6 +87,7 @@
 // next one within a minute of it starting, and the operator would be told a run ended that never began.
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/record_overlay.js');
 
 const fs = require('fs');
 const path = require('path');

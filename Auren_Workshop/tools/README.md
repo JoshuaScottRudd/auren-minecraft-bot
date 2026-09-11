@@ -320,15 +320,17 @@ did with it — the picture, anything the page threw or logged, and the answer t
 live DOM with `--read`. Nothing in it names a file, so no refactor can leave it green while checking
 nothing. It asserts nothing and therefore cannot go stale; it *shows*, and the reader decides.
 
-```
-node Cutting_room/photograph_page.js /config
-node Cutting_room/photograph_page.js "/thumbnail?take=<take>&profile=highlight" --until="document.querySelector('.tb')" --read="document.querySelector('.tb').textContent"
-node Cutting_room/photograph_page.js "/highlight?take=<take>" --do="document.querySelector('#reelIn .clip').click()" --do="document.getElementById('textHere').click()"
-```
+**Its commands are NOT reproduced here, and that omission is deliberate** (2026-09-11). Three copyable
+invocations of it stood at this spot, in a file whose whole job is telling you which instrument answers
+which question — so the one reader most likely to type them was a downloader, who has no editor folder at
+all and would get "cannot find module" from their own troubleshooting guide. The tool's
+usage lives with the tool, in `Cutting_room/README.md`. **A document in the shipped tree may explain the
+layer above it and must not instruct you to run it**; `preflight`'s layer-separation pass holds that line,
+and it is the pass that found these three.
 
-Pictures land in `footage/_shots/`, which is out of Git. Two mistakes it refuses rather than photographs,
-both of which otherwise produce a flawless PNG of the wrong thing: a path the shell rewrote into a Windows
-file path, and a port with nothing listening on it.
+The argument above is kept because it is about INSTRUMENTS rather than about the editor: a pass that reads
+source cannot see a rendered page, whatever the page belongs to. If you are building a browser surface of
+your own, that is the reasoning you need and the tool is a detail.
 
 ### Pass 4 — a Law 13 rule, enforced as a SHAPE
 

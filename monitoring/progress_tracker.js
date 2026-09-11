@@ -33,6 +33,7 @@
 // Exit codes: 0 rendered · 1 no readable HQ found.
 
 'use strict';
+require('../js_kernel/utils/developer_door').enter('monitoring/progress_tracker.js');
 
 const fs = require('fs');
 const path = require('path');

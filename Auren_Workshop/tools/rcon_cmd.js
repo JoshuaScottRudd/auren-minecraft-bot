@@ -12,6 +12,7 @@
 // Usage: node rcon_cmd.js "gamemode spectator Gimbal_Cam" "spectate Gimbal_Cam Cam_AurenBot" ...
 // Exit codes: 0 ok · 1 link/auth failure.
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/rcon_cmd.js');
 
 const rconLink = require(require('../workshop_paths').bot('js_kernel/utils/rcon_link'));
 

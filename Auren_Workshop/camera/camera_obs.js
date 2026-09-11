@@ -68,6 +68,7 @@
 //                                                           only — it decides nothing.
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/camera/camera_obs.js');
 
 // The @-aliases are registered EXPLICITLY, before the watcher require. package.json's _moduleAliases
 // only self-register for an entry point launched from that package root; this file is a workshop tool

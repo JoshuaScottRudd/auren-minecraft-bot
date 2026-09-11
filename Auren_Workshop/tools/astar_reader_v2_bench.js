@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/astar_reader_v2_bench.js');
 // tool: astar_reader_v2_bench — the live A/B/C that decides whether voxel_reader_v2_prototype ships.
 // Architect 2026-08-04: "ok build a prototype and AB with all your recommendations. use a live server to
 // determine if we save more time… i would like to see a signifigant reduction in scan time."

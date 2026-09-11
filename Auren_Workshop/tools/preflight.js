@@ -80,6 +80,7 @@ Exit: 0 if every fragment loads, 1 if any fail (usable as a pre-handoff gate).
 ============================================================
 */
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/preflight.js');
 
 const path = require('path');
 const fs = require('fs');
@@ -979,6 +980,77 @@ if (leaks.length) {
 }
 console.log(`Shipped tree is self-contained — ${shipped.length} file(s), no require reaches private ground.`);
 
+// ── PASS: THE SHIPPED TREE MAY EXPLAIN THE LAYER ABOVE IT. IT MAY NOT TELL YOU TO USE IT ────────────
+//
+// ── WHY THIS EXISTS (Architect 2026-09-11) ──────────────────────────────────────────────────────────
+// *"look for other ways to separate architect from user. so ways we start and end is the biggest part.
+// the second part is the troubleshooting tools. i want my run to be the same as a user run one level
+// higher. a user run wont even know that theres a second layer above it."*
+//
+// The `require` pass above catches the layer above being DEPENDED ON — a load-time failure a stranger
+// meets as MODULE_NOT_FOUND. This pass catches the quieter half: the layer above being ADVERTISED. A
+// document in the shipped tree that says `node Cutting_room/photograph_page.js` costs a stranger nothing
+// at load and everything at the moment they need it — they type the one command their troubleshooting
+// guide gave them and get "cannot find module", from an instruction their own copy handed them. Nothing
+// fails, so nothing reports it; that is the shape of thing this file exists to catch.
+//
+// ── THE RULE, AND WHY IT IS NOT A WHITELIST (Law 29) ────────────────────────────────────────────────
+// A mention of private ground is a leak when it is an INSTRUCTION and fine when it is an EXPLANATION.
+// `overseer/owner_memory.js` names `Privacy/` eight times to explain why that folder is legitimately
+// absent on a published copy — that is the separation being documented, which is the opposite of the
+// separation failing, and a pass that flagged it would be teaching people to delete their own reasons.
+//
+// The machine form of "instruction" is a line a person would COPY: it starts with a runner (`node`,
+// `&`, `.\`, `./`, a `$`-prefixed shell line) or sits inside a fenced code block. That is a property of
+// the line, not a list of blessed files — so there is nothing here to add yourself to, which is what
+// keeps a guard something people obey rather than something they edit.
+//
+// ── IT WARNS, IT DOES NOT REFUSE, AND THAT ASYMMETRY IS DELIBERATE (Law 13) ─────────────────────────
+// The require pass exits 1 because its finding is a stranger's copy that cannot load. This one's finding
+// is a stranger's copy that loads perfectly and then misleads, which is a real fault and not a broken
+// build — refusing every commit until the prose is rewritten would stop work on the fleet to fix a
+// paragraph. It prints the file, the line and the text, every run, so the list is impossible to lose.
+const DOC_EXT = /\.(md|txt)$/i;
+// A markdown TABLE ROW is prose in a grid, so `|` is not a bullet here — `fleet_runbook.md`'s resolver
+// table names `../Architect_workstation/workstation.json` as the thing a stranger does NOT have, which is
+// this separation being documented. A `$name = ...` assignment is code computing a path, not a command
+// somebody types; `scripts/_node.ps1` builds the manifest path and then existence-checks it, which is the
+// resolver doing its job. Both were flagged on this pass's first run and both were the pass being wrong.
+const RUNNER_LINE = /^\s*(?:[-*>]\s*)?(?:`{0,3})\s*(?:node|npm|npx|&|\.\\|\.\/|git)\s/;
+const advertised = [];
+(function sweepAdvertised(rel) {
+  const dir = path.join(BOT_DIR, rel);
+  if (!fs.existsSync(dir)) return;
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (ent.name === 'node_modules' || ent.name === 'fleet_logs') continue;
+    const childRel = rel ? path.join(rel, ent.name) : ent.name;
+    if (ent.isDirectory()) { sweepAdvertised(childRel); continue; }
+    if (!/\.(js|md|txt|ps1)$/i.test(ent.name)) continue;
+    const lines = fs.readFileSync(path.join(BOT_DIR, childRel), 'utf8').split('\n');
+    let fenced = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (DOC_EXT.test(ent.name) && /^\s*```/.test(line)) { fenced = !fenced; continue; }
+      PRIVATE_REQUIRE.lastIndex = 0;
+      const names = new RegExp(`(?:${PRIVATE_DOMAINS.join('|')})[\\\\/]`).test(line);
+      if (!names) continue;
+      // A line that RUNS something, or a line inside a code block, is a line somebody will copy.
+      if (!fenced && !RUNNER_LINE.test(line)) continue;
+      advertised.push({ rel: childRel, line: i + 1, text: line.trim().slice(0, 120) });
+    }
+  }
+})('');
+if (advertised.length) {
+  console.log(`\nTHE LAYER ABOVE IS ADVERTISED — ${advertised.length} copyable line(s) in the shipped tree`);
+  console.log('  name ground a downloaded copy does not have. Each one is a command somebody will type and');
+  console.log('  a "cannot find" they did not cause. Explaining these folders is fine and expected; telling');
+  console.log('  a stranger to RUN something in them is the leak. Move the command up a level — the private');
+  console.log(`  side may read down into Auren_Bot/, never the reverse. Domains: ${PRIVATE_DOMAINS.join(', ')}.`);
+  for (const a of advertised) console.log(`      ${a.rel}:${a.line}   ${a.text}`);
+} else {
+  console.log('Layer separation OK — nothing in the shipped tree tells a stranger to run anything they do not have.');
+}
+
 // ── PASS: THE DEPENDENCY RUNS ONE WAY — THE WORKSHOP READS THE BOT, THE BOT NEVER READS THE WORKSHOP ──
 //
 // A DIFFERENT QUESTION FROM THE PASS ABOVE, and it gets its own pass for that reason (Law 29). That one
@@ -1025,6 +1097,94 @@ if (inward.length) {
   process.exit(1);
 }
 console.log('Dependency direction OK — no bot file requires the workshop.');
+
+// ── PASS: ANYTHING IN THE WORKSHOP OR THE LENSES THAT RUNS MUST ASK THE DOOR FIRST ──────────────────
+//
+// THE ASK (Architect 2026-09-11): *"no tool for troubleshooting shall run for a user… a user who is just
+// running the bots shall not know that the tools are there and should not start for any of their
+// processes. if you want to work on the code then you go into debug mode or developer mode and must enter
+// through the architects door."*
+//
+// ── WHY THIS NEEDS A MACHINE AND CANNOT BE A HABIT ──────────────────────────────────────────────────
+// The door is one line at the top of thirty-odd files. A new bench written next month works perfectly
+// without it — it runs, it does its job, and NOTHING is wrong from where its author is standing, because
+// its author has the door open. The omission is invisible on every machine that could notice it and
+// visible only on a stranger's, which is the exact shape of fault this file exists for and the same
+// argument as the dependency-direction pass above: a mistake that works is a mistake nothing reports.
+//
+// ── THE RULE, STATED AS A WHITELIST (Law 29) ────────────────────────────────────────────────────────
+// A file under `Auren_Workshop/` or `monitoring/` that DOES SOMETHING WHEN IT IS LOADED must make
+// `developer_door.enter(...)` its FIRST executable statement.
+//
+// "Does something when it is loaded" is decided from the parse tree, and the permitted top-level
+// statements are named here and nowhere else: a directive (`'use strict'`), a declaration (`const`,
+// `let`, `function`, `class`), an assignment to `module.exports` or `exports.x`, and the MODULE-PATH
+// BOOTSTRAP. A file built only from those is a LIBRARY — requiring it computes nothing and starts
+// nothing, so the door has nothing to guard and the lens modules, `run_config.js` and
+// `workshop_paths.js` are silently correct. Any other top-level statement means `node <file>` acts, and
+// the first act must be the question.
+//
+// ── WHY THE PATH BOOTSTRAP IS ON THAT LIST, SAID OUT LOUD BECAUSE IT IS THE ONE JUDGEMENT CALL ──────
+// `paths.registerAliases()`, `paths.bootstrapModules()` and `module.paths.unshift(bootstrapModulePath())`
+// are how a file in this tree teaches `require` where the kernel lives. They are declarations wearing a
+// call's clothing: nothing connects, nothing spawns, nothing prints, and a module that skipped them could
+// not resolve its own next line. Eight lens and helper modules do exactly this and nothing else, and
+// forcing a door into them would be WRONG rather than merely noisy — a library is loaded by a parent that
+// has already asked, so the refusal would name the wrong file and the gate would fire twice.
+//
+// The cost of the exemption, named rather than hidden: a statement that CALLS one of those three and also
+// does something else in the same breath reads as inert here. It is one line in a file whose whole top
+// level is being read, so the exposure is a line somebody would have to write on purpose.
+//
+// FIRST, not merely present. A door call below a `mineflayer.createBot()` is a bot already connected; a
+// door call below a `spawn()` is a process already raised. The gate is only a gate at the top (Law 13 —
+// the default is STOPPED, so nothing may happen before the state is known).
+{
+  const DOOR_DIRS = new Set(['Auren_Workshop', 'monitoring']);
+  const ungated = [];
+  const misplaced = [];
+
+  // The permitted-at-load set, as a predicate. Everything not matched here is an ACT.
+  const PATH_BOOTSTRAP = /\b(?:registerAliases|bootstrapModules|bootstrapModulePath)\s*\(/;
+  const isInert = (st, src) => {
+    if (st.type === 'VariableDeclaration' || st.type === 'FunctionDeclaration'
+      || st.type === 'ClassDeclaration' || st.type === 'EmptyStatement') return true;
+    if (PATH_BOOTSTRAP.test(src.slice(st.range[0], st.range[1]))) return true;  // teaches require, acts not
+    if (st.type === 'ExpressionStatement') {
+      if (typeof st.directive === 'string') return true;                       // 'use strict'
+      const e = st.expression;
+      if (e.type === 'AssignmentExpression' && /^(?:module\.exports|exports\.)/.test(
+        src.slice(e.left.range[0], e.left.range[1]))) return true;             // module.exports = …
+    }
+    return false;
+  };
+
+  for (const rel of shipped) {
+    const top = rel.split(/[\\/]/)[0];
+    if (!DOOR_DIRS.has(top)) continue;
+    const src = fs.readFileSync(path.join(BOT_DIR, rel), 'utf8');
+    let ast;
+    try { ast = espree.parse(src, { ecmaVersion: 'latest', range: true }); } catch { continue; }
+
+    const acts = ast.body.filter(st => !isInert(st, src));
+    if (!acts.length) continue;                                                // a library: nothing to gate
+    const callsDoor = st => /developer_door['"`]?\s*\)?\s*\.?[\s\S]{0,40}\.enter\s*\(/.test(
+      src.slice(st.range[0], st.range[1]));
+    if (!acts.some(callsDoor)) ungated.push(rel);
+    else if (!callsDoor(acts[0])) misplaced.push(rel);
+  }
+
+  if (ungated.length || misplaced.length) {
+    console.error('\nTHE DOOR IS NOT SHUT — a developer tool would run in an ordinary copy of Auren.');
+    console.error('  Every file here acts when it is loaded, so it must ask the door before it acts:');
+    console.error("      require('<path to>/js_kernel/utils/developer_door').enter('<its own name>');");
+    console.error('  as the FIRST executable line. A file that only declares and exports needs nothing.');
+    for (const rel of ungated) console.error(`      ${rel}   — never asks`);
+    for (const rel of misplaced) console.error(`      ${rel}   — asks, but something already happened above it`);
+    process.exit(1);
+  }
+  console.log('Developer door OK — nothing in the workshop or the lenses runs without it.');
+}
 
 const shape = scanCatchShape();
 if (shape.total === 0) {

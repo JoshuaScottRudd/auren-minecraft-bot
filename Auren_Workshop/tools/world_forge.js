@@ -37,6 +37,7 @@
 // 2 IS NOT AN ERROR — it is a candidate honestly reporting it is not the one. Try another seed.
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/world_forge.js');
 
 const fs = require('fs');
 const path = require('path');

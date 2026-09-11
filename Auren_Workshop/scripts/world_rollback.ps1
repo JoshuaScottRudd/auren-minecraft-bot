@@ -89,6 +89,11 @@ param(
   [string]$LaunchCommand
 )
 
+# THE DOOR, FIRST - this script deletes and restores a world folder, which is the most destructive verb
+# in the shipped tree. It sits below `param` only because PowerShell requires that block first.
+. "$PSScriptRoot\_developer_door.ps1"
+Assert-DeveloperMode 'Auren_Workshop/scripts/world_rollback.ps1'
+
 $ErrorActionPreference = 'Stop'
 
 function Write-Info($msg){ Write-Host "[INFO] $msg" -ForegroundColor Cyan }

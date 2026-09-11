@@ -90,6 +90,7 @@
 //             1 could not run at all (no scout / no rcon).
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/lanista.js');
 
 const {
   ARENA_TAG, SCOUT_NAME, SITING, WORLD, AGGRO_RANGE, AGGRO_VERTICAL_RANGE, aggroRangeFor,

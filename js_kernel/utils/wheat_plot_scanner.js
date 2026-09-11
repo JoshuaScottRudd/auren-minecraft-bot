@@ -437,7 +437,7 @@ function emptyScan(scan, t0, ringCellsSeen, scanRadius, loadedFrontier) {
     // same bench readers, and a missing key here surfaces as `undefined` in a report rather than as an error.
     axis: null, stripeParity: null, standDir: null, offStripe: 0, wrongFacing: 0,
     plotsAvailable: 0, runsAvailable: 0, runsUsed: 0, minRun: MIN_RUN,
-    clusterArea: 0, clusterSpan: 0, density: 0, meshCount: 0,
+    clusterArea: 0, clusterSpan: 0, density: 0, meshCount: 0, unloadedShore: 0,
   };
 }
 
@@ -495,6 +495,7 @@ async function scanWheatPlots(bot0, { origin, target = TARGET, seaY = DEFAULT_SE
   const pool = [];                                              // candidate cells: solid, air above, hydratable
   let waterCells = 0;
   let ringCellsSeen = 0, lastSeedRadius = 0, hitFrontier = false, bodiesUsed = 0, enoughFound = false;
+  let unloadedShore = 0;                                        // flood neighbours not streamed in yet (see PHASE 2)
   const WATER_CAP = Math.max(4096, poolTarget * 128);          // runaway backstop across ALL bodies
 
   // Candidate seed points, nearest-first. Default (bench / no biome data): just origin — the ring search finds
@@ -559,6 +560,10 @@ async function scanWheatPlots(bot0, { origin, target = TARGET, seaY = DEFAULT_SE
         if (waterSeen.has(wk)) continue;
         if (Math.abs(wx - origin.x) > maxRadius || Math.abs(wz - origin.z) > maxRadius) continue;
         if (isSeaWater(wx, wz)) { waterSeen.add(wk); queue.push({ x: wx, z: wz }); }
+        // A NEIGHBOUR THAT IS NOT WATER BECAUSE IT IS NOT HERE YET is counted, never taken for shore. An
+        // unloaded cell reads as "not water", so a lake cut off by the streaming edge floods as a small one:
+        // run seven (2026-09-11) saw 23 cells of a lake the same scan found 67 of, 26s later.
+        else if (!scan.blockAt(wx, seaY, wz)) unloadedShore++;
         await pace();
       }
     }
@@ -601,7 +606,7 @@ async function scanWheatPlots(bot0, { origin, target = TARGET, seaY = DEFAULT_SE
     meshCount: field.length ? unionPatches(field.map(p => p.crop), ROW_MESH_GAP).length : 0,
     distinctStands,
     waterCells, bodiesUsed, bodyExhausted, ringCellsSeen, cellsRead: scan.stats.reads, reachedTarget: field.length >= target,
-    scanRadius: seedRadius, loadedFrontier: hitFrontier, elapsedMs: Date.now() - t0,
+    scanRadius: seedRadius, loadedFrontier: hitFrontier, unloadedShore, elapsedMs: Date.now() - t0,
     // Penalty-freedom is CHECKED per placement now (no global parity to guarantee it), so this is the
     // independent re-derivation that the checking actually held (Law 25 — the flag has to be earned).
     penaltyFree: verifyNoPenalty(field.map(p => p.crop)),

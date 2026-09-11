@@ -49,6 +49,7 @@
 // to preserve. Default-stopped (Law 13) is the whole value here.
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/fleet_revive.js');
 
 const fs = require('fs');
 const path = require('path');

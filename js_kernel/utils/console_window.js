@@ -180,13 +180,20 @@ function followFile({ title, logFile, style }) {
   //   Get-Content -Encoding UTF8   — how the FILE's bytes are decoded on the way in
   // The last one is the one that is easy to miss: with the console fixed but the read left at default,
   // the text is already mangled before it reaches the screen, so the fix looks like it did not work.
+  //
+  // ── THE LOG CAN VANISH UNDER IT, AND THAT IS NOT AN ERROR (2026-09-11) ──────────────────────────────
+  // A new run empties fleet_logs/ whole, so a window left open from an earlier run — one stopped without
+  // its teardown — is following a file that no longer exists, and PowerShell printed a red `Could not find
+  // file … console_person.log` over the last thing the person said. So the read stops quietly and the
+  // window says what happened instead.
   const psCmd =
     `$OutputEncoding = [System.Text.Encoding]::UTF8; `
     + `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; `
     + `$null = & chcp 65001; `
     + `$Host.UI.RawUI.WindowTitle = ${psQuote(title)}; `
     + `Write-Host ${psQuote(`-- ${title} -- live console · ${logFile}`)} -ForegroundColor Cyan; `
-    + `Get-Content -LiteralPath ${psQuote(logFile)} -Encoding UTF8 -Wait -Tail ${FOLLOW_TAIL_LINES}`;
+    + `Get-Content -LiteralPath ${psQuote(logFile)} -Encoding UTF8 -Wait -Tail ${FOLLOW_TAIL_LINES} -ErrorAction SilentlyContinue; `
+    + `Write-Host ${psQuote('-- the log this window was following is gone: a new run clears the logs folder when it starts. Nothing is wrong; this window can be closed. --')} -ForegroundColor Yellow`;
   const r = tryOpenProcess({
     exe: 'powershell',
     argv: ['-NoProfile', '-NoExit', '-Command', psCmd],

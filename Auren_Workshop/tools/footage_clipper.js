@@ -50,6 +50,7 @@
 // Lives outside the fragment tree: a read-only observer of the record, joined to no signal bus.
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/footage_clipper.js');
 
 const fs = require('fs');
 const path = require('path');

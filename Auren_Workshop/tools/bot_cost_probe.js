@@ -45,6 +45,7 @@
 //   node Auren_Workshop/tools/bot_cost_probe.js --seconds=180
 //   node Auren_Workshop/tools/bot_cost_probe.js --seconds=180 --note="2 bots, autonomy running"
 
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/bot_cost_probe.js');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');

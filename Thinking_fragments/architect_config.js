@@ -36,6 +36,13 @@ const WORLD_DEPTH_FLOOR_Y = 0;
 // sides can agree is for one number to author both.
 const SPAWN_PROTECTION_RADIUS = 16;
 
+// PERSON_CLEAR_OF_SPAWN — how far from WORLD SPAWN the test harness's person must stand before a crew is
+// fetched to them (Architect 2026-09-11: *"it should be atleast 50 blocks away from world center"*).
+// Chebyshev on X/Z, the same shape as the square above. A crew is teleported to the person and sites its
+// base around them, so a person near the square puts the whole crew's work inside it — where every break
+// and placement is refused and the server says nothing.
+const PERSON_CLEAR_OF_SPAWN = 50;
+
 // SERVER_MINECRAFT_VERSION — the protocol the fleet speaks, and the block registry that answers questions
 // ABOUT blocks. It lived only in master_core's createBot call; it is here because a second reader arrived
 // that must not disagree with the body, and cannot ask it. The virtual playground authors block names and
@@ -69,14 +76,18 @@ const SERVER_MINECRAFT_VERSION = process.env.AUREN_MINECRAFT_VERSION || '1.21.5'
 // git and be wrong on all but one. `AUREN_SERVER_HOST` / `AUREN_SERVER_PORT` are read once, here, and
 // nowhere else — `fleet_control` spawns bots with `{...process.env}`, so a value set in the launching
 // shell reaches every body without any of them knowing it was overridden.
-// THE PORT IS VALIDATED RATHER THAN TRUSTED. A malformed env value would otherwise become NaN and travel
-// all the way to a socket error naming nothing; a bad value falls back to the default instead (Law 13).
-const _SERVER_ENDPOINT_ENV_PORT = parseInt(process.env.AUREN_SERVER_PORT, 10);
-const SERVER_ENDPOINT = {
-    host: process.env.AUREN_SERVER_HOST || 'localhost',
-    port: (Number.isFinite(_SERVER_ENDPOINT_ENV_PORT) && _SERVER_ENDPOINT_ENV_PORT > 0 && _SERVER_ENDPOINT_ENV_PORT < 65536)
-        ? _SERVER_ENDPOINT_ENV_PORT : 25565,
-};
+// THE VALUE AND THE ENV HANDLING BOTH MOVED TO `Auren_Bot/your_server.js` (2026-09-11), and this is now
+// a re-export rather than a second answer. Same defaults, same overrides, same validation — what changed
+// is only WHERE a person edits them. This file is the fleet's brain: nine hundred lines of reach
+// distances, job tiers, blueprint names and seniority, none of which a downloader should have to open in
+// order to say "my server is on a different port". `your_server.js` is that page, it sits at the top of
+// the bot beside the README, and it holds nothing else.
+//
+// THE RE-EXPORT STAYS because the endpoint is read by name in the foreman, the camera rig and the seed
+// scanner, and one of those is a shipped tool a stranger runs. Renaming the constant across them would
+// buy nothing; having two files each compute `process.env.AUREN_SERVER_HOST || 'localhost'` would be the
+// parallel-array fault this file exists to prevent (Law 16), and that is what this line avoids.
+const SERVER_ENDPOINT = require('../your_server');
 
 // Fleet pecking order for peer tiebreaks. Lower = elder = higher priority; a bot absent from this table
 // ranks most-junior and yields to all.
@@ -1293,6 +1304,7 @@ for (const alias of Object.keys(ORDER_ALIASES)) {
 module.exports = {
     WORLD_DEPTH_FLOOR_Y,
     SPAWN_PROTECTION_RADIUS,
+    PERSON_CLEAR_OF_SPAWN,
     SERVER_MINECRAFT_VERSION,
     SERVER_ENDPOINT,
     BOT_SENIORITY,

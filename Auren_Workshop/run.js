@@ -1,12 +1,35 @@
 // module: run
-// purpose: THE ONE SCRIPT. Reads `run_config.js` once, then performs the whole run without being driven.
+// purpose: THE ONE SCRIPT. Reads `run_config.js`'s `run` block once, then performs the whole run without
+//          being driven. **It joins a world that is already running.**
 //
-//     . .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\run.js
+//     1. start your Minecraft server
+//     2. . .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\run.js
 //
 // There are no flags. Everything a run can be told is on the page next door, which is the point
 // (Architect 2026-09-10: *"you make all the configurations before you start anything on one page then
 // you click the same runscript and it runs according to the configure"*). A flag here would be a second
 // place to say the same thing, and the two would disagree the first time somebody used both (Law 16).
+//
+// ── IT DOES NOT START, STOP OR ROLL BACK A WORLD, AND THAT IS ITS DEFINITION (Architect 2026-09-11) ───
+// *"i have a script that autostarts the server, then when its the bots turn to connect its a seperate
+// piece that only cares if the server is there not if the script runs correctly? so law 1. isolated verb.
+// my script autostarts server then foreman check to see if the server is there not if i started it with
+// the script. this is so a stranger can use it. i want an architect and a user start to be identical."*
+//
+// This file asks the world exactly ONE question — **are you there** — and gets its answer from the world,
+// by dialling the address in `Auren_Bot/your_server.js` and speaking to it. It never asks, and cannot
+// find out, who started that world. A stranger starts theirs by hand; `host_and_run.js` starts his in the
+// same pass and then runs THIS FILE as a child process. Both arrive here identical, because the thing
+// that differs happened outside and left no trace in the config this file reads (Law 1, decoupled).
+//
+// WHAT THIS REPLACED IS THE SHAPE, NOT A FEATURE. A `server: 'local' | 'already-up' | 'auto'` field stood
+// on the config page and this file branched on it — minting a console password, stopping a JVM, restoring
+// a snapshot, starting a JVM, and stopping it again at teardown. Every one of those needs the server
+// FOLDER, which only a host has, so the branch meant the Architect's run and a stranger's run were two
+// different sequences through one file and only one of them was ever exercised here. All of it moved to
+// `host_and_run.js`, whole, and none of it was rewritten on the way (`fleet_control`'s `server-start`,
+// `server-stop` and `snapshot-restore` were already the isolated verbs — what was missing was a caller
+// that was not this one).
 //
 // ── WHAT THIS REPLACED, AND WHY IT IS LESS CODE RATHER THAN MORE ─────────────────────────────────────
 // Nine named tests, two conductors and three PowerShell launchers, all of which started a fleet. Each
@@ -35,6 +58,7 @@
 // one feature and certifying the whole tree, and no two runs test the same thing.
 
 'use strict';
+require('../js_kernel/utils/developer_door').enter('Auren_Workshop/run.js');
 
 const fs = require('fs');
 const path = require('path');
@@ -43,42 +67,57 @@ const { spawn, spawnSync, execFileSync } = require('child_process');
 const paths = require('./workshop_paths');
 paths.registerAliases();
 const rcon = require(paths.bot('js_kernel/utils/rcon_link'));
-const workstation = require(paths.bot('js_kernel/utils/workstation'));
+// `workstation` (which Java, which server FOLDER) is deliberately NOT required here any more: this script
+// never touches a server folder, so having the resolver in scope would be an invitation to start.
 // The one owner of "open a visible console window" — this runner's children are watched through it.
 const consoleWindow = require(paths.bot('js_kernel/utils/console_window'));
 
-const CONFIG = require('./run_config');
+// ONLY THE `run` BLOCK. The page's other block, `hosting`, belongs to `host_and_run.js` and this file
+// does not read it, validate it, or know what is in it — which is what makes the two verbs separable
+// rather than merely separated (Law 1). Destructured here so there is no `CONFIG.hosting` in scope to
+// reach for by accident.
+const { run: CONFIG } = require('./run_config');
 
-// ── THE CONFIG IS PROVED WHOLE BEFORE THE WORLD IS TOUCHED (Law 13) ─────────────────────────────────
+// ── THE CONFIG IS PROVED WHOLE BEFORE ANYTHING IS TOUCHED (Law 13) ──────────────────────────────────
 // Every field is checked against the values it permits, and an unknown field is an error rather than
 // something ignored — a typo in a key would otherwise read as "left at its default" and the run would
 // quietly not be the run that was asked for. Nothing below this block can be reached by a config that
 // does not make sense, which is why none of the phases carry their own validation.
 const PERMITTED = {
-  world:    ['fresh', 'continue', 'as-is'],
+  memory:   ['clear', 'keep'],
   clock:    ['dawn', 'day', 'held'],
   crew:     ['homesteader', 'contractor'],
   record:   ['off', 'cameras', 'film'],
   teardown: ['down', 'leave-up'],
-  server:   ['already-up', 'local'],
 };
 const WAKE_SIGS = ['error', 'halt', 'death'];
 const SHAPE = {
-  world: 'enum', snapshot: 'string', worldName: 'string', clock: 'enum', person: 'string',
+  memory: 'enum', clock: 'enum', person: 'string',
   standing: 'string', crew: 'enum', soak: 'number', watch: 'boolean', wake: 'list',
-  stream: 'list', record: 'enum', teardown: 'enum', server: 'enum', host: 'string',
-  // `rconPassword` STOOD HERE AND IS GONE (Architect 2026-09-10: *"no password at all for local server.
-  // theres no ports open."*). It is absent from this list on purpose: the validator refuses any key it
-  // does not name, so leaving the page's old field in place would now be caught and reported rather than
-  // read and silently ignored — which is the behaviour wanted, since a password typed on that page would
-  // no longer do anything. Where the value comes from instead: `mintLocalConsolePassword()` below.
-  port: 'number', rconPort: 'number',
+  stream: 'list', record: 'enum', teardown: 'enum',
+  // ── FIVE KEYS STOOD HERE AND ARE GONE, EACH FOR ITS OWN REASON. They are absent on purpose: the
+  // validator refuses any key it does not name, so a page still carrying one is REPORTED by name rather
+  // than read and silently ignored, which is the failure a move like this otherwise causes.
+  //   `server`                 — the whole question of who starts the world. Moved to `host_and_run.js`,
+  //                              where it is not a question at all: that script is the host (2026-09-11).
+  //   `world` `snapshot`       — rolling a world back needs the server folder and the server stopped.
+  //   `worldName`                Now `hosting.world` / `.snapshot` / `.worldName`, same page, other block.
+  //                              What `world: 'fresh'` also did — wiping the bots' notes — stayed here
+  //                              and is now `memory: 'clear'`, which anybody can do.
+  //   `host` `port` `rconPort` — in `Auren_Bot/your_server.js`, the one page a downloader edits and the
+  //                              one answer the bots, the foreman, the camera rig and the seed scanner
+  //                              all read. This script is only one of that file's readers (Law 16).
+  //   `rconPassword`           — same file, or `AUREN_RCON_PASSWORD`. A hosted run is handed a freshly
+  //                              minted one through the environment and never sees it on any page.
 };
+
+// WHERE THE WORLD IS — read from the one page a downloader edits, never restated here (Law 16).
+const WORLD = require(paths.bot('your_server.js'));
 const NAME_OK = /^[A-Za-z0-9_]{3,16}$/;
 const COORDS_OK = /^-?\d+\s+-?\d+\s+-?\d+$/;
 
 function refuse(lines) {
-  console.error(`\n  run: NOTHING WAS STARTED — Auren_Workshop/run_config.js does not make sense yet.\n`);
+  console.error(`\n  run: NOTHING WAS STARTED — Auren_Workshop/run_config.js's 'run' block does not make sense yet.\n`);
   for (const l of lines) console.error(`    ${l}`);
   console.error(`\n  Fix the page and run the same command again.\n`);
   process.exit(1);
@@ -117,137 +156,40 @@ function validate(c) {
   }
   if (typeof c.soak === 'number' && c.soak <= 0) wrong.push(`soak: ${c.soak} minutes is not a run`);
 
-  // ── THE ONE CROSS-FIELD RULE, AND IT IS A FACT ABOUT MINECRAFT RATHER THAN A POLICY ───────────────
-  // A snapshot cannot be restored under a running server: world files mid-write are not a world, and
-  // `rollback.ps1` refuses for that reason. So asking for a fresh world while declaring the server
-  // somebody else's business is asking for two things that cannot both happen, and the honest moment
-  // to say so is now — before a rollback has half-happened to a world that was serving players.
-  // THE SNAPSHOT IS PROVED TO EXIST BEFORE THE SERVER IS STOPPED, NOT DURING THE ROLLBACK. Without
-  // this the sequence gets as far as taking the world down and only then discovers there is nothing to
-  // restore — which leaves the machine in a worse state than it started in, for a fault that was
-  // knowable before anything moved (Law 13). Measured on this workstation: `world_snapshots/` did not
-  // exist at all, so the shipped default named a baseline that was never here.
-  if (c.world === 'fresh' && typeof c.snapshot === 'string' && typeof c.worldName === 'string') {
-    // The server folder is the workstation resolver's answer — AUREN_SERVER_DIR, then the Architect's
-    // workstation file (Law 16) — and a fresh world with no server folder to roll it back in is refused
-    // here, by name, for the same reason as a missing snapshot.
-    const server = workstation.findServerDir();
-    const home = server.dir && path.join(server.dir, 'world_snapshots', c.worldName);
-    const asDir = home && path.join(home, c.snapshot);
-    if (!home) {
-      wrong.push(`world: 'fresh' rolls a world back, and there is no server folder to roll it back in.`);
-      wrong.push(`  tried: ${server.tried.join(', ')}`);
-      wrong.push(`  Set AUREN_SERVER_DIR to the folder that holds your server's server.properties.`);
-    } else if (!fs.existsSync(asDir) && !fs.existsSync(`${asDir}.zip`)) {
-      const have = fs.existsSync(home) ? fs.readdirSync(home) : [];
-      wrong.push(`snapshot: there is no '${c.snapshot}' to roll back to. Looked in ${home}`);
-      wrong.push(have.length ? `  What is there: ${have.join(', ')}` : `  That folder holds no snapshots at all.`);
-      wrong.push(`  Either name one that exists, or set world: 'as-is' / 'continue' to keep the world`);
-      wrong.push(`  that is running. To make this world the baseline: stop the server, then`);
-      wrong.push(`      node Auren_Workshop/fleet_control.js snapshot --name=${c.snapshot}`);
-    }
-  }
-
-  if (c.world === 'fresh' && c.server === 'already-up') {
-    wrong.push(`world: 'fresh' needs to stop the server to roll the world back, so it cannot run with`);
-    wrong.push(`  server: 'already-up'. Either set server: 'local' (this script owns the world), or set`);
-    wrong.push(`  world: 'continue' / 'as-is' to keep the world that is running.`);
-  }
+  // THERE ARE NO CROSS-FIELD RULES LEFT, and their absence is the shape of the change rather than a gap
+  // (2026-09-11). The only one this file ever had was "a fresh world cannot be rolled back under a running
+  // server" — a fact about who owns the server folder, which is now a fact about `host_and_run.js` and is
+  // checked there, before it stops anything. Every field above is independent of every other, which is
+  // what a page belonging to ONE verb looks like.
   if (wrong.length) refuse(wrong);
 }
 validate(CONFIG);
 
-// ── THERE IS NO CONSOLE PASSWORD TO SET FOR A LOCAL WORLD (Architect 2026-09-10) ─────────────────────
-// *"no password at all for local server. theres no ports open."*
+// ── THE ONE THING THIS SCRIPT NEEDS FROM THE WORLD, AND THE ONLY WAY IT CAN GET IT ──────────────────
+// A crew is placed beside a person through the server's console (RCON), so a console this script cannot
+// reach is a run it cannot do. `WORLD` is `Auren_Bot/your_server.js`, which reads the environment first
+// and its own values second — so a hosted run, which mints a password and exports it before spawning this
+// file, arrives here through the SAME two lines a stranger's typed-in password does. There is no branch
+// for who set it, because there is nothing in either case to branch on.
 //
-// A LITERALLY BLANK ONE IS NOT AVAILABLE, and Minecraft rather than this file is what settles that. Asked
-// directly, with `rcon.password=` empty in server.properties, the server answers:
+// A BLANK PASSWORD IS NOT A BLANK FIELD, and Minecraft rather than this file settles that: with
+// `rcon.password=` empty in server.properties the server answers
 //     [Server thread/WARN]: No rcon password set in server.properties, rcon disabled!
-// and the port never opens. The fleet reaches the world's console to place a crew beside a person, so
-// "no rcon" is "no run" — a blank password does not remove the password, it removes the feature.
-//
-// SO THE PASSWORD IS REMOVED FROM HIS SIDE INSTEAD OF FROM THE PROTOCOL. For `server: 'local'` this
-// script owns the world's whole lifecycle: it writes server.properties, starts the server, and is the
-// only thing that connects. That means it can MINT a fresh random one per run and hand it to both ends.
-// Nothing to choose, nothing to remember, nothing to type, and no credential sitting in a tracked file
-// for the extract to carry — which is the same answer to "should the shipped config page hold his
-// password" that was still open from the previous turn.
-//
-// `already-up` CANNOT BE TREATED THE SAME WAY, and that asymmetry is deliberate rather than an omission
-// (Law 13 — never default a missing field). That server is somebody's already-running world; this script
-// does not own it, must not rewrite its properties, and cannot guess what it was started with. So it is
-// asked for by name, through the environment, and refused if absent.
-const OWNS_THE_SERVER = CONFIG.server === 'local';
-
-// The server folder is the workstation resolver's answer (AUREN_SERVER_DIR, then the Architect's
-// workstation file). Null when neither names one — which only matters for `server: 'local'`, and the mint
-// below refuses by name when it does.
-const SERVER_FOLDER = workstation.findServerDir().dir;
-const PROPS_FILE = SERVER_FOLDER ? path.join(SERVER_FOLDER, 'server.properties') : null;
-
-// WHAT THE FILE SAYS RIGHT NOW, which is the password of the server that is RUNNING right now.
-// That equivalence is the whole discipline of the two functions below and it is only true while the mint
-// happens after the stop — see `mintLocalConsolePassword`.
-function consolePasswordOnFile() {
-  if (!fs.existsSync(PROPS_FILE)) return '';
-  const m = /^rcon\.password=(.*)$/m.exec(fs.readFileSync(PROPS_FILE, 'utf8'));
-  return m ? m[1].trim() : '';
-}
-
-// ── THE MINT HAPPENS AFTER THE OLD SERVER IS STOPPED, AND THAT ORDER IS THE FIX (2026-09-10) ────────
-// This used to run at module load, before anything else, and it destroyed the credential needed to stop
-// the server that was already up: `server-stop` reads the password from this same file, so it presented
-// the NEW one to a JVM booted with the OLD one and got `rcon auth refused`. The stop then correctly
-// refused to hard-kill a live world, the rollback hit a locked `session.lock`, and the run halted with
-// nothing started — a sequence whose every step was right and whose order was wrong. The symptom reads
-// as a wrong password and is actually a stale process, which is the confusion the old comment here
-// warned about while the code caused it.
-//
-// So: the file holds the RUNNING server's password until that server is gone, and only then is a new one
-// written. Called exactly once, from the world phase, between the stop and the start.
-function mintLocalConsolePassword() {
-  // Random per run, so it is never a shared secret and never the same twice. Not cryptographic and it
-  // does not need to be: it authenticates this script to a loopback port on a world it just created.
-  const token = `auren-${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 6)}`;
-  if (!fs.existsSync(PROPS_FILE)) {
-    refuse([`server: 'local' but there is no server folder with a server.properties to configure.`,
-            `  This script starts the world it tests, so it needs the server it is starting.`,
-            `  Set AUREN_SERVER_DIR to the folder that holds your server's server.properties.`]);
-  }
-  const before = fs.readFileSync(PROPS_FILE, 'utf8');
-  const after = /^rcon\.password=.*$/m.test(before)
-    ? before.replace(/^rcon\.password=.*$/m, `rcon.password=${token}`)
-    : `${before.replace(/\s*$/, '')}\nrcon.password=${token}\n`;
-  // Written before the server BOOTS, because the server reads this file once at boot.
-  fs.writeFileSync(PROPS_FILE, after);
-  CREDS.password = token;
-  return token;
-}
-
-const PASSWORD_AT_START = OWNS_THE_SERVER
-  ? consolePasswordOnFile()
-  : (process.env.AUREN_RCON_PASSWORD || '');
-if (!PASSWORD_AT_START && !OWNS_THE_SERVER) {
-  refuse([`server: '${CONFIG.server}' points at a world this script does not own, and`,
-          `  AUREN_RCON_PASSWORD is not set. A crew cannot be placed beside a person without that`,
-          `  world's console, so the run stops rather than guessing at it.`,
+// and never opens the port at all. So a blank one removes the console rather than the password, which is
+// why it is refused here by name instead of tried and failed on later (Law 13).
+const CREDS = { port: WORLD.rconPort, password: WORLD.rconPassword };
+if (!CREDS.password) {
+  refuse([`No console password has been given for the world at ${WORLD.host}:${WORLD.port}.`,
+          `  A crew cannot be placed beside a person without that world's console, so the run stops`,
+          `  rather than guessing at it.`,
           ``,
-          `  For a world this script starts for you, set server: 'local' — it mints its own console`,
-          `  password every run and there is nothing for you to choose.`]);
-}
-// A LOCAL WORLD WITH A BLANK PASSWORD ON FILE IS ONLY SURVIVABLE WHERE A MINT IS COMING, and that is
-// `world: 'fresh'` alone. A continue or an as-is run starts the server from this file untouched, and
-// Minecraft answers a blank password by disabling rcon and never opening the port — so the run would
-// come up and then fail to reach its own console (Law 13 — refuse the missing field, never default it).
-if (OWNS_THE_SERVER && !PASSWORD_AT_START && CONFIG.world !== 'fresh') {
-  refuse([`server: 'local' with world: '${CONFIG.world}' starts the server from`,
-          `  MinecraftServer/server.properties as it stands, and rcon.password there is empty.`,
-          `  Minecraft answers a blank one by disabling rcon outright, so the console this run needs`,
-          `  would never open.`,
+          `  THE SPOT TO CHANGE:  Auren_Bot/your_server.js   ->   rconPassword`,
+          `  (or set AUREN_RCON_PASSWORD, which wins over that file.) It must match rcon.password in`,
+          `  your server.properties, and that server needs enable-rcon=true.`,
           ``,
-          `  world: 'fresh' mints a fresh password for you. For this world, put any value on that line.`]);
+          `  If this machine HOSTS the world, run Auren_Workshop/host_and_run.js instead — it starts the`,
+          `  server, mints a password for it and hands it to this script, and there is nothing to type.`]);
 }
-const CREDS = { port: CONFIG.rconPort, password: PASSWORD_AT_START };
 const EXTRACT = paths.bot();     // the tree this file lives in — see clearMemory's header for why there is no copy
 const TRACE = path.join(EXTRACT, 'fleet_logs', 'traces', 'watcher_overseer.jsonl');
 
@@ -374,15 +316,22 @@ async function waitForPlayer(name, timeoutMs) {
 // is, because a person standing in a river is a legitimate thing to test and the desk's own refusal is
 // the honest outcome (Law 25). Returning the verdict rather than acting on it keeps that decision at the
 // call site.
-const PERSON_SETTLE_MS = 30000;
+//
+// STILL IS NOT SETTLED WHILE THE BODY HAS NOT LEFT (measured 2026-09-11). The proxy waits up to 20s for
+// the survey area's chunks before it moves at all, and that wait is perfectly still — three matching
+// polls passed at 10:48:14, seven seconds after `architect` logged in at (1.5,74,-9.5), and the run
+// measured a body that had not started moving. So a caller hands in `settled(at)` — where the body has
+// to BE — and a position that fails it does not count toward stillness. 90s covers the proxy's slowest
+// honest path: survey wait 20s + /tp 2s + eight step-out moves at 2s + chunk wait 8s + /tp 2s ≈ 50s.
+const PERSON_SETTLE_MS = 90000;
 const STILL_POLL_MS = 1000;
 const STILL_CONSECUTIVE = 3;
-async function waitForStillness(name, timeoutMs) {
+async function waitForStillness(name, timeoutMs, settled = () => true) {
   let last = null;
   let same = 0;
   for (const end = Date.now() + timeoutMs; Date.now() < end;) {
     const at = await rcon.entityPos(name, { creds: CREDS });
-    const key = at ? `${Math.floor(at.x)}|${Math.floor(at.y)}|${Math.floor(at.z)}` : null;
+    const key = at && settled(at) ? `${Math.floor(at.x)}|${Math.floor(at.y)}|${Math.floor(at.z)}` : null;
     if (key && key === last) {
       if (++same >= STILL_CONSECUTIVE) {
         say(`${name} has stopped moving at (${key.split('|').join(',')}) — that is the cell the crew is fetched to`);
@@ -394,8 +343,8 @@ async function waitForStillness(name, timeoutMs) {
     last = key;
     await sleep(STILL_POLL_MS);
   }
-  say(`${name} was still moving after ${timeoutMs / 1000}s — the crew is fetched to wherever it is now, `
-    + `and the placement checks below measure what actually happened`);
+  say(`${name} had not come to rest where it has to be after ${timeoutMs / 1000}s — the placement checks `
+    + `below measure where it actually is`);
   return false;
 }
 
@@ -436,9 +385,9 @@ async function waitForStillness(name, timeoutMs) {
 //      the room by name, every run, and says what it removed.
 function clearRecords() {
   phase('the records room');
-  // NOT GATED ON `world: 'fresh'`, and that separation is the point (Law 29). `continue` carries what the
-  // bots KNOW; records are EXHAUST that nothing running reads. A continue that inherited the last run's
-  // trace would make every lens answer about two runs at once, which is the one thing the rule forbids.
+  // NOT GATED ON `memory`, and that separation is the point (Law 29). `memory: 'keep'` carries what the
+  // bots KNOW; records are EXHAUST that nothing running reads. A run that inherited the last run's trace
+  // would make every lens answer about two runs at once, which is the one thing the rule forbids.
   const { sweepRecords, RECORDS_DIR } = require(paths.bot('js_kernel', 'utils', 'record_homes'));
   const swept = sweepRecords();
   if (!swept.swept) return say(`nothing to clear — no ${path.basename(RECORDS_DIR)}/ yet, the first writer makes it`);
@@ -447,14 +396,20 @@ function clearRecords() {
     : 'the records room was already empty');
 }
 //
-// WHAT A `fresh` RUN STILL HAS TO DO is clear what the bots KNOW, and it is now cleared in place rather
-// than sidestepped by building somewhere empty. `corporate_headquarters.<bot>.json` and `player_memory/`
-// are untracked runtime state, and both halves of what a bot knows — the world, and its own notes about
-// that world — have to move together, which is the reason `fresh` and `continue` are one field.
+// WHAT THE BOTS KNOW is cleared in place rather than sidestepped by building somewhere empty.
+// `corporate_headquarters.<bot>.json` and `player_memory/` are untracked runtime state, and both halves of
+// what a bot knows — the shared record of the base, and its own private notes — move together, which is
+// why `memory` is ONE field covering both rather than two that could disagree.
+//
+// IT IS A RUN SETTING AND NOT A HOSTING ONE (2026-09-11). This used to be the second half of
+// `world: 'fresh'`, which also rolled the server's world folder back — fusing something anybody can do
+// (delete the bots' own files, inside the bot) with something only a host can (restore a snapshot, with
+// the server stopped). Pair `memory: 'clear'` with `hosting.world: 'fresh'` for the old baseline; the
+// point of the split is that a stranger can have the first without needing the second.
 function clearMemory() {
   phase('the bots\' own memory');
-  if (CONFIG.world === 'continue') {
-    return say('carried forward — this is a continue, and wiping what the bots know would defeat it');
+  if (CONFIG.memory === 'keep') {
+    return say('carried forward — memory: \'keep\', so what the bots know survives this run');
   }
   const kernel = path.join(EXTRACT, 'js_kernel');
   let wiped = 0;
@@ -539,19 +494,20 @@ function teardown(why) {
     // that mode.
     if (c.window) consoleWindow.closeWindow(c.window.pid);
   }
-  if (CONFIG.server === 'local') fleetControl(['server-stop']);
-  say('desk, crew and person are down.');
+  // THE WORLD IS LEFT RUNNING, ALWAYS. This script did not start it and has no business ending it —
+  // whoever did owns that, and on a hosted run that is `host_and_run.js`, after this process returns.
+  say('desk, crew and person are down. The world is left exactly as it was found: running.');
 }
 
 // ── THE RUN ─────────────────────────────────────────────────────────────────────────────────────────
 (async () => {
-  console.log(`\n══ run — ${CONFIG.world} world · ${CONFIG.crew} · ${CONFIG.soak} min`
+  console.log(`\n══ run — ${CONFIG.crew} · ${CONFIG.soak} min · memory ${CONFIG.memory}`
     + `${CONFIG.watch ? ' · watched' : ''}${CONFIG.record !== 'off' ? ` · ${CONFIG.record}` : ''} ══`);
   say(`the fleet      ${EXTRACT}`);
-  say(`the world      ${CONFIG.host}:${CONFIG.port}   (${CONFIG.server})`);
+  say(`the world      ${WORLD.host}:${WORLD.port}   (joined, not started)`);
   say(`the person     ${CONFIG.person}, standing at ${CONFIG.standing}`);
 
-  // ── PREFLIGHT IS THE FIRST STEP, BEFORE THE WORLD IS TOUCHED (Architect 2026-08-10) ───────────────
+  // ── PREFLIGHT IS THE FIRST STEP, BEFORE ANYTHING JOINS (Architect 2026-08-10) ─────────────────────
   // The deleted conductors both ran this in their own preflight, and the reason is worth keeping: a load
   // fault found by the LIVE route surfaces ~40 seconds in — after a rollback, a JVM start and a bot
   // login — and it surfaces wearing the costume of a bot that will not come online. Here it costs
@@ -562,46 +518,49 @@ function teardown(why) {
   phase('preflight — does the tree load at all');
   if (spawnSync(process.execPath, [paths.workshop('tools', 'preflight.js')],
         { stdio: ['ignore', 'inherit', 'inherit'] }).status !== 0) {
-    console.error(`\n  run: preflight failed, so NOTHING was started. The world was not touched and no`);
-    console.error(`  process was launched. Read its output above — it names the file.\n`);
+    console.error(`\n  run: preflight failed, so NOTHING was started. No process was launched and nothing`);
+    console.error(`  joined the world. Read its output above — it names the file.\n`);
     process.exit(1);
   }
   say('the tree loads');
 
-  // ── THE WORLD, SETTLED BEFORE ANYTHING JOINS IT ───────────────────────────────────────────────────
-  // A rollback under a live fleet restores the files beneath running clients, so the order is: nothing
-  // is in the world → change the world → let things in. This is the ordering the three old launchers
-  // each answered separately.
-  phase(`the world (${CONFIG.world})`);
-  if (CONFIG.world === 'fresh') {
-    if (!fleetControl(['down'])) say('nothing was up to bring down, which is the expected state');
-    fleetControl(['server-stop']);
-    // The old world is gone, so its console password is no longer the one that matters. Minted HERE and
-    // not at module load — see `mintLocalConsolePassword` for the run this ordering cost.
-    mintLocalConsolePassword();
-    if (!fleetControl(['snapshot-restore', `--world=${CONFIG.worldName}`, `--snapshot=${CONFIG.snapshot}`])) {
-      console.error(`\n  run: the world could not be rolled back to '${CONFIG.snapshot}'. NOTHING was started —`);
-      console.error(`  a fresh run on last run's world is not the run that was asked for.\n`);
-      process.exit(1);
-    }
-    if (!fleetControl(['server-start'])) {
-      console.error(`\n  run: the world was restored but the server did not come back up. Nothing joined it.\n`);
-      process.exit(1);
-    }
-    say(`rolled back to '${CONFIG.snapshot}' and restarted`);
-  } else if (CONFIG.server === 'local') {
-    fleetControl(['server-start']);
-    say('the local server is up; the world is exactly as the last run left it');
-  } else {
-    say(`left alone — ${CONFIG.world === 'continue' ? 'this is what a continue preserves' : 'staged by hand'}`);
-  }
-
-  // THE CONSOLE IS PROVED BEFORE THE DOWNLOAD IS BUILT, because everything after this needs it and the
-  // cheapest failure is the earliest one.
-  phase('is the world reachable');
+  // ── IS THE SERVER THERE. THAT IS THE WHOLE QUESTION (Architect 2026-09-11, Law 1) ─────────────────
+  // *"when its the bots turn to connect its a seperate piece that only cares if the server is there not
+  // if the script runs correctly… foreman check to see if the server is there not if i started it with
+  // the script."*
+  //
+  // The answer comes from the WORLD, by speaking to it — not from a flag, a lock file, a PID, or an exit
+  // code handed down by whatever started it. That is what makes this script indifferent to who did: a
+  // world started by hand ten minutes ago and one started by `host_and_run.js` four seconds ago are the
+  // same fact at this line, and there is nothing here that could tell them apart even if it wanted to.
+  //
+  // ASKED FIRST, BEFORE ANYTHING IS SWEPT OR LAUNCHED, because everything after it needs the console and
+  // the cheapest failure is the earliest one.
+  //
+  // THE ADDRESS IS ASSUMED, SO A WRONG ONE MUST SAY WHERE IT IS WRITTEN (*"so assume the server is there,
+  // if not crash and report pointing to the spot where to change"*). Nothing here probes for a server,
+  // scans a port range or falls back to a second address — the one in `your_server.js` is tried and that
+  // is all. This is the only place that assumption can be wrong, so it is the place that names the file,
+  // the fields, and what was actually attempted.
+  phase('is the world there');
   const reach = await rcon.probe({ creds: CREDS });
   if (!reach.ok) {
     check('a server is up with rcon enabled', false, reach.reason);
+    console.error(`\n  Nothing answered at ${WORLD.host}:${WORLD.port} (console port ${WORLD.rconPort}).`);
+    console.error(`  This script does not start servers. Start your world, then run it again.`);
+    console.error(``);
+    console.error(`  THE SPOT TO CHANGE:  Auren_Bot/your_server.js`);
+    const field = (name, value, why) => console.error(`      ${name.padEnd(13)}${String(value).padEnd(12)}<- ${why}`);
+    field('host', WORLD.host, 'the computer the world runs on');
+    field('port', WORLD.port, 'server-port in your server.properties');
+    field('rconPort', WORLD.rconPort, 'rcon.port, and enable-rcon must be true');
+    field('rconPassword', WORLD.rconPassword ? '(set)' : '(EMPTY)', 'must equal rcon.password there');
+    console.error(``);
+    console.error(`  If your server IS running with those numbers, it is the console that is off:`);
+    console.error(`  set enable-rcon=true in server.properties and restart it.`);
+    console.error(``);
+    console.error(`  If this machine HOSTS the world, run Auren_Workshop/host_and_run.js — it starts the`);
+    console.error(`  server first and then runs this exact script.\n`);
     return finish('the world could not be reached');
   }
   const before = (await playersOnline()) || [];
@@ -625,8 +584,8 @@ function teardown(why) {
   // desk swept a second time, after this runner had created `console_desk.log` and handed over its
   // descriptor — deleting the desk's console out from under the open handle, silently, on every single
   // run.js-driven run. `start_auren.js`'s sweep site carries the mechanism.
-  const deskArgs = ['start_auren.js', '--host', CONFIG.host, '--port', String(CONFIG.port),
-    '--rcon-password', CREDS.password, '--rcon-port', String(CONFIG.rconPort), '--records', 'keep'];
+  const deskArgs = ['start_auren.js', '--host', WORLD.host, '--port', String(WORLD.port),
+    '--rcon-password', CREDS.password, '--rcon-port', String(WORLD.rconPort), '--records', 'keep'];
   const desk = launch('desk', process.execPath, deskArgs, EXTRACT);
   const deskUp = await waitForPlayer('Foreman', 60000);
   if (!check('the desk joined the world', deskUp,
@@ -684,11 +643,40 @@ function teardown(why) {
   // MEASURED OFF THE SERVER, not read out of the proxy's console. The server is the witness to where a
   // body is (Law 26); parsing the child's log for a "placed" line would make this gate depend on the
   // wording of a sentence written for a person.
-  await waitForStillness(CONFIG.person, PERSON_SETTLE_MS);
+  //
+  // ── AND WHERE IT HAS TO COME TO REST IS CLEAR OF WORLD SPAWN (Architect 2026-09-11) ───────────────
+  // *"you were supposed to have architect bot teleport away from world center before having it call
+  // foreman get… it should be atleast 50 blocks away from world center"*. The proxy moves the body; this
+  // is the witness that it did, measured off the server's position and the world's own level.dat (Law 26)
+  // BEFORE the one command that raises a crew. Both runs of that afternoon fetched their crews to world
+  // spawn, and the second spent its soak refused inside the protected square. The same distance is what
+  // the stillness wait counts toward, so a body resting at spawn while the proxy surveys is not "settled".
+  //
+  // The spawn comes from fleet_control's `world-spawn` verb — `worldSpawn`, the one level.dat reader.
+  const minFromSpawn = require(paths.bot('Thinking_fragments/architect_config.js')).PERSON_CLEAR_OF_SPAWN;
+  const spawnReply = spawnSync(process.execPath, [paths.workshop('fleet_control.js'), 'world-spawn'], { encoding: 'utf8' });
+  const spawnLine = (spawnReply.stdout || '').trim().split('\n').pop();
+  const spawnAt = spawnReply.status === 0 && spawnLine ? JSON.parse(spawnLine) : null;
+  if (!check('the world spawn is known', spawnAt !== null,
+    spawnAt ? `(${spawnAt.x},${spawnAt.z})`
+      : `it could not be read — ${(spawnReply.stderr || '').trim() || 'fleet_control world-spawn said nothing'}`)) {
+    return finish('the world spawn could not be read, so the person\'s distance from it cannot be measured');
+  }
+  const fromSpawn = at => Math.max(Math.abs(at.x - spawnAt.x), Math.abs(at.z - spawnAt.z));
+  await waitForStillness(CONFIG.person, PERSON_SETTLE_MS, at => fromSpawn(at) >= minFromSpawn);
   const personAt = await rcon.entityPos(CONFIG.person, { creds: CREDS });
   if (!check(`${CONFIG.person} has a position to be brought to`, !!personAt,
     personAt ? `(${personAt.x},${personAt.y},${personAt.z})` : 'the server reported no position')) {
     return finish('the person had no position');
+  }
+  // The proxy's own last lines ride along on a failure — they are the only place that says WHY it did
+  // not move (no acceptable biome, no op, water under every aim), and without them this check names the
+  // symptom and nothing else. Shown, never parsed: the verdict is the server's number.
+  if (!check(`${CONFIG.person} stands at least ${minFromSpawn} blocks from world spawn`,
+    fromSpawn(personAt) >= minFromSpawn,
+    fromSpawn(personAt) >= minFromSpawn ? `${fromSpawn(personAt)} blocks from world spawn (${spawnAt.x},${spawnAt.z})`
+      : `${fromSpawn(personAt)} blocks from world spawn (${spawnAt.x},${spawnAt.z}). It said: ${person.read().slice(-900)}`)) {
+    return finish('the person was not moved clear of world spawn');
   }
 
   // ── THE CAMERAS GO UP BEFORE THE CREW, NOT AFTER ──────────────────────────────────────────────────

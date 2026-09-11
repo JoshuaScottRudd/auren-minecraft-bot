@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/proxy_human.js');
 // tool: proxy_human — A PERSON IN THE WORLD, TYPING FROM THE TERMINAL.
 //
 //   "im not always at a computer so is it possible to make a proxy human that i can type commands into
@@ -79,14 +80,15 @@ paths.registerAliases();
 process.env.BOT_ID = process.env.BOT_ID || 'proxy_human';
 
 const { guardExternalSync } = require('@utils/external_library_guard');
-const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX, ACCEPTABLE_BIOMES } = require('@thinking/architect_config');
+const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX, ACCEPTABLE_BIOMES, PERSON_CLEAR_OF_SPAWN } = require('@thinking/architect_config');
 
 // ── THE FLEET'S OWN EYES, NOT A SECOND OPINION (Law 16, and seed_scanner's own rule) ────────────────
-// `--stand=biome` reads the ground with `@perception/biome_scanner` — the same node the bots survey with
+// `--stand=biome` reads the biome with `@perception/biome_scanner` — the same node the bots survey with
 // — and judges it against `ACCEPTABLE_BIOMES`, the same set `find_buildingspot` gates on. A world vetted
 // here with anything else would be vetted with an opinion the fleet does not hold. The scanner REPORTS
-// and decides nothing (Law 0); the choosing is this file's and is written out in `idealBiomeCell`.
-const { scanBiomes } = require('@perception/biome_scanner');
+// and decides nothing (Law 0); the choosing is this file's and is written out in `placeInBiome`.
+const { getBiomeName } = require('@perception/biome_scanner');
+const watcher = require('@kernel/watcher');
 const { armSpawnProtection, spawnProtectionBox } = require('@perception/spawn_protection');
 
 // WHERE THE PACKAGES LIVE IS ASKED, NEVER ASSUMED. The portable node distribution differs per machine and
@@ -180,6 +182,12 @@ const rl = readline.createInterface({ input: process.stdin, output: process.stdo
 // After the terminal is closed there is no prompt to redraw and no composition to protect, so it degrades
 // to a plain write rather than reaching into a closed interface.
 let terminalOpen = true;
+// PLACEMENT DECISIONS GO INTO THE TRACE AS WELL AS THE TERMINAL (2026-09-11). `say` writes only this
+// process's console, which no lens reads, so a run that failed on where the person stood could not say
+// why: run four's survey ran, placed nobody, and the reason left with the console. Where the person was
+// put, and why, is a fact about the run, so it is written where the lens reads (Law 26).
+function record(text) { say(`proxy_human: ${text}`); watcher.summary(TAG, text); }
+
 function say(text) {
   if (!terminalOpen) { process.stdout.write(text + '\n'); return; }
   readline.cursorTo(process.stdout, 0);
@@ -384,9 +392,21 @@ async function waitForChunk(reader, cell) {
 // region is a SQUARE — using Euclidean distance here would pass cells that sit inside a corner of it.
 const BASE_MARGIN = 32;
 
-// Reported honestly rather than defaulted (Law 13): a scan that finds nothing acceptable leaves the body
-// where the server put it and says which of the three reasons applied, because "no good biome within
-// reach" and "the world spawn is still unknown" are different worlds and want different responses.
+// ── WHERE THE PERSON MUST END (Architect 2026-09-11) ────────────────────────────────────────────────
+// *"it should be atleast 50 blocks away from world center"* — `floorFrom` is where the body must END,
+// measured the same Chebyshev way as the square: PERSON_CLEAR_OF_SPAWN, or the base clearance above if
+// that were ever the larger. A spot the biome search finds is already proven standable, so it is held to
+// the floor itself. `clearanceFrom` adds PLACEMENT_RADIUS for the one BLIND move, `stepClearOfSpawn`:
+// the ground there is unread, and the ground test that follows may still move the body that far back
+// toward spawn.
+function floorFrom(box) { return Math.max(PERSON_CLEAR_OF_SPAWN, box.radius + BASE_MARGIN); }
+function clearanceFrom(box) { return floorFrom(box) + PLACEMENT_RADIUS; }
+function fromSpawn(box, x, z) { return Math.max(Math.abs(x - box.centerX), Math.abs(z - box.centerZ)); }
+
+// Reported honestly rather than defaulted (Law 13): a scan that finds nothing acceptable says which of
+// the reasons applied, because "no good biome within reach" and "the world spawn is still unknown" are
+// different worlds and want different responses. Either way the body is then stepped clear of spawn by
+// `stepClearOfSpawn`, which runs after every kind of placement.
 // ── THE SURVEY WAITS FOR THE WORLD, AND THE FIRST VERSION OF THIS DID NOT (measured 2026-09-10) ─────
 // `biome_scanner.getBiomeName` returns null for a column `bot.world.getColumnAt` has never seen — a
 // deliberate choice with its own note, because `getBiome` answers 0 for an unloaded column and biome 0
@@ -423,58 +443,62 @@ async function waitForSurveyArea(reader, at) {
   return { ready: false, loaded: loaded(), of: probes.length };
 }
 
-async function idealBiomeCell(reader, at) {
+async function placeInBiome(reader, at) {
+  const { ringScan, formatRejections, evaluateOpenBox, surfaceY, REASON } =
+    require(path.join(paths.bot('js_kernel', 'utils'), 'site_geometry.js'));
   const box = spawnProtectionBox(bot);
   const area = await waitForSurveyArea(reader, at);
   if (!area.ready) {
-    say(`proxy_human: only ${area.loaded} of ${area.of} survey probes had chunks after ${SURVEY_WAIT_MS}ms `
+    record(`only ${area.loaded} of ${area.of} survey probes had chunks after ${SURVEY_WAIT_MS}ms `
       + `— the biome choice below is made from the ground that did arrive.`);
   }
-  const scan = guardExternalSync(TAG, 'biome_scanner survey for the landing cell', () => scanBiomes(bot));
-  if (!scan.ok) return { cell: null, why: `the biome survey did not run — ${scan.reason}` };
+  // CLEARANCE IS MEASURED FROM THE REAL SQUARE, AND NO SQUARE MEANS NO CHOICE. A box of null means the
+  // spawn packet has not arrived, and inventing a centre would put the person in the one place this is
+  // trying to avoid — so the search declines and says why.
+  if (!box) return record('--stand=biome found no spot — the world spawn is not known yet (no spawn_position packet received).');
+  const from = floorFrom(box);
 
-  const patches = (scan.value && scan.value.patches) || [];
-  const acceptable = patches.filter(p => ACCEPTABLE_BIOMES.has(p.biome));
-  if (!acceptable.length) {
-    return {
-      cell: null,
-      why: `no ${[...ACCEPTABLE_BIOMES].length}-way acceptable biome in ${patches.length} patch(es) within `
-        + `the surveyed area. Found: ${[...new Set(patches.map(p => p.biome))].join(', ') || 'nothing'}`,
-    };
-  }
-
-  // CLEARANCE IS MEASURED FROM THE REAL SQUARE WHEN THE SERVER HAS NAMED IT, and when it has not the
-  // whole rule is skipped rather than guessed at — a box of null means either the rule is off (radius 0)
-  // or the spawn packet has not arrived, and inventing a centre would put the base in the one place this
-  // is trying to avoid.
-  const clearOf = (p) => {
-    if (!box) return true;
-    const need = box.radius + BASE_MARGIN;
-    return Math.max(Math.abs(p.centroid.x - box.centerX), Math.abs(p.centroid.z - box.centerZ)) >= need;
+  // ── OUTWARD FROM THE LINE, AND THE FIRST SPOT THAT PASSES IS THE SPOT (Architect 2026-09-11) ──────
+  // *"how about just search in a circle like you did and a spot only counts if the standing spot is in
+  // the correct biome? with a 3 by 3 clearance centered around the bot"* — and just before it, *"as long
+  // as its in the biome then its ok. edge of the biome is ok. as long as the bot can stand in the biome
+  // with nothing blocking, and its not close to world spawn"*. So a spot is exactly three things:
+  //   · at least `from` blocks from world spawn (Chebyshev, the protected square's own shape) — the
+  //     sweep's `minRadius`;
+  //   · a 3×3 floor centred on the person with 2 clear above every cell, read as-is — `evaluateOpenBox`,
+  //     the same test the desk and the arena use (Law 16);
+  //   · the biome AT THE FEET is acceptable — `biome_scanner.getBiomeName`, the one biome read.
+  // `ringScan` walks outward from that line nearest-first and stops at the first spot, finishing only the
+  // few rings that could still hold a closer one; a column with no chunk answers UNLOADED, which is how it
+  // knows it has reached the edge of the map. The height comes from the ground it read, so the move is a
+  // plain /tp to that block. It replaced a version that gathered every qualifying survey cell, sorted
+  // them and took the first, and demanded 12 blocks of the same biome on every side (*"i dont know why
+  // that 28 by 28 exists"*).
+  //
+  // THE SURFACE FIRST, THEN THE BOX. `evaluateOpenBox` finds each floor with `floorNearest`, the floor
+  // nearest the reference height — and the only reference here is the body's height back at spawn, so a
+  // cave floor at that level would beat grass 20 blocks above it. `surfaceY` (topmost ground) gives the
+  // reference the box then reads from.
+  const isSpot = (x, z) => {
+    const top = surfaceY(reader, x, z, at.y);
+    if (!top) return { valid: false, reason: reader.blockAt(x, at.y, z) === null ? REASON.UNLOADED : REASON.NO_FLOOR };
+    const biome = getBiomeName(bot, x, top.y + 1, z);
+    if (!ACCEPTABLE_BIOMES.has(biome)) return { valid: false, reason: 'wrong_biome' };
+    const standing = evaluateOpenBox(reader, x, z, top.y, { size: 3, height: 2, occupancy: 'as-is' });
+    return standing.valid ? { ...standing, biome } : standing;
   };
-  const clear = acceptable.filter(clearOf);
-  if (!clear.length) {
-    const nearest = acceptable[0];
-    return {
-      cell: null,
-      why: `${acceptable.length} acceptable patch(es) but every one sits within ${box ? box.radius + BASE_MARGIN : 0} `
-        + `blocks of world spawn (${box ? `${box.centerX},${box.centerZ}` : 'unknown'}) — nearest was `
-        + `${nearest.biome} at ${nearest.dist}b`,
-    };
+  const sweep = await ringScan(reader, { origin: { x: box.centerX, z: box.centerZ }, step: 1, minRadius: from }, isSpot);
+  if (!sweep.found) {
+    return record(`--stand=biome found no spot ${from}+ blocks from world spawn in an acceptable biome with a clear `
+      + `3x3 — ${formatRejections(sweep.rejections)} across ${sweep.checked} cell(s).`);
   }
-
-  // THE BIGGEST PATCH, AND DISTANCE ONLY BREAKS A TIE. The fleet builds inside the area the server
-  // streams around a body, so what a run needs is ROOM of one kind — a large patch is a base that can
-  // grow without the next job stepping into a swamp. Walking further costs a few seconds once; a cramped
-  // site costs every job for the rest of the run.
-  const pick = clear.sort((a, b) => (b.size - a.size) || (a.dist - b.dist))[0];
-  return {
-    cell: { x: pick.centroid.x, y: pick.seed.y, z: pick.centroid.z },
-    why: `${pick.biome}, ${pick.size} sampled cell(s) (~${pick.bbox.dx}x${pick.bbox.dz} blocks), `
-      + `${pick.dist}b from spawn`,
-    box,
-    rejected: acceptable.length - clear.length,
-  };
+  const spot = { x: sweep.best.x, y: sweep.best.result.spawnY, z: sweep.best.z };
+  if (await teleportTo(spot)) {
+    return record(`${USERNAME} was placed at (${spot.x},${spot.y},${spot.z}) — ${sweep.best.result.biome}, a clear 3x3, `
+      + `${fromSpawn(box, spot.x, spot.z)} blocks from world spawn; the first spot out, after ${sweep.checked} cell(s).`);
+  }
+  return record(`/tp to (${spot.x},${spot.y},${spot.z}) did not land within ${PLACEMENT_SETTLE_MS}ms — still at `
+    + `${whereAmI()}. Most likely '${USERNAME}' is not an op on this server.`);
 }
 
 // One teleport, re-issued while it has not landed, and the truth about whether it did.
@@ -482,16 +506,11 @@ async function idealBiomeCell(reader, at) {
 // It is re-issued rather than sent once because `/tp` from a player prompt needs op, and the op is
 // granted by the harness at almost the same moment this runs — a single command sent one tick early is
 // refused with nothing to show for it. Re-sending costs a chat line and removes the ordering assumption.
-async function teleportTo(cell) {
-  const at = () => (bot.entity && bot.entity.position) || null;
-  const landed = () => {
-    const p = at();
-    return !!p && Math.hypot(p.x - (cell.x + 0.5), p.z - (cell.z + 0.5)) <= 1.5;
-  };
+async function commandUntilLanded(command, landed) {
   let next = 0;
   for (const end = Date.now() + PLACEMENT_SETTLE_MS; Date.now() < end;) {
     if (Date.now() >= next) {
-      bot.chat(`/tp ${USERNAME} ${cell.x + 0.5} ${cell.y} ${cell.z + 0.5}`);
+      bot.chat(command);
       next = Date.now() + PLACEMENT_RETRY_MS;
     }
     await new Promise(r => setTimeout(r, PLACEMENT_POLL_MS));
@@ -500,9 +519,76 @@ async function teleportTo(cell) {
   return landed();
 }
 
+async function teleportTo(cell) {
+  return commandUntilLanded(`/tp ${USERNAME} ${cell.x + 0.5} ${cell.y} ${cell.z + 0.5}`, () => {
+    const p = bot.entity && bot.entity.position;
+    return !!p && Math.hypot(p.x - (cell.x + 0.5), p.z - (cell.z + 0.5)) <= 1.5;
+  });
+}
+
+// THE SURFACE OF A COLUMN, CHOSEN BY THE SERVER — for a place whose X/Z is known and whose height is not
+// (a surveyed biome column, a step out of spawn). `/spreadplayers` with no spread and a range of 1 puts
+// the body on the top block of that column and refuses liquid or fire under the feet, so one command
+// gives ground rather than a height guessed from somewhere else.
+async function spreadTo(aim, landed = () => nearAim(aim)) {
+  return commandUntilLanded(`/spreadplayers ${aim.x + 0.5} ${aim.z + 0.5} 0 1 false ${USERNAME}`, landed);
+}
+function nearAim(aim) {
+  const q = bot.entity && bot.entity.position;
+  return !!q && Math.max(Math.abs(q.x - (aim.x + 0.5)), Math.abs(q.z - (aim.z + 0.5))) <= 3;
+}
+
 function whereAmI() {
   const p = bot.entity && bot.entity.position;
   return p ? `(${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)})` : '(?,?,?)';
+}
+
+// ── CLEAR OF WORLD SPAWN, WHATEVER CHOSE THE CELL (Architect 2026-09-11) ───────────────────────────
+// *"you were supposed to have architect bot teleport away from world center before having it call
+// foreman get… it should be atleast 50 blocks away from world center"*. The biome choice already aims
+// past this, but when it found nothing the body was simply left where the server put it — world spawn —
+// and that is what happened in BOTH runs of 2026-09-11: the crew was fetched to (-1,69,0) and the second
+// run's soak died of `no_reachable_free_tree` inside the protected square. `standing: 'spawn'` and an
+// authored cell near the centre land in the same place. So this runs after every kind of placement, and
+// a body still inside the clearance is moved out.
+//
+// `/spreadplayers` rather than `/tp`, because the target is ground this client has never streamed: the
+// server picks the top block itself and refuses water and lava, so one command gives a surface to stand
+// on. The eight aims are straight out along the axes and diagonals, tried in the order of the side the
+// body already leans to (ties in list order), so the choice is the same every time for the same start.
+async function stepClearOfSpawn() {
+  const box = spawnProtectionBox(bot);
+  const p = bot.entity && bot.entity.position;
+  if (!p) return;
+  if (!box) {
+    record(`the world spawn is not known (no spawn_position packet received), so there is no centre `
+      + `to step away from — the body stays at ${whereAmI()} and the run's distance check will refuse the crew.`);
+    return;
+  }
+  // BLOCK coordinates, as the server and run.js count them. A /tp puts the body at the block's centre, so
+  // at x = -50 the position reads -49.5 — 49.5 out as a float, 50 out as a block. Measuring the float made
+  // this move a person the search had just placed exactly 50 out (run six: (-50,72,0) → (-65,69,64)).
+  const was = fromSpawn(box, Math.floor(p.x), Math.floor(p.z));
+  if (was >= floorFrom(box)) return;
+  const need = clearanceFrom(box);
+  const out = need + 2;                                      // spreadplayers lands within ~1.5 of its aim
+  const ox = p.x - box.centerX, oz = p.z - box.centerZ;
+  const aims = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]
+    .map(([dx, dz], i) => ({ x: box.centerX + dx * out, z: box.centerZ + dz * out, lean: dx * ox + dz * oz, i }))
+    .sort((a, b) => (b.lean - a.lean) || (a.i - b.i));
+  for (const aim of aims) {
+    const landed = () => nearAim(aim)
+      && fromSpawn(box, Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.z)) >= need;
+    if (await spreadTo(aim, landed)) {
+      record(`${USERNAME} was ${was} blocks from world spawn (${box.centerX},${box.centerZ}) and must be ${need} out `
+        + `before the ground test — moved straight out to ${whereAmI()}. The biome there was NOT chosen; only the `
+        + `distance was.`);
+      return;
+    }
+  }
+  record(`none of ${aims.length} moves ${out} blocks out from world spawn landed — still at ${whereAmI()}, `
+    + `${was} blocks out. Most likely '${USERNAME}' is not an op on this server, or every aimed spot was water or `
+    + `lava (spreadplayers refuses both). The run's distance check will refuse the crew.`);
 }
 
 async function standOnGround() {
@@ -512,9 +598,12 @@ async function standOnGround() {
   const reader = makeVoxelReader(bot);
 
   // ── THE BIOME CHOICE IS MADE HERE, FOR THE SAME REASON THE AUTHORED CELL IS (one writer, above) ──
-  // It resolves to a cell and then takes exactly the authored path: teleport, then the ground test from
-  // wherever the body actually ended up. So a scanned cell gets the same proof an authored one does —
-  // which matters more here, not less, because this cell was chosen from a biome map rather than by him.
+  // It resolves to a COLUMN, the server puts the body on that column's surface (`spreadTo`), and the
+  // ground test then runs from wherever the body actually ended up. So a scanned place gets the same proof
+  // an authored one does — which matters more here, not less, because it was chosen from a biome map
+  // rather than by him. It used to take the authored path, a `/tp` to a full cell, with the height taken
+  // from the survey — which is the body's OWN altitude, not the ground's: on 2026-09-11 that sent the body
+  // to (34.5,76,-79.5), it fell to (34,48,-80), and the desk found nowhere beside it to stand.
   //
   // The body's position is read BEFORE the choice, because the survey is centred on where the body
   // currently is and its chunk probes need somewhere to probe from.
@@ -522,18 +611,7 @@ async function standOnGround() {
   let authored = authoredStand();
   if (!authored && wantsBiomeStand() && start) {
     const from = { x: Math.floor(start.x), y: Math.floor(start.y), z: Math.floor(start.z) };
-    const choice = await idealBiomeCell(reader, from);
-    if (choice.cell) {
-      authored = choice.cell;
-      say(`proxy_human: biome scan picked (${authored.x},${authored.y},${authored.z}) — ${choice.why}.`);
-      if (choice.rejected) {
-        say(`             ${choice.rejected} acceptable patch(es) were rejected for sitting inside `
-          + `world spawn's protected square plus ${BASE_MARGIN}b of base clearance.`);
-      }
-    } else {
-      say(`proxy_human: --stand=biome found nowhere better than where the server put me — ${choice.why}.`);
-      say(`             the body stays at ${whereAmI()} and the ground test below runs from there.`);
-    }
+    await placeInBiome(reader, from);
   }
   if (authored) {
     const put = await teleportTo(authored);
@@ -545,6 +623,7 @@ async function standOnGround() {
         + `'${USERNAME}' is not an op on this server, so the command was refused. The ground test below `
         + `runs from where the body actually is, so this run is seeded there and not at the authored cell.`);
   }
+  await stepClearOfSpawn();
   const p = bot.entity && bot.entity.position;
   if (!p) { say('proxy_human: no body position yet — standing where the server put me.'); return; }
   const feet = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
@@ -564,18 +643,18 @@ async function standOnGround() {
   }
   const spot = await standingSpotNear(reader, feet, { radius: PLACEMENT_RADIUS });
   if (!spot.found) {
-    say(`proxy_human: ${USERNAME} is on ground no body can stand on and nothing better is within `
+    record(`${USERNAME} is on ground no body can stand on and nothing better is within `
       + `${PLACEMENT_RADIUS} blocks — staying put. ${spot.why}`);
     say('             the desk will refuse a crew here, and that refusal is the correct outcome.');
     return;
   }
   if (spot.distance === 0) {
-    say(`proxy_human: ${USERNAME} stands on valid ground at (${feet.x},${feet.y},${feet.z}) — not moved.`);
+    record(`${USERNAME} stands on valid ground at (${feet.x},${feet.y},${feet.z}) — not moved.`);
     return;
   }
   const to = spot.cell;
   if (await teleportTo(to)) {
-    say(`proxy_human: ${USERNAME} moved ${spot.distance.toFixed(1)} blocks to valid standing ground at `
+    record(`${USERNAME} moved ${spot.distance.toFixed(1)} blocks to valid standing ground at `
       + `(${to.x},${to.y},${to.z}) — the cell a crew will be teleported to.`);
     return;
   }

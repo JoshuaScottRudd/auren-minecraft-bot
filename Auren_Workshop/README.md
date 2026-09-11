@@ -9,6 +9,29 @@ with one word.
 
 ---
 
+## Nothing in here runs until the door is open
+
+```
+node developer_mode.js on
+```
+
+**Every file in this folder asks one question as its first act — is this a workbench?** An ordinary copy
+answers no, prints one sentence naming the tool and that command, and exits. The answer is a marker file
+at `Auren_Bot/.developer_mode`; it is untracked, so it cannot travel through git and is not in anybody's
+download.
+
+**There is one door and it is the one the Architect uses.** Nothing checks whose machine this is. His
+machines are machines where that command has been run, and that is the entire difference — an auto-open
+for him would be a path only he ever walks, which is the exact fault the `run.js` / `host_and_run.js`
+split was made to remove.
+
+**Shipping is not the same act as offering.** All of this is in every download because a tool that cannot
+read the bot cannot fix the bot. None of it is put in front of somebody who only wants two bots to build a
+house. `preflight` proves the gate after every change: a file here that acts when it is loaded and does
+not ask first fails the run by name.
+
+---
+
 ## The one idea this folder exists to hold
 
 **THE EQUIPMENT LIVES WITH THE THING IT MEASURES.** This was a sibling of `Auren_Bot/` for two days and
@@ -54,12 +77,13 @@ first), and the current scratchpad volume §5–§6.
 | `monitoring/` | 21 | **The instruments — things that READ.** 20 lenses plus the trace reader and dashboard. A run record is read only through its lens, machines included. `monitoring/LENSES.md` maps every question to the flag that answers it. |
 | `camera/` | 8 | **The camera crew.** Rig, follow, gimbal, scout, sightline, combat witness, configure, and the OBS bridge. |
 | `scripts/` | 9 | **The one-button PowerShell.** `_node.ps1` and `npm.ps1` resolve this machine's toolchain and say which one they picked; the rest raise the cameras and the dashboard, and `world_rollback.ps1` snapshots and restores a world folder it is always told the path of. The three fleet launchers are gone — a run is started by `run.js` (2026-09-10). |
-| `run_config.js` | 1 | **THE ONE PAGE.** Every choice a run has — world, clock, person, crew, soak, watch, wake rules, record, teardown, server — authored before anything starts. Every field is a whitelist and nothing is defaulted for you. |
-| `run.js` | 1 | **THE ONE SCRIPT.** Reads the page once and performs the whole run: builds the stranger download from the working tree, launches it in a stripped environment, seats a person, has that PERSON ask the desk for a crew, measures placement off the server, soaks it watched, reads the trace through the lens, tears down. No flags. |
-| `fleet_control.js` | 1 | **The world's lifecycle, and the fleet's vocabulary.** Server up/down, snapshots and restores, the clock, teardown, status, rcon, operator verbs. `run.js` composes these verbs rather than reimplementing them, so this stays the one owner (Law 16). It *operates* the construct and is not part of it: no fragment, no signal bus, no decision inside the SPA loop. |
+| `run_config.js` | 1 | **THE ONE PAGE, in two blocks.** `run` — memory, clock, person, crew, soak, watch, wake rules, record, teardown — is read by `run.js` and is identical for everybody. `hosting` — world, snapshot, worldName — is read by `host_and_run.js` and by nothing else. Every field is a whitelist and nothing is defaulted for you. |
+| `run.js` | 1 | **THE ONE SCRIPT, AND EVERYBODY RUNS IT.** Joins a world that is already there — it never starts, stops or rolls one back. Reads the `run` block once, then sweeps records, clears the bots' memory, installs, opens the desk, seats a person, has that PERSON ask for a crew, measures placement off the server, soaks it watched, reads the trace through the lens, reaps the fleet. No flags. |
+| `host_and_run.js` | 1 | **THE OVERLAY FOR A MACHINE THAT HOSTS THE WORLD** (2026-09-11, Law 1 — isolated verb). Stops the server, rolls the world back to a snapshot, mints a console password, starts the server, **spawns `run.js` as a child process**, stops the server after. `run.js` learns nothing from it but an environment variable, and asks the world itself whether it is there. Refuses on a machine with no server folder and points at `run.js`. |
+| `fleet_control.js` | 1 | **The world's lifecycle, and the fleet's vocabulary.** Server up/down, snapshots and restores, the clock, teardown, status, rcon, operator verbs. `run.js` and `host_and_run.js` compose these verbs rather than reimplementing them, so this stays the one owner (Law 16). It *operates* the construct and is not part of it: no fragment, no signal bus, no decision inside the SPA loop. |
 | `workshop_paths.js` | 1 | **The one crossing point of the boundary** — see below. |
-| `fleet_runbook.md` · `camera_runbook.md` | 2 | The procedure documents. Running the fleet; filming and editing a run. |
-| `Architect_Commands.txt` | 1 | Copy-paste command sheet, written for him rather than for a machine. |
+| `fleet_runbook.md` · `camera_runbook.md` | 2 | The procedure documents. Running the fleet; filming a run. Editing moved to `Cutting_room/cutting_runbook.md` at the repo root — it is not bot code and does not ship. |
+| `COMMANDS.txt` | 1 | **Copy-paste command sheet for everybody.** Every line on it names something inside `Auren_Bot/`, so every line works in a downloaded copy. The Architect's own sheet is `Architect_Commands.txt` at the repo root and does not ship — it holds the cutting room, the session machinery and the public server, and points down at this one (2026-09-11). |
 
 ---
 
@@ -180,7 +204,7 @@ as you go — not saved for the end of the turn.**
 | you want to | read |
 |---|---|
 | start, test or inspect a live fleet | `fleet_runbook.md` |
-| film or edit a run | `camera_runbook.md` (§1–5 film, §6 edit; the suite is `Cutting_room/` at the repo root) |
+| film a run | `camera_runbook.md`. Editing is a separate tool that does not ship — `Cutting_room/cutting_runbook.md` at the repo root |
 | write, keep or run a test | `tools/README.md` — what a test is here, and when it is allowed to exist |
 | answer a question about a run | `monitoring/LENSES.md`, then `monitoring/README.md` |
 | know the current state of any of it | the newest entry of `Documentation/Refurbishing planning/architect_bugsquashing.md` — a runbook holds procedure, the record holds state |

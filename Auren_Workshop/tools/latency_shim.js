@@ -36,6 +36,7 @@
 //   node Auren_Workshop/tools/latency_shim.js --listen=25567 --target=127.0.0.1:25565 --delay-ms=60 --jitter-ms=15
 //   AUREN_SERVER_PORT=25567   → the fleet then dials the shim instead of the server (architect_config).
 
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/latency_shim.js');
 const net = require('net');
 
 function delayedPipe(from, to, halfDelayMs, jitterMs, stats) {

@@ -27,6 +27,7 @@
 // Exit: runs until Ctrl-C (or --once: writes a single snapshot and exits 0).
 
 'use strict';
+require('../js_kernel/utils/developer_door').enter('monitoring/dashboard.js');
 
 const fs = require('fs');
 const path = require('path');

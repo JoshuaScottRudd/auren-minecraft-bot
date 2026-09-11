@@ -61,6 +61,7 @@
 // Warns on launcher/scout/drought.
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/camera/camera_rig.js');
 
 const paths = require('../workshop_paths');
 // NODE_PATH and the aliases before ANYTHING from the bot: `module-alias` is third-party and lives in

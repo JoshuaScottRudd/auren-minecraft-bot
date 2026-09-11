@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/sign_probe.js');
 // tool: sign_probe — the LIVE observation that settles whether a wooden sign can carry a human's order
 // into the fleet (control_program_plan.md §7 "Phase 0 — THE PROBE. Nothing is built before it passes").
 //

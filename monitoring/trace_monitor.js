@@ -110,6 +110,7 @@
 // Exit codes: 0 clean · 2 flags found · 1 could not read trace.
 
 'use strict';
+require('../js_kernel/utils/developer_door').enter('monitoring/trace_monitor.js');
 
 const fs = require('fs');
 const path = require('path');

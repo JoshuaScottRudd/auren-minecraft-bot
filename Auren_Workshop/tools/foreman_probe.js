@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/foreman_probe.js');
 // tool: foreman_probe — does the foreman actually answer a HUMAN, and does it refuse everything else?
 //
 // The foreman is the first thing in this fleet that takes instructions from outside the terminal, so

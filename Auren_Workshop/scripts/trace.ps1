@@ -1,4 +1,4 @@
-# trace_monitor entry point — the inspection twin of start_fleet.ps1. Its only job is to run
+# trace_monitor entry point — the inspection twin of fleet_control.js. Its only job is to run
 # trace_monitor.js under a node the current machine actually has: bare `node` is not on PATH on every
 # machine, so `node trace_monitor.js` can die "node not recognized". This resolves node the way every
 # other entry point does (_node.ps1: PATH first, then the Architect's workstation file - runbook §2) and

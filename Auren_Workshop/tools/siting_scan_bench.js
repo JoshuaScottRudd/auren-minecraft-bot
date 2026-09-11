@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/siting_scan_bench.js');
 // tool: siting_scan_bench — how long does finding a blueprint location actually take, before and after?
 // Architect 2026-08-04: "especially test the setting a blueprint location. normally it takes 30 seconds
 // or more to set the intial blueprint locations. id like to see how much time we save."

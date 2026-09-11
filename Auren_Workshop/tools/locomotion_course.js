@@ -62,6 +62,7 @@
 // Exit codes: 0 the course ran · 2 no leg arrived · 1 could not run (no scout / no rcon / no course).
 
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/locomotion_course.js');
 
 const path = require('path');
 const fs = require('fs');

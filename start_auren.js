@@ -65,9 +65,16 @@ const OVERSEER_PORT = Number(process.env.OVERSEER_PORT) || 3001;
 // download. Same shape as `--host`: whoever points the fleet at a world also tells it how to speak to
 // that world's console. The environment variables stay the path a non-human caller uses (`start_bot.js`
 // documents that convention and the foreman relies on it); these flags are how a PERSON says it.
+//
+// THE DEFAULTS COME FROM `your_server.js` RATHER THAN FROM LITERALS HERE (2026-09-11). That file is the
+// one page a downloader is told to edit, and a literal `'localhost'` on this line would silently ignore
+// their edit — they would change the address, run the one documented command, and watch the desk dial the
+// old one. The flags still win over the file, which is what makes them a per-run override rather than a
+// second answer (Law 16).
+const WORLD = require('./your_server');
 const FLAGS = [
-  { flag: 'host', def: 'localhost', help: 'server address the foreman connects to' },
-  { flag: 'port', def: '25565', help: 'server port' },
+  { flag: 'host', def: WORLD.host, help: 'server address the foreman connects to' },
+  { flag: 'port', def: String(WORLD.port), help: 'server port' },
   { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', help: "your server's rcon.password — how the crew gets brought to you" },
   { flag: 'rcon-port', env: 'AUREN_RCON_PORT', help: "your server's rcon.port  (default: 25575)" },
   // 'sweep' (default) empties fleet_logs/ because this door is the start of a run. 'keep' is for a
@@ -81,11 +88,14 @@ function usage() {
 
     node start_auren.js --rcon-password <your server's rcon password>
 
-    --host <address>        server address the foreman connects to  (default: localhost)
-    --port <n>              server port  (default: 25565)
+    --host <address>        server address the foreman connects to  (default: ${WORLD.host})
+    --port <n>              server port  (default: ${WORLD.port})
     --rcon-password <pw>    your server's rcon.password — REQUIRED, see below
-    --rcon-port <n>         your server's rcon.port  (default: 25575)
+    --rcon-port <n>         your server's rcon.port  (default: ${WORLD.rconPort})
     --help                  this text
+
+  Those defaults are read from your_server.js, beside this file. Edit that once instead of typing
+  --host and --port every time.
 
   Your server needs a console, and these two lines in server.properties turn it on:
 
@@ -134,8 +144,8 @@ for (let i = 0; i < argv.length; i++) {
   given[name] = value;
 }
 
-const host = given.host || 'localhost';
-const port = given.port || '25565';
+const host = given.host || WORLD.host;
+const port = given.port || String(WORLD.port);
 
 // STAMPED INTO THIS PROCESS, not added to the child `env` literal below, and that is deliberate:
 // `child_fleet.start` spreads `process.env` underneath whatever it is handed, so one assignment here
@@ -144,6 +154,22 @@ const port = given.port || '25565';
 // leaves the variable untouched, so a machine that already exports it is unchanged.
 if (given['rcon-password'] !== undefined) process.env.AUREN_RCON_PASSWORD = given['rcon-password'];
 if (given['rcon-port'] !== undefined) process.env.AUREN_RCON_PORT = given['rcon-port'];
+
+// ── A CONSOLE PASSWORD WRITTEN IN `your_server.js` HAS TO REACH THE PROBE (2026-09-11) ──────────────
+// Without this the file is a page you can fill in that does nothing: `rcon_link.credentials()` reads the
+// environment and then a properties file, and never that page. Stamped here rather than read there so
+// there is still exactly ONE place the fleet learns a console password from (the environment), and this
+// is the door that puts it there — the same shape `--rcon-password` above already uses.
+//
+// ONLY WHEN IT IS NON-EMPTY, and the port travels with it rather than separately. An empty password is
+// the shipped default and means "I have not said"; stamping it would shadow the properties-file fallback
+// a local run depends on, replacing a working lookup with a blank (Law 13 — never default a missing field
+// into an answer). The two move together because a port without its password would send the fallback to
+// the right door with the wrong key.
+if (!process.env.AUREN_RCON_PASSWORD && WORLD.rconPassword) {
+  process.env.AUREN_RCON_PASSWORD = WORLD.rconPassword;
+  process.env.AUREN_RCON_PORT = String(WORLD.rconPort);
+}
 
 (async () => {
   // ── THE CONSOLE IS PROVED BEFORE THE DESK OPENS (Law 13, default-stopped) ─────────────────────────
@@ -166,7 +192,8 @@ if (given['rcon-port'] !== undefined) process.env.AUREN_RCON_PORT = given['rcon-
       + `      rcon.password=<pick anything>\n\n`
       + `  Restart the server, then start Auren with that same password:\n\n`
       + `      node start_auren.js --rcon-password <that password>\n\n`
-      + `  If your rcon.port is not 25575, pass --rcon-port too.`);
+      + `  If your rcon.port is not ${WORLD.rconPort}, pass --rcon-port too.\n\n`
+      + `  To stop typing it every time, put the password and port in your_server.js beside this file.`);
   }
 
   // ── NO RECORD SURVIVES A RUN (Architect 2026-08-31, STANDING) ───────────────────────────────────

@@ -1,5 +1,5 @@
 // Auren_Workshop/fleet_control.js
-// Headless fleet operation — the non-TTY twin of start_fleet.ps1 + the overseer
+// Headless fleet operation — the one implementation of launch, command and teardown, and the only
 // console, built so an AI monitor (or any script) can run the whole stack
 // without GUI windows: Minecraft server, overseer, bots, operator verbs,
 // snapshots, teardown. It exists because the interactive surfaces (PowerShell
@@ -56,6 +56,7 @@
 // Exit codes: 0 ok · 1 the requested operation could not be completed.
 
 'use strict';
+require('../js_kernel/utils/developer_door').enter('Auren_Workshop/fleet_control.js');
 
 const fs = require('fs');
 const net = require('net');
@@ -2166,6 +2167,19 @@ async function worldSpawn(worldName) {
       return true;
     },
     'move': moveTest,
+    // WORLD SPAWN AS ONE JSON LINE (2026-09-11), so `run.js` measures the person's distance from the
+    // centre off the same level.dat reader the spawn-protection drill uses (Law 16), rather than a copy.
+    'world-spawn': async () => {
+      const world = effectiveWorld();
+      const at = await worldSpawn(world);
+      if (!at) {
+        console.error(`world-spawn: no spawn could be read from ${path.join(serverDir(), world, 'level.dat')} `
+          + `— the file is missing or holds no SpawnX/SpawnY/SpawnZ.`);
+        return false;
+      }
+      console.log(JSON.stringify(at));
+      return true;
+    },
     // Print the canonical roster (seniority order, comma-joined) so the PowerShell launchers read the
     // same single source (architect_config BOT_SENIORITY) instead of a hand-mirrored array (Law 16).
     'roster': () => { console.log(ROSTER.join(',')); return true; },

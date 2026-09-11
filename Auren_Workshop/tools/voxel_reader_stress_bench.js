@@ -1,4 +1,5 @@
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/voxel_reader_stress_bench.js');
 // tool: voxel_reader_stress_bench — the ADVERSARIAL half of the reader evidence. Its job is to BREAK the
 // prototype, not to confirm it.
 //

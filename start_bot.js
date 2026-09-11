@@ -45,9 +45,14 @@ const path = require('path');
 // Kept as a table rather than a parser full of if-statements so that `--help` is generated FROM the same
 // table the parser reads. A flag that is documented but not honoured (or honoured but not documented) is
 // not possible here, which is the failure this shape is chosen to prevent.
+// The address defaults come from `your_server.js` — the one page a downloader edits — rather than from
+// literals here, so an edit there reaches a bot started directly by this door too (2026-09-11, Law 16).
+// A flag still wins, and the environment still wins over the file; this only settles what happens when
+// nobody has said anything.
+const WORLD = require('./your_server');
 const FLAGS = [
-  { flag: 'host',     env: 'AUREN_SERVER_HOST',        def: 'localhost', help: 'server address the bot connects to' },
-  { flag: 'port',     env: 'AUREN_SERVER_PORT',        def: '25565',     help: 'server port' },
+  { flag: 'host',     env: 'AUREN_SERVER_HOST',        def: WORLD.host, help: 'server address the bot connects to' },
+  { flag: 'port',     env: 'AUREN_SERVER_PORT',        def: String(WORLD.port), help: 'server port' },
   { flag: 'name',     env: 'BOT_ID',                   def: 'AurenBot',  help: "the bot's name in the world" },
   { flag: 'mode',     env: 'BOT_MODE',                 def: 'homesteader', help: 'homesteader | contractor' },
   { flag: 'owner',    env: 'BOT_OWNER',                def: null,        help: 'your Minecraft name — REQUIRED for contractor, forbidden for homesteader' },

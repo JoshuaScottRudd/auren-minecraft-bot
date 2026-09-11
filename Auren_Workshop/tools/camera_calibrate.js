@@ -21,6 +21,7 @@
 // Writes: footage/calibration/{shot_NN.jpg, contact_sheet.jpg, manifest.json}
 //   manifest.json holds the index→score mapping — the ANSWER KEY. Read it only AFTER he has labelled.
 'use strict';
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/camera_calibrate.js');
 
 const fs = require('fs');
 const path = require('path');

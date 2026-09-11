@@ -41,6 +41,7 @@
 //   node tools/machine_load_sampler.js stop
 // Read it back with:  node monitoring/trace_monitor.js --machine-load [--label=NAME]
 
+require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/machine_load_sampler.js');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
