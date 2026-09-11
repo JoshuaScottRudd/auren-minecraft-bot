@@ -34,6 +34,7 @@
 //
 // Run:  node start_auren.js        (raises the overseer and this desk together)
 
+const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
@@ -87,6 +88,10 @@ const mineflayer = require('mineflayer');
 const { FOREMAN_NAME, FOREMAN_PREFIX, FOREMAN_CHANNEL, BOT_SENIORITY,
         SERVER_ENDPOINT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const channel = require('./foreman_channel');
+// The one owner of "open a visible console window", and the one owner of where a run's records live —
+// this desk shows each body it fetches and keeps that body's console beside the traces. See `startBot`.
+const consoleWindow = require('@utils/console_window');
+const { RECORDS_DIR } = require('@utils/record_homes');
 // THE DESK NO LONGER TELEPORTS ANYTHING, and its `body_recovery` require went with the act (2026-09-10).
 // It used to bring each new body to whoever hired it; the measurement that moved that act into the body's
 // own start path is in the launch loop, and the reason it could not simply be delayed here is that this
@@ -122,6 +127,14 @@ const BODY_ARRIVAL_WAIT_MS = CREW_ARRIVAL_WAIT_MS / 2;
 // each body to register before launching the next; this is the FLOOR that still applies when a body fails
 // instantly and there is nothing to wait for.
 const CREW_LAUNCH_GAP_MS = 5000;
+
+// HOW FAR "NEXT TO THE HUMAN" IS ALLOWED TO MEAN, when the desk checks there is room to stand before it
+// launches anything. Set to the body's own arrival tolerance (`body_recovery.PLAYER_ARRIVAL_TOLERANCE`,
+// 4.0) rather than to something roomier: a cell this desk accepts and the body then rejects as "not
+// beside my person" is a launch spent on ground that was never going to work. It is written as a number
+// here rather than imported because it is the DESK'S standard for how close a crew is delivered — the two
+// happen to agree today, and the day they should differ this is the one that changes (Law 25).
+const CREW_PLACEMENT_RADIUS = 4;
 
 // ── SAYING `wipe` TWICE IS WHAT MAKES IT A DECISION (Architect 2026-09-05) ───────────────────────────
 // *"make them have to type foreman wipe twice. first time says a warning. second time does the wipe. do
@@ -255,6 +268,30 @@ const fetched = [];
 // itself — see the launch loop for the measurement that moved the act, and why one owner of it is the
 // whole point (Law 16). It is stamped for both species: a homesteader has no owner to derive it from,
 // and a contractor's owner is the same person anyway, so passing it always is one rule rather than two.
+// ── A BOT'S CONSOLE IS KEPT AND SHOWN (2026-09-10) ──────────────────────────────────────────────────
+// Architect: *"why doesent any terminal run? im at home looking at the dedicated computer and nothing
+// runs so i cant see whats going on and help at all. every terminal always needs to be visible."*
+//
+// This desk was one of the three reasons for that, and the worst of them. The bots were spawned
+// `windowsHide: true` with stdout and stderr piped into a local string that was read ONCE — at the
+// three-second launch grace, to explain a body that died on the way up — and then appended to for the
+// rest of the run and never read again. So a bot's console had no window, no file, and no reader: the
+// only surviving account of a crew member was its structured trace, which is the right record for a
+// machine and not the thing a person watches to see whether anything is happening.
+//
+// TWO FAULTS, ONE EDIT. The string also grew without bound for the life of the desk, because nothing
+// detached the handler after the grace window closed — a chatty bot across a twenty-minute soak was
+// accumulating megabytes into a variable whose only purpose had already been served.
+//
+// So the pipe is DRAINED TO A FILE and the in-memory copy stops at the grace window, and a window tails
+// the file. `fleet_logs/` is where a run's records live and a start empties it whole (Architect
+// 2026-08-31 — no record survives a run), so the console belongs there with the traces rather than in a
+// folder of its own; `record_homes` owns that path, so this asks it rather than spelling it (Law 16).
+//
+// THE PIPE IS KEPT RATHER THAN HANDING THE OS A DESCRIPTOR because the grace report genuinely needs the
+// bytes in this process — `run.js` documents the opposite choice for its own children for the opposite
+// reason. Draining to a stream is what makes the pipe safe: the failure mode that killed three soaks was
+// a pipe nobody read, not a pipe as such.
 function startBot(botId, species, owner, placeBeside) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(BOT_DIR, 'start_bot.js')], {
@@ -264,31 +301,65 @@ function startBot(botId, species, owner, placeBeside) {
       // through whole. BOT_ID is overridden explicitly — this process carries `foreman` in it for its
       // own record, and inheriting that would file the bot's log under the desk.
       env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: '1', BOT_START_NEAR: placeBeside },
-      windowsHide: true,
+      // No window of its OWN: with both streams on a pipe the child has no console to show, so the
+      // window is the follower opened below. Keeping the flag would claim an intent this no longer has.
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    fetched.push(child);
+
+    fs.mkdirSync(RECORDS_DIR, { recursive: true });
+    const logFile = path.join(RECORDS_DIR, `console_${String(botId).replace(/[^A-Za-z0-9_-]/g, '_')}.log`);
+    const sink = fs.createWriteStream(logFile, { flags: 'w' });
+    // A console log is a convenience, not the run's record — the trace is that. So a write failure says
+    // so once and the bot keeps working, rather than taking a crew member down over a log file.
+    sink.on('error', e => console.log(`  [${botId}] console log unavailable: ${e.message}`));
+    const window = consoleWindow.followFile({ title: `auren ${botId}`, logFile });
+
+    fetched.push({ child, sink, window, botId });
 
     let out = '';
     let settled = false;
     const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
 
-    child.stdout.on('data', d => { out += d.toString(); });
-    child.stderr.on('data', d => { out += d.toString(); });
+    // Every chunk goes to the file for the whole run; only the grace window keeps a copy in memory.
+    const tee = (d) => {
+      sink.write(d);
+      if (!settled) out += d.toString();
+    };
+    child.stdout.on('data', tee);
+    child.stderr.on('data', tee);
     child.on('error', e => finish({ code: -1, out: `could not start ${botId}: ${e.message}` }));
-    child.on('exit', code => finish({
-      code,
-      out: out.trim() || `${botId}: stopped immediately (exit ${code}) — nothing was said about why`,
-    }));
+    child.on('exit', code => {
+      // The view goes when the thing it was viewing goes (Law 8, applied to the window rather than the
+      // process): a follower left tailing a dead bot's log reads as a bot that is merely quiet.
+      if (window) consoleWindow.closeWindow(window.pid);
+      if (!sink.writableEnded) sink.end();
+      finish({
+        code,
+        out: out.trim() || `${botId}: stopped immediately (exit ${code}) — nothing was said about why`,
+      });
+    });
     setTimeout(() => finish({ code: 0, out: `${botId}: launched` }), BOT_LAUNCH_GRACE_MS);
   });
 }
 
 // Ends every body this desk fetched. Registered for the ordinary exits and for Ctrl-C, because a desk
 // killed at the keyboard is the common case rather than the exotic one.
+// Each entry is { child, sink, window, botId } rather than a bare child — a fetched body now owns a
+// console log and a window watching it, and all three end together (Law 8: whatever raised a thing ends
+// it, and the window is a thing this desk raised).
 function releaseFetched() {
-  for (const child of fetched) {
+  for (const { child, sink, window } of fetched) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    if (window) consoleWindow.closeWindow(window.pid);
+    // The log is CLOSED and not deleted: a desk going down is exactly when somebody wants to read why.
+    // The next start empties `fleet_logs/` whole, which is what keeps it one run's record.
+    //
+    // ASKED RATHER THAN ATTEMPTED-AND-CAUGHT. A bot that exited on its own already ended its own sink,
+    // and a second `end()` raises ERR_STREAM_ALREADY_FINISHED on the stream's error channel — which the
+    // handler above would faithfully print as a console-log failure that did not happen. The state is
+    // readable, so it is read (Law 13: a catch here would be a decision to continue taken before knowing
+    // what arrived).
+    if (sink && !sink.writableEnded) sink.end();
   }
 }
 process.on('exit', releaseFetched);
@@ -335,6 +406,10 @@ const { INGAME_VERBS, CREW_SIZE, SPECIES, helpLines, parseRequest, parseCancel,
 // word either is a legal name or it is not, and being wrong about a plural is impossible rather than
 // unlikely.
 const { isRequestable, isBlueprint } = require('@kernel/requestable_catalogue');
+// The ground test the desk declines on, and the SAME one every base is sited with — see the gate in
+// `get` for why a second implementation here would be the fault rather than the convenience.
+const siteGeometry = require('@utils/site_geometry');
+const { makeVoxelReader } = require('@utils/voxel_reader');
 
 // THE THIRD OUTCOME AT THE HUMAN BOUNDARY. Law 13 throws at a coding violation and soft-fails an
 // environmental one; a person typing the wrong thing is neither, so it CORRECTS — nothing crosses, nothing
@@ -559,6 +634,47 @@ async function handle(from, text, reply) {
       return;
     }
     const crew = free.slice(0, needed);
+
+    // ── NOTHING IS LAUNCHED UNTIL THE GROUND BESIDE THE ASKER WILL HOLD A BODY ─────────────────────
+    // (Architect 2026-09-10): *"the foreman shouldnt spawn the bot if there is no valid teleport spot
+    // available next to the human. the whole thing should be refused before a bot is even spawned."*
+    //
+    // WHY IT HAS TO BE HERE AND NOT IN THE BODY. The body already refuses to work unless it confirms it
+    // is standing beside its person (`body_recovery.arriveAtPlayer`, gated in `start_injector`), and that
+    // refusal is correct and stays. But it happens AFTER a process has been spawned, a player slot taken,
+    // a login negotiated and a name spent — and the person watching sees a bot arrive and then sit down
+    // dead, which reads as a broken bot rather than as bad ground. The desk holds the one handle that can
+    // decline before any of that is spent, so declining is the desk's job (Law 13, default-stopped: prove
+    // it is safe to act, and this is the last moment the proof is free).
+    //
+    // IT IS THE SAME QUESTION THE BODY WILL ASK, ANSWERED ONCE (Law 16). `standingSpotNear` is
+    // `evaluateOpenBox` at body scale in `@utils/site_geometry` — the module that also sites every base —
+    // so a refusal here and an arrival there cannot disagree about the same cell. A second implementation
+    // in this file is exactly how the desk starts turning bots away from ground a body would have been
+    // happy on, or launching them onto ground it will not accept.
+    //
+    // THE RADIUS IS THIS DESK'S NUMBER AND IT MATCHES THE BODY'S TOLERANCE, deliberately: a spot the body
+    // would land on and then reject as "not beside my person" is not a spot worth launching for.
+    //
+    // A READER THAT CANNOT SEE IS NOT A REFUSAL. If the asker has no entity in the desk's own player
+    // table there is nothing to measure, and saying "no room" about ground nobody looked at is the Law 23
+    // fault pointed inward — the honest answer is that the desk cannot see them, and it is a different
+    // sentence because the person acts on it differently (walk back into view, rather than walk uphill).
+    const asker = bot.players && bot.players[from] && bot.players[from].entity;
+    if (!asker || !asker.position) {
+      trouble(from, 'asker_unseen', `I can't see where you're standing, so I won't send anyone. Come back into view and say "${FOREMAN_PREFIX} get" again.`,
+              `no entity for '${from}' in the desk's player table — nothing to measure ground against`);
+      return;
+    }
+    const feet = { x: Math.floor(asker.position.x), y: Math.floor(asker.position.y), z: Math.floor(asker.position.z) };
+    const room = await siteGeometry.standingSpotNear(makeVoxelReader(bot), feet, { radius: CREW_PLACEMENT_RADIUS });
+    if (!room.found) {
+      record.refused(from, 'no_standing_room', `${crew.length} launch(es) withheld`);
+      trouble(from, 'no_standing_room',
+        `there's nowhere beside you for anyone to stand — try again on open ground. Nobody was sent.`,
+        `${room.why} | withheld ${crew.join(', ')} before launch`);
+      return;
+    }
 
     // WHAT THEY ARE GETTING IS SAID WHILE THEY WAIT, not after. The two species look identical from here
     // — same names, same arrival, both walking to where the asker stands — and the difference only shows

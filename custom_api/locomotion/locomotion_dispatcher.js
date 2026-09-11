@@ -240,7 +240,7 @@ function invoke(verb, goal) {
 //                                 clear). For PLACING and DIGGING, where the angle is what matters.
 //
 // AND A THIRD THING THAT IS NOT A GOAL SHAPE: to USE a station — open a chest, load a furnace, work a
-// table — call `goToStationAnchor` below. Do not reach for require_los there; see its header.
+// table — call `goToStationStance` below. Do not reach for require_los there; see its header.
 function goTo(goal) { return invoke('goTo', goal); }
 
 // goToStand: "stand ON this anchor block." An ANCHOR names the block the bot's feet rest on, so the feet
@@ -315,7 +315,7 @@ async function reposition(awayFrom, opts = {}) {
   return goTo(targetFeet);
 }
 
-// ── goToStationAnchor: THE ONE WAY A BOT GOES TO USE A STATION ────────────────────────────────────
+// ── goToStationStance: THE ONE WAY A BOT GOES TO USE A STATION ────────────────────────────────────
 //
 // Architect 2026-08-31: *"since all chests and furnaces operate off of blueprints, with the only
 // exception being a temporary crafting table to boostrap the bot — then instead of the LOS logic, remove
@@ -340,43 +340,114 @@ async function reposition(awayFrom, opts = {}) {
 // (Law 19), inside the building by construction — which is the immersion half of his ruling, and the one
 // no reach metric can deliver.
 //
-// RETURNS { arrived, anchor, blueprint, roomKey, anchorIndex, reason? }.
-//   reason 'no_anchor'  — no locked blueprint claims that cell. The Architect named the one legitimate
-//                         case: a temporary crafting table a bot sets down beside itself. NOTHING MOVES,
-//                         and the caller must decide — it is not permission to improvise a stance.
-//   reason 'unassigned' — a blueprint owns the cell but filed it outside every anchor. That is a
-//                         blueprint to edit, not a stance to invent, so it is named apart from
-//                         'no_anchor' rather than folded into it (Law 25).
-async function goToStationAnchor(pos) {
+// ── ONE UTILITY, BOTH KINDS OF STATION (Architect 2026-09-10) ───────────────────────────────────────
+// *"how does it work for when its in the blueprint like the headframe or the contract house. however
+// that works extract as a utility and use it for both location or however. i already know the bot will
+// walk to an anchor and then use a chest. instead use look at for navigation. something like that."*
+//
+// THIS FUNCTION WAS `goToStationAnchor` AND SERVED ONLY THE BLUEPRINT HALF. A station a bot set down in a
+// field had no authored cell to walk to, so it answered `no_anchor` and moved nothing — correctly, since
+// inventing a stance is the thing three previous designs got wrong. But the caller then crafted anyway,
+// from 12.6 blocks, five times, twenty seconds each, while carrying a table it could have set at its own
+// feet (`architect_bugsquashing.md` §11). The gap was never the refusal to move: it was that only ONE of
+// the two kinds of station had a cell to move to.
+//
+// SO BOTH KINDS NOW CARRY THE SAME KIND OF FACT, and this resolves whichever one exists:
+//
+//   'anchor'    a locked blueprint claims the voxel → the owning anchor. Authored when the blueprint was
+//               drawn, proven to reach every voxel in its group, inside the building by construction.
+//   'recorded'  a registry row carries `stance` → the cell the body stood on when it PLACED the station.
+//               Recorded once at placement, never re-derived; `canPlaceFrom` proved reach from it and
+//               the placement then happened from it.
+//   'in_reach'  the body is already close enough to use it, so there is nothing to resolve. Not a
+//               stance and not treated as one — it is the legitimate throwaway-beside-me case, and the
+//               body stays exactly where it is.
+//
+// NEITHER SOURCE IS A SEARCH, and that is the property being preserved rather than a coincidence. He
+// rejected a searched stance twice — a raycast vantage, then a radius — because a search returns
+// whichever acceptable cell is cheapest from wherever the body happens to be, so a station has as many
+// stances as there are approaches, and cheapest from outside a building is a cell outside the wall. Both
+// sources here are single authored cells, identical on every run and from every direction (Law 19).
+//
+// THE LOOK IS PART OF ARRIVING, NOT THE CALLER'S JOB. Every caller used to `bot.lookAt` the station
+// itself after this returned, which is one step of one procedure written out five times. Folded in here:
+// arriving at a station means standing on its cell AND facing it, and a window opened without facing
+// the block is the failure this whole path exists to prevent (Law 16).
+//
+// RETURNS { arrived, stance, source, blueprint, roomKey, anchorIndex, reason? }.
+//   reason 'no_stance'   — nothing authored a cell and the body is not already in reach. NOTHING MOVES.
+//                          The caller must decide, and for a crafting table the right decision is to set
+//                          down its own — it is not permission to improvise a stance.
+//   reason 'unassigned'  — a blueprint owns the cell but filed it outside every anchor. That is a
+//                          blueprint to edit, not a stance to invent, so it is named apart from
+//                          'no_stance' rather than folded into it (Law 25).
+//   reason 'unreachable' — a cell WAS authored and navigation could not get the body onto it. Distinct
+//                          from having no cell at all: one is a world problem, the other a data problem.
+async function goToStationStance(pos) {
   const bot = global.bot;
   if (!bot?.entity?.position) {
-    throw new Error('[locomotion_dispatcher] CODING VIOLATION: goToStationAnchor called with no bot loaded.');
+    throw new Error('[locomotion_dispatcher] CODING VIOLATION: goToStationStance called with no bot loaded.');
   }
+  // Required here rather than at module scope, matching `reposition` above — this file's convention.
+  const Vec3 = require('vec3');
+  // The one shared interaction distance, from the module that owns it (Law 16). A second number here
+  // would be a second opinion about reach, and `craft_handler`'s STATION_REACH already reads the same one.
+  const { BLOCK_REACH } = require('@utils/fragment_utils');
+  const centre = new Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5);
+  const face = async () => { await bot.lookAt(centre); };
+
   const owner = require('@perception/blueprint_survey').resolveVoxelAnchor(pos);
 
-  if (!owner) {
-    watcher.warn('locomotion_dispatcher',
-      `🚪 no blueprint claims the station at (${pos.x},${pos.y},${pos.z}) — no authored stance exists for it. `
-      + `Only a temporary bootstrap table should ever land here; the caller decides what to do.`);
-    return { arrived: false, anchor: null, blueprint: null, roomKey: null, anchorIndex: -1, reason: 'no_anchor' };
-  }
-  if (!owner.anchor) {
+  if (owner && !owner.anchor) {
     watcher.warn('locomotion_dispatcher',
       `🚪 the ${owner.type} at (${pos.x},${pos.y},${pos.z}) belongs to blueprint "${owner.blueprint}" but to no anchor `
       + `(unassigned voxel) — that blueprint needs the voxel filed under an anchor before a bot can use it.`);
-    return { arrived: false, anchor: null, blueprint: owner.blueprint, roomKey: owner.roomKey, anchorIndex: -1, reason: 'unassigned' };
+    return { arrived: false, stance: null, source: null, blueprint: owner.blueprint, roomKey: owner.roomKey, anchorIndex: -1, reason: 'unassigned' };
   }
 
-  const a = owner.anchor;
+  // The blueprint's anchor outranks a recorded stance wherever both exist: the anchor is inside the
+  // building by construction, which is the immersion half of his 2026-08-31 ruling and the reason no
+  // reach metric was allowed to choose. A recorded stance is only ever consulted for a station no
+  // blueprint claims.
+  let stance = null, source = null, blueprint = null, roomKey = null, anchorIndex = -1;
+  if (owner) {
+    stance = owner.anchor; source = 'anchor';
+    blueprint = owner.blueprint; roomKey = owner.roomKey; anchorIndex = owner.anchorIndex;
+  } else {
+    const row = require('@perception/station_registry').stationAt(pos);
+    if (row && row.stance) { stance = row.stance; source = 'recorded'; }
+  }
+
+  if (!stance) {
+    // ALREADY IN REACH IS CHECKED ONLY HERE, AFTER BOTH AUTHORED SOURCES CAME BACK EMPTY. Checking it
+    // first would let a body that happens to be standing near a blueprint station use it from outside
+    // the wall, which is precisely what the anchor rule exists to forbid.
+    const d = bot.entity.position.distanceTo(centre);
+    if (d <= BLOCK_REACH) {
+      watcher.summary('locomotion_dispatcher',
+        `🚪 station at (${pos.x},${pos.y},${pos.z}) has no authored stance and is already within reach `
+        + `(${d.toFixed(1)}b) — using it where the body stands, which is the set-it-down-beside-me case.`);
+      await face();
+      return { arrived: true, stance: null, source: 'in_reach', blueprint: null, roomKey: null, anchorIndex: -1 };
+    }
+    watcher.warn('locomotion_dispatcher',
+      `🚪 the station at (${pos.x},${pos.y},${pos.z}) has no authored stance — no blueprint claims it and no `
+      + `placement stance was recorded for it — and it is ${d.toFixed(1)} blocks away, past the ${BLOCK_REACH}-block `
+      + `reach. NOTHING MOVES; the caller decides (for a crafting table, set down its own).`);
+    return { arrived: false, stance: null, source: null, blueprint: null, roomKey: null, anchorIndex: -1, reason: 'no_stance' };
+  }
+
   watcher.summary('locomotion_dispatcher',
-    `🚪 ${owner.type} at (${pos.x},${pos.y},${pos.z}) → standing on ${owner.blueprint} anchor ${owner.anchorIndex} (${a.x},${a.y},${a.z}).`);
+    `🚪 station at (${pos.x},${pos.y},${pos.z}) → standing on its ${source} stance (${stance.x},${stance.y},${stance.z})`
+    + `${source === 'anchor' ? ` [${blueprint} anchor ${anchorIndex}]` : ''}.`);
   // goToStand owns the "+1 to stand ON it" conversion and defaults exact:true — the feet must land on the
-  // anchor cell itself, not merely within tolerance of it, or the stance is back to being approximate.
-  const nav = await goToStand(a);
+  // stance cell itself, not merely within tolerance of it, or the stance is back to being approximate.
+  const nav = await goToStand(stance);
+  const arrived = !!(nav && nav.arrived);
+  if (arrived) await face();
   return {
-    arrived: !!(nav && nav.arrived), anchor: a,
-    blueprint: owner.blueprint, roomKey: owner.roomKey, anchorIndex: owner.anchorIndex,
-    reason: nav && nav.arrived ? undefined : (nav?.reason || 'unreachable_anchor'),
+    arrived, stance, source, blueprint, roomKey, anchorIndex,
+    reason: arrived ? undefined : (nav?.reason || 'unreachable'),
   };
 }
 
@@ -568,7 +639,7 @@ module.exports = {
   // The doorway: movement APIs.
   goTo,
   goToStand,
-  goToStationAnchor,
+  goToStationStance,
   reposition,
   descendColumn,
 };

@@ -97,7 +97,16 @@ function assess({ inventory, buildClaim }) {
             // resolution ever really answered — is there anywhere to put this yet? — and the first
             // registered chest answers it, so a delivery that walks to the nearest one is not walking
             // past a "wrong" chest.
-            const chestEntry = Object.values(allStations).find(e => e && e.type === 'chest') || null;
+            // `entries`, NOT `values` — THE KEY IS THE DELIVERABLE HALF (fixed 2026-09-10). This read
+            // dropped the registry key on the floor and passed only `.pos` downstream, so the one thing
+            // that could open the chest had to be REBUILT from coordinates further down the chain. It was
+            // rebuilt wrong for eleven days: `station_registry.stationKey` appends the owner
+            // (`25|65|-1|homesteader`) and the rebuild produced `25|65|-1`, which matches no row. Every
+            // storage delivery abandoned. A key is minted in exactly one place (Law 16); anything that
+            // needs it carries it.
+            const chestRow = Object.entries(allStations).find(([, e]) => e && e.type === 'chest') || null;
+            const chestId = chestRow ? chestRow[0] : null;
+            const chestEntry = chestRow ? chestRow[1] : null;
 
             // ── NO CHEST YET → THE POCKET STANDS IN — the bot's own inventory stands in for shared
             // storage until a chest exists, then transfers there like normal, reusing the same order logic
@@ -188,6 +197,12 @@ function assess({ inventory, buildClaim }) {
                     stock,
                     what: want, need: stock.deficit_below - chestCount,
                     where: chestEntry.pos,
+                    // THE CHEST'S OWN REGISTRY KEY, carried rather than rebuilt from `where` (see the
+                    // `Object.entries` note above). `where` answers "walk to roughly here"; this answers
+                    // "open exactly this row", and the two are not interchangeable because the row key
+                    // carries the owner and a coordinate cannot. Same shape the furnace assessor already
+                    // posts (`station_id: id`).
+                    station_id: chestId,
                     // The LAYER, not a place. `destination` is read downstream only as "this order ends in
                     // a chest rather than a pocket" (supply_manager's pocket-is-not-fulfilment rule, and
                     // job_gates' held-stock check); naming a blueprint here implied a routing decision no

@@ -409,6 +409,14 @@ brain.onPlanningGrant((botId) => {
   sendToBot(client.ws, 'planning_granted', botId, {});
 });
 
+// The brain's own lines into the run record, beside this file's. Registered here rather than in the
+// brain because the brain must stay require-able cold (preflight loads it with no server); `persistCombined`
+// is passed unwrapped so the brain's `[OVERSEER_BRAIN]` tag survives into the trace and a lens can tell
+// the arbiter's decisions apart from the transport's. Without this the one component that decides which
+// bot may think wrote nothing any lens could read — see the header of overseer_brain.js SECTION 4 for the
+// run that cost.
+brain.onLog(persistCombined);
+
 function handlePlanningRequest(ws, msg) {
   const botId = msg.bot_id;
   if (!botClients.has(botId)) {

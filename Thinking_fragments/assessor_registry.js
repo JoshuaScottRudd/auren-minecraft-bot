@@ -36,7 +36,17 @@ const mining        = require('@thinking/assessors/mining');
 const building      = require('@thinking/assessors/building');
 const supply        = require('@thinking/assessors/supply');
 const furnace       = require('@thinking/assessors/furnace');
-const exploration   = require('@thinking/assessors/exploration');
+
+// `exploration` IS GONE — DELETED 2026-09-10, not merely unregistered. Its only output was the
+// `seek_biome` job, which marched a homesteader out of an unbuildable biome to found its base
+// elsewhere. Ruled out: *"i dont want the bots to teleport to a player who lives in the desert and the
+// bots just walk off to another loaded chunk to make a base. it should just refuse and crash and tell
+// the human that it cant find a place to build the base."* A crew is brought to where a person stands,
+// and that placement is the instruction — a base sited in another chunk overrules it.
+// `assessors/base_layout` now throws a Law 13 violation naming the biome instead of returning silence.
+// BIOME HUNTING FOR MATERIAL SURVIVES and is untouched: `supply_manager` routes to
+// `exploration_executor` directly for that, so it never needed a board job (*"it should only biome hunt
+// if searching for surface items like logs"*).
 const baseLayout    = require('@thinking/assessors/base_layout');
 const woodPreference= require('@thinking/assessors/wood_preference');
 const hunger        = require('@thinking/assessors/hunger');
@@ -60,14 +70,14 @@ const GATE = respawn;
 // and the rung do that — so what it must not do is drift AWAY from `building`, where a later reader
 // would stop recognising the two as one kind of work.
 const EVALUATE_ORDER = [
-    hunger, mining, building, contractorHouse, supply, furnace, exploration,
+    hunger, mining, building, contractorHouse, supply, furnace,
     baseLayout, woodPreference, farming, lighting, canopy, groundSalvage,
 ];
 
 // ASSEMBLE — urgent → stable (Law 18). The order jobs are CONCATENATED in, which survives into the
 // printed board because the display sort is stable. It breaks no ties: equals are picked at random.
 const ASSEMBLE_ORDER = [
-    hunger, groundSalvage, exploration, baseLayout, woodPreference, supply,
+    hunger, groundSalvage, baseLayout, woodPreference, supply,
     furnace, building, contractorHouse, mining, farming, lighting, canopy,
 ];
 

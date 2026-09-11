@@ -216,7 +216,11 @@ const JOB_TYPES = [
     ['preconditions', [
         { key: 'respawn_recover',        stage: null },
         { key: 'eat_food',               stage: null },
-        { key: 'exploration_seek_biome', stage: null },
+        // `exploration_seek_biome` was here and is DELETED (2026-09-10) along with the assessor that was
+        // its only producer. A whitelist entry for a job nothing can post claims a permission that
+        // cannot be exercised, and the daylight-gate check below would then guard a name no job carries.
+        // Removing it shifts the rungs beneath it by one and changes no PAIRWISE order, which is all a
+        // band comparison reads. Reasons: `assessor_registry`'s note, and bugsquashing §7.
         { key: 'base_layout_lock',       stage: null },
         { key: 'wood_preference_lock',   stage: null },
         { key: 'ground_salvage',         stage: null },
@@ -437,7 +441,9 @@ const DAYLIGHT_ONLY_JOBS = new Set([
     // build either way; only the headframe's deadline earns an exemption, and this carries none.
     'building_contractor_house',
     'light_base',               // torching the yard
-    'exploration_seek_biome',   // long travel in the open
+    // `exploration_seek_biome` was the third entry and went with its job type (2026-09-10). It was the
+    // only member here that existed for TRAVEL rather than for exposed work, and nothing travels for a
+    // build site any more — a homesteader in the wrong biome stops instead (Law 13).
 ]);
 // A gate keyed on a name no job carries never closes, and it fails SILENTLY — surface jobs run all night
 // and nothing says why. Law 13: a coding violation, so it throws at load and a rename catches for free.

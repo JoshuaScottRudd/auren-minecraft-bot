@@ -132,16 +132,18 @@ function _abandon(reason) {
 // place against the station it was already beside.
 //
 // NO DISTANCE TEST SURVIVES HERE, and its removal is the point rather than a tidy-up. An early return on
-// "am I close enough" is a second opinion about the stance, and the whole ruling behind goToStationAnchor
+// "am I close enough" is a second opinion about the stance, and the whole ruling behind goToStationStance
 // is that there is only one: the blueprint's anchor. A bot four blocks away with a clear line is NOT
 // close enough — it may be outside the wall. When the body is already on the anchor the search returns an
 // empty path and this costs nothing, so the check bought nothing either.
 //
-// A furnace is always a blueprint voxel (that is why nothing may dig one), so `no_anchor` here is a real
-// fault and not a case to accommodate: false travels to the caller's abandon path with the reason logged
-// by locomotion.
+// A furnace is always a blueprint voxel (that is why nothing may dig one), so a stance it cannot resolve
+// is a real fault here and not a case to accommodate: false travels to the caller's abandon path with the
+// reason logged by locomotion. The 2026-09-10 change that gave FIELD stations a recorded stance does not
+// reach this file — a blueprint voxel resolves through its anchor exactly as before, and the anchor
+// outranks a recorded stance wherever both exist, so a furnace can never be worked from a set-down cell.
 async function _reach(bot, pos) {
-  const nav = await locomotion.goToStationAnchor({ x: pos.x, y: pos.y, z: pos.z });
+  const nav = await locomotion.goToStationStance({ x: pos.x, y: pos.y, z: pos.z });
   return !!nav.arrived;
 }
 

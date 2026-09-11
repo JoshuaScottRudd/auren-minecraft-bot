@@ -521,8 +521,29 @@ async function _withdrawFromChest(payload, item, amount) {
 // true; Law 16: a route that cannot produce its own outcome). A storage deficit closes only by material
 // entering the fleet.
 
+// ── THE STATION KEY IS CARRIED, NEVER REBUILT (fixed 2026-09-10) ────────────────────────────────────
+// This line used to be `const stationId = `${magnet.where.x}|${magnet.where.y}|${magnet.where.z}``, and
+// that rebuild was WRONG from 2026-08-30 onward — the day `station_registry.stationKey` began appending
+// the owner to the voxel (`25|65|-1|homesteader`, the keycard change). A coordinate cannot carry an
+// owner, so the rebuilt key matched no row, `inventory_swapper` found no target, and EVERY storage
+// delivery abandoned with `no_deposit_target_for_<item>` and re-posted forever.
+//
+// It took eleven days to see because reaching this line needs a chest BUILT and a storage row in
+// deficit, and no run got that far — the runs in between died on the freeze, the planks loop and the
+// craft regression. The first clean run found it in eight minutes.
+//
+// A KEY IS MINTED IN ONE PLACE (Law 16). The chest's key now travels: assessor → job → magnet
+// whitelist → here. A missing one is a WIRING fault, not a world state, so it throws rather than
+// improvising a key that would fail the same silent way (Law 13).
 function _dispatchDelivery(payload, magnet) {
-    const stationId = `${magnet.where.x}|${magnet.where.y}|${magnet.where.z}`;
+    const stationId = magnet.station_id;
+    if (!stationId) {
+        throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a deliver magnet for "${magnet.what}" carries no `
+            + `station_id, so there is no chest row to open. The assessor that posted this job must carry the `
+            + `chest's registry key (see supply.js's storage row), and \`dispatcher._claimJob\`'s magnet field `
+            + `whitelist must list station_id. Do NOT rebuild it from \`where\` — the key carries an owner `
+            + `and a coordinate does not.`);
+    }
     routeSignal(TAG, 'delivery_executor', {
         ...payload,
         manager:    TAG,
@@ -594,8 +615,9 @@ module.exports = {
 
         // ── Deliver return: delivery_executor finished a chest deposit ──
         if (magnet.action === 'deliver' && payload.executor === 'delivery_executor') {
-            const sid = `${magnet.where.x}|${magnet.where.y}|${magnet.where.z}`;
-            watcher.summary(TAG, `${targetItem} (${holdGoal}) from=${from} | deliver complete to ${magnet.destination} (${sid}) | RELEASE`);
+            // The carried key, not a rebuilt one — a trace that prints an id no row has is what let the
+            // delivery bug hide: the line looked exactly right (see `_dispatchDelivery`'s note).
+            watcher.summary(TAG, `${targetItem} (${holdGoal}) from=${from} | deliver complete to ${magnet.destination} (${magnet.station_id}) | RELEASE`);
             _releaseJob(`deliver done for ${targetItem}`);
             return;
         }
@@ -699,8 +721,7 @@ module.exports = {
         // ── Step 1: Do I already have enough? ────────────────────────────
         if (haveSpendable >= holdGoal) {
             if (magnet.destination && magnet.where) {
-                const sid = `${magnet.where.x}|${magnet.where.y}|${magnet.where.z}`;
-                watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | COMPLETE → deliver to ${magnet.destination} (${sid})`);
+                watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | COMPLETE → deliver to ${magnet.destination} (${magnet.station_id})`);
                 _dispatchDelivery(payload, magnet);
                 return;
             }

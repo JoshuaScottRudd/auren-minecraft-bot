@@ -1,0 +1,10 @@
+{
+  "name": "auren-tools-vendor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vendored JS analyzer for preflight's unbound-identifier and catch-shape passes (espree parses; eslint-scope resolves bindings for the standard no-undef analysis). Committed in-tree because node_env2/ is gitignored: a dependency installed there exists on one workstation and is missing on the other, which would make the instrument crash on one machine or be made optional and silently skip. Install with this directory as the npm prefix and commit node_modules/ with it — a copy without the built dist/ is what broke it before.",
+  "dependencies": {
+    "eslint-scope": "^9.1.2",
+    "espree": "^11.2.0"
+  }
+}

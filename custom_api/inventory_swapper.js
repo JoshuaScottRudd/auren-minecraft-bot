@@ -404,7 +404,7 @@ async function _queueAtChest(bot, stationId, pos, orderType, deadline) {
     if (!holder) return { ok: true, waited: false };
     watcher.summary(TAG, `chest ${stationId} is in use by ${holder} — moving there to queue for release.`);
     const locomotion = require('@locomotion/locomotion_dispatcher');
-    const moveResult = await locomotion.goToStationAnchor({ x: pos.x, y: pos.y, z: pos.z });
+    const moveResult = await locomotion.goToStationStance({ x: pos.x, y: pos.y, z: pos.z });
     if (!moveResult.arrived) {
         return { ok: false, reason: `cannot_reach_locked_${orderType}_chest_at_(${pos.x},${pos.y},${pos.z})_${moveResult.reason}` };
     }
@@ -465,7 +465,47 @@ async function _executeTransfer(bot, orderType, orders, targetStationId) {
     let target;
     if (targetStationId) {
         const entry = stations[targetStationId];
-        if (entry) target = { id: targetStationId, ...entry };
+        // ── A NAMED STATION THAT IS NOT A ROW IS A WIRING FAULT, NOT AN EMPTY SHELF ──────────────────
+        // This used to fall through to the shared `no_${orderType}_target_for_${item}` abandon below,
+        // and those are two different facts wearing one sentence (Law 25). The abandon's real meaning is
+        // "the selector looked at every chest and none can serve this item" — a legitimate world state
+        // early in a run. A caller NAMING a station the registry has never heard of cannot be a world
+        // state: the id came from code.
+        //
+        // Reported as the same shortfall, that distinction was invisible for eleven days. `supply_manager`
+        // rebuilt the key from coordinates and lost the owner half (`25|65|-1` for a row filed as
+        // `25|65|-1|homesteader`), so every storage delivery answered "no deposit target for stone_sword"
+        // — which reads as "nowhere to put a sword yet" and is exactly what a fresh base looks like. The
+        // loop was read as a full pocket with nowhere to dump. It was a typo in a key.
+        //
+        // ── THE TEST IS THE KEY'S SHAPE, NOT WHETHER THE ROW IS THERE ─────────────────────────────────
+        // Those are the two conditions, and only one of them is a bug (Law 29 — one condition per
+        // branch). A key the registry could never have minted came from code. A well-formed key with no
+        // row behind it is a chest that was BROKEN between the plan and the act — a creeper, a player,
+        // another crew — and that is an ordinary world event that must abandon, never crash.
+        //
+        // Shape is checkable without asking the registry anything, which is what makes the distinction
+        // available at all: `stationKey` is `x|y|z|owner`, so four parts with three integers and a
+        // non-empty owner. `25|65|-1` fails it on arity alone.
+        const parts = String(targetStationId).split('|');
+        const wellFormed = parts.length === 4
+            && parts.slice(0, 3).every(p => Number.isInteger(Number(p)))
+            && parts[3].length > 0;
+        if (!wellFormed) {
+            throw new Error(`[${TAG}] CODING VIOLATION (Law 13): asked to ${orderType} ${item} at station `
+                + `"${targetStationId}", which is not a station key. Keys are minted ONLY by `
+                + `station_registry.stationKey — voxel AND owner, e.g. "25|65|-1|homesteader". A caller that `
+                + `builds one from coordinates drops the owner half and can never match any row. Carry the `
+                + `key from the registry instead of rebuilding it.`);
+        }
+        if (!entry) {
+            // A world state, so it is named and abandoned rather than thrown — and named DISTINCTLY from
+            // the selector's "no chest can serve this item" below, because the caller's chest being gone
+            // and there being no suitable chest are different facts (Law 25).
+            _abandon(`station_row_gone_${targetStationId}`);
+            return;
+        }
+        target = { id: targetStationId, ...entry };
     } else {
         // Selection sees locked chests too (their snapshots are countable state);
         // the selectors prefer an unlocked equivalent and fall back to a locked
@@ -560,7 +600,7 @@ async function _executeTransfer(bot, orderType, orders, targetStationId) {
     // The retry loop below is NOT the defect and is not weakened: a chest a peer holds open really does
     // need waiting out. What was wrong is that it was being fed an arrival that had not happened.
     const locomotion = require('@locomotion/locomotion_dispatcher');
-    const moveResult = await locomotion.goToStationAnchor({ x: target.pos.x, y: target.pos.y, z: target.pos.z });
+    const moveResult = await locomotion.goToStationStance({ x: target.pos.x, y: target.pos.y, z: target.pos.z });
     if (!moveResult.arrived) {
         _abandon(`cannot_reach_${orderType}_chest_at_(${target.pos.x},${target.pos.y},${target.pos.z}) — ${moveResult.reason}`);
         return;

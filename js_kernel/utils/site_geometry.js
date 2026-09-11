@@ -238,11 +238,35 @@ const ADJACENT_HALF = [[1, 0], [0, 1], [1, 1], [1, -1]];
 //                        1×2 pocket: a cramped cave fails on the footprint, not on a separate test.
 //   on the surface OR in a cave → sky is NOT required. floorNearest finds either.
 //
-// opts: { size=3, height=3, maxVariance=1, flatness='span', maxStep=1, refY }
+// ── `occupancy` — WHICH OF THE TWO QUESTIONS THIS CALL IS ASKING (2026-09-10) ────────────────────────
+// 'clearable' (default)  can a body stand here ONCE THE CREW HAS CLEARED THE CANOPY — the BUILD SITE
+//                        question. Leaves and logs overhead are room the build will make, so
+//                        `isPassable` counts them as passable and that is correct here.
+// 'as-is'                can a body stand here RIGHT NOW, with nothing cleared first — the BODY
+//                        PLACEMENT question. Nothing clears a leaf before a body is teleported into it.
+//
+// THE TWO ARE NOT INTERCHANGEABLE AND CONFLATING THEM COST A RUN. `standingSpotNear` placed a body at
+// (-6,63,-3) with `oak_leaves` at head height on 2026-09-10: the headroom clause read `isPassable`,
+// `CLEARABLE` contains `oak_leaves`, so the cell passed. A* then expanded ZERO nodes from that start on
+// every one of 150 attempts — near goals and far alike — because a body needs two clear cells and the
+// head cell was solid. The bot never moved from spawn, the tree feller found no reachable tree among 82
+// it could plainly SEE, and the judge killed the signal at 1m21s. `architect_bugsquashing.md` §14.
+//
+// 'as-is' DELEGATES TO `pathfinding_utils.isBlockPassable` RATHER THAN DEFINING A SECOND ANSWER — that
+// is the whole point (Law 16). It is exported for exactly this reuse, and its own export comment names
+// the hazard: a copied membership set drifts silently, and a copy that disagrees about passability
+// "plans routes through walls". Here the disagreement placed a body somewhere no route could start.
+//
+// opts: { size=3, height=3, maxVariance=1, flatness='span', maxStep=1, refY, occupancy='clearable' }
 // Returns { valid, spawnY, floorY, reason, detail, sky, floorNames }.
 function evaluateOpenBox(reader, cx, cz, refY, opts = {}) {
   const size = opts.size || 3;
   const height = opts.height || 3;
+  // Required at call time rather than at module scope: this file is loaded by the workshop's benches and
+  // by the arena, and pathfinding_utils pulls the movement stack in behind it.
+  const clearFor = opts.occupancy === 'as-is'
+    ? require('@utils/pathfinding_utils').isBlockPassable
+    : isPassable;
   const maxVariance = opts.maxVariance != null ? opts.maxVariance : 1;
   const flatness = opts.flatness || FLATNESS.SPAN;
   const maxStep = opts.maxStep != null ? opts.maxStep : 1;
@@ -306,7 +330,7 @@ function evaluateOpenBox(reader, cx, cz, refY, opts = {}) {
       const b = above[i];
       if (isLava(b.name)) return { valid: false, reason: REASON.HAZARD, detail: `lava at (${cell.x},${cell.y + i + 1},${cell.z})` };
       if (isWater(b.name)) return { valid: false, reason: REASON.SUBMERGED, detail: `water at (${cell.x},${cell.y + i + 1},${cell.z})` };
-      if (!isPassable(b)) return { valid: false, reason: REASON.OVERHEAD_BLOCKED, detail: `${b.name} at (${cell.x},${cell.y + i + 1},${cell.z})` };
+      if (!clearFor(b)) return { valid: false, reason: REASON.OVERHEAD_BLOCKED, detail: `${b.name} at (${cell.x},${cell.y + i + 1},${cell.z})` };
     }
     // Lava directly beneath a floor cell disqualifies too: a body standing on a one-block crust over
     // lava is standing on a hazard, and the crust is exactly what a fight breaks.
@@ -470,9 +494,67 @@ function formatRejections(rejections) {
   return entries.length ? entries.join('; ') : 'none';
 }
 
+// ── WHERE CAN ONE BODY STAND, NEAR HERE? ────────────────────────────────────────────────────────────
+//
+// THE ASK (Architect 2026-09-10): *"the architect needs to be teleported to a valid standing spot…
+// the foreman shouldnt spawn the bot if there is no valid teleport spot available next to the human. the
+// whole thing should be refused before a bot is even spawned."*
+//
+// Two callers, one question, so one function (Law 16). The desk asks it about the PERSON'S cell before it
+// launches anything; the test harness asks it about its faux person's cell before it stands them up. Both
+// were about to grow their own version, and two versions of "can a body stand here" is exactly how a
+// refusal and a placement end up disagreeing about the same ground.
+//
+// IT IS `evaluateOpenBox` AT BODY SCALE AND NOTHING ELSE — `size: 1, height: 2` is one column, two cells
+// of headroom, which is a player. Every clause that makes the box test worth trusting comes free and is
+// NOT restated here: no canopy to fall through, no lava above or beneath, no water to drown in, no
+// blocked overhead, a real floor rather than an unloaded chunk. The 3×3 base-siting call and this one are
+// the same code reading the same world with different dials, which is the property that lets the desk's
+// refusal and the body's arrival mean the same thing.
+//
+// FLATNESS IS IRRELEVANT AT SIZE 1 and is left at its default deliberately rather than passed: one column
+// has no unevenness to measure, so naming a flatness here would be a dial with no effect — and a dial
+// with no effect is read by the next person as a dial that matters.
+//
+// ORIGIN FIRST, THEN OUTWARD. `ringScan` starts at radius 0, so a person standing on perfectly good
+// ground gets their own cell back and nothing moves. The search only widens when where they stand will
+// not hold a body, and `maxRadius` bounds how far "next to the human" is allowed to mean — a spot 40
+// blocks away is not next to them, and returning one would be the drift this refusal exists to prevent.
+//
+// THE SHORTFALL IS NAMED, NEVER GUESSED AT (Law 25 / Law 13). A failure returns `why` built from the
+// sweep's own rejection tally — "12 submerged; 4 no floor" — because "no valid spot" is unactionable and
+// "you are standing in water" tells a person to walk up the beach. `radius` is the asker's number and
+// travels in; this function does not own how close is close enough.
+// ── EVERY CALLER OF THIS FUNCTION IS PLACING A BODY, SO IT ASKS THE BODY QUESTION (2026-09-10) ───────
+// Both of them — `proxy_human.standOnGround` and the desk's crew placement in `foreman.js` — teleport a
+// body to the cell this returns, and neither clears anything first. So `occupancy: 'as-is'` is not an
+// option this function offers its callers; it is what this function MEANS, and it is set here so no
+// caller can forget it (Law 16 — the guarantee cannot be left to the accident of who passes what).
+// See `evaluateOpenBox`'s `occupancy` note for the run this cost.
+async function standingSpotNear(reader, origin, { radius = 8, step = 1 } = {}) {
+  const scan = await ringScan(reader, { origin, step, maxRadius: radius },
+    (x, z) => evaluateOpenBox(reader, x, z, origin.y, { size: 1, height: 2, occupancy: 'as-is' }));
+  if (!scan.found) {
+    return {
+      found: false, cell: null, distance: null, scan,
+      why: `no cell within ${radius} block(s) of (${origin.x},${origin.y},${origin.z}) will hold a `
+        + `standing body — ${formatRejections(scan.rejections)} across ${scan.checked} cell(s) checked`,
+    };
+  }
+  const m = scan.best;
+  return {
+    found: true,
+    cell: { x: m.x, y: m.result.spawnY, z: m.z },
+    distance: m.distance,
+    scan,
+    why: null,
+  };
+}
+
 module.exports = {
   CLEARABLE, REASON, REASON_LABELS, FLATNESS, SCAN_UP, SCAN_DOWN,
   isAir, isWater, isLava, isCanopy, isStone, isGround, isPassable,
   surfaceY, floorNearest, columnAbove, hasSkyAccess,
   evaluateOpenBox, enumerateRing, ringScan, formatRejections,
+  standingSpotNear,
 };

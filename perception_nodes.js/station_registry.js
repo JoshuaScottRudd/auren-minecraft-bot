@@ -256,7 +256,30 @@ function lockChest(stationId, botId) {
 // Returns { ok: true, id, items } on success.
 // Returns { ok: false, reason } on failure — nothing is written.
 // The caller MUST have an open window (bot.currentWindow) before calling.
-function registerStation(pos, type, window, blueprint) {
+// ── `stance` — THE ONE CELL A BODY STANDS ON TO REACH THIS STATION ──────────────────────────────────
+// Architect 2026-09-10: *"how does it work for when its in the blueprint like the headframe or the
+// contract house. however that works extract as a utility and use it for both."*
+//
+// A BLUEPRINT STATION ALREADY HAS ONE and it is the owning anchor — authored when the blueprint was
+// drawn, proven to reach every voxel in its group, the same cell on every run and from every direction
+// (Law 19). A station set down in a field had none, which is why the walk-to-a-station call (then named
+// `goToStationAnchor`, now `goToStationStance`) answered `no_anchor` and moved nothing: there was no
+// authored cell to move TO. That is the whole of the craft regression — see `architect_bugsquashing.md`
+// §11, and §12 for this fix.
+//
+// SO A FIELD STATION IS GIVEN THE SAME KIND OF FACT, AND IT IS NOT COMPUTED AT APPROACH TIME. He rejected
+// a searched stance twice (a raycast vantage, then a radius) for the reason that a search returns
+// whichever acceptable cell is cheapest from wherever the body happens to be, so the answer changes per
+// approach. This is the opposite: `stance` is the cell the body WAS STANDING ON at the instant it placed
+// the station, recorded once and never re-derived. It is the strongest possible evidence that the cell
+// reaches the station — `canPlaceFrom` proved reach and visibility from it, and then the placement
+// actually happened from it.
+//
+// NULL IS A REAL ANSWER, NOT A MISSING FIELD (Law 13). A row written before this existed, or a station
+// somebody built by hand and the local scan happened to find, has no recorded stance. The reader must
+// treat that as "no authored stance" and refuse to move, exactly as it did for every field station
+// before — never as licence to guess one.
+function registerStation(pos, type, window, blueprint, stance) {
     if (!window) {
         return { ok: false, reason: 'no_window' };
     }
@@ -302,6 +325,11 @@ function registerStation(pos, type, window, blueprint) {
         // reader below can only ever form its own key.
         owner: key,
         blueprint: blueprint || null,
+        // The FLOOR cell the feet rest on, matching what an anchor names, so one `goToStand` serves both
+        // sources without a caller knowing which kind of station it has. `null` when nothing authored it.
+        stance: stance
+          ? { x: Math.floor(stance.x), y: Math.floor(stance.y), z: Math.floor(stance.z) }
+          : null,
         // updated_at: the last-writer-wins key for the Phase 6 overseer merge (a station id
         // is a unique voxel, so freshest write wins). Stamped on every mutation below too.
         updated_at: Date.now(),
@@ -524,6 +552,18 @@ function findStation(type) {
     return field;
 }
 
+// stationAt(pos) — THE ROW FOR ONE VOXEL, or null. Asked by `locomotion.goToStationStance` for one field
+// only: whether a placement stance was recorded for this station (see `registerStation`'s `stance` note).
+//
+// IT GOES THROUGH `getStations()` LIKE EVERY OTHER READER rather than indexing the raw map, because that
+// is where the viewer filter and the tombstone filter live — a reader that reached past it would answer
+// from another crew's shelf, or hand back a station that has been removed (Law 16, one pathway in).
+function stationAt(pos) {
+    const id = stationKey(pos);
+    const stations = getStations();
+    return stations[id] || null;
+}
+
 // findChests: every registered chest, as { id, ...entry }. THE one door to "where can material go or
 // come from" — replaces `findStationsByRole`, whose callers all wanted a chest and had to name a role to
 // get one. `findStationsByRole('buffer')` returning nothing was how a missing role tag disabled dumping
@@ -617,4 +657,4 @@ function logContents() {
     }
 }
 
-module.exports = { posId, stationKey, openProofWindow, registerStation, snapshotStation, removeStation, getStations, getStationTypes, stationUsable, findStation, findChests, lockChest, unlockChest, getLockHolder, acquireChestLock, setSmeltState, getSmeltState, clearSmeltState, verifyAgainstWorld, logContents };
+module.exports = { posId, stationKey, openProofWindow, registerStation, snapshotStation, removeStation, getStations, getStationTypes, stationUsable, findStation, stationAt, findChests, lockChest, unlockChest, getLockHolder, acquireChestLock, setSmeltState, getSmeltState, clearSmeltState, verifyAgainstWorld, logContents };

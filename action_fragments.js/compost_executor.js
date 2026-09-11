@@ -174,10 +174,21 @@ function composterDeclaredAtAnchor() {
 async function reach(bot, block) {
   const locomotion = require('@locomotion/locomotion_dispatcher');
   // The composter is a blueprint voxel (headframe anchor 3, contractor_house anchor 0), so its stance is
-  // authored: goToStationAnchor stands the body on the owning anchor. A bare coordinate would order the
+  // authored: goToStationStance stands the body on the owning anchor. A bare coordinate would order the
   // navigator to stand INSIDE the block and it would dig the composter out to comply; a raycast or radius
   // goal would let it work the bin from outside the wall. No distance shortcut — one stance, always.
-  await locomotion.goToStationAnchor({ x: block.position.x, y: block.position.y, z: block.position.z });
+  // BOTH ANSWERS ARE REQUIRED, AND THEY ARE DIFFERENT QUESTIONS (2026-09-10). This used to discard the
+  // navigation result and return on the block read alone — so a bin that could not be reached still
+  // answered `true`, because the composter is plainly VISIBLE from wherever the body gave up. That is
+  // the same defect that produced the craft regression one file over (`architect_bugsquashing.md` §11):
+  // "can I see it" standing in for "can I reach it". Arriving is asked of the navigator; the block still
+  // being a composter is asked of the world.
+  const nav = await locomotion.goToStationStance({ x: block.position.x, y: block.position.y, z: block.position.z });
+  if (!nav.arrived) {
+    watcher.warn(TAG, `composter at (${block.position.x},${block.position.y},${block.position.z}) could not be `
+      + `reached (${nav.reason}) — nothing is fed this visit and the material stays in the pocket.`);
+    return false;
+  }
   const fresh = bot.blockAt(block.position);
   return !!(fresh && fresh.name === 'composter');
 }

@@ -13,6 +13,26 @@
 # reconstructs the tree from them exactly. The tree itself is ~440 MB of other people's code.
 node_modules/
 
+# THE ONE VENDORED TREE THAT IS TRACKED, and it is not a dependency of the bot at all: `preflight`'s
+# pass 4 needs a real JavaScript parser to decide whether an identifier is bound, and the instrument
+# has to behave identically on both of the Architect's workstations. A parser reached through
+# `npm install` exists wherever somebody last ran the install; this one travels with the repo, so the
+# one test in the fleet cannot report OK on a machine where it checked nothing.
+#
+# WHY THE NEGATION IS HERE RATHER THAN IN THE ROOT `.gitignore`, where it lived until 2026-09-10: the
+# workshop moved inside the bot, so this path is now under `Auren_Bot/` and THIS file gets the last
+# word on it. A deeper `.gitignore` overrides a shallower one unconditionally, which means the
+# `node_modules/` line four rows above would beat any negation written at the root. The rule that has
+# to be beaten and the negation that beats it now sit together.
+#
+# WHY TWO LINES. Git will not look inside a directory it has excluded, so the negation has to re-admit
+# the DIRECTORY before the contents can be re-admitted at all. The first line does that against the
+# rule above; the second is what defeats the root's `**/node_modules/*`, which excludes every direct
+# child of any `node_modules` in its own right — `espree/` among them — and would otherwise keep the
+# contents unreachable even with the directory back in.
+!Auren_Workshop/tools/vendor/node_modules/
+!Auren_Workshop/tools/vendor/node_modules/**
+
 # ── Run records ─────────────────────────────────────────────────────────────────────────────────
 # Every bot replaces its own trace file the moment it starts, so no file here ever describes more
 # than one run — see the troubleshooting section of README.md. The folder is absent from a fresh

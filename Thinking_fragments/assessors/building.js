@@ -204,6 +204,11 @@ function assess() {
             jobs.push(supplyJob({
                 id: `build_chest_${raw}`, what: raw, need: gap,
                 where: poolChest.station.pos,
+                // `homeChest()` hands back { id, station } and this job used only the position, so the
+                // key had to be rebuilt downstream from coordinates — and the rebuild lost the owner half
+                // `station_registry.stationKey` appends, abandoning every delivery (fixed 2026-09-10; see
+                // `supply_manager._dispatchDelivery`). Carry the key that was already in hand.
+                station_id: poolChest.id,
                 destination: 'headframe',
                 job_type: supplyJobType,
                 claimed_by: null,

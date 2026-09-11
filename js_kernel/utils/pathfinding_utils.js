@@ -509,7 +509,7 @@ function goalReached(bot, nodePos, goal, trace) {
   // instead of making some non deterministic way to stand."* A radius admits many cells and the search
   // picks whichever is cheapest, which is a different cell on a different approach — including one
   // OUTSIDE the building, reaching a chest through a wall. The anchor is one cell, authored, the same
-  // every time (Law 19). Station approach is now `locomotion.goToStationAnchor`, which resolves the
+  // every time (Law 19). Station approach is now `locomotion.goToStationStance`, which resolves the
   // owning anchor and uses the ordinary exact-position goal; nothing needs a radius goal.
   return false;
 }

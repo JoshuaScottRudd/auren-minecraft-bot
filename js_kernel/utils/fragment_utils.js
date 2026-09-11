@@ -461,7 +461,7 @@ const BLOCK_REACH = 4.5;
 // admits many cells and lets the route search pick whichever is cheapest, which is a different cell on a
 // different approach — including one OUTSIDE the building, opening a chest through the wall. That is the
 // defect he was actually naming, and it is not a distance problem, so no distance fixes it. The stance is
-// `locomotion.goToStationAnchor`, and a second opinion about "close enough" living here would only ever
+// `locomotion.goToStationStance`, and a second opinion about "close enough" living here would only ever
 // disagree with it (Law 16). Measured, for the record: every station voxel in every blueprint sits 1.00 to
 // 1.73 from its own anchor's stand cell, so the anchor satisfies the old number everywhere — it simply
 // answers a better question.

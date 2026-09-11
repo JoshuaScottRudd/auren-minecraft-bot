@@ -291,11 +291,40 @@ function releaseForBot(botId) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 4 — Logging
+//
+// THE ARBITER'S DECISIONS BELONG IN THE RUN RECORD, NOT ONLY ON A CONSOLE
+// (2026-09-10). Every line this file writes went to `console.log` and nowhere
+// else, so the one component that decides which bot may think was absent from
+// `watcher_overseer.jsonl` entirely — no grant, no queue entry, no TTL
+// expiry, nothing a lens could read.
+//
+// Measured cost of that, the day it was fixed: a 15-minute standard run died at
+// 3m 36s with both bots' final line reading `Requested planning token.` and no
+// grant ever arriving. Every branch of `requestPlanningToken` either grants
+// immediately or queues behind a sweep that frees a stale holder in 250ms, so
+// the trace ruled out the bookkeeping and pointed at the process — and the
+// evidence that would have said which was on a console the runner had buffered
+// and thrown away. Two mechanisms, one unprovable turn.
+//
+// `onLog` is the same registrar shape as `onPlanningGrant` above, for the same
+// reason: this module must stay require-able COLD (preflight loads it with no
+// server, no transport and no side effects), so it cannot reach for the
+// server's writer itself. The server registers its persister at listen time;
+// with nothing registered the lines still print, which is what a cold require
+// and a bare `node overseer_brain.js` should do.
 // ─────────────────────────────────────────────────────────────────────────────
+
+let _logSink = null;
+
+function onLog(callback) {
+  _logSink = callback;
+}
 
 function log(msg) {
   const ts = new Date().toISOString();
-  console.log(`[${ts}] [OVERSEER_BRAIN] ${msg}`);
+  const line = `[${ts}] [OVERSEER_BRAIN] ${msg}`;
+  console.log(line);
+  if (_logSink) _logSink(line);
 }
 
 module.exports = {
@@ -304,5 +333,6 @@ module.exports = {
   requestPlanningToken,
   releasePlanningToken,
   onPlanningGrant,
+  onLog,
   releaseForBot,
 };

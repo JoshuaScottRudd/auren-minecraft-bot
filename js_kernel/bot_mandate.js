@@ -198,8 +198,13 @@ function isHomesteader() { return currentMode() === BOT_MODES.HOMESTEADER; }
 //
 // A BARE `start_bot.js` HOMESTEADER STILL WAITS, and deliberately. One bot from a terminal owns that
 // terminal's stdin, so `start` at the readline works and is the right shape for looking a body over
-// before it does anything. `--work` is what distinguishes the two, which is why this is a launch fact
-// and not a species one.
+// before it does anything. What distinguishes the two is whether the DESK raised this body — it stamps
+// `BOT_AUTOSTART` when it fetches one — which is why this is a launch fact and not a species one.
+//
+// `--work` used to be a second way to say it and was deleted on 2026-09-10 (*"law 16 the system. only
+// one way to do it"*). A launcher flag that autostarted a homesteader also bypassed placement, siting a
+// base wherever the world dropped the body rather than where a person was standing. The reasoning is in
+// `start_bot.js` where the flag lived; nothing here changed except that only the desk now sets the field.
 function beginsWorkAtBirth() { return isContractor() || readMandate().autostart; }
 
 // startNearPlayer — the player this body must be standing beside before it begins working, or null when

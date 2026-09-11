@@ -986,7 +986,7 @@ async function runNavigation(payload) {
     // which is what a raycast answers. USING a station needs a specific pre-approved stance, which a
     // raycast cannot answer at all — it is satisfied from across a room and through a doorway, which is
     // how a bot came to report ARRIVED without moving and then retry a chest window forever. Station
-    // approach left this goal on 2026-08-31 for `locomotion.goToStationAnchor`; leave this to the
+    // approach left this goal on 2026-08-31 for `locomotion.goToStationStance`; leave this to the
     // callers that place and dig.
     const losTarget = validCoordinate(capsule.coordinate) ? capsule.coordinate : nearest.position;
     goal = { type: 'los', targetPos: losTarget, required_side: capsule.required_side || null };

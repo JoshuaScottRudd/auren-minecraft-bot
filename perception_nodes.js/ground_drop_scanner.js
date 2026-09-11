@@ -110,10 +110,19 @@ function scan(bot, center) {
   if (!bot || !center || typeof center.x !== 'number') return out;
 
   for (const e of Object.values(bot.entities || {})) {
-    // `objectType`/`name` both carry 'item' depending on client version and how the entity arrived;
+    // `displayName`/`name` both carry 'item' depending on client version and how the entity arrived;
     // asking for the metadata-decoded item would be a second decode of a fact the entity name states.
+    //
+    // `displayName` AND NOT `objectType`, WHICH COST 4,560 STACK TRACES IN TEN MINUTES (2026-09-10).
+    // prismarine-entity deprecated `objectType` and reports it with `console.trace` — an eight-line stack
+    // dump per read, on a getter this loop touches for EVERY entity on EVERY sweep. Measured off the
+    // captured bot console: 4,560 traces in one soak, which is the bulk of the 1.6 MB that console holds.
+    // It was invisible in two ways at once: the trace goes to stdout rather than through the watcher, so
+    // every lens scored the run `❌ 0` while it happened, and until this turn the bots' stdout was
+    // discarded unread by the foreman. `displayName` is the substitute the library's own message names,
+    // so this is a translation of the field and not a change to what counts as a drop.
     if (!e || !e.position) continue;
-    const isItem = e.name === 'item' || e.objectType === 'Item' || e.entityType === 'item';
+    const isItem = e.name === 'item' || e.displayName === 'Item' || e.entityType === 'item';
     if (!isItem) continue;
     out.scanned++;
 

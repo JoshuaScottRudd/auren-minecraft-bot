@@ -180,6 +180,13 @@ function _claimJob(botId, job) {
         hunger_goal:    job.hunger_goal ?? null,
         hunger_now:     job.hunger_now ?? null,
         destination: job.destination || null,
+        // WHICH STATION ROW, by the registry's own key. Added 2026-09-10 because its absence from this
+        // whitelist is what made the delivery bug possible: the assessor knew the chest's key, this list
+        // dropped it, and `supply_manager` rebuilt it from `where` — missing the owner half that
+        // `station_registry.stationKey` appends, so every storage delivery abandoned with
+        // `no_deposit_target_for_<item>`. A rebuild is a second minting of a key (Law 16); carrying it is
+        // the whole reason this list exists.
+        station_id:  job.station_id || null,
         source:      job.source || null,
         category:    job.category || null,
         tier:        job.tier || null,

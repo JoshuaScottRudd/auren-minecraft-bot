@@ -102,7 +102,7 @@ const AFTER_PLACE_SLEEP_MS = 200;
 const POST_PLACE_SUCCESS_MS = 300;
 // 4.5 — PLACEMENT and SCAN reach only: anywhere inside this is placed in situ, and it is the radius the
 // nearby-station scan sweeps. It is NOT how close a bot must stand to USE a station: using one means
-// standing on the blueprint anchor that owns it (locomotion.goToStationAnchor), which is a cell rather
+// standing on the blueprint anchor that owns it (locomotion.goToStationStance), which is a cell rather
 // than a distance. This number now answers only "can I click to PLACE here" and "how far out shall I look
 // for a table I could reuse".
 const STATION_REACH = BLOCK_REACH;
@@ -368,19 +368,31 @@ async function tryScanNearbyStation(bot, stationType) {
     // THE STANCE IS THE BLUEPRINT'S ANCHOR (2026-08-31). Two searched stances came before it and both
     // were the same mistake: a raycast vantage, then a radius — each returns whichever acceptable cell is
     // cheapest from wherever the body is, and cheapest from outside a building is a cell outside the
-    // wall. goToStationAnchor stands the body on the cell the blueprint already nominates for reaching
-    // these voxels. `no_anchor` is not an error to recover from here: the registry entry named a station
-    // no locked blueprint claims, so it falls through to the local scan below and, failing that, to a
-    // fresh table — which is the correct answer for the one station that legitimately has no anchor.
-    if (!block || block.name !== stationType) {
-      await locomotion.goToStationAnchor({ x: pos.x, y: pos.y, z: pos.z });
+    // wall. goToStationStance stands the body on ONE authored cell — the blueprint's anchor where a
+    // blueprint claims the voxel, otherwise the cell the body stood on when it placed the station. When
+    // it can resolve neither and the block is out of reach it moves nothing and says `no_stance`, and the
+    // fall-through below is the answer to that: the local scan, then a fresh table of this bot's own.
+    // ── THE WALK IS UNCONDITIONAL NOW, AND THAT IS THE FIX (2026-09-10) ──────────────────────────────
+    // These four lines were guarded by `if (!block || block.name !== stationType)` — walk only when the
+    // block reads WRONG — and the answer was discarded. So a registered table that was plainly VISIBLE
+    // but 12.6 blocks away was returned untouched, the body never moved, and `bot.craft` waited 20 s for
+    // a window that cannot open at that range, five times, until the judge killed the chain. The whole
+    // regression was that "can I see it" was standing in for "can I reach it" (bugsquashing §11).
+    //
+    // A NAVIGATION RESULT IS READ, LIKE AT EVERY OTHER CALL SITE. This was the only one in the codebase
+    // that threw it away; `goToStationStance` exists to answer "is the body now somewhere it can use
+    // this", and discarding that makes arriving indistinguishable from refusing to move.
+    const nav = await locomotion.goToStationStance({ x: pos.x, y: pos.y, z: pos.z });
+    if (!nav.arrived) {
+      watcher.warn(TAG, `registered ${stationType} at ${pos} is not usable from here (${nav.reason}) — `
+        + `falling through to a local scan, then to placing one.`);
+    } else {
+      // Re-read AFTER arriving: the row said a station is here, and the world is what confirms it.
+      // goToStationStance has already faced the block, so there is no lookAt to repeat here.
       block = bot.blockAt(pos);
+      if (block && block.name === stationType) return block;
+      watcher.warn(TAG, `Registry says ${stationType} at ${pos} but world has "${block?.name || 'null'}" after navigation — stale`);
     }
-    if (block && block.name === stationType) {
-      await bot.lookAt(pos.offset(0.5, 0.5, 0.5));
-      return block;
-    }
-    watcher.warn(TAG, `Registry says ${stationType} at ${pos} but world has "${block?.name || 'null'}" after navigation — stale`);
   }
 
   const botPos = bot.entity.position.floored();
@@ -658,7 +670,22 @@ async function placeStation(bot, stationType) {
 async function registerFieldStation(bot, block) {
   const diag = {};
   const win = await stationRegistry.openProofWindow(bot, block, diag);
-  const result = stationRegistry.registerStation(block.position, block.name, win, null);
+  // ── THE STANCE IS RECORDED HERE, AND HERE IS THE ONLY MOMENT IT CAN BE (2026-09-10) ────────────────
+  // Architect: *"however that works extract as a utility and use it for both."* A blueprint station's
+  // stance is its owning anchor; a field station had none, so nothing could walk to it and the caller
+  // crafted at range instead (bugsquashing §11). This gives it one — and not a computed one.
+  //
+  // THE CELL IS WHERE THE BODY IS STANDING RIGHT NOW, which is the strongest evidence available that it
+  // reaches this block: `canPlaceFrom` proved reach and visibility from this exact cell moments ago, and
+  // then the placement actually succeeded from it. Recorded once, never re-derived — so unlike the two
+  // searched stances he rejected, it cannot answer differently on the next approach (Law 19).
+  //
+  // STORED AS THE FLOOR CELL, matching what an anchor names: `locomotion.goToStand` owns the "+1 to
+  // stand ON it" conversion, so both sources hand it the same kind of cell and neither caller has to
+  // know which kind of station it is holding.
+  const feet = bot.entity.position.floored();
+  const stance = { x: feet.x, y: feet.y - 1, z: feet.z };
+  const result = stationRegistry.registerStation(block.position, block.name, win, null, stance);
   if (win) {
     guardExternalSync(TAG, 'closeWindow after field registration', () => bot.closeWindow(win));
     await sleep(AFTER_PLACE_SLEEP_MS);
@@ -748,6 +775,41 @@ function locateCraftedItem(bot, itemId) {
   return { inv, cursor, result, grid, total: inv + cursor + result + grid };
 }
 
+// ── CAN THE OUTPUT LAND AT ALL? (Law 13 — prove it is safe to act, do not act and find out) ─────────
+// MEASURED 2026-09-10, and this is the whole "planks crafting loop": a homesteader with a FULL pocket
+// asked for 12 oak_planks. `bot.craft` RESOLVED — mineflayer reports the craft, the server consumes the
+// ingredient — and the four planks had no slot to land in, so they never materialized:
+//
+//   craft no-op: oak_planks total did not rise (0→0/12) though bot.craft resolved
+//   split[inv=0 cursor=0 result=0 grid=0], free_slots=0, table=no, delta[have(Δ)]=oak_log:4(-1)
+//
+// The no-op net below caught it correctly and broke, but by then a log was already gone. The job was
+// re-dispatched, another log went, and the trace shows `oak_log:4 → 3 → 2` — **each retry silently
+// destroyed a log** until `recursive_judge` killed the signal at 5/5 contiguous repeats. Nothing in the
+// loop was wrong; it was answering the wrong question. "Did the craft work?" cannot be asked safely,
+// because asking it costs a log. "Can the output land?" is free, and it is knowable first.
+//
+// THE ANSWER IS NOT `emptySlotCount() > 0`. A craft can also land by topping up a stack of the same item
+// that has room, which is the ordinary case for a bot part-way through an order. So the test is: no empty
+// slot AND no room in any existing stack of the output.
+//
+// IT FAILS OPEN, deliberately (Law 23): an inventory whose free count cannot be read is not evidence of a
+// full one, and suppressing a legitimate craft on a missing measurement is the more expensive mistake.
+function outputHasNowhereToLand(bot, itemId) {
+  const inv = bot && bot.inventory;
+  if (!inv || typeof inv.emptySlotCount !== 'function' || typeof inv.items !== 'function') return false;
+  if (inv.emptySlotCount() > 0) return false;
+  // Resolved here rather than taken as a parameter, matching this file's other three sites: `mcData` is
+  // a per-function local keyed on `bot.version`, never a module constant, so a helper that wants it asks
+  // for it the same way (Law 16 — one way to reach minecraft-data in this file).
+  const mcData = require('minecraft-data')(bot.version);
+  const stackSize = (mcData.items[itemId] && mcData.items[itemId].stackSize) || 64;
+  const roomInStacks = inv.items()
+    .filter(i => i && i.type === itemId)
+    .reduce((n, i) => n + Math.max(0, stackSize - i.count), 0);
+  return roomInStacks <= 0;
+}
+
 // THE STATION OUTLIVES THE ORDER, AND NOW THE BOOK AS WELL. `ctx` is the batch's shared workspace — the
 // station context, the placed-station ledger and the metric counters — created ONCE per batch by
 // `newCraftContext()`, not once per order: an order that arrives second finds the table already in
@@ -820,18 +882,22 @@ async function craftWithSequence(bot, sequence, ctx) {
     let block = await tryScanNearbyStation(bot, type);
     let cleanup = false;
     if (block) {
-      // THE BOOTSTRAP TABLE IS THE ONE STATION WITH NO ANCHOR, and the Architect named it himself when he
-      // made the anchor the stance: *"since all chests and furnaces operate off of blueprints, with the
-      // only exception being a temporary crafting table to boostrap the bot."* A table a bot sets down
-      // beside itself and takes back has no blueprint and therefore no authored stand — so when
-      // goToStationAnchor answers `no_anchor` NOTHING MOVES and the block is used where it stands, which
-      // is legitimate precisely because a throwaway is within arm's reach by definition (placeStation
-      // puts it on an adjacent cell, and the scan that found it swept only STATION_REACH). Any OTHER
-      // reason — a real anchor this body could not reach — drops the block and lets the caller place its
-      // own, rather than working a blueprint station from a stance nobody approved.
-      const nav = await locomotion.goToStationAnchor({ x: block.position.x, y: block.position.y, z: block.position.z });
-      if (!nav.arrived && nav.reason !== 'no_anchor') {
-        watcher.warn(TAG, `${type} at ${block.position} has an anchor this body could not reach (${nav.reason}) — placing its own instead.`);
+      // ── ONE QUESTION NOW: DID THE BODY GET SOMEWHERE IT CAN USE THIS? ──────────────────────────────
+      // This branch used to make an exception of `no_anchor`, on the reasoning that a station with no
+      // authored stance must be a throwaway and therefore *"within arm's reach by definition (placeStation
+      // puts it on an adjacent cell, and the scan that found it swept only STATION_REACH)"*. That
+      // enumerated two of the three ways a block arrives here. The third is `findStation`, which has no
+      // distance bound at all, so the exception silently covered a table 12.6 blocks away and the craft
+      // was attempted from there (bugsquashing §11).
+      //
+      // `goToStationStance` now answers for BOTH kinds of station — a blueprint's anchor, or the cell the
+      // body stood on when it placed the table — and it decides "already in reach" itself, for the one
+      // legitimate case, by measuring rather than by inferring it from the absence of a blueprint. So
+      // there is nothing left to make an exception of: `arrived` is the whole question, and any reason it
+      // did not arrive drops the block and lets this caller set down its own.
+      const nav = await locomotion.goToStationStance({ x: block.position.x, y: block.position.y, z: block.position.z });
+      if (!nav.arrived) {
+        watcher.warn(TAG, `${type} at ${block.position} could not be reached to use (${nav.reason}) — placing its own instead.`);
         block = null;
       } else {
         const fresh = bot.blockAt(block.position);
@@ -939,6 +1005,52 @@ async function craftWithSequence(bot, sequence, ctx) {
         break;
       }
       const recipe = batchRecipes[0];
+
+      // CHECKED BEFORE THE CRAFT, NOT AFTER — see `outputHasNowhereToLand`. A full pocket makes
+      // `bot.craft` a pure loss: the ingredient is consumed and the output evaporates. Reported as a
+      // SHORTAGE OF ROOM rather than a craft failure, because the two need opposite responses — a craft
+      // failure invites a retry, and a retry here costs another log (Law 25: name the shortfall, do not
+      // relabel it as the nearest failure the caller already handles).
+      if (outputHasNowhereToLand(bot, itemId)) {
+        const held = locateCraftedItem(bot, itemId).total;
+
+        // ── FULL POCKET *AND* NOWHERE TO DUMP IS A DEADLOCK, SO IT IS A CODING VIOLATION ────────────
+        // Ruled 2026-09-10: *"inventory dumping is part of normal bot working. they normally dump after
+        // every turn. or at a certain fullness but only if they have a chest setup. thats a coding
+        // violation because a normal bot cannot craft a chest to empty its inventory if the inventory is
+        // already full."*
+        //
+        // THE ARGUMENT IS AN IMPOSSIBILITY, WHICH IS EXACTLY LAW 13'S TEST. To empty the pocket the bot
+        // needs a chest; to get a chest it must craft one; to craft one it needs a free slot; it has
+        // none. There is no sequence of correct actions out of this state, so it cannot be a world
+        // condition a correct system tolerates — nothing about a normal Minecraft world creates it. It is
+        // reached only by a fleet that stopped doing its ordinary offloading, and a bot that keeps
+        // planning through it burns a log per attempt while never being able to finish (§6 of
+        // architect_bugsquashing has the measured 3-log loss).
+        //
+        // WITH A CHEST REGISTERED IT IS NOT A VIOLATION and must not throw: a dump can empty the pocket,
+        // so the state is recoverable and the honest report is a shortage of ROOM (Law 25 — a craft
+        // failure invites a retry, and a retry here costs another log). The two branches below are the
+        // whole difference between "the fleet is wedged" and "this order has to wait its turn".
+        const chests = require('@perception/station_registry').findChests();
+        if (!chests.length) {
+          throw new Error(`[${TAG}] CODING VIOLATION (Law 13): DEADLOCK — this bot's inventory is FULL `
+            + `(0 empty slots, no partial ${step.item} stack with room) and there is NO CHEST REGISTERED `
+            + `to dump anything into. It cannot craft ${step.item} because the output would have nowhere `
+            + `to land, and it cannot craft a chest to fix that for the same reason. Offloading is part `
+            + `of ordinary work and it has not been happening — that is the defect, not this craft. `
+            + `The pocket must be emptied by hand, or a chest placed, before this fleet can work.`);
+        }
+
+        watcher.warn(TAG, `no room to craft ${step.item}: the pocket is FULL (0 empty slots, no partial ` +
+          `${step.item} stack with space) and holds ${held}/${target}, but ${chests.length} chest(s) are ` +
+          `registered — so this is recoverable. NOT crafting: bot.craft would consume the ingredients and ` +
+          `the output would have nowhere to land, which is a silent loss of material. This is a shortage ` +
+          `of ROOM, not a crafting fault; the pocket has to be dumped before this order can progress.`);
+        note(`${step.item}: pocket full at ${held}/${target} — needs offloading, not another craft attempt`);
+        break;
+      }
+
       const beforeCraft = locateCraftedItem(bot, itemId).total;
       // Station-window instrumentation (Architect, long-run kill hunt): one dense line per craft
       // capturing exactly what the crafting window did — the station used, the open window's type,

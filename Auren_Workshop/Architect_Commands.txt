@@ -1,0 +1,197 @@
+================================================================================
+  ARCHITECT COMMANDS — copy-paste from C:\Auren
+================================================================================
+
+
+================================================================================
+  START A RUN
+================================================================================
+
+--------------------------------------------------------------------------------
+  RUNS YOU PLAY IN — untimed, you end them
+--------------------------------------------------------------------------------
+  node Auren_Workshop/fleet_control.js run letsplay-record
+  node Auren_Workshop/fleet_control.js run letsplay-watch
+  node Auren_Workshop/fleet_control.js run foreman-standard
+  node Auren_Workshop/fleet_control.js run foreman-continue
+  node Auren_Workshop/fleet_control.js run bare
+
+  letsplay-record    your seat, your mic, cameras on every contractor, recording
+  letsplay-watch     the same, nothing written
+  foreman-standard   desk on duty, world rolled back
+  foreman-continue   desk on duty, world and crew memory kept
+  bare               server + overseer
+
+  Say `foreman get` in chat to hire.
+
+--------------------------------------------------------------------------------
+  RUNS THAT RUN THEMSELVES — soak, read, tear down
+--------------------------------------------------------------------------------
+  node Auren_Workshop/tools/test_conductor.js record
+  node Auren_Workshop/tools/test_conductor.js watch
+  node Auren_Workshop/tools/test_conductor.js standard
+  node Auren_Workshop/tools/test_conductor.js continue
+
+  record      a camera per bot, OBS writing them
+  watch       a camera per bot, nothing written
+  standard    world rolled back, terminal only
+  continue    the world and HQ the last run left
+
+--------------------------------------------------------------------------------
+  SEE A RUN WITHOUT STARTING IT
+--------------------------------------------------------------------------------
+  node Auren_Workshop/tools/test_conductor.js --list
+  node Auren_Workshop/fleet_control.js run letsplay-record --dry
+
+--------------------------------------------------------------------------------
+  CHANGE WHAT A RUN DOES
+--------------------------------------------------------------------------------
+  Auren_Bot\Thinking_fragments\architect_fleetrunbook_config.js
+
+  soak.minutes   take length. 0 = untimed
+  bots.count     how many, one camera each when filmed
+  autonomy       start on its own, tear down at the end
+
+
+================================================================================
+  END A RUN
+================================================================================
+
+  node Auren_Workshop/fleet_control.js down             # EVERYTHING — recording, cameras, world
+  .\Auren_Workshop\scripts\start_fleet.ps1 takeover     # kill switch
+
+  down stops the recording if one is running, wraps the take, closes the cameras
+  and takes the world down. Nothing else to remember. If no recording was on it
+  says so and moves on.
+
+
+================================================================================
+  WHILE A RUN IS UP
+================================================================================
+
+  .\Auren_Workshop\scripts\start_fleet.ps1 status
+  .\Auren_Workshop\scripts\start_fleet.ps1 start
+  .\Auren_Workshop\scripts\start_fleet.ps1 stop
+  .\Auren_Workshop\scripts\start_fleet.ps1 flush
+  node Auren_Workshop/fleet_control.js verb respawn
+  node Auren_Workshop/fleet_control.js repair
+
+
+================================================================================
+  FILMING
+================================================================================
+
+  .\Auren_Workshop\scripts\camera_obs.ps1 status
+  .\Auren_Workshop\scripts\camera_obs.ps1 miccheck      # 8 seconds, measures, deletes
+  node Auren_Workshop/tools/record_overlay.js status
+
+  Your own flying camera:   architect.enable: true
+  Your playing seat:        host.playerName, host.micDevice
+  Both live in:             Auren_Workshop\camera\camera_configure.js
+
+  Never minimize a camera window.
+
+
+================================================================================
+  CUTTING
+================================================================================
+
+  .\Cutting_room\cutting_room.ps1
+  .\Cutting_room\cutting_room.ps1 --take=<stamp>
+
+  Footage lands in:  footage\<date_time>\
+  Cuts land in:      footage\edit\<project name>\
+
+--------------------------------------------------------------------------------
+  IN THE ROOM
+--------------------------------------------------------------------------------
+  Shelf        pick a take, pick let's play or highlight reel
+  Let's play   one continuous window, camera changes, speed-ups
+  Highlight    judge each clip in or out, trim, cut out, reorder
+  Preview      drop music and voice on, mark where each line starts, print it
+
+  Every surface saves as you work. Close the tab and open it again.
+
+--------------------------------------------------------------------------------
+  THE LET'S PLAY KEYS
+--------------------------------------------------------------------------------
+  Space      play / pause
+  ← →        5 seconds        Shift + ← →   30 seconds
+  1 - 9      take that camera
+  I  O       start / end of the video — trims the dead air at each end
+  S          speed up a stretch — press at each end, Esc drops the mark
+  E          teaser            T   grab the frame for a thumbnail
+
+  Dead air before you start and after you stop: park on the real start,
+  press I; park on the real end, press O. Everything outside is dropped.
+
+  Inside that window nothing is removed. A slow stretch is sped up instead.
+  1x puts a span back. A sped-up span is silent — game audio and your mic
+  both drop. The music bed plays over it.
+
+  What happened lists the WHOLE crew, including bots with no camera —
+  their names are underlined. Clicking one jumps the timeline there.
+
+--------------------------------------------------------------------------------
+  RENDER FROM THE TERMINAL
+--------------------------------------------------------------------------------
+  node Cutting_room/edit_renderer.js render --name=<project>
+  node Cutting_room/edit_renderer.js render --name=<project> --final
+
+  draft    540p, fast, no music
+  final    1080p60, music and voice mixed
+
+--------------------------------------------------------------------------------
+  CHANGE HOW A CUT LOOKS
+--------------------------------------------------------------------------------
+  In the room:  settings — the edge, the teaser, the typeface
+  Or:           node Cutting_room/edit_tuning.js      # prints what is set now
+
+
+================================================================================
+  THE PUBLIC SERVER
+================================================================================
+
+  .\online.ps1
+  .\offline.ps1
+  node Public_server/joinable.js
+  .\Public_server\rollback.ps1 -Take <name>
+  .\Public_server\rollback.ps1 <name>
+
+
+================================================================================
+  THE LOCAL WORLD
+================================================================================
+
+  .\Auren_Workshop\scripts\start_fleet.ps1 local           # world + desk, no bots
+  .\Auren_Workshop\scripts\start_fleet.ps1 local -Count 4  # ...plus 4 homesteaders
+
+  Join at localhost, Java 1.21.5.
+
+--------------------------------------------------------------------------------
+  SNAPSHOTS  (from MinecraftServer\)
+--------------------------------------------------------------------------------
+  .\rollback.ps1 -Action list    -World 'sub_agent_01'
+  .\rollback.ps1 -Action snapshot -World 'sub_agent_01' -Name <name>
+  .\rollback.ps1 -Action restore  -World 'sub_agent_01' -Name <name> -Force
+
+
+================================================================================
+  ODDS AND ENDS
+================================================================================
+
+  cd auren_viewer_vite; npm run dev
+  ollama create auren-coder -f "C:\Auren\AurenModelfile"
+  node Auren_Workshop/tools/seed_scanner.js scan --tries=14
+  node Sessions/session_log.js
+
+
+================================================================================
+  ASK INSTEAD OF READING
+================================================================================
+
+  Reading a run          Auren_Workshop\monitoring\LENSES.md
+  Current status         Documentation\Refurbishing planning\architect_bugsquashing.md
+  Runs and the fleet     Auren_Workshop\fleet_runbook.md
+  Cameras and editing    Auren_Workshop\camera_runbook.md
+  The laws               Auren_Bot\Auren_Structural_Laws.md

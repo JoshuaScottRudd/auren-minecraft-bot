@@ -95,6 +95,35 @@ module.exports = {
         `📍 Placed beside ${placeBeside} — ${placed.distance.toFixed(1)} blocks away. The base will be surveyed from here.`);
     }
 
+    // ── AND IF THAT PLACE IS THE WORLD CENTRE, SAY SO LOUDLY (Architect 2026-09-10) ─────────────────
+    // *"also notify loudly that the bots are in the world center."*
+    //
+    // WHY HERE AND NOT AT THE FIRST REFUSED DIG. The square refuses breaks and placements SILENTLY, so
+    // the fleet only discovers it one swing at a time — the 2026-09-10 soak logged `dig refused` at
+    // (14,64,8), (5,64,16) and (6,64,16), and TessaBot's stone work returned `0x cobblestone of 8
+    // asked` twice, all of it as scattered per-cell warnings that never added up to the sentence "this
+    // crew is standing in the one place it cannot work". This line is that sentence, said once, BEFORE
+    // the survey — which is the last moment it is still cheap, because the base layout lock is the one
+    // act in this sequence that outlives the mistake.
+    //
+    // WARN AND NOT ERROR, deliberately. An error wakes the watch and ENDS the run, and `standing:
+    // 'spawn'` is a legitimate mode — it samples what a stranger gets, and a stranger gets exactly this
+    // square. Refusing to start would delete the ability to test the thing. So it is told, in every
+    // channel he reads (the bot's own window, the merged trace, the fleet console, the watch digest),
+    // and the decision stays his (Law 25 — name the shortfall, do not act on his behalf).
+    const spawnGuard = require('@perception/spawn_protection');
+    const here = global.bot && global.bot.entity && global.bot.entity.position;
+    if (here && spawnGuard.isSpawnProtectedAt(global.bot, here)) {
+      watcher.warn('start_injector',
+        `🚨 THIS BODY IS STANDING IN THE WORLD CENTRE — the spawn-protected square. `
+        + `${spawnGuard.describeSpawnProtection(global.bot)} `
+        + `Inside it the server refuses every break and placement by a non-op and REPORTS NOTHING, so `
+        + `every dig this crew attempts near its base will be refused and the jobs that need stone, `
+        + `seeds or a cleared site will return nothing. The base is about to be surveyed from HERE. `
+        + `To move it: set 'standing' to 'biome' in run_config.js, which places the person in the `
+        + `nearest good biome clear of this square and brings the crew to them.`);
+    }
+
     watcher.summary('start_injector', '🧪 Injected autonomous start signal to recursive_judge');
     // REQUIRED HERE, NOT AT MODULE SCOPE, and it is a cycle rather than a style choice:
     //   signal_bus:28 → fragment_registry:56 → start_injector → signal_bus

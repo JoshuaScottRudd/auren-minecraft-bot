@@ -107,10 +107,26 @@ fleet_logs/traces/watcher_<botname>.jsonl
 One line per event, plain JSON, English sentences inside. **A bot replaces its own trace every time it
 starts**, so a restart destroys the evidence — copy the file before you try again.
 
-**There is no reader shipped with it.** The tools that turn a trace into a report are built for my own
-workflow and would need explaining more than they'd help. So: read it by hand, write your own reader, or
-**send it to me** — open an issue, attach the trace, say what you expected. That last one is the intended
-path. A trace tells me in thirty seconds what would cost you an evening.
+**Don't read it by hand — there is a reader, and it ships.** A trace is tens of thousands of lines by
+design, because a program answers questions about it:
+
+```
+node monitoring/trace_monitor.js                       # what went wrong, and the lines around it
+node monitoring/trace_monitor.js --story               # every job as plan → what it did → verdict
+node monitoring/trace_monitor.js --jobs                # where the time went
+node monitoring/trace_monitor.js --inventory           # where every item is, and every move
+node monitoring/trace_monitor.js --progress            # is it progressing, or looping
+node monitoring/trace_monitor.js --watch               # live, while it runs
+```
+
+Read-only, no server needed, and it works on a trace you copied somewhere else — pass the file as the
+first argument. `monitoring/LENSES.md` lists every question it answers and the flag that answers it;
+`monitoring/README.md` says what each file is. Three flags (`--camera`, `--witness`, `--machine-load`)
+read a camera stack that is not part of this download and will tell you so.
+
+**If the reader can't answer your question, that is a defect in the reader** — say so in an issue. And
+**sending me the trace is still the best thing you can do**: open an issue, attach it, say what you
+expected. A trace tells me in thirty seconds what would cost you an evening.
 
 **Common ones:**
 
@@ -124,7 +140,8 @@ path. A trace tells me in thirty seconds what would cost you an evening.
 - **A bot says it did not start because it is not standing with you** — it was raised, it could not be
   brought to you, and it refused to plan a base somewhere you did not choose. Usually the console
   password: see the line above.
-- **Joins and stands still** — check the trace. A bot on ground it can't work (no wood, spawn-protected)
+- **Joins and stands still** — run `node monitoring/trace_monitor.js --story`, which shows the job board
+  it was offered and what it did with the job it picked. A bot on ground it can't work (no wood, spawn-protected)
   will re-plan and get the same answer.
 - **Version mismatch** — pass `--version 1.21.5` to match your server exactly.
 
@@ -143,8 +160,37 @@ path. A trace tells me in thirty seconds what would cost you an evening.
 | `js_kernel/` | shared machinery: state store, trace writer, calculators |
 | `custom_api/` | the layer between the bot's vocabulary and Minecraft's |
 | `overseer/` · `foreman/` | job arbitration, and the desk you hire from |
+| `monitoring/` | the readers — `trace_monitor.js` and its lenses. Nothing the bot runs depends on this folder; it only reads what a run wrote |
+| `Auren_Workshop/` | **my own equipment, and you have all of it** — see the section below |
 | `Auren_Structural_Laws.md` | the rules all of it obeys |
 | `MECHANISM_REGISTRY.md` | every named mechanism, one line each — the index to read before assuming a thing isn't already here |
+
+---
+
+## If you want the whole stack
+
+**One command runs this thing, and nothing is hidden behind it.** `Auren_Workshop/` is the equipment I
+build the bot with, and it is in your download unchanged. You never need to open it; if you want to, it is
+all there.
+
+I tried keeping it back and it made the project worse rather than safer. There were two ways to run the
+fleet — mine and yours — so every fault arrived twice, and I could not point my own instruments at what a
+downloader actually had. **The tools have to live with the bot in order to read the bot**, so they do.
+
+```
+node Auren_Workshop/tools/preflight.js          the one test: does the tree still load, and hold its own rules
+node Auren_Workshop/run.js                      a whole scripted run — fresh world, a crew, a soak, read at the end
+node Auren_Workshop/fleet_control.js status     what is up right now
+```
+
+`Auren_Workshop/run.js` is the run I use myself, and it is configured on one page — `run_config.js`, every
+choice in one place, edited before anything starts. `Auren_Workshop/README.md` is the map of the folder;
+`fleet_runbook.md` is the long-form operating manual for the parts of it that drive a live server.
+
+**Two honest warnings.** The benches under `tools/` connect real clients and send real console commands —
+they drive a world rather than reading a record, so run them against a world you do not mind disturbing.
+And the camera stack expects an installation you almost certainly do not have; the three lenses that read
+its records will tell you so in one sentence rather than failing.
 
 ---
 

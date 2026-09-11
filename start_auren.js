@@ -70,6 +70,9 @@ const FLAGS = [
   { flag: 'port', def: '25565', help: 'server port' },
   { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', help: "your server's rcon.password — how the crew gets brought to you" },
   { flag: 'rcon-port', env: 'AUREN_RCON_PORT', help: "your server's rcon.port  (default: 25575)" },
+  // 'sweep' (default) empties fleet_logs/ because this door is the start of a run. 'keep' is for a
+  // caller that IS the start and already swept — see the sweep site below for what the second sweep did.
+  { flag: 'records', def: 'sweep', help: "'sweep' empties fleet_logs/ first (default) · 'keep' if your launcher already did" },
 ];
 
 function usage() {
@@ -164,6 +167,45 @@ if (given['rcon-port'] !== undefined) process.env.AUREN_RCON_PORT = given['rcon-
       + `  Restart the server, then start Auren with that same password:\n\n`
       + `      node start_auren.js --rcon-password <that password>\n\n`
       + `  If your rcon.port is not 25575, pass --rcon-port too.`);
+  }
+
+  // ── NO RECORD SURVIVES A RUN (Architect 2026-08-31, STANDING) ───────────────────────────────────
+  // Swept HERE and nowhere else in the shipped tree, because this is the one door that starts a whole
+  // fleet before any bot exists. The watcher cannot do it — every bot imports the watcher, so the second
+  // bot would delete the first bot's trace mid-run — and `start_bot.js` cannot, because a bot joining a
+  // fleet that is already working is not the start of a run. One sweep per run, owned by the thing that
+  // knows a run is beginning.
+  //
+  // WHY A STRANGER WANTS THIS AND NOT JUST THE ARCHITECT: the whole troubleshooting story here is "run
+  // it, then read `monitoring/trace_monitor.js`". A records room holding three runs makes every one of
+  // those lenses answer about a mixture, and the answer looks exactly as confident as a true one. That
+  // is not hypothetical — it is how the run of 2026-09-10 came to be scored FAIL on an error a bench had
+  // written an hour earlier under a bot name that was not even in the fleet.
+  // ── AND EXACTLY ONCE PER RUN, WHICH IT WAS NOT (fixed 2026-09-10) ─────────────────────────────────
+  // `run.js` sweeps this same room itself — it reports the count as a check, in its own step 4 — and
+  // THEN launches this door. So a run.js-driven run swept twice, and the second sweep landed after
+  // run.js had already created `fleet_logs/console_desk.log` and handed the descriptor to this process.
+  //
+  // ON WINDOWS THAT DELETE SUCCEEDS AND IS SILENT. Node opens files with FILE_SHARE_DELETE, so the
+  // directory entry went away while the write handle stayed valid: run.js kept writing the desk's whole
+  // console into a file with no name, `keepConsoles()` found nothing to report, and the window following
+  // it showed the first few lines and then nothing forever. The desk's console is the one that explains
+  // a fleet that will not come up, and it was the only one being destroyed.
+  //
+  // The rule is one sweep per run owned by the thing that knows a run is beginning — so when something
+  // upstream IS that thing, it says so and this door does not take a second bite.
+  const records = given.records || 'sweep';
+  if (records !== 'sweep' && records !== 'keep') {
+    die(`'--records ${records}' is not a choice. Use 'sweep' (empty fleet_logs/ first) or 'keep' (your launcher already did).`);
+  }
+  if (records === 'sweep') {
+    const sweep = require('./js_kernel/utils/record_homes').sweepRecords();
+    if (sweep.swept && sweep.entries.length) {
+      console.log(`\n  cleared ${sweep.entries.length} record(s) from the last run — everything in `
+        + `fleet_logs/ now belongs to this one.`);
+    }
+  } else {
+    console.log(`\n  fleet_logs/ left as it is — the launcher that started this desk already swept it.`);
   }
 
   console.log(`\n  Auren — the desk is opening on ${host}:${port}`

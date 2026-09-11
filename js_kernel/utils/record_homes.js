@@ -65,4 +65,43 @@ function deepTraceFile(unit) {
   return path.join(TRACE_DIR, unit ? `watcher_${unit}_trace.json` : 'watcher_trace.json');
 }
 
-module.exports = { TRACE_DIR, ensureTraceDir, traceFile, deepTraceFile, BOT_DIR };
+// ── NO RECORD SURVIVES A RUN (Architect 2026-08-31, STANDING) ───────────────────────────────────────
+// *"A start empties `fleet_logs/` whole, so every file there belongs to exactly one run."*
+//
+// THIS RULE WAS ENFORCED BY NOTHING UNTIL 2026-09-10, and the gap was found by the run that exposed it:
+// `fleet_logs/traces/` held twenty-four trace files dated across six days — 5, 6, 9 and 10 September —
+// sitting beside the two the current run had just written. What used to keep the room clean was an
+// ACCIDENT of the stranger test: `run.js` copied the tracked tree to a fresh sibling directory and ran
+// the copy, and `fleet_logs/` is gitignored, so the copy simply had no records in it. Shipping the whole
+// stack as one piece deleted that copy, and the emptiness left with it (Law 13 — a guarantee must not
+// quietly leave with the thing that happened to provide it). It is the second guarantee the copy was
+// silently providing; the first was shipped-tree self-containment, now a `preflight` pass.
+//
+// WHAT IT COST IMMEDIATELY, which is why this is a real fault and not housekeeping: the lens reads the
+// records room, so it read a `ProbeBot` error written at 11:12 by a bench that was not part of the run at
+// all, and `run.js` scored the run FAIL on it — "the run record is clean (no errors): the lens found 5
+// error line(s)". A verdict about this run, computed from another run's exhaust. Invariant B exactly:
+// rows written days apart never measured the same system.
+//
+// WHY IT IS CALLED BY A FLEET START AND NOT BY THE WATCHER. Every bot imports the watcher, so a sweep
+// there would have the SECOND bot delete the FIRST bot's trace mid-run — the rule is one sweep per run,
+// and only something that owns a whole run knows when a run begins. `start_auren.js` (the one public
+// door: desk and referee, before any bot exists) and `run.js` (the bench) are those things. A bare
+// `start_bot.js` joining an existing fleet deliberately does NOT sweep.
+//
+// It reports what it removed rather than returning a count, because a caller printing "records cleared"
+// with no subject cannot be checked against the room afterwards (Law 25).
+const RECORDS_DIR = path.join(BOT_DIR, 'fleet_logs');
+
+function sweepRecords() {
+  if (!fs.existsSync(RECORDS_DIR)) return { swept: false, entries: [], dir: RECORDS_DIR };
+  const entries = fs.readdirSync(RECORDS_DIR);
+  for (const name of entries) {
+    fs.rmSync(path.join(RECORDS_DIR, name), { recursive: true, force: true });
+  }
+  return { swept: true, entries, dir: RECORDS_DIR };
+}
+
+module.exports = {
+  TRACE_DIR, RECORDS_DIR, ensureTraceDir, traceFile, deepTraceFile, sweepRecords, BOT_DIR,
+};

@@ -55,7 +55,22 @@ const FLAGS = [
   { flag: 'near',     env: 'BOT_START_NEAR',           def: null,        help: 'a player in the world — the bot is teleported to them and confirmed there before it starts working (a contractor uses its owner when this is absent)' },
   { flag: 'version',  env: 'AUREN_MINECRAFT_VERSION',  def: null,        help: "the server's Minecraft version (default: 1.21.5, set in architect_config)" },
   { flag: 'overseer', env: 'OVERSEER_URL',             def: null,        help: 'ws://host:port of a running overseer — omit it and the bot runs alone' },
-  { flag: 'work',     env: 'BOT_AUTOSTART',            def: null,        help: "pass 1 and a homesteader starts working on spawn instead of waiting for you to type 'start'" },
+  // ── `--work` IS DELETED, AND THE MECHANISM BEHIND IT IS NOT (Architect 2026-09-10) ──────────────────
+  // *"law 16 the system. only one way to do it so remove --work 1."*
+  //
+  // The flag let anyone launch a homesteader that begins working on spawn, which is a SECOND way to get a
+  // working bot. The first — and now the only — way is to stand in the world and ask the desk:
+  // `foreman get homesteader`. Two doors to one outcome is the thing Law 16 forbids, and this one was
+  // worse than redundant: it bypassed the placement gate's whole reason for existing, because a bot that
+  // autostarts on spawn plans its base wherever the world dropped it rather than where a person stands.
+  //
+  // `BOT_AUTOSTART` REMAINS, and it is not a hole left open. It is how the desk tells a body it was
+  // fetched on purpose (`foreman.js` stamps it into the child's environment), read once at birth by
+  // `bot_mandate`. The distinction that matters: an environment variable set by the one fragment allowed
+  // to raise a body is a mechanism; a documented flag on the launcher is a door. Deleting the flag closes
+  // the door and leaves the mechanism, which is exactly what "only one way to do it" asks for.
+
+
   // Needed only when this bot has somebody to be placed beside (`--near`, or a contractor's owner):
   // reaching a server console is what a teleport costs. `start_auren.js` carries the same two flags and
   // proves the link before it opens the desk; here they are simply passed through, because a bot launched
