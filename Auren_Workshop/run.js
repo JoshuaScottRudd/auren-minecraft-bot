@@ -494,6 +494,11 @@ function teardown(why) {
     // that mode.
     if (c.window) consoleWindow.closeWindow(c.window.pid);
   }
+  // AND EVERY OTHER TERMINAL THE RUN OPENED — the crew's followers above all, which the foreman's own close
+  // never reaches on Windows — then LOOK AGAIN and say what is left (Architect 2026-09-11: *"at the end of
+  // the run, the run shall check and close all terminals"*). The world's terminal is not this run's.
+  const reaped = consoleWindow.closeWindows({ except: ['server'] });
+  say(`terminals: closed ${reaped.closed.length}; ${consoleWindow.describeWindows(reaped.stillOpen)}.`);
   // THE WORLD IS LEFT RUNNING, ALWAYS. This script did not start it and has no business ending it —
   // whoever did owns that, and on a hosted run that is `host_and_run.js`, after this process returns.
   say('desk, crew and person are down. The world is left exactly as it was found: running.');
@@ -515,6 +520,21 @@ function teardown(why) {
   //
   // It reads the tree this run will actually start, which since 2026-09-10 is the only tree there is —
   // the workshop moved inside the bot and the run no longer builds a copy of anything.
+  // ── EVERY TERMINAL CLOSED BEFORE ANYTHING STARTS — CHECKED, NEVER CLOSED HERE (Architect 2026-09-11) ──
+  // *"before startup it should also check but not close. just prevent another start from happening and say
+  // what terminals are open that prevents another start. thats our server hang problem"*. The world's own
+  // terminal is the one expected open: this run joins a world, and whoever started it owns that window.
+  phase('every terminal closed?');
+  const openTerminals = consoleWindow.openWindows({ except: ['server'] });
+  if (openTerminals.length) {
+    console.error(`\n  run: NOTHING WAS STARTED — ${consoleWindow.describeWindows(openTerminals)}.`);
+    console.error(`  A run started beside those shares the world with whatever is still in it. Nothing was`);
+    console.error(`  closed; close them, then start again:`);
+    console.error(`      node Auren_Workshop/fleet_control.js down --keep-server\n`);
+    process.exit(1);
+  }
+  say('no terminals open');
+
   phase('preflight — does the tree load at all');
   if (spawnSync(process.execPath, [paths.workshop('tools', 'preflight.js')],
         { stdio: ['ignore', 'inherit', 'inherit'] }).status !== 0) {

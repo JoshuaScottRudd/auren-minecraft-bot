@@ -384,9 +384,13 @@ async function tendPlot(bot, roomKey, blueprintName) {
     if (!bot?.entity?.position) {
       throw new Error(`[${TAG}] CODING VIOLATION: global.bot is not set before tendPlot ran.`);
     }
-    // WHICH geometry — falls back to config's phase-1 default (the cluster is homogeneous wheat_plot_pair).
+    // WHICH geometry — READ from this instance's chair, never named from config. The two are the same
+    // string today (every plot is a `wheat_plot_pair`), and that is exactly why the constant was the wrong
+    // way to get it: it states what the geometry OUGHT to be instead of what set_buildspot stamped, so it
+    // goes stale silently the first time an instance is locked under anything else (Law 25). The room key
+    // still defaults to instance 0 for a single-farm caller, which is a different question (which plot).
     roomKey = roomKey || FARM_BLUEPRINT_NAME;
-    blueprintName = blueprintName || FARM_BLUEPRINT_NAME;
+    blueprintName = blueprintName || blueprintSurvey.geometryOf(roomKey);
 
     // The field's anchors, one stand each (anchor floor Y + 1). A blueprint may declare MULTIPLE anchors
     // when its field exceeds one stand's reach; wheat_plot_pair has ONE, its

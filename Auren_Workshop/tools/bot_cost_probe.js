@@ -1,17 +1,17 @@
 // bot_cost_probe — measures what ONE BOT costs this machine, in CPU and memory.
 //
-// WHY IT EXISTS. The public-server plan sizes a bot-host machine from a number nobody had ever taken:
-// two bots per human means the fleet grows with the audience, so "how much compute does one bot need"
-// decides how many people can be let in per box. Before this, the only answers available were an
-// impression of Task Manager and arithmetic on a whole-machine average.
+// WHY IT EXISTS. Sizing a machine for a fleet needs a number nobody had ever taken: if bots grow with the
+// number of people being served, "how much compute does one bot need" is what decides how many fit on one
+// box. Before this, the only answers available were an impression of Task Manager and arithmetic on a
+// whole-machine average.
 //
 // ── WHY PER-PROCESS AND NOT WHOLE-MACHINE (the reason this is not machine_load_sampler) ──────────────
 // `tools/machine_load_sampler.js` answers a different question — *did the box have headroom while a run
 // filmed* — and answers it for the WHOLE machine over time, which is right for that question and wrong for
 // this one. A whole-machine before/after delta would fold three things into one number that must be kept
-// apart: the Minecraft server (which on the target architecture runs on a rented box, not the bot host),
-// the overseer (one per fleet, not one per bot), and whatever the Architect happens to be doing on his own
-// desktop while the probe runs. Attribution is the entire point here, so this reads per-process counters
+// apart: the Minecraft server (which may not even be on the same machine as the bots), the overseer (one
+// per fleet, not one per bot), and whatever else the operator happens to be doing on that desktop while
+// the probe runs. Attribution is the entire point here, so this reads per-process counters
 // and reports each role separately. Neither instrument can answer the other's question; there is no
 // redundant route (Law 16).
 //

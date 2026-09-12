@@ -69,11 +69,11 @@ function readServerProperties(file = serverPropertiesFile()) {
 //
 // `readServerProperties` above answers "what did the fleet's OWN server get configured with", which is
 // the right answer whenever the fleet launched the world it is talking to. It is the WRONG answer the
-// moment the fleet is a guest on a world somebody else started — the public server — and it fails in the
-// most confusing way available: that backend also listens for rcon on 25575, so the socket CONNECTS and
-// only the auth is refused, with a password belonging to a different server entirely.
+// moment the fleet is a guest on a world somebody else started, and it fails in the most confusing way
+// available: any other Minecraft server also listens for rcon on 25575 by default, so the socket CONNECTS
+// and only the auth is refused, with a password belonging to a different server entirely.
 //
-// MEASURED 2026-09-05, and this is the second time the same fault has been fixed. `fleet_control.js`
+// MEASURED, and this is the second time the same fault has been fixed. `fleet_control.js`
 // gained `AUREN_RCON_PASSWORD` / `AUREN_RCON_PORT` for exactly this, with its reasoning written out at
 // `rconCommand` — and this file, the tree's OTHER rcon path, did not get it. The visible symptom was the
 // foreman's `tp` failing for every contractor it fetched (`rcon auth failed — check rcon.password`) while

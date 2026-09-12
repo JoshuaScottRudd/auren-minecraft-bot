@@ -18,8 +18,9 @@
 // base as tight as the terrain allows; the distance is reported for context, never gated.
 //
 // So this is a SURVEY-then-JUDGE, never a fail-on-first:
-//   1. Site the WHOLE phase-1 wheat field in ONE wheat_plot_scanner sweep from the bot's spawn — the nearest
-//      FARM_PLOT_COUNT (crop, stand) plots that are hydratable, stand-pairable, and mutually PENALTY-FREE.
+//   1. Site the WHOLE phase-1 wheat field with one wheat_plot_scanner sweep of EVERY river and ocean body in
+//      the loaded area — up to FARM_PLOT_COUNT hydratable, stand-pairable, mutually PENALTY-FREE (crop, stand)
+//      plots, all cut from the BIGGEST plot cluster wherever it lies.
 //      The scanner (not find_buildingspot) sites this field because its penalty-free guarantee is cross-plot;
 //      each plot locks as one wheat_plot_pair instance. Instance 0's stand is the base anchor.
 //   2. Locate each non-farm satellite (headframe) from farm instance 0's stand (uncapped ring, nearest-first,
@@ -31,8 +32,13 @@
 //   4. All found → lock them all (set_buildspot.lock). A genuine miss → Law 13, lock NOTHING (default-stopped).
 //      A transient (world still streaming: no water in the loaded area yet) soft-fails for a retry.
 //
-// No navigation anywhere: locomotion carves the path at build time, so a pre-lock walk would only be a
-// fake reachability test. This fragment operates ON the record only; it joins no build pathway. Reuses
+// NO NAVIGATION HERE (2026-09-11). A walk-and-rescan lived here for one afternoon and was ruled out: *"water
+// biome only, bank only, cluster only. that way it can find what it needs the first time instead of walk anc
+// check again… id rather the walk be farther because it will setup its base there."* The survey waits for
+// the loaded area to arrive, reads it once, and locks the biggest river/ocean cluster in it wherever that
+// is; the crew walks there to build, which is the only walk a base needs. The bot that locks the headframe
+// says where in chat (bot_voice.baseSited), so a person watching a crew walk off knows why. This fragment
+// joins no build pathway. Reuses
 // the extracted engines: wheat_plot_scanner (field siting) + find_buildingspot.locate (satellite siting)
 // + set_buildspot.lock (commit) — Law 16, one siter per field, one lock primitive.
 
@@ -44,10 +50,14 @@ const { routeToJudge } = require('@utils/signal_utils');
 const { locate, loadBlueprintDims, getExistingFootprints, footprintBox } = require('@action/find_buildingspot');
 const { lock } = require('@action/set_buildspot');
 const { footprintExtent } = require('@perception/blueprint_survey');   // a plot's reach at its own rotation
-const { scanWheatPlots, plotRotation } = require('@utils/wheat_plot_scanner');
+const { scanWheatPlots, plotRotation, loadedAreaSettled, settleLine, describeScan, SETTLE_MAX_MS } = require('@utils/wheat_plot_scanner');
+const { baseSited } = require('@kernel/bot_voice');
 const { MIN_BLUEPRINT_SPACING, FARM_BLUEPRINT_NAME, FARM_PLOT_COUNT, FARM_ROOM_KEYS } = require('@thinking/architect_config');
 
 const TAG = 'lock_all_buildspots';
+
+// The wait for the loaded area to arrive (loadedAreaSettled), its report line, and the scan's own report
+// (describeScan) live in wheat_plot_scanner beside the scan they serve — wheat_site_probe calls the same three.
 
 // The canonical base-layout sequence (this batch is now the ONE locator — Law 16; Phase 2 retires the
 // duplicated per-blueprint find-routing in building_manager/farm_manager). The ANCHOR is the wheat farm
@@ -229,26 +239,14 @@ async function run(bot, opts = {}) {
     anchorCenter = centers[FARM_ROOM_KEYS[0]];
     report.push(`${FARM_BLUEPRINT_NAME}: phase-1 field already locked (${Object.keys(centers).length}/${FARM_PLOT_COUNT} plots) — skipping scan.`);
   } else {
-    const spawn = bot.entity.position;
-    let origin = { x: Math.floor(spawn.x), y: Math.floor(spawn.y), z: Math.floor(spawn.z) };
-    // Seed the shoreline scan at the river/ocean biome PATCHES (biome_scanner — biome cache, ~ms, no block
-    // reads) so the water-BFS starts ON the water instead of radiating from spawn to find it, AND can jump
-    // body→body — pick the closest river/ocean, and when it runs out of candidates pick another. biome_scanner
-    // returns a distance-sorted patch list, so `origin` = the nearest water body (the base reference) and
-    // `seeds` = ALL water patch seeds nearest-first (the scanner floods each in turn into one shared pool
-    // until it has FARM_PLOT_COUNT). The scanner stays biome-agnostic (its own ring search still finds water
-    // from any seed). No biome data (headless/edge) → seeds stays null, the scanner ring-searches from spawn
-    // origin, the single-body path.
-    let seeds = null;
-    const patches = require('@perception/biome_scanner').scanBiomes(bot)?.patches || [];
-    const water = patches.filter(p => /river|ocean/.test(p.biome));   // every water body, nearest-first (dist-sorted)
-    if (water.length) {
-      origin = { x: water[0].seed.x, y: origin.y, z: water[0].seed.z };  // base reference = nearest body's seed
-      seeds = water.map(p => ({ x: p.seed.x, z: p.seed.z }));            // ordered candidates for the multi-body flood
-    }
-    // No guard: an unloaded world yields an empty patch list, never a throw (biome_scanner's own note), so
-    // the headless/edge case already falls through to the spawn-origin ring search by way of `seeds` null.
-    const scan = await scanWheatPlots(bot, { origin, target: FARM_PLOT_COUNT, seeds });
+    const at = bot.entity.position;
+    const origin = { x: Math.floor(at.x), y: Math.floor(at.y), z: Math.floor(at.z) };
+    // The scan reads every river and ocean body in the loaded area from where the body stands — the loaded
+    // area is centred on the body, so that is the one origin that sees all of it — and it waits for that
+    // area to arrive first, because it reads it exactly once (scanWheatPlots v4).
+    const settled = await loadedAreaSettled(bot);
+    report.push(settleLine(settled));
+    const scan = await scanWheatPlots(bot, { origin, target: FARM_PLOT_COUNT });
     const plots = scan.field;
     if (plots.length > 0) {
       // Lock every plot the scanner returned (its whole-field penalty-free property holds for this set —
@@ -261,6 +259,10 @@ async function run(bot, opts = {}) {
       // area only when the crop happens to lie in the direction the box was guessed to extend; the
       // rotation is chosen per plot from which side the water is on, so half of them reserved the bare
       // cell opposite the crop and left the crop itself open for the headframe to land on.
+      // ONE GEOMETRY FOR EVERY PLOT, because the farm plane is pinned to seaY and a stand is therefore always
+      // level with its crop — which is the offset the fixed blueprint already carries. (A three-geometry
+      // split existed for a few hours on 2026-09-11, for a tuple allowed to straddle a bank's step; it went
+      // with the step. The scanner's header holds why.)
       const plotBuilding = require('@kernel/blueprint_registry').getBuilding(FARM_BLUEPRINT_NAME, TAG);
       plots.forEach((p, i) => {
         const roomKey = FARM_ROOM_KEYS[i];
@@ -273,43 +275,25 @@ async function run(bot, opts = {}) {
         toLock.push({ spec: { blueprint: FARM_BLUEPRINT_NAME, roomKey }, candidate });
         pendingRaw.push({ roomKey, center: bc, extent });
       });
-      // A mesh is reported by its REACH (rows × longest row), not just its bbox — how far the row pattern
-      // runs unbroken along one bank is the useful measure of a cluster, which a bounding box cannot show.
-      const cl = scan.clusters;
-      const patchLine = cl ? `\n      ↳ ${cl.count} mesh(es): ` +
-        cl.clusters.map(c => `${c.size} plots in ${c.rows} row(s), longest ${c.longestRow} @${c.distFromOrigin.toFixed(0)}b from bot (${c.bbox.dx}×${c.bbox.dz})`).join(', ') +
-        (cl.count > 1 ? `; meshes ${cl.interClusterMinGap.toFixed(0)}–${cl.interClusterMaxGap.toFixed(0)}b apart.` : '.') : '';
-      report.push(`${FARM_BLUEPRINT_NAME}: FOUND ${plots.length}/${FARM_PLOT_COUNT} plots (scan ${(scan.elapsedMs / 1000).toFixed(1)}s, seed radius ${scan.scanRadius}, ` +
-        `${scan.bodiesUsed} water ${scan.bodiesUsed === 1 ? 'body' : 'bodies'}, ` +
-        `${scan.penaltyFree ? 'all penalty-free' : '⚠ PENALTY PRESENT'}, ${scan.distinctStands} stands, ${scan.waterCells} water-body cells, pool ${scan.poolSize}).\n` +
-        // The density line is the one to read when a field looks wrong. `density` is plots per block of the
-        // cluster's own footprint — the top siting criterion, reported as a number rather than implied.
-        `      ↳ lattice axis ${scan.axis}, parity ${scan.stripeParity}, stand ${scan.standDir > 0 ? '+' : '-'} (water side); ` +
-        `${scan.runsUsed} run(s) of ≥${scan.minRun} from ${scan.runsAvailable} legal (${scan.plotsAvailable} plots); ` +
-        `DENSITY ${scan.density} plots/block² in ${scan.clusterArea}b² (span ${scan.clusterSpan}b), ${scan.meshCount} piece(s).\n` +
-        `      ↳ instance 0 stand (${anchorCenter.x},${anchorCenter.y},${anchorCenter.z}) is the base anchor.` +
-        patchLine +
-        (plots.length < FARM_PLOT_COUNT ? `\n      ↳ SHORT ${FARM_PLOT_COUNT - plots.length} (idle, not a stop): no_stand=${scan.noStand}, water_locked=${scan.waterLocked}, off_stripe=${scan.offStripe} (walkway, not a reject).` : ''));
-    } else if (scan.loadedFrontier && scan.waterCells === 0) {
-      // No water anywhere in the LOADED area and the scan hit the streaming frontier (not maxRadius) — the
-      // world around spawn is likely still streaming in. Soft-retry like the old chunks_not_loaded path,
-      // rather than condemn a seed whose river hasn't loaded yet.
+      report.push(describeScan(scan, FARM_PLOT_COUNT) +
+        `\n      ↳ instance 0 stand (${anchorCenter.x},${anchorCenter.y},${anchorCenter.z}) is the base anchor.`);
+    } else if (!settled.settled) {
+      // THE WORLD WAS STILL ARRIVING WHEN IT WAS READ, so finding nothing is not yet evidence that nothing is
+      // there (Invariant B): soft-retry. Run seven is why — 23 water cells at 0m 7s, 67 of the same lake 26 s
+      // later. Once the loaded area has stopped growing, an empty answer is the world's answer.
       transient = true;
-      report.push(`${FARM_BLUEPRINT_NAME}: no water in the loaded area yet (frontier at radius ${scan.scanRadius}) — retry.`);
-    } else if (scan.unloadedShore > 0) {
-      // WATER WAS SEEN, BUT THE LAKE RUNS INTO GROUND NOT STREAMED IN YET (2026-09-11). The flood reads an
-      // unloaded cell as "not water", so a lake cut off by the streaming edge looks like a small one, and the
-      // branch below condemned it. Run seven: 23 water cells and 1 candidate at 0m 7s — Law 13, run over —
-      // and 26s later the same scan on the same lake found 67 cells and 10 plots. What is not sensed is not
-      // known (Invariant B), so this is the same soft retry as the no-water case above.
-      transient = true;
-      report.push(`${FARM_BLUEPRINT_NAME}: water seen (${scan.waterCells} cells) but its shore runs into ` +
-        `${scan.unloadedShore} unloaded cell(s) — the lake has not all arrived yet; retry.`);
+      report.push(describeScan(scan, FARM_PLOT_COUNT),
+        `${FARM_BLUEPRINT_NAME}: no plot yet, and the loaded area had not all arrived by the ${SETTLE_MAX_MS / 1000}s cap — retry.`);
     } else {
-      // Water was seen but no hydratable, stand-paired, penalty-free plot fit — OR the whole loaded area is
-      // genuinely water-less. Either way the phase-1 field has no anchor: Law 13, lock nothing (below).
-      problems.push(`${FARM_BLUEPRINT_NAME}: NOT FOUND — 0 plots in ${scan.scanRadius} rings (water sources ${scan.waterCells}, candidates ${scan.candidates}, meshes ${scan.meshCount}, no_stand ${scan.noStand}, water_locked ${scan.waterLocked}).`);
-      report.push(`${FARM_BLUEPRINT_NAME}: ✗ NOT FOUND — 0 plots (water ${scan.waterCells}, candidates ${scan.candidates}). The base has no anchor.`);
+      // THE WHOLE LOADED AREA WAS READ AND NO RIVER OR OCEAN BANK IN IT HOLDS A PLOT. Law 13, lock nothing,
+      // and say it in words the person can act on — the 2026-09-10 ruling: refuse, and tell the human there
+      // is nowhere to build.
+      problems.push(`${FARM_BLUEPRINT_NAME}: NOT FOUND — no river or ocean bank within view holds a wheat plot ` +
+        `(${scan.bodiesFound} river/ocean ${scan.bodiesFound === 1 ? 'body' : 'bodies'}, ${scan.waterCells} of their water cells, ` +
+        `${scan.candidates} bank candidates, no_stand ${scan.noStand}, water_locked ${scan.waterLocked}; ${scan.otherWater} ` +
+        `lake/pond water cells were not considered). Stand within sight of a river or the sea and ask for a crew again.`);
+      report.push(describeScan(scan, FARM_PLOT_COUNT),
+        `${FARM_BLUEPRINT_NAME}: ✗ NOT FOUND — no river or ocean bank in view holds a plot. The base has no anchor.`);
     }
   }
 
@@ -405,6 +389,11 @@ function finish(dryRun, report, toLock, problems, transient) {
     lock(candidate, spec.blueprint, spec.roomKey);
     locked.push(spec.roomKey);
   }
+  // The base is where the headframe is, and a person watching the crew walk off to it needs to hear where
+  // that is (bot_voice's one homestead line). Only the pass that locked it speaks; a later pass finds it
+  // already locked and has nothing in `toLock` for it.
+  const headframe = toLock.find(t => t.spec.roomKey === 'headframe');
+  if (headframe) baseSited(headframe.candidate.build_center);
   watcher.summary(TAG, `✅ Base layout locked as one unit: ${locked.length ? locked.join(', ') : 'nothing new (all already locked)'}.`);
   return { ok: true, report, locked };
 }

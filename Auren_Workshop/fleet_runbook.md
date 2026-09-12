@@ -85,21 +85,20 @@ as a stub after `npm install` pruned `node_modules/npm` as extraneous. Its refus
 **Scripts, documents and instructions use the resolver even where a bare `node` happens to work**: PATH
 is per-machine state git does not carry, so a `node` line works on one machine and fails on the next.
 
-### 2a-pre. The dev world runs VANILLA. Paper is the public server's, and the two stay apart
+### 2a-pre. The dev world runs VANILLA, and Paper stays a deliberate opt-in
 
 **RULING 2026-09-11, delegated by the Architect** (*"only make paper native if its backwards compatible…
 if theres a set of problems that happen with paper and specific problems that happen without paper then
 we keep it seperate"*). **This section previously said the opposite — "put Paper on every machine's dev
-world" — and that instruction is withdrawn.** Its reason ("test what you run") was written when the
-public server was the only target; the 2026-09-10 open-source ruling made a stranger's vanilla server an
-equal first-class one, and that is the fact that moves the answer. Full reasoning and the measurements:
-`architect_bugsquashing.md` §1 (volume 46).
+world" — and that instruction is withdrawn.** Its reason ("test what you run") was written when one
+particular Paper server was the only target; the 2026-09-10 open-source ruling made a stranger's vanilla
+server an equal first-class one, and that is the fact that moves the answer.
 
 **Each flavour has its own problem set, which is the case his test says keeps them apart.** Vanilla-only:
-a 12,797 ms tick stall from vanilla chunk handling, measured 2026-09-11, which timed out a whole fleet.
-Paper-only: entity activation ranges, mob spawning and chunk behaviour — the layer a pathfinding bot sits
-on, and a vanilla user never meets it. Paper also does **not** fix the disconnect it would be adopted
-for: the 30-second keep-alive lives in vanilla's packet handler and Paper 1.21.5 exposes no key for it.
+a 12,797 ms tick stall from vanilla chunk handling, which timed out a whole fleet. Paper-only: entity
+activation ranges, mob spawning and chunk behaviour — the layer a pathfinding bot sits on, and a vanilla
+user never meets it. Paper also does **not** fix the disconnect it would be adopted for: the 30-second
+keep-alive lives in vanilla's packet handler and Paper 1.21.5 exposes no key for it.
 
 **THE INVARIANT THAT ACTUALLY BUYS COMPATIBILITY — NO BOT CODE MAY BRANCH ON SERVER FLAVOUR.** The fleet
 is a mineflayer client speaking the vanilla protocol and holds zero references to Paper, Spigot, Bukkit or
@@ -108,9 +107,8 @@ the thing to protect. A jar choice is not what keeps the bot portable; never wri
 
 **Which world is which** (runbook §3h): `MinecraftServer/` is the LOCAL dev world every soak uses — keep
 it **vanilla**, because it is the harsher substrate and the lower common denominator, and testing on the
-harsher while shipping to the more forgiving is the safe direction. `Public_server/runtime/backend/` is
-the PUBLIC world and stays **Paper** (plus GrimAC, CoreProtect, LuckPerms, SkinsRestorer — so Paper alone
-was never the whole ship target anyway).
+harsher while shipping to the more forgiving is the safe direction. Any world serving other people is
+likely to be Paper plus an anticheat, which is a *more* forgiving substrate than the one soaked against.
 
 **Converting a dev world to Paper is an OPT-IN parity check, not a setup step** — worth doing deliberately
 when the question is *"does this behave the same under Paper?"*, and worth reverting after. Server folders
@@ -498,7 +496,7 @@ node Auren_Workshop/fleet_control.js down                   # world + overseer +
 
 Then join in Minecraft at **`localhost`** (Java **1.21.5**) and say `foreman get` in ordinary chat.
 
-**It comes up with zero bots on purpose**, exactly like a public server: the thing under test is
+**It comes up with zero bots on purpose**, exactly like a world serving people: the thing under test is
 `foreman get`, the path a real arrival walks. `-Count N` is for the other kind of test, where
 homesteaders are the subject.
 
@@ -967,9 +965,8 @@ diagnosing), `error()` (❌, auto-dumps buffered context). Nothing finer-grained
 **An LLM may not be placed in a loop that acts on the system without a human present in it.** Not bounded
 by attempts, not bounded by a budget, not bounded by a permission list. This has been built and removed
 **twice** — `autofix_controller.js` / `launch_subagent.js` / `start_subagent.ps1` / a `claude -p` fixer
-(deleted 2026-07-10), and `Public_server/waker.js`, a warden escalation that woke a headless session on a
-fault (built and deleted 2026-09-05, the same day). *"I've tried this at different scopes and it just
-never works."*
+(deleted 2026-07-10), and a waker that escalated a watchdog fault by starting a headless session (built
+and deleted the same day, 2026-09-05). *"I've tried this at different scopes and it just never works."*
 
 **The previous note recorded a *situation* — "it existed to run with nobody in the chat; that premise is
 gone" — and a situation is exactly the kind of reason a later session argues past.** The premise came back
@@ -1000,10 +997,10 @@ Deterministic code detects and reports (it cannot lie while it runs); the LLM *t
 **Automating the human hop is what both deleted systems were, and it is the hop that cannot be automated
 — it is the only one where a decision is made by a party that can be held accountable for it** (Law 28).
 
-**What IS legitimate:** deterministic self-repair with a named owner and a cause-naming alert.
-`Public_server/warden.js` restarts components, backs off, gives up after five attempts and posts why. It
+**What IS legitimate:** deterministic self-repair with a named owner and a cause-naming alert — a watchdog
+that restarts a component, backs off, gives up after a fixed number of attempts and posts *why*. It
 contains no generator, cannot invent an action it was not built with, and when it runs out of moves it
-wakes a *person*. Extend that, and let the escalation end at him.
+wakes a *person*. Extend that, and let the escalation end at a human.
 
 ### The loop, one turn at a time
 

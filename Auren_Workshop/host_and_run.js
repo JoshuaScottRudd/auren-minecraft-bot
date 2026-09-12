@@ -37,12 +37,14 @@
 require('../js_kernel/utils/developer_door').enter('Auren_Workshop/host_and_run.js');
 
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
 const paths = require('./workshop_paths');
 paths.registerAliases();
 const workstation = require(paths.bot('js_kernel/utils/workstation'));
+const consoleWindow = require(paths.bot('js_kernel/utils/console_window'));
 const rcon = require(paths.bot('js_kernel/utils/rcon_link'));
 const { guardExternal } = require(paths.bot('js_kernel/utils/external_library_guard'));
 
@@ -117,6 +119,15 @@ function fleetControl(args) {
   return r.status === 0;
 }
 
+function portAnswers(port) {
+  return new Promise(resolve => {
+    const s = net.connect({ host: '127.0.0.1', port, timeout: 1500 });
+    s.once('connect', () => { s.destroy(); resolve(true); });
+    s.once('timeout', () => { s.destroy(); resolve(false); });
+    s.once('error', () => resolve(false));
+  });
+}
+
 function propsValue(key) {
   if (!fs.existsSync(PROPS_FILE)) return '';
   const m = new RegExp(`^${key.replace(/\./g, '\\.')}=(.*)$`, 'm').exec(fs.readFileSync(PROPS_FILE, 'utf8'));
@@ -158,20 +169,28 @@ function mintConsolePassword() {
   say(`the world      ${CONFIG.world === 'fresh' ? `rolled back to '${CONFIG.snapshot}'` : 'carried forward as it stands'}`);
   say(`then           Auren_Workshop/run.js, unchanged — the same run a stranger gets`);
 
-  // ── NOTHING IS IN THE WORLD → CHANGE THE WORLD → LET THINGS IN ─────────────────────────────────────
-  // A rollback under a live fleet restores files beneath running clients. The fleet comes down first, and
-  // it comes down before the server so the clients are gone before the thing they were talking to is.
-  phase(`take the world down`);
-  if (!fleetControl(['down'])) say('nothing was up to bring down, which is the expected state');
-  // NOT `refuse()`: that says "the world was not touched", and by this line the fleet HAS been brought
-  // down. A refusal that overstates what it left alone is worse than no message (Law 23).
-  if (!fleetControl(['server-stop'])) {
-    console.error(`\n  host_and_run: the server would not stop, so the world was NOT rolled back and no run`);
-    console.error(`  was started. A rollback under a running server restores files mid-write, which is not`);
-    console.error(`  a world. The fleet was already brought down before this, so nothing is in there.`);
-    console.error(`  Read the message above — it names what refused.\n`);
-    process.exit(1);
+  // ── EVERY TERMINAL CLOSED BEFORE ANYTHING STARTS — CHECKED HERE, NEVER CLOSED HERE (2026-09-11) ────
+  // *"before startup it should also check but not close. just prevent another start from happening and
+  // say what terminals are open that prevents another start. thats our server hang problem"*. This used to
+  // BRING DOWN whatever it found (`down`, then `server-stop`), which made a leftover invisible: every start
+  // cleaned up after the last run, so nobody learned the last run had not. Now a leftover stops the start
+  // by name, and the teardown that left it is the thing to fix. A world already answering is a leftover as
+  // well — and a rollback under a live server restores files mid-write, which is not a world.
+  phase('every terminal closed?');
+  const open = consoleWindow.openWindows();
+  const serverPort = Number(propsValue('server-port')) || 25565;
+  const worldUp = await portAnswers(serverPort);
+  if (open.length || worldUp) {
+    refuse([
+      `${consoleWindow.describeWindows(open)}.`,
+      ...(worldUp ? [`A Minecraft server is already answering on port ${serverPort} — a world from an earlier start is still up.`] : []),
+      ``,
+      `A start beside those shares a world with them. Nothing was closed; close them, then start again:`,
+      `    node Auren_Workshop/fleet_control.js down`,
+      `(the verb that closes every terminal a run opened and stops the world through its console).`,
+    ]);
   }
+  say('no terminals open, and no world answering');
 
   phase(`the world (${CONFIG.world})`);
   const password = mintConsolePassword();
@@ -236,8 +255,13 @@ function mintConsolePassword() {
     say(`They are yours to reap:  node Auren_Workshop/fleet_control.js down`);
     say(`Then stop the world:     node Auren_Workshop/fleet_control.js server-stop`);
   } else {
-    fleetControl(['server-stop']);
-    say('the world this script started is down again');
+    // `down`, NOT `server-stop` (2026-09-11: *"you had like 20-30 terminals open"*). `down` stops the world
+    // AND reaps the windows no other teardown owns: the merged fleet-console (it ends by waiting for Enter)
+    // and each crew bot's follower (the foreman's own close never runs on Windows), every one of them from
+    // console_window's ledger. A bare server-stop left those on the desktop after every hosted run. `down`
+    // then looks again and prints what is still open, which is how this end of the run CHECKS.
+    fleetControl(['down']);
+    say('the world this script started is down again, with every window it opened');
   }
 
   console.log(`\n══ host_and_run finished — the run ${code === 0 ? 'PASSED' : `exited ${code}`} ══\n`);

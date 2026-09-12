@@ -68,9 +68,9 @@ const SERVER_MINECRAFT_VERSION = process.env.AUREN_MINECRAFT_VERSION || '1.21.5'
 // SERVER_ENDPOINT — where a body connects to reach the world. It lived as a literal `localhost:25565` in
 // master_core's createBot call, twice more in the camera rig's two clients, and as a private env pair in
 // the foreman: four answers to one question, which is the "parallel array kept in lockstep" this file
-// exists to prevent (Law 16). It is centralised now because the endpoint is about to start CHANGING — the
-// public-server plan puts the world on a rented box and the bots on a dedicated runner, and a value that
-// changes with four homes changes in three of them.
+// exists to prevent (Law 16). It is centralised because the endpoint CHANGES per deployment — a world on
+// this machine, a world on another box, somebody else's server entirely — and a value with four homes
+// changes in three of them.
 // THE ENV OVERRIDE IS THE POINT, not a convenience. Pointing the fleet at another host must never require
 // editing tracked code: the host differs per deployment, and an edit would travel to every machine through
 // git and be wrong on all but one. `AUREN_SERVER_HOST` / `AUREN_SERVER_PORT` are read once, here, and
@@ -902,6 +902,16 @@ const ACCEPTABLE_BIOMES = new Set([
     'flower_forest', 'dark_forest', 'old_growth_birch_forest',
 ]);
 
+// The water a wheat field is sited against: river and ocean biomes (Architect 2026-09-11 — *"it must
+// either be a river or ocean biome tile… water biome only, bank only, cluster only"*). Sea-level water in
+// any other biome is a lake or a pond, and wheat_plot_scanner neither floods it nor counts its banks.
+// Written out name by name, so a biome is on this list by being written here.
+const FARM_WATER_BIOMES = new Set([
+    'river', 'frozen_river',
+    'ocean', 'deep_ocean', 'cold_ocean', 'deep_cold_ocean', 'lukewarm_ocean', 'deep_lukewarm_ocean',
+    'warm_ocean', 'frozen_ocean', 'deep_frozen_ocean',
+]);
+
 // Smelting. Fuel preference order (first one held is used; logs excluded — a log burns like a
 // plank but is worth four, so it is 4x the waste). Yield = smelts per fuel unit; cook = ms per
 // item (vanilla 200 ticks = 10s), `default` covering every smeltable.
@@ -1367,6 +1377,7 @@ module.exports = {
     STOCK_THRESHOLDS,
     OPTIONAL_BUILD_MATERIALS,
     ACCEPTABLE_BIOMES,
+    FARM_WATER_BIOMES,
     FUEL_PREFERENCES,
     FUEL_SMELT_YIELD,
     SMELT_COOK_MS,

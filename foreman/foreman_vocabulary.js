@@ -82,9 +82,9 @@ const SPECIES = Object.freeze([BOT_MODES.CONTRACTOR, BOT_MODES.HOMESTEADER]);
 // then wants to know what a word does says it and finds out. The argument shapes are not lost either —
 // `parseRequest` answers a malformed `request` with the exact form that would have worked, at the only
 // moment that form is information rather than notation. **The explanation was always somewhere better;
-// the page was a second copy of it in the worst place to read** (Law 16), and *elsewhere* now exists in
-// the two places the video doctrine requires teaching to sit anyway: the Discord arrival message and the
-// pinned arrival screen.
+// the page was a second copy of it in the worst place to read** (Law 16). *Elsewhere* is wherever the
+// person running the world greets arrivals — the README, a welcome message, a pinned screen — which is
+// where a paragraph can be read and a chat line cannot.
 //
 // THE ONE THING SHORTENING MAY NOT DROP, and the reason the page is two lines rather than one: a verb
 // whose consequence is larger than it sounds has to say so HERE, because nowhere later is early enough
@@ -194,7 +194,7 @@ const HELP_CEILING = 4;
     throw new Error(`[foreman_vocabulary] CODING VIOLATION (Law 13): the help page is ${lines.length} lines `
       + `and the ceiling is ${HELP_CEILING}. This page is a list of WORDS (Architect 2026-09-05: "only list `
       + 'the commands the words only") — a new line means a gloss has crept back in. Put the explanation '
-      + 'where the explanation lives: the Discord arrival message and the pinned screen.');
+      + 'where a paragraph can be read: the README, or however this world greets arrivals.');
   }
   const long = lines.filter(l => l.length > 50);
   if (long.length) {

@@ -101,8 +101,8 @@ function Write-Warn($msg){ Write-Host "[WARN] $msg" -ForegroundColor Yellow }
 function Write-Err($msg){ Write-Host "[ERR ] $msg" -ForegroundColor Red }
 
 # -Root MAKES THIS THE ONE ROLLBACK IMPLEMENTATION FOR EVERY SERVER ON THE MACHINE (Law 16). A machine can
-# hold several Minecraft servers — the fleet's dev world, and on the dedicated box the PUBLIC world under
-# Public_server\runtime\backend — and each needs snapshots, restores and the same pre-restore safety copy.
+# hold several Minecraft servers — the fleet's own dev world and any other world beside it — and each needs
+# snapshots, restores and the same pre-restore safety copy.
 # A second rollback per server would be a second set of retention rules, a second world-is-held guard and
 # a second place for the destructive path to be wrong. Every path below resolves through $scriptRoot.
 #
@@ -143,9 +143,16 @@ $snapRoot = Join-Path -Path $scriptRoot -ChildPath $SnapshotsDir
 $worldSnapRoot = Join-Path $snapRoot ($World -replace '[\\/:*?"<>|]','_')
 if(!(Test-Path $worldSnapRoot)){ New-Item -ItemType Directory -Path $worldSnapRoot | Out-Null }
 
+# ALWAYS A LIST, and the leading comma is what makes it one (fixed 2026-09-11). A world with exactly ONE
+# snapshot came back as a bare folder object, and every caller asks .Count: fine for years, until the
+# developer door was dot-sourced above and brought strict mode in with it, which refuses .Count on a single
+# object. The first restore after that died "The property 'Count' cannot be found on this object" before
+# touching anything. @() alone is not enough: PowerShell unrolls an array a function returns, so a
+# one-item @() arrives as the item again. The unary comma returns the array itself. Get-PreRestoreBackups
+# below carries the same fix; it had only escaped because three backups existed.
 function Get-Snapshots(){
-  if(!(Test-Path $worldSnapRoot)){ return @() }
-  Get-ChildItem -Path $worldSnapRoot -Directory | Sort-Object Name -Descending
+  if(!(Test-Path $worldSnapRoot)){ return ,@() }
+  return ,@(Get-ChildItem -Path $worldSnapRoot -Directory | Sort-Object Name -Descending)
 }
 
 # ── The pre-restore safety copies ────────────────────────────────────────────────────────────────
@@ -163,8 +170,8 @@ function Get-Snapshots(){
 # $snapshots[0], the newest by name, and a backup landing in that list would make an accidental
 # restore-of-a-backup the default. They stay separate and are pruned on their own clock.
 function Get-PreRestoreBackups(){
-  if(!(Test-Path $snapRoot)){ return @() }
-  @(Get-ChildItem -Path $snapRoot -Directory -ErrorAction SilentlyContinue |
+  if(!(Test-Path $snapRoot)){ return ,@() }
+  return ,@(Get-ChildItem -Path $snapRoot -Directory -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -like 'backup_before_restore_*' } | Sort-Object Name -Descending)
 }
 

@@ -99,8 +99,8 @@ function render(c) {
 // refuses is the worse half of the two failure directions `foreman_vocabulary`'s page assertion guards —
 // a person invited to say something that cannot work.
 //
-// WHAT REPLACES IT IS AN EXAMPLE, NOT A POINTER. `request 20 logs` is the same form the Discord arrival
-// message teaches, it is a request that actually succeeds, and it fits the sentence it is in. It teaches
+// WHAT REPLACES IT IS AN EXAMPLE, NOT A POINTER. `request 20 logs` is a request that actually succeeds
+// and it fits the sentence it is in. It teaches
 // the SHAPE, which is what a person who mistyped a name needs; it does not claim to be a catalogue,
 // because there is no longer one and a refusal that implies otherwise is a second wrong turn (Law 25).
 const TRY = `try a plain name — "${PREFIX} request 20 logs".`;

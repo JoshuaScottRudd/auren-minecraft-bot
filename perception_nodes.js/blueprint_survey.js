@@ -466,6 +466,36 @@ function getFootprintCells(blueprintName, conferenceRoomKey) {
 // The one caller today is the bootstrap crafting table's placement search (craft_handler): a table left
 // standing permanently inside a footprint is a block the builder has to break before it can lay that
 // voxel, which is the digging this fleet no longer does.
+// geometryOf — WHICH blueprint geometry a locked instance is. The room key names the INSTANCE and the chair
+// names the GEOMETRY, and since 2026-07-16 those are two different things: `wheat_plot_pair#7` is an instance
+// key, and the geometry locked under it is whatever `set_buildspot` stamped.
+//
+// THE RESOLUTION WAS ALREADY WRITTEN FIVE TIMES before it was a function — four places in this file and one
+// in find_buildingspot, all spelling `entry?.blueprint_paster?.building_name || roomKeyName(roomKey)`. Those
+// five sit inside `Object.entries(room)` loops and already hold the entry, so they keep the inline form; this
+// exists for the callers that hold only a key. It replaced a worse thing than a copy: `farming_integrity`'s
+// survey and `farm_manager`'s tendPlot were passing the config CONSTANT, which is an assumption about what is
+// locked rather than a reading of it. Asking is the same cost and cannot go stale (Law 25).
+// THE KEY IS RESOLVED THROUGH hq.readBuildingChair, NOT BY INDEXING THE ROOM. Measured the hard way: the
+// room is keyed WITH the owner suffix (`wheat_plot_pair#1|homesteader`) and every farm caller holds the
+// bare instance key (`wheat_plot_pair#1`, from FARM_ROOM_KEYS), so a direct `room[roomKey]` misses, falls
+// back, and hands `getBuilding` an instance key that is not a blueprint — a live run died on
+// `Blueprint "wheat_plot_pair#1" not found`. readBuildingChair applies bot_mandate.buildingRoomKey, which is
+// the same owner resolution every other chair read uses (Law 16). The other five copies of this lookup are
+// inside `Object.entries(room)` loops, so they always held the full key and never met this.
+//
+// THE FALLBACK ALSO STRIPS THE INSTANCE SUFFIX, for the same reason: `roomKeyName` strips the OWNER and
+// nothing else, which is right for `headframe|homesteader` and wrong for an instanced key. Config builds
+// those as `${blueprintName}#${i}`, so cutting at the '#' recovers the geometry name by construction. The
+// fallback only fires for a chair written before the paster stamp existed; it must not fire into a throw.
+function geometryOf(roomKey) {
+  const stamped = hq.readBuildingChair(roomKey, 'blueprint_paster')?.building_name;
+  if (stamped) return stamped;
+  const bare = roomKeyName(roomKey);
+  const hash = bare.indexOf('#');
+  return hash === -1 ? bare : bare.slice(0, hash);
+}
+
 function getAllFootprintCells() {
   const room = hq.readOffice('building_confrence_room', {});
   const set = new Set();
@@ -638,5 +668,6 @@ module.exports = {
   getAllProtectedBlocks,
   getFootprintCells,
   getAllFootprintCells,
+  geometryOf,        // the one answer to "which blueprint is locked under this instance key"
   resolveVoxelAnchor,
 };

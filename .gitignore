@@ -42,6 +42,9 @@ fleet_logs/
 
 # Which processes are alive right now, by process id. True for minutes, on one machine.
 fleet_control_runtime.json
+# Which terminals the fleet has open (console_window's ledger) — the same kind of fact, for the same reason.
+console_windows.json
+console_windows.json.*.tmp
 
 # ── A bot's memory of one world ─────────────────────────────────────────────────────────────────
 # Buildspots, chest positions and inventories, keyed to the exact world that produced them. On any

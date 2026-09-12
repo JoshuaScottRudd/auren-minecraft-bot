@@ -63,54 +63,26 @@ const { roomKeyOwner } = require('./message_schema');
 
 const TAG = 'owner_memory';
 
-// ── TWO STORES, AND WHAT DECIDES BETWEEN THEM (Architect 2026-09-08) ────────────────────────────────
+// ── ONE STORE, AND IT IS INSIDE THE BOT ─────────────────────────────────────────────────────────────
 //
-//   the dedicated public server  →  <repo>/Privacy/player_memory/   TRACKED IN GIT
-//   every other deployment       →  Auren_Bot/player_memory/        untracked, like every other log
+//   every deployment  →  Auren_Bot/player_memory/   untracked, like every other thing the fleet writes
 //
-//   *"its only supposed to hold data according to players on the public server only. thats why its
-//    gittracked so i can work on it at multiple locations because you can only get player data once. if
-//    its made for the user then it should save in the normal spot. so by default contractor bots should
-//    save within auren bot… the unique spot is for the dedicated server only."*
+// ONE PATH, SO THERE IS NOTHING TO CHOOSE AND NOTHING TO DECLARE (Law 16). There used to be a second
+// store selected by an environment variable, and the variable was the whole hazard: chosen wrongly in
+// either direction it was silent, because an overseer serves an empty store perfectly well and says
+// nothing while the real rows sit in the other folder. A single path cannot be pointed at the wrong
+// folder, which is the constitutional form of that guarantee rather than a rule about setting a flag
+// correctly (Law 27).
 //
-// WHY THE PUBLIC SERVER'S HALF IS TRACKED, AND IT IS NOT PRIVACY. A stranger joins that world once,
-// builds, and leaves. Nothing can collect that again. Git is the only mechanism in this project that
-// carries a file to his second workstation and into history, so the one store that must survive a
-// machine is the one store that is tracked, and `Privacy/` at the repo root is where a tracked file can
-// live without riding out in the published copy of `Auren_Bot/`.
+// WHY IT LIVES UNDER THE BOT AND NOWHERE ELSE. These coordinates are true about ONE world on ONE disk,
+// so they are per-machine live state rather than a record: carrying them to another machine delivers
+// facts about a world that is not there (Invariant B). A person running the published copy has only this
+// path anyway — everything above `Auren_Bot/` is absent by construction in a download, so a store
+// outside the bot is not a preference, it is a path that does not exist.
 //
-// WHY EVERY OTHER DEPLOYMENT'S HALF MUST NOT BE. A dev world's coordinates are true about one world on
-// one disk; syncing them delivers to the other workstation a set of facts about a world that is not
-// there. That is the repo's own worked example for what an ignore rule is for, and it is why the normal
-// spot is untracked rather than merely elsewhere. A user of the published copy has no `Privacy/` beside
-// them at all, so for them the normal spot is not a preference — it is the only path that exists.
-//
-// THE DEPLOYMENT DECLARES ITSELF AND THIS FILE DOES NOT GUESS (Law 23). `AUREN_PUBLIC_SERVER=1` is set
-// by the two things that raise the public stack — `online.ps1` and the warden's own repair — and by
-// nothing else. Inferring it from host, port or the presence of a folder would be a guess anybody could
-// accidentally match, and the two ways of being wrong are both unacceptable and not symmetric: guessing
-// INTO the tracked store publishes a stranger's data, and guessing OUT of it loses data that cannot be
-// collected twice. A fact with that shape is stated, never derived.
-//
-// AN UNRECOGNISED VALUE THROWS RATHER THAN FALLING BACK. `AUREN_PUBLIC_SERVER=true` silently choosing the
-// local store would be the losing failure above, arriving as a typo nothing reports (Law 13 — a value
-// present but not legal is a coding violation, and the message carries the form that works).
-//
-// Still deliberately NOT under `fleet_logs/`, whichever store is chosen: a run start empties that folder
-// whole, and this is the one thing the fleet keeps that must survive a run (see `resetRunArtifacts`).
-const _publicFlag = process.env.AUREN_PUBLIC_SERVER;
-if (_publicFlag !== undefined && _publicFlag !== '1' && _publicFlag !== '0') {
-  throw new Error(
-    `CODING VIOLATION (Law 13): AUREN_PUBLIC_SERVER='${_publicFlag}' is not a legal value — it is '1' on `
-    + `the dedicated public server and unset everywhere else. It decides which player-memory store is `
-    + `written, and player data cannot be collected a second time, so it is never guessed at.`
-  );
-}
-const IS_PUBLIC_SERVER = _publicFlag === '1';
-
-const PUBLIC_STORE = path.join(__dirname, '..', '..', 'Privacy', 'player_memory');
-const LOCAL_STORE = path.join(__dirname, '..', 'player_memory');
-const MEMORY_DIR = IS_PUBLIC_SERVER ? PUBLIC_STORE : LOCAL_STORE;
+// Deliberately NOT under `fleet_logs/`: a run start empties that folder whole, and this is the one thing
+// the fleet keeps that must survive a run (see `resetRunArtifacts`).
+const MEMORY_DIR = path.join(__dirname, '..', 'player_memory');
 
 // A username is 3-16 of [A-Za-z0-9_], and `homesteader` (the commons key) is the one other legal value.
 // ANYTHING ELSE IS REFUSED RATHER THAN SANITISED, because an owner key reaching here is derived from a
@@ -161,37 +133,12 @@ function ownerOf(key) {
 function loadAll(report) {
   const out = { buildings: {}, stations: {} };
 
-  // WHICH STORE, SAID OUT LOUD ON EVERY START (Invariant C). The choice is made by an environment
-  // variable set two processes away, which is exactly the kind of decision that is invisible until it is
-  // wrong — and the way it goes wrong is silent by nature: the overseer works perfectly against an empty
-  // store and nobody's places come back.
-  report(`${TAG}: store is ${MEMORY_DIR} — `
-       + `${IS_PUBLIC_SERVER ? 'the DEDICATED PUBLIC SERVER store, tracked in git' : 'this machine only, untracked'}.`);
+  // WHICH STORE, SAID OUT LOUD ON EVERY START (Invariant C). There is only one path now, so this can no
+  // longer be the wrong folder — it is printed because a reader diagnosing "nobody's places came back"
+  // needs the absolute path in front of them rather than derived from where they think the bot lives.
+  report(`${TAG}: store is ${MEMORY_DIR} — this machine only, untracked.`);
 
-  // AND THE ONE CONTRADICTION WORTH SHOUTING ABOUT. The public stack raises the overseer twice — once from
-  // `online.ps1` and again from the warden's repair every thirty seconds — and both have to stamp the flag.
-  // If one of them ever stops, this process comes up on the LOCAL store while a tracked store full of real
-  // players sits beside it, serving everybody an empty world and overwriting nothing, with no error
-  // anywhere. Reported rather than corrected: a file count is evidence about the past, not authority to
-  // override what the deployment just declared about itself (Law 23).
-  //
-  // ASKED BY PRESENCE FIRST, and that is not a style choice. On every machine that is not the dedicated
-  // server — including every published copy, where `Privacy/` cannot exist by construction — this folder
-  // is legitimately absent, and putting the boundary guard first made an ⚠️ warning about a missing
-  // directory the normal state of a normal start. A directory either exists or it does not, which is a
-  // decision with an answer; the guard belongs on the read that follows, where a failure IS news.
-  if (!IS_PUBLIC_SERVER && fs.existsSync(PUBLIC_STORE)) {
-    const stranded = guardExternalSync(TAG, `list ${PUBLIC_STORE}`, () => fs.readdirSync(PUBLIC_STORE));
-    if (stranded.ok && stranded.value.some((n) => /^player_hq\..+\.json$/.test(n))) {
-      report(`${TAG}: ${stranded.value.length} file(s) sit in the PUBLIC SERVER store at ${PUBLIC_STORE} `
-           + `and this process is NOT reading them — AUREN_PUBLIC_SERVER is unset. If this machine is the `
-           + `dedicated server, every player's places are invisible right now and new ones are being `
-           + `written elsewhere. If it is not, that store holds data that belongs on the dedicated box.`);
-    }
-  }
-
-  // ASKED BY PRESENCE FIRST, for the same reason the PUBLIC_STORE check above is — and this is where that
-  // rule was written down and then not applied. On a fresh install this directory has never been created,
+  // ASKED BY PRESENCE FIRST. On a fresh install this directory has never been created,
   // so the guarded read below fired `guardExternalSync`'s own ⚠️ line before the ENOENT branch could
   // decide it was not news: **the first thing a new person saw was the word "failed"**, about a folder
   // whose absence is the correct state of a machine nobody has hired a contractor on yet. The branch that

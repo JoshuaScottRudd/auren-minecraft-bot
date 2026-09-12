@@ -1,16 +1,15 @@
 // latency_shim — puts a measured network delay between the fleet and the Minecraft server, on one machine.
 //
-// WHY IT EXISTS. The whole fleet was written against `localhost`, where a round trip is effectively zero,
-// and the public-server plan moves the world onto a rented box 20-80 ms away. Nothing in this codebase has
-// ever run under that condition, and `public_server_plan.md` §10 names it as the one unknown that can
-// invalidate the rest of the plan: tick-counted waits, chat used as synchronisation, physics prediction and
-// multi-bot ordering all currently get their timing for free.
+// WHY IT EXISTS. The whole fleet was written against `localhost`, where a round trip is effectively zero.
+// Point it at a world across a network — a box in another room, a rented host 20-80 ms away, anybody
+// else's server — and tick-counted waits, chat used as synchronisation, physics prediction and multi-bot
+// ordering all lose the timing they were getting for free.
 //
-// The obvious way to find out is to rent a server and try. This is the cheaper way and it comes FIRST: a
-// TCP relay that holds every byte for a set delay before passing it on. Bots connect here instead of to the
-// server; the server never knows. The answer arrives before a cent is spent, and — more useful — the delay
-// is a DIAL, so the question stops being "does it work remotely" and becomes "at what latency does it stop
-// working", which is a number the plan can be built on.
+// The obvious way to find out is to connect to a remote world and try. This is the cheaper way and it
+// comes FIRST: a TCP relay that holds every byte for a set delay before passing it on. Bots connect here
+// instead of to the server; the server never knows. The delay is a DIAL, so the question stops being
+// "does it work remotely" and becomes "at what latency does it stop working", which is a number a
+// deployment decision can be built on.
 //
 // ── ORDER IS THE WHOLE CORRECTNESS PROBLEM ───────────────────────────────────────────────────────────
 // Minecraft's protocol is a stream, not messages: a chunk delayed past the chunk behind it does not arrive
@@ -24,7 +23,7 @@
 // ── WHAT THE DELAY MEANS ─────────────────────────────────────────────────────────────────────────────
 // `--delay-ms` is the ROUND TRIP, matching how latency is quoted everywhere else. Each direction is
 // therefore held for half of it. Asking for 60 means a bot's action reaches the server 30 ms later and the
-// world's answer comes back 30 ms after that, which is what a 60 ms ping to a rented box costs.
+// world's answer comes back 30 ms after that, which is what a 60 ms ping to a remote host costs.
 //
 // ── WHAT IT DOES NOT SIMULATE ────────────────────────────────────────────────────────────────────────
 // Packet loss, reordering, bandwidth limits and MTU behaviour. A real link drops packets and TCP recovers

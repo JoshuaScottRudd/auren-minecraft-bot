@@ -1,5 +1,5 @@
 // js_kernel/bot_voice.js
-// A CONTRACTOR SAYS ONE THING AND ONE THING ONLY: WHETHER IT IS AVAILABLE.
+// WHAT A BOT SAYS IN OPEN CHAT: a contractor, whether it is available; a homestead, where its base is.
 //
 // ── THE TWO RULINGS THAT BUILT THIS FILE, IN ORDER, BECAUSE THE SECOND IS NOT A REVERSAL ──────────
 // 2026-09-06, morning: *"when they post to their owner. its way too much. it will block the players
@@ -20,13 +20,13 @@
 // because the moment a crew becomes free is the moment a person needs to know and the one moment they
 // have no reason to be asking.
 //
-// ── THE WHOLE VOCABULARY IS THREE SENTENCES ────────────────────────────────────────────────────────
+// ── AVAILABILITY IS THREE SENTENCES ────────────────────────────────────────────────────────────────
 //   greeting       said once, at birth, when the body has found its owner in the world
 //   → idle         said when the bot parks with nothing it can start, and again about once a minute
 //                  for as long as it stays parked
 //   → working      said once, when it picks work back up
-// There is no fourth, and adding one is how this becomes narration again. The test for a proposed line:
-// **does it change whether this bot can take an order?** If not, it belongs in `foreman where`.
+// There is no fourth availability line, and adding one is how this becomes narration again. The test for a
+// proposed line: **does it change whether this bot can take an order?** If not, it belongs in `foreman where`.
 //
 // ── WHY A STATE MACHINE AND NOT A REPEAT-SUPPRESSOR ────────────────────────────────────────────────
 // The deleted file compared the last SENTENCE and dropped a duplicate. That is wrong for availability:
@@ -62,10 +62,18 @@
 // the floor lifts. A wobble that has resolved by then correctly says nothing at all: the state it would
 // have announced is no longer the state.
 //
-// ── ONLY A CONTRACTOR SPEAKS ───────────────────────────────────────────────────────────────────────
+// ── ONLY A CONTRACTOR SPEAKS OF AVAILABILITY ───────────────────────────────────────────────────────
 // A homesteader answers to nobody by design (Law 19), nobody is standing beside it, and its availability
 // is not a question anybody is asking. The species test is the whole gate; there is no per-run switch,
 // because a switch is a second place the answer lives and the answer never varies by run.
+//
+// ── THE ONE LINE A HOMESTEAD SPEAKS: WHERE ITS BASE IS (Architect 2026-09-11) ──────────────────────
+// *"also announce when it places its headframe in chat. where the location is set so players dont see
+// anything wrong."* A homestead sites its base at the biggest river or ocean bank in view, which can be a
+// long walk from where anybody is standing, and a crew that walks 150 blocks away without a word looks
+// like a crew that has broken. So the bot that locks the headframe says where, once, as coordinates a
+// person can type. It is one line per base, so it takes no part in the availability state machine or its
+// floor.
 //
 // ── SPEECH IS NEVER THE WORK ───────────────────────────────────────────────────────────────────────
 // Nothing here may stop, delay or fail a decision. The chat call goes through the external-library guard
@@ -157,4 +165,16 @@ function greet() {
 function goneIdle()  { _availability('idle', IDLE, true); }
 function backToWork() { _availability('working', WORKING); }
 
-module.exports = { greet, goneIdle, backToWork, MIN_GAP_MS };
+// baseSited(center) — the homestead's one line, said by the bot that locks the headframe (see THE ONE LINE
+// A HOMESTEAD SPEAKS above). Once per base by construction: the base-layout batch locks a headframe once,
+// and every later pass finds it already locked.
+function baseSited(center) {
+  const bot = global.bot;
+  if (!bot || typeof bot.chat !== 'function') return false;   // pre-spawn / headless: no world to speak into
+  const line = `base set — headframe at ${center.x} ${center.y} ${center.z}.`;
+  const sent = guardExternalSync(TAG, 'bot.chat base sited', () => bot.chat(line));
+  if (sent.ok) watcher.summary(TAG, `announced the base in chat: "${line}"`);
+  return sent.ok;
+}
+
+module.exports = { greet, goneIdle, backToWork, baseSited, MIN_GAP_MS };

@@ -86,7 +86,7 @@ const MAX_MATCHES = 100;         // return up to this many nearest matches; navi
 const SURFACE_SCAN_TOP = 160;    // highest Y a natural overworld surface realistically reaches
 
 // ── EXPANDING RINGS, BECAUSE THE PARAGRAPH ABOVE IS ONLY TRUE FOR COMMON TARGETS ────────────────────
-// MEASURED 2026-09-04, twelve bots on the public server: a single log scan took **10.4 SECONDS**, and
+// MEASURED with twelve bots on one world: a single log scan took **10.4 SECONDS**, and
 // the bots ran them back to back, forever. That one number explains most of what the fleet had been
 // blamed for — bots taking 23-33s to make their first move, bots burning a whole CPU core, and bots
 // dropped by the server for failing to answer a keep-alive inside 30s.

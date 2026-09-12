@@ -41,7 +41,7 @@ const inventoryLens = require('@kernel/inventory_lens');
 const TAG = 'farming_integrity';
 
 // ── CONFIG: the wheat-farm instances this subsystem owns ───────────────────────────────────────
-// ONE blueprint geometry (FARM_BLUEPRINT), N sited instances each under a distinct conference-room key
+// ONE plot DESIGN, ONE geometry (FARM_BLUEPRINT), N sited instances each under a distinct conference-room key
 // (FARM_ROOM_KEYS, from architect_config — the single source, Invariant D). scan(bot, roomKey) returns ONE
 // instance's verdict; job_board loops FARM_ROOM_KEYS and posts one job per instance — per-instance keys
 // over duplicate-named blueprints, reusing the mining-cell instance pattern (Law 16). Grow the farm count
@@ -127,7 +127,10 @@ function _structureMaterialsRemaining(structure) {
 // and the phase is idle mid-growth (post nothing). Planting is seed-gated; locate/build gate on
 // seeds + structure blocks + a hoe — the full build+plant pipeline cannot run without them.
 // scan(bot, roomKey) → ONE farm instance's verdict. roomKey is the instance's conference-room key
-// (defaults to instance 0 for single-farm callers); geometry is always the shared FARM_BLUEPRINT.
+// (defaults to instance 0 for single-farm callers); geometry is THIS instance's, READ from its chair by
+// blueprintSurvey.geometryOf rather than named from config — the same string today, but a reading and not an
+// assumption about what was locked (Law 25). FARM_BLUEPRINT below is the DESIGN, used only for the
+// per-design needs (seed count, hoe cost) that any variant would share by construction.
 function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   if (!bot || !bot.blockAt) {
     throw new Error('[farming_integrity] CODING VIOLATION: bot must be initialized before scan(). Check caller.');
@@ -155,7 +158,11 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   if (located) {
     // The neutral survey returns the raw structural diff (no craft aggregation, no logging) — farming
     // does its own material gating below, so it wraps the survey directly, never building_integrity.
-    structure = blueprintSurvey.survey(bot, FARM_BLUEPRINT, roomKey);
+    // GEOMETRY IS READ, NOT ASSUMED (2026-09-11). blueprintSurvey.geometryOf returns what set_buildspot
+    // actually stamped into this instance's chair. It matches the config constant today; the constant was
+    // still the wrong way to get it, because surveying a plot against a geometry it was not locked under
+    // projects the dirt voxel somewhere it is not and reports the cell missing forever (Law 16, Law 25).
+    structure = blueprintSurvey.survey(bot, blueprintSurvey.geometryOf(roomKey), roomKey);
     structureComplete = structure.all_complete === true;
     structureSteps = Array.isArray(structure.steps) ? structure.steps : [];
     field = getFarmState(bot, roomKey);

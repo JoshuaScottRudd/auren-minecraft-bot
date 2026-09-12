@@ -33,7 +33,7 @@ const farmExecutor = require('@action/farm_executor');
 // paid for costs nothing here.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { routeToJudge } = require('@utils/signal_utils');
-const { FARM_BLUEPRINT_NAME } = require('@thinking/architect_config');
+const blueprintSurvey = require('@perception/blueprint_survey');   // geometryOf: which blueprint this instance is
 
 const TAG = 'farm_manager';
 
@@ -120,7 +120,10 @@ module.exports = {
 
       // tendPlot is a Law-15 API: environmental per-plot failure returns worked=0 with a reason (skip it);
       // a genuine CODING VIOLATION throws (Law 13) and must surface loudly, so it is NOT caught here.
-      const res = await farmExecutor.tendPlot(bot, plot.roomKey, FARM_BLUEPRINT_NAME);
+      // The geometry is THIS plot's, READ from its chair rather than named from config. Same string today;
+      // the difference is that one is a reading and the other an assumption about what was locked (Law 25).
+      // One answer to that question, and it is blueprint_survey.geometryOf (Law 16).
+      const res = await farmExecutor.tendPlot(bot, plot.roomKey, blueprintSurvey.geometryOf(plot.roomKey));
       workedTotal += res.worked || 0;
       refusedTotal += res.refused || 0;
     }

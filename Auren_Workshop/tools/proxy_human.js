@@ -332,7 +332,11 @@ bot.on('kicked', reason => {
 // cell in a record that never matched the world (Law 25 / Law 26 — the client is the witness, not the
 // command's return).
 const PLACEMENT_RADIUS = 12;
-const PLACEMENT_SETTLE_MS = 2000;
+// 10 s, not 2: the wait ends the instant the body lands, so the cap is only paid by a command that never
+// lands. Run ten (2026-09-11) had its /tp to a correct biome spot miss a 2 s cap while the server logged
+// "Can't keep up" on a freshly generating world — and the /spreadplayers right after it, which needs the
+// same op, landed. A lagging server answers late; a 2 s cap read that lateness as a refusal.
+const PLACEMENT_SETTLE_MS = 10000;
 const PLACEMENT_POLL_MS = 100;
 const PLACEMENT_RETRY_MS = 700;
 
@@ -455,7 +459,10 @@ async function placeInBiome(reader, at) {
   // CLEARANCE IS MEASURED FROM THE REAL SQUARE, AND NO SQUARE MEANS NO CHOICE. A box of null means the
   // spawn packet has not arrived, and inventing a centre would put the person in the one place this is
   // trying to avoid — so the search declines and says why.
-  if (!box) return record('--stand=biome found no spot — the world spawn is not known yet (no spawn_position packet received).');
+  if (!box) {
+    record('--stand=biome found no spot — the world spawn is not known yet (no spawn_position packet received).');
+    return false;
+  }
   const from = floorFrom(box);
 
   // ── OUTWARD FROM THE LINE, AND THE FIRST SPOT THAT PASSES IS THE SPOT (Architect 2026-09-11) ──────
@@ -489,16 +496,19 @@ async function placeInBiome(reader, at) {
   };
   const sweep = await ringScan(reader, { origin: { x: box.centerX, z: box.centerZ }, step: 1, minRadius: from }, isSpot);
   if (!sweep.found) {
-    return record(`--stand=biome found no spot ${from}+ blocks from world spawn in an acceptable biome with a clear `
+    record(`--stand=biome found no spot ${from}+ blocks from world spawn in an acceptable biome with a clear `
       + `3x3 — ${formatRejections(sweep.rejections)} across ${sweep.checked} cell(s).`);
+    return false;
   }
   const spot = { x: sweep.best.x, y: sweep.best.result.spawnY, z: sweep.best.z };
   if (await teleportTo(spot)) {
-    return record(`${USERNAME} was placed at (${spot.x},${spot.y},${spot.z}) — ${sweep.best.result.biome}, a clear 3x3, `
+    record(`${USERNAME} was placed at (${spot.x},${spot.y},${spot.z}) — ${sweep.best.result.biome}, a clear 3x3, `
       + `${fromSpawn(box, spot.x, spot.z)} blocks from world spawn; the first spot out, after ${sweep.checked} cell(s).`);
+    return true;
   }
-  return record(`/tp to (${spot.x},${spot.y},${spot.z}) did not land within ${PLACEMENT_SETTLE_MS}ms — still at `
-    + `${whereAmI()}. Most likely '${USERNAME}' is not an op on this server.`);
+  record(`the spot was found — (${spot.x},${spot.y},${spot.z}), ${sweep.best.result.biome} — but the /tp there, re-sent `
+    + `every ${PLACEMENT_RETRY_MS}ms, had not moved the body after ${PLACEMENT_SETTLE_MS / 1000}s; it is still at ${whereAmI()}.`);
+  return false;
 }
 
 // One teleport, re-issued while it has not landed, and the truth about whether it did.
@@ -549,8 +559,9 @@ function whereAmI() {
 // past this, but when it found nothing the body was simply left where the server put it — world spawn —
 // and that is what happened in BOTH runs of 2026-09-11: the crew was fetched to (-1,69,0) and the second
 // run's soak died of `no_reachable_free_tree` inside the protected square. `standing: 'spawn'` and an
-// authored cell near the centre land in the same place. So this runs after every kind of placement, and
-// a body still inside the clearance is moved out.
+// authored cell near the centre land in the same place. So this runs after those two placements, and a
+// body still inside the clearance is moved out. The biome placement does not use it: its search starts at
+// the clearance line, and a blind step picks no biome (see standOnGround).
 //
 // `/spreadplayers` rather than `/tp`, because the target is ground this client has never streamed: the
 // server picks the top block itself and refuses water and lava, so one command gives a surface to stand
@@ -609,9 +620,11 @@ async function standOnGround() {
   // currently is and its chunk probes need somewhere to probe from.
   const start = bot.entity && bot.entity.position;
   let authored = authoredStand();
-  if (!authored && wantsBiomeStand() && start) {
+  const biomeMode = !authored && wantsBiomeStand() && !!start;
+  let placedInBiome = false;
+  if (biomeMode) {
     const from = { x: Math.floor(start.x), y: Math.floor(start.y), z: Math.floor(start.z) };
-    await placeInBiome(reader, from);
+    placedInBiome = await placeInBiome(reader, from);
   }
   if (authored) {
     const put = await teleportTo(authored);
@@ -623,7 +636,18 @@ async function standOnGround() {
         + `'${USERNAME}' is not an op on this server, so the command was refused. The ground test below `
         + `runs from where the body actually is, so this run is seeded there and not at the authored cell.`);
   }
-  await stepClearOfSpawn();
+  // ── THE BLIND STEP-OUT SERVES THE MODES THAT CHOOSE NO BIOME (2026-09-11, run ten) ─────────────────
+  // The biome search already starts at the clearance line, so a body it placed is clear by construction.
+  // A body it did NOT place stays where it is: stepping it out blind is how run ten's person went from a
+  // found birch-forest spot whose /tp missed its cap to (63,71,0), stony_shore, where both crew bots then
+  // stopped on "NO PLACE TO BUILD" with a message blaming the person's choice of ground. Left near spawn,
+  // the run's own distance check refuses the crew and names the real cause — the placement.
+  if (!biomeMode) await stepClearOfSpawn();
+  else if (!placedInBiome) {
+    record(`--stand=biome did not place ${USERNAME}, so the body stays at ${whereAmI()} rather than being stepped `
+      + `out blind into whatever biome lies ${clearanceFrom(spawnProtectionBox(bot) || { radius: 0 })} blocks away. The `
+      + `run's distance check will refuse the crew; the reason is the line above.`);
+  }
   const p = bot.entity && bot.entity.position;
   if (!p) { say('proxy_human: no body position yet — standing where the server put me.'); return; }
   const feet = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };

@@ -47,7 +47,7 @@
 //                                               down or sweeps fleet_logs — which is exactly what `up` and
 //                                               `bots-up` do first, so neither of them can be re-run
 //                                               against a half-live fleet. DEFAULT IS ZERO BOTS: overseer
-//                                               and foreman only, because the public server is on-order.
+//                                               and foreman only, because bots arrive on order.
 //   node fleet_control.js roster                (print the canonical roster, seniority order — the launchers read this)
 //   node fleet_control.js verb start [--stagger=45000] [--min-gap=1500]   paced by FIRST MOVEMENT, not a timer
 //   node fleet_control.js verb <start|stop|flush|wipe|...>
@@ -245,8 +245,7 @@ function launch(name, exe, argv, cwd, env, windowStyle) {
 // extend the lens rather than reading the file raw).
 //
 // It is opened NORMAL while the bots are minimized: this is the window meant to be looked at, and the
-// contrast is what makes it the obvious one on the taskbar. It only READS, so closing it stops nothing -
-// the same property that makes the public server's board safe to leave open.
+// contrast is what makes it the obvious one on the taskbar. It only READS, so closing it stops nothing.
 function fleetConsole() {
   const existing = readRuntime()['fleet-console'];
   if (pidAlive(existing)) {
@@ -507,9 +506,9 @@ function rconPacket(id, type, body) {
 //
 // By default they are read out of the fleet's OWN `MinecraftServer/server.properties`, which is correct
 // whenever the fleet launched the world it is talking to. It is WRONG the moment the fleet is a guest on
-// a world somebody else started — which is exactly the public-server case, and it fails in the most
-// confusing way available: the public backend also listens for rcon on 25575, so the connection SUCCEEDS
-// and the auth is refused, because the password belongs to a different server. `playersOnline()` then
+// a world somebody else started, and it fails in the most confusing way available: any other Minecraft
+// server also listens for rcon on 25575 by default, so the connection SUCCEEDS and the auth is refused,
+// because the password belongs to a different server. `playersOnline()` then
 // rejects, `foremanStart` can never confirm its clerk arrived, and `status` reports "rcon did not answer"
 // about a server answering perfectly well.
 //
@@ -537,17 +536,17 @@ function rconCommand(command) {
         // the fault is always on this side of the wire. An auth refusal is never ambiguous: the socket
         // connected, so something is listening on that port and answering — this fleet simply presented
         // the wrong password. The one thing a reader needs is WHICH password it used, and only this
-        // function knows (measured 2026-09-05: a bare `foreman-start` against the public server read the
-        // dev world's properties, was refused, and the failure surfaced 45 seconds later as "Foreman
-        // never appeared in the server's player list" — a claim about the world, from an instrument that
-        // had never once worked).
+        // function knows. Measured against a world this fleet did not start: it read its OWN dev world's
+        // properties, was refused, and the failure surfaced 45 seconds later as "Foreman never appeared in
+        // the server's player list" — a claim about the world, from an instrument that had never once
+        // worked.
         if (id === -1) {
           sock.destroy();
           reject(new Error(envPw
             ? `rcon auth refused on port ${port} — AUREN_RCON_PASSWORD was set but this server rejected it`
             : `rcon auth refused on port ${port} — no AUREN_RCON_PASSWORD was set, so this fleet used its `
               + `OWN MinecraftServer/server.properties password. If you are addressing a server this fleet `
-              + `did not start (the public server), it must be TOLD the password.`));
+              + `did not start, it must be TOLD the password.`));
           return;
         }
         stage = 'cmd';
@@ -923,7 +922,7 @@ async function playersOnline() {
 
 // IS THIS ONE PLAYER IN THE WORLD? Asked of the entity directly, NEVER by looking for the name in `list`.
 //
-// WHY, measured 2026-09-05 on the public server with a full fleet up: the server's own `list` reply is
+// WHY, measured with a full fleet up: the server's own `list` reply is
 // TRUNCATED. Twenty players online, and the reply is 180 characters ending in a literal ", ..." after the
 // fourteenth name — confirmed through two independent rcon clients, so it is the server truncating and not
 // a packet this code failed to reassemble. `playersOnline()` therefore returns a SHORT LIST with no
@@ -1063,7 +1062,7 @@ async function sendVerb(verb, args = {}) {
 }
 
 // ── STAGGERED START ─────────────────────────────────────────────────────────────────────────────────
-// MEASURED 2026-09-03 (architect_bugsquashing.md round 223, Public_server/CAPACITY.md §5). Twelve bots
+// MEASURED. Twelve bots
 // sent `start` in one broadcast: NINE were kicked off the server inside seventy seconds. Twelve bots
 // running is fine — the machine sat at 20% busy and the server held 20.0 TPS. Twelve bots STARTING
 // together is not.
@@ -1244,7 +1243,10 @@ async function startStaggered() {
     // NOT do its job, and it is also the most likely bot to have been dropped.
     console.log(`  hit the ceiling with no plan-done signal: ${slow.join(', ')} — check these first.`);
   }
-  console.log('  Confirm they actually held:  node Public_server\\rcon.js list');
+  // Pointed at this file's own `status`, which asks the server through `playersOnline()`. It used to name
+  // a second rcon client living outside the bot — a redundant route (Law 16) to a question this file
+  // already answers, and one a downloaded copy has no path to at all.
+  console.log('  Confirm they actually held:  node Auren_Workshop/fleet_control.js status');
   return started === online.length;
 }
 
@@ -1426,40 +1428,25 @@ async function up() {
   return true;
 }
 
-// ── THE LOCAL SERVER — this machine, for testing, while the dedicated one stays up ─────────────────
-// THE ASK (Architect 2026-09-05): *"we dont have to use the remote server. we can do a contractor test on
-// this computer correct?… so make a test version for me to use to minimize downtime. so i will work on
-// the local version on this computer while dedicated stays up, make changes and just restart the main
-// server when i apply changes… it starts nearly identical to the server start withuot the online checks
-// because i will only be using it locally so no need for access port."*
+// ── THE LOCAL SERVER — a world on this machine, with a foreman standing in it ──────────────────────
+// A WORLD SOMEBODY WALKS INTO, as distinct from `up`, which opens a RUN for an operator to drive. This
+// one comes up at localhost and puts the in-game clerk in it, so the thing under test is the path a
+// person actually takes: join, say `auren get` in chat, receive a contractor.
 //
-// TWO SERVERS, TWO NAMES, AND THE NAMES ARE HIS:
-//   **dedicated server** — the public one strangers join. Proxy, join gate, warden, `online.ps1`, and the
-//                          eight-step joinable check that ends outside the machine.
-//   **local server**     — this. The world on this box, reached at localhost, with none of that.
+// IT ANSWERS NO QUESTION ABOUT REACHABILITY, deliberately. A world only this machine can reach cannot
+// fail a can-a-stranger-get-in check, and an instrument that cannot fail is noise rather than
+// reassurance. Somebody serving their own world to other people gets that answer from their own host.
 //
-// WHY IT IS A VERB HERE RATHER THAN A THIRD SCRIPT AT THE REPO ROOT. His standing ruling on the operator
-// surface is *"you are allowed exactly 2 scripts. either up or down"*, and that pair (`online.ps1` /
-// `offline.ps1`) belongs to the dedicated stack. The local world is the FLEET's own server, which already
-// has exactly one launcher — this file — so the local path is a verb on the one implementation and is
-// surfaced through the one wrapper (Law 16). Nothing new appears at the root.
-//
-// WHAT IT DELIBERATELY DOES NOT DO, which is the whole of *"without the online checks"*: no proxy, no
-// AurenGate, no TCPShield, no public address, no `joinable.js`, no warden. Those exist to answer *can a
-// stranger get in*, and on a world only this machine can reach that question has no meaning — an
-// instrument that cannot fail is not reassurance, it is noise (and `online` is a word this project has
-// already had to make honest once).
-//
-// ZERO BOTS, LIKE THE DEDICATED ONE, and that is what makes it a real rehearsal rather than a different
-// system: the thing under test is `foreman get`, so a world that came up with a standing roster would be
-// testing something nobody is going to ship. `--count=N` is there for the other kind of test.
+// ZERO BOTS BY DEFAULT, and that is what makes it a rehearsal rather than a different system: the thing
+// under test is `foreman get`, so a world that came up with a standing roster would be testing something
+// nobody walks into. `--count=N` is there for the other kind of test.
 async function local() {
   // ── THE ONE GUARD, AND IT IS THE ONLY WAY THIS COMMAND COULD DO REAL HARM ────────────────────────
   // `AUREN_SERVER_HOST` / `_PORT` override where every body connects, and `launch()` hands children
-  // `{...process.env}` — so a shell that was pointed at the public proxy earlier would have this command
-  // start a Minecraft server on THIS box and then send the bots, the foreman and every contractor to the
-  // DEDICATED WORLD. Every window would look right. The local server would sit empty while a "local test"
-  // edited the world strangers are in.
+  // `{...process.env}` — so a shell pointed at a REMOTE world earlier would have this command start a
+  // Minecraft server on THIS box and then send the bots, the foreman and every contractor to that remote
+  // world instead. Every window would look right. The local world would sit empty while a "local test"
+  // edited somebody else's.
   //
   // FORCED RATHER THAN REFUSED, because the verb's own name settles the ambiguity: `local` cannot mean
   // anything other than this machine, so an inherited endpoint is stale environment rather than an
@@ -1470,7 +1457,7 @@ async function local() {
   if ((inheritedHost && inheritedHost !== 'localhost' && inheritedHost !== '127.0.0.1')
       || (inheritedPort && Number(inheritedPort) !== SERVER_PORT)) {
     console.log(`local: this shell was pointed at ${inheritedHost || 'localhost'}:${inheritedPort || SERVER_PORT} — `
-      + `overriding to localhost:${SERVER_PORT}. \`local\` means this machine; nothing here touches the dedicated server.`);
+      + `overriding to localhost:${SERVER_PORT}. \`local\` means this machine; nothing here touches a remote world.`);
   }
   process.env.AUREN_SERVER_HOST = 'localhost';
   process.env.AUREN_SERVER_PORT = String(SERVER_PORT);
@@ -1498,8 +1485,7 @@ async function local() {
   console.log(`\nlocal: LOCAL SERVER UP — world + overseer + foreman${count ? ` + ${count} homesteader(s)` : ', no bots'} on localhost:${SERVER_PORT}.`);
   console.log('  Join it in Minecraft at:  localhost');
   console.log(`  Then say in chat:         ${FOREMAN_PREFIX} get`);
-  console.log('  Take it down with:        node Auren_Workshop/fleet_control.js down');
-  console.log('  This is the LOCAL server. The dedicated (public) one is untouched and is run by .\\online.ps1.\n');
+  console.log('  Take it down with:        node Auren_Workshop/fleet_control.js down\n');
   return true;
 }
 
@@ -1542,10 +1528,10 @@ async function botsUp() {
 // is the only state a world restore can happen in anyway. Absent is a legal HQ state; it is what a bot's
 // first-ever boot finds, and it writes a fresh one.
 //
-// EXTRACTED FROM `runProfile` 2026-09-05 so that the public server's rollback and the bench's fresh start
-// are the same act rather than two copies of it (Law 16). It was inline in one caller, and the second
-// caller would have been a PowerShell reimplementation of a glob and an rmSync — which is exactly how the
-// two would have drifted the first time a fourth memory file was added.
+// EXTRACTED FROM `runProfile` so that every caller wanting a fresh start performs the same act rather
+// than a copy of it (Law 16). It was inline in one caller, and the second caller would have been a
+// PowerShell reimplementation of a glob and an rmSync — which is exactly how the two would have drifted
+// the first time a fourth memory file was added.
 //
 // WORLD AND MEMORY ARE ONE DECISION. HQ holds a build centre, sited blueprints, chest and furnace cells —
 // coordinates FOR A PARTICULAR WORLD. Restoring the world without wiping this leaves bots acting on
@@ -1593,17 +1579,15 @@ function wipeMemory() {
 //
 // The coldness test lives HERE rather than in the caller because this is where the pid map and the
 // overseer probe already are; a second implementation in PowerShell would be a second thing to keep true.
-// THE DEFAULT IS ZERO BOTS, and that is the public server's model rather than a cautious setting
-// (Architect 2026-09-05: *"it shouldnt be bringing up 20 bots. its to order remember? so the server should
-// just host the foreman and the overseer. if i want to add homesteaders later i can... theres no room for
-// humans"*). On the public world a bot exists because somebody in the game ASKED the foreman for one, and
-// it arrives as a CONTRACTOR owned by that person. Twenty homesteaders standing in the world by default
-// are twenty of the sixty slots and a share of the tick budget spent on nobody's request - and the whole
-// reason the foreman exists is that this is on-order.
+// THE DEFAULT IS ZERO BOTS, and that is the ON-ORDER MODEL rather than a cautious setting. A bot exists
+// because somebody in the game ASKED the foreman for one, and it arrives as a CONTRACTOR owned by that
+// person, so a world serving people hosts the foreman and the overseer and nothing else. Homesteaders
+// standing in the world by default are player slots and a share of the tick budget spent on nobody's
+// request — and the whole reason the foreman exists is that this is on-order.
 //
-// `--count=N` still brings up the first N of the roster as homesteaders, which is what a bench run on the
-// dev box wants. `up` is unchanged and still defaults to the whole roster: opening a RUN and maintaining a
-// SERVICE are different acts, and this is the service.
+// `--count=N` still brings up the first N of the roster as homesteaders, which is what a bench run wants.
+// `up` is unchanged and still defaults to the whole roster: opening a RUN and maintaining a SERVICE are
+// different acts, and this is the service.
 async function repair() {
   const count = Math.min(parseInt(opt('count', '0'), 10), ROSTER.length);
   const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
@@ -1788,9 +1772,12 @@ async function down() {
   // Same argument as the camera crew directly above, for the same kind of window: a follower tailing a
   // console log is a view of a fleet that is now gone, and `down` means everything off. It is here
   // rather than left to the process that opened it because the foreman's teardown provably does not run
-  // on Windows — `console_window.closeStale` carries that measurement.
-  const stale = consoleWindow.closeStale();
-  if (stale.closed.length) console.log(`down: closed ${stale.closed.length} console window(s) — ${stale.closed.join(', ')}.`);
+  // on Windows. Every terminal console_window opened is in its ledger, and this closes them all and then
+  // LOOKS AGAIN, so what it prints is what is still open (Architect 2026-09-11: *"at the end of the run, the
+  // run shall check and close all terminals"*). The server is never killed there — it was stopped above.
+  const reaped = consoleWindow.closeWindows();
+  if (reaped.closed.length) console.log(`down: closed ${reaped.closed.length} terminal(s) — ${reaped.closed.map(e => e.label).join(', ')}.`);
+  console.log(`down: ${consoleWindow.describeWindows(reaped.stillOpen)}.`);
   console.log('down: done.');
   return true;
 }
@@ -2134,18 +2121,19 @@ async function worldSpawn(worldName) {
       ? startStaggered()
       : sendVerb(positional[0], opt('bot') ? { bot: opt('bot') } : {}),
     'up': up,
-    // THE LOCAL SERVER — this machine, world + overseer + foreman, no bots. The dedicated (public) server
-    // is `online.ps1` at the repo root and shares nothing with this path.
+    // THE LOCAL SERVER — this machine, world + overseer + foreman, no bots.
     'local': local,
     'bots-up': botsUp,
     'repair': repair,
-    // Cold, offline, and deliberately NOT paired with a world restore here: the pairing is enforced by the
-    // callers that own both halves (`run --restore`, and the public server's rollback.ps1), because only
-    // they know which world is being restored.
+    // Cold, offline, and deliberately NOT paired with a world restore here: the pairing is enforced by
+    // the caller that owns both halves (`run --restore`), because only it knows which world is being
+    // restored.
     'memory-wipe': () => wipeMemory(),
     // Standalone, because the window it opens is read-only and the usual reason to want it is that it
     // was closed while the fleet kept running.
     'fleet-console': () => { fleetConsole(); return true; },
+    // The terminal check on its own, for any moment between runs — the same one every start gate asks.
+    'windows': () => { console.log(`windows: ${consoleWindow.describeWindows(consoleWindow.openWindows())}.`); return true; },
     'down': down,
     'takeover': takeover,
     'rcon': () => rconExec(positional[0]),

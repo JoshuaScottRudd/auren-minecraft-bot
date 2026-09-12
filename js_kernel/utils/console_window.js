@@ -42,6 +42,8 @@
 
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { spawnSync } = require('child_process');
 
 const TAG = 'console_window';
@@ -148,6 +150,7 @@ function tryOpenProcess({ exe, argv = [], cwd, env = {}, style, label = 'process
         + `${(res.stderr || '').trim() || (res.error && res.error.message) || 'no pid on stdout'}`,
     };
   }
+  remember(pid, label, exe);   // into the ledger at the instant it exists — see THE LEDGER below
   return { ok: true, pid, style: resolved };
 }
 
@@ -247,7 +250,9 @@ function closeWindow(pid) {
   return (res.stdout || '').trim() === 'gone';
 }
 
-// closeStale() → { closed: [pid], reason? } — end every follower window left over from a previous run.
+// (closeStale was REMOVED 2026-09-11 and the ledger below replaced it. It found followers by the window
+// title on the powershell process, and under Windows Terminal that process has no window — so on this
+// machine it found nothing, every run. Its notes stay because they are why the ledger exists:)
 //
 // WHY THE OWNERS CANNOT BE RELIED ON TO DO IT, measured 2026-09-10. Each follower is closed by whatever
 // opened it: `run.js`'s teardown closes the desk's and the person's, and the foreman's `releaseFetched`
@@ -285,23 +290,91 @@ function closeWindow(pid) {
 // A PID REGISTRY WAS THE OTHER CANDIDATE AND IS WORSE HERE: it would have to live outside `fleet_logs/`
 // to survive the sweep that precedes every run, which means a file that outlives runs in a project where
 // no record does (Architect 2026-08-31), and it can go stale where a live query cannot.
-function closeStale() {
-  if (!isWindows()) return { closed: [] };
-  const query =
-    `Get-Process powershell -ErrorAction SilentlyContinue | `
-    + `Where-Object { $_.MainWindowTitle -clike 'auren *' } | `
-    + `ForEach-Object { [Console]::Out.Write([string]$_.Id + ' ') }`;
-  const found = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', query],
+// ── THE LEDGER: EVERY TERMINAL THIS MODULE OPENS, WRITTEN AS IT OPENS (Architect 2026-09-11) ─────────
+// *"this can never happen again. before every run, before starting anything. we have to verify all
+// terminals are closed fully. its a part of both startup and ending. so at the end of the run, the run
+// shall check and close all terminals, and before startup it should also check but not close. just prevent
+// another start from happening and say what terminals are open that prevents another start. thats our
+// server hang problem"* — after he found twenty to thirty terminals open on his desktop.
+//
+// WHY A LEDGER AND NOT A LOOK AT THE DESKTOP, measured the same day. On Windows 11 every console opened here
+// is handed to Windows Terminal: the launched process's own MainWindowHandle is 0 and the window, title and
+// all, belongs to a WindowsTerminal.exe. So closeStale, which asked powershell processes for their title,
+// found nothing, and every bot follower (-NoExit: it outlives its log) and every fleet-console (it ends by
+// waiting for Enter) stayed open until he closed them by hand. Measured too: a Windows Terminal window
+// closes the moment its process ends — exit 0, exit 3 or killed, all within two seconds. So the PROCESS is
+// the terminal, and the only question is which processes are ours: the one launcher knows that at the
+// instant it launches, and nothing that looks later knows it as well.
+//
+// Machine-local and gitignored beside fleet_control_runtime.json, for that file's reason: a pid means
+// nothing on another machine. It is not a record of a run and nothing reads history out of it; a dead
+// entry is dropped the next time the ledger is read. Each entry carries its start time, and a pid now held
+// by a later process is not ours — Windows recycles pids (fleet_control.pidAlive's rule, same skew).
+const LEDGER = path.join(__dirname, '..', '..', 'console_windows.json');
+const PID_SKEW_MS = 15000;
+
+function readLedger() {
+  if (!fs.existsSync(LEDGER)) return [];
+  const entries = JSON.parse(fs.readFileSync(LEDGER, 'utf8'));   // written only below, whole, by rename
+  return Array.isArray(entries) ? entries : [];
+}
+function writeLedger(entries) {
+  const tmp = `${LEDGER}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(entries, null, 2));
+  fs.renameSync(tmp, LEDGER);   // whole or not at all: a reader never meets half a file
+}
+function remember(pid, label, exe) {
+  writeLedger([...readLedger().filter(e => e.pid !== pid),
+    { pid, label, exe: path.basename(String(exe)), started_at: new Date().toISOString() }]);
+}
+
+// startTimes(pids) → Map(pid → epoch ms) for the pids still alive. One PowerShell call for the whole ledger.
+function startTimes(pids) {
+  const out = new Map();
+  if (!pids.length) return out;
+  const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+    `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { `
+    + `[Console]::Out.WriteLine([string]$_.Id + ' ' + $_.StartTime.ToUniversalTime().ToString('o')) }`],
     { encoding: 'utf8' });
-  if (found.error) return { closed: [], reason: found.error.message };
-  const pids = String(found.stdout || '')
-    .trim().split(/\s+/).filter(Boolean).map(n => parseInt(n, 10))
-    .filter(n => Number.isInteger(n) && n !== process.pid);
-  const closed = pids.filter(pid => closeWindow(pid));
-  return { closed };
+  for (const line of String(r.stdout || '').split(/\r?\n/)) {
+    const [pid, iso] = line.trim().split(' ');
+    const ms = Date.parse(iso);
+    if (pid && Number.isFinite(ms)) out.set(parseInt(pid, 10), ms);
+  }
+  return out;
+}
+
+// openWindows({ except }) → [{ pid, label, exe, started_at }] — every terminal this module opened that is
+// still open. `except` names labels the caller EXPECTS open: run.js joins a world it did not start, so the
+// server's terminal is not a reason for it to refuse. Looking also drops the dead entries.
+function openWindows({ except = [] } = {}) {
+  if (!isWindows()) return [];
+  const all = readLedger();
+  const started = startTimes(all.map(e => e.pid));
+  const live = all.filter(e => started.has(e.pid) && started.get(e.pid) <= Date.parse(e.started_at) + PID_SKEW_MS);
+  if (live.length !== all.length) writeLedger(live);
+  return live.filter(e => !except.includes(e.label));
+}
+
+// closeWindows({ except }) → { closed, stillOpen } — end every terminal this module opened, then LOOK AGAIN:
+// what is reported open afterwards is read off the machine, never assumed from the kills.
+//
+// THE SERVER IS NEVER CLOSED HERE. A killed JVM is a world killed mid-save; the server stops through its
+// console (fleet_control serverStop) and its terminal closes when it has finished. If it is still open
+// when this runs, it is REPORTED in stillOpen, which is the truth, rather than killed, which is damage.
+function closeWindows({ except = [] } = {}) {
+  const closed = openWindows({ except }).filter(e => e.label !== 'server' && closeWindow(e.pid));
+  return { closed, stillOpen: openWindows({ except }) };
+}
+
+// describeWindows(list) — the one sentence every start gate and every teardown prints (Law 16).
+function describeWindows(list) {
+  return list.length
+    ? `${list.length} terminal(s) open — ${list.map(e => `${e.label} (${e.exe}, pid ${e.pid}, opened ${e.started_at.slice(11, 19)} UTC)`).join('; ')}`
+    : 'no terminals open';
 }
 
 module.exports = {
-  openProcess, tryOpenProcess, followFile, closeWindow, closeStale, psQuote, resolveStyle,
+  openProcess, tryOpenProcess, followFile, closeWindow, openWindows, closeWindows, describeWindows, psQuote, resolveStyle,
   FOLLOW_TAIL_LINES,
 };
