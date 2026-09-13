@@ -179,22 +179,39 @@ module.exports = {
     // checked on the COLLECT because that is the act the missing chest makes impossible: a load puts
     // material IN, an empty takes a shared batch OUT and must be able to put down what is not its own.
     //
-    // A CODING VIOLATION, NOT AN ENVIRONMENTAL ONE, and the distinction is the whole reason this throws
-    // instead of soft-failing. Law 13's test is "could this happen in a correctly-written system in a
-    // normal world?" — and it cannot: a furnace only exists in a placed blueprint that also carries a
-    // chest, so a registered furnace with no registered chest anywhere means either the blueprint was
-    // authored with a furnace and no chest, or the chest half of an anchor was registered and then lost
-    // while its furnace was kept. Both are faults upstream of this fragment, and both are silent — the
-    // emptier would walk away holding the whole batch, the asker's demand would still read unmet, and
-    // the next sweep would size a second cook for charcoal already sitting in a pocket. Soft-failing
-    // would hide exactly that, once per sweep, forever.
+    // ── THIS THREW UNTIL 2026-09-12, AND ITS OWN ARGUMENT CONTAINED THE COUNTEREXAMPLE ─────────────
+    // *"a code 13 violation should be a true coding violation. meaning i coded something wrong or a
+    // setting is wrong. double check that theres no enviomental throws."* (Architect 2026-09-12)
+    //
+    // The old reasoning ran: a furnace only exists in a placed blueprint that also carries a chest, so a
+    // registered furnace with no registered chest means either the blueprint was authored wrong OR *"the
+    // chest half of an anchor was registered and then lost while its furnace was kept."* The first is a
+    // coding fault. THE SECOND IS THE WORLD, and it was written down here and then counted as the same
+    // thing. `station_registry.verifyStations` de-registers a station whose block reads as air — which is
+    // exactly what happens when a player breaks that chest, a creeper opens the wall it was in, or lava
+    // reaches it. A user tidying up their own base could stop their own bot, with a message telling them
+    // to fix a blueprint they did not write.
+    //
+    // WHAT SURVIVES IS THE REFUSAL, AND IT MATTERS AS MUCH AS EVER. The concern the throw protected
+    // against is real and unchanged: an emptier with nowhere to put a shared batch walks away holding it,
+    // the asker's demand still reads unmet, and the next sweep sizes a second cook for charcoal already
+    // in a pocket. That is prevented by NOT COLLECTING — which this still does — and not by halting the
+    // bot. So the collect is declined, loudly, with `success:false` so the judge counts a real fault, and
+    // the fleet's next sweep sees the furnace still full and the chest still missing (Law 25 — the
+    // shortfall is named every sweep rather than hidden once).
     if (action === 'collect' && _registeredChestIds().length === 0) {
-      throw new Error(`[${TAG}] CODING VIOLATION (Law 13): dispatched to EMPTY furnace ${stationId} with no registered chest in the fleet. `
-        + `Smelting is a SHARED, BATCHED task: one cook fills the whole fleet's order (two bots wanting 12 torches each = 6 charcoal in one load), `
-        + `so whoever empties the furnace is usually not whoever asked for the output. Output cannot go back into the furnace, so the emptier must be `
-        + `able to keep its own share and DUMP the rest where a peer can withdraw it — the chest IS that handover. A furnace and a chest are one `
-        + `fitting: the only furnace this fleet uses stands in a placed blueprint that also carries a chest (headframe anchor 0). Fix the blueprint or `
-        + `the station registration, never this assertion.`);
+      const why = `declined to empty furnace ${stationId}: there is no registered chest in the fleet to hand the batch to. `
+        + `Smelting is SHARED — one cook fills the whole fleet's order, so whoever empties the furnace is usually not whoever asked for the `
+        + `output, and the output cannot go back into the furnace. Without a chest the emptier would walk away holding everyone's charcoal and `
+        + `the next sweep would cook a second batch for it. Leaving the load in the furnace instead. `
+        + `A chest needs building or rebuilding (the headframe carries one at anchor 0) — check whether one was broken.`;
+      watcher.warn(TAG, why);
+      return routeToJudge(TAG, {
+        ...payload,
+        readable: `${TAG}: ${why}`,
+        [TAG]: { success: false, action, station_id: stationId, reason: 'no_registered_chest' },
+        success: false,
+      });
     }
 
     // ── FETCH THE INPUT FIRST (see the storage note in the header) ──────────

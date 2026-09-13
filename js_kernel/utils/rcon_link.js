@@ -54,7 +54,19 @@ function readServerProperties(file = serverPropertiesFile()) {
     const m = line.match(/^([^#=]+)=(.*)$/);
     if (m) props[m[1].trim()] = m[2].trim();
   }
-  if (props['enable-rcon'] !== 'true') throw new Error('rcon disabled in server.properties');
+  // NAMED SO A STRANGER CAN FIX IT (Architect 2026-09-12: a code 13 should mean *"i coded something wrong
+  // or a setting is wrong"* — this is the second kind, so it stays a throw, and what it owed was the
+  // remedy). It said only "rcon disabled in server.properties", which is a true statement of the fault and
+  // gives somebody who did not write this fleet nothing to do about it: not which file, not which lines,
+  // not that the server has to be restarted afterwards for a properties change to take.
+  if (props['enable-rcon'] !== 'true') {
+    throw new Error(`RCON is switched off in ${file}, and the fleet drives the server through RCON. `
+      + `Open that file and set:\n`
+      + `    enable-rcon=true\n`
+      + `    rcon.password=<pick anything>\n`
+      + `    rcon.port=25575\n`
+      + `then restart the server — a properties change does not take effect while it is running.`);
+  }
   // `level` rides along because this is the ONE parser of server.properties (Law 16) and the world the
   // server is actually serving is a fact other callers need — a continue's preflight audits playerdata
   // under that directory, and a second parser would let the audited world drift from the served one.

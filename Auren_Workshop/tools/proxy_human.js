@@ -80,7 +80,8 @@ paths.registerAliases();
 process.env.BOT_ID = process.env.BOT_ID || 'proxy_human';
 
 const { guardExternalSync } = require('@utils/external_library_guard');
-const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX, ACCEPTABLE_BIOMES, PERSON_CLEAR_OF_SPAWN } = require('@thinking/architect_config');
+const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX, ACCEPTABLE_BIOMES, PERSON_CLEAR_OF_SPAWN,
+        SEA_LEVEL, HUMAN_MAX_ABOVE_SEA } = require('@thinking/architect_config');
 
 // ── THE FLEET'S OWN EYES, NOT A SECOND OPINION (Law 16, and seed_scanner's own rule) ────────────────
 // `--stand=biome` reads the biome with `@perception/biome_scanner` — the same node the bots survey with
@@ -491,6 +492,13 @@ async function placeInBiome(reader, at) {
     if (!top) return { valid: false, reason: reader.blockAt(x, at.y, z) === null ? REASON.UNLOADED : REASON.NO_FLOOR };
     const biome = getBiomeName(bot, x, top.y + 1, z);
     if (!ACCEPTABLE_BIOMES.has(biome)) return { valid: false, reason: 'wrong_biome' };
+    // ── AND NOT UP A HILL, BECAUSE THE DESK NOW REFUSES ONE (2026-09-12) ──────────────────────────
+    // The foreman's `get` gate turns down a person standing more than HUMAN_MAX_ABOVE_SEA above sea
+    // level: a base is sited against sea-level water and there is none within a loaded chunk of a peak.
+    // Plains and forest legitimately roll into the 80s, so this search could and did land its body on
+    // ground the desk then refuses — and a harness whose person gets turned away at the door measures
+    // nothing. Held to the same ceiling from the same constant, so the two cannot drift (Law 16).
+    if (top.y + 1 > SEA_LEVEL + HUMAN_MAX_ABOVE_SEA) return { valid: false, reason: 'too_high' };
     const standing = evaluateOpenBox(reader, x, z, top.y, { size: 3, height: 2, occupancy: 'as-is' });
     return standing.valid ? { ...standing, biome } : standing;
   };

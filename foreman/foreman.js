@@ -54,6 +54,20 @@ moduleAlias.addAliases({
   // The event grammar the desk's record is written in. Added with the record itself: the alternative
   // was a second grammar spelled here, which is the drift crew_log's one-file design exists to stop.
   '@api':      path.join(BOT_DIR, 'custom_api'),
+  // ONE PERCEPTION NODE, AND THE RULE ABOVE IS WHY THIS LINE CARRIES AN ARGUMENT (2026-09-12).
+  // The desk's `get` gate has to know where world spawn is, and the world-spawn latch has exactly one
+  // owner — `@perception/spawn_protection`, which listens for the server's `spawn_position` packet and
+  // remembers WHETHER it arrived. The alternative to this alias was a second latch spelled in this file,
+  // which would give the desk and the bodies two answers to "where is spawn" and let them drift (Law 16).
+  // Reaching for the owner is the smaller cost, and it is the one the short-list rule is protecting: the
+  // objection above is to the desk acquiring CAPABILITIES, and a read-only sensor is not one.
+  '@perception': path.join(BOT_DIR, 'perception_nodes.js'),
+  // AND THE SITER, for the same reason and with the same limit (2026-09-12). The desk runs
+  // `lock_all_buildspots.run(..., { dryRun: true })` to decide whether a base can be placed where a person
+  // is standing. A second siting opinion spelled in this file is the thing this alias avoids: the desk
+  // must refuse exactly the ground the crew would fail on, which means calling the crew's own surveyor.
+  // It still writes nothing — `dryRun` is what keeps this a read.
+  '@action':     path.join(BOT_DIR, 'action_fragments.js'),
 });
 
 // ── THE DESK KEEPS A RECORD, AND IT IS THE FLEET'S OWN WRITER ────────────────────────────────────
@@ -86,7 +100,8 @@ require('@utils/node_module_homes').bootstrapModulePath();
 
 const mineflayer = require('mineflayer');
 const { FOREMAN_NAME, FOREMAN_PREFIX, FOREMAN_CHANNEL, BOT_SENIORITY,
-        SERVER_ENDPOINT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
+        SERVER_ENDPOINT, SERVER_MINECRAFT_VERSION, PERSON_CLEAR_OF_SPAWN,
+        SEA_LEVEL, HUMAN_SURFACE_SLACK, HUMAN_MAX_ABOVE_SEA, ACCEPTABLE_BIOMES } = require('@thinking/architect_config');
 const channel = require('./foreman_channel');
 // The one owner of "open a visible console window", and the one owner of where a run's records live —
 // this desk shows each body it fetches and keeps that body's console beside the traces. See `startBot`.
@@ -409,6 +424,16 @@ const { isRequestable, isBlueprint } = require('@kernel/requestable_catalogue');
 // The ground test the desk declines on, and the SAME one every base is sited with — see the gate in
 // `get` for why a second implementation here would be the fault rather than the convenience.
 const siteGeometry = require('@utils/site_geometry');
+// The desk's spawn-clearance gate on `get`. `armSpawnProtection` is called at createBot; the two readers
+// are used in the gate itself. One module owns the world-spawn latch and the Chebyshev metric, so the
+// desk's refusal and a body's own dig refusal cannot disagree about where spawn is (Law 16).
+const { armSpawnProtection, chebyshevFromWorldSpawn, worldSpawnPoint } = require('@perception/spawn_protection');
+const { getBiomeName } = require('@perception/biome_scanner');      // the one biome read (Law 16)
+// THE BODY'S OWN SITER, called dry. The desk asks whether a base can be placed where a person stands
+// BEFORE it spawns anybody; running the crew's own surveyor is what makes the desk's answer and the
+// crew's answer the same answer. `run` is a plain exported function — requiring this fragment wires it
+// to no signal bus, because the desk has none.
+const lockAllBuildspots = require('@action/lock_all_buildspots');
 const { makeVoxelReader } = require('@utils/voxel_reader');
 
 // THE THIRD OUTCOME AT THE HUMAN BOUNDARY. Law 13 throws at a coding violation and soft-fails an
@@ -667,13 +692,169 @@ async function handle(from, text, reply) {
       return;
     }
     const feet = { x: Math.floor(asker.position.x), y: Math.floor(asker.position.y), z: Math.floor(asker.position.z) };
-    const room = await siteGeometry.standingSpotNear(makeVoxelReader(bot), feet, { radius: CREW_PLACEMENT_RADIUS });
+
+    // ── AND NOT AT WORLD SPAWN, WHICHEVER OF US IS ASKING (Architect 2026-09-12) ───────────────────
+    // *"i want to add if the player is standing in world spawn area or within 50 blocks of it to warn and
+    // refuse to spawn bots if asked. right now our faux architect does it but i dont want a user
+    // confused."*
+    //
+    // THE GAP THIS CLOSES, AND IT IS A LAYER GAP RATHER THAN A MISSING RULE. The clearance has been
+    // enforced since 2026-09-11 — but in `Auren_Workshop/run.js`, the Architect's own harness, against
+    // `proxy_human`, which teleports itself clear before it types anything. So the rule was real for every
+    // run he watched and did not exist for anybody who downloaded the bot and typed `foreman get` while
+    // standing where the server had just put them, which is the FIRST thing a new player does and the most
+    // likely place in the world for them to be standing. The harness cannot hold a rule a user's run needs:
+    // the desk is the one door both paths come through, so the rule belongs on the desk (Law 16).
+    //
+    // WHY IT IS A REFUSAL AND NOT A WARNING. Inside the protected square the server silently refuses every
+    // break and placement, and a crew sites its whole base AROUND THE ASKER — so a person standing at
+    // spawn does not get a slow crew, they get two bots that walk, dig nothing, build nothing, and report
+    // refusals into a console they are not reading. The measured shape is in bugsquashing §14.10: every
+    // run that ever started inside the square made no progress at all. Launching would spend two player
+    // slots, two names and two logins to produce that, and the desk is the last moment refusing is free
+    // (Law 13, default-stopped — the same argument the ground check below already makes).
+    //
+    // THE NUMBER IS 50 AND IT IS THE SAME 50 (`PERSON_CLEAR_OF_SPAWN`), read from config rather than
+    // written here, so the desk and the harness cannot drift apart on what "clear" means. It is measured
+    // CHEBYSHEV, the protected square's own metric, which is why this asks `spawn_protection` for the
+    // distance instead of computing a Euclidean one that would pass the corners.
+    //
+    // AN UNKNOWN CENTRE REFUSES TOO, and says so as its own sentence. The desk cannot prove the person is
+    // clear of a place it cannot locate, and Law 13 is prove-safe-to-continue, never prove-unsafe-to-stop.
+    // In practice this is unreachable — `spawn_position` arrives during login, long before anybody can type
+    // — so it exists to be a named state rather than a coordinate quietly trusted.
+    // THE PERSON'S HALF IS A DIRECTION TO WALK, NOT A DIAGNOSIS, AND IT IS ONE CHAT LINE (Law 24;
+    // Architect 2026-09-12: *"make sure you make comments short so it fits in chat"*). They cannot act on
+    // "spawn protection", they can act on "walk 43 blocks out". The machine half carries the numbers.
+    const spawnAt = worldSpawnPoint(bot);
+    if (!spawnAt) {
+      record.refused(from, 'world_spawn_unknown', `${crew.length} launch(es) withheld`);
+      trouble(from, 'world_spawn_unknown',
+        `I don't know where world spawn is yet — try again in a moment. Nobody was sent.`,
+        `no spawn_position packet latched for the desk — cannot measure ${from}'s clearance | withheld ${crew.join(', ')}`);
+      return;
+    }
+    const outFromSpawn = chebyshevFromWorldSpawn(bot, feet);
+    if (outFromSpawn < PERSON_CLEAR_OF_SPAWN) {
+      record.refused(from, 'too_close_to_world_spawn', `${crew.length} launch(es) withheld at ${outFromSpawn}b`);
+      trouble(from, 'too_close_to_world_spawn',
+        `too close to world spawn (${outFromSpawn}b, need ${PERSON_CLEAR_OF_SPAWN}) — building is blocked there. `
+        + `Walk ${PERSON_CLEAR_OF_SPAWN - outFromSpawn} more blocks out. Nobody was sent.`,
+        `${from} at (${feet.x},${feet.y},${feet.z}) is ${outFromSpawn}b Chebyshev from world spawn (${spawnAt.x},${spawnAt.z}), `
+        + `inside the ${PERSON_CLEAR_OF_SPAWN}b clearance | withheld ${crew.join(', ')}`);
+      return;
+    }
+
+    // ── ON THE OVERWORLD SURFACE, NEAR SEA LEVEL (Architect 2026-09-12) ───────────────────────────────
+    // *"we either need to make it so the bots can work from anything including in the middle of the ocean
+    // 500 blocks from land. in the nether, in the overworld at the peak of a mountain, at the bottom of
+    // deepslate or we need to restrict the usage."*
+    //
+    // THE CHOICE IS TO RESTRICT, AND THIS IS WHERE THE RESTRICTION IS STATED. This fleet sites a base on
+    // the overworld surface against sea-level water; everything downstream assumes it (the farm is pinned
+    // to the water plane, the headframe sinks a shaft from the surface). So the limit is declared once, at
+    // the door, in words a person can act on — rather than discovered by a crew that spawns, walks, and
+    // finds nothing it can use.
+    //
+    // THE DIMENSION NEEDS NO CHECK OF ITS OWN. The desk only sees entities in its own dimension, so a
+    // person in the nether or the end has already been turned away by the `asker_unseen` branch above —
+    // a second test here would be a second answer to a question that is already answered (Law 16).
+    const reader = makeVoxelReader(bot);
+    const ground = siteGeometry.surfaceY(reader, feet.x, feet.z, feet.y);
+    if (!ground) {
+      record.refused(from, 'ground_unreadable', `${crew.length} launch(es) withheld`);
+      trouble(from, 'ground_unreadable',
+        `I can't read the ground where you are — move a little and try again. Nobody was sent.`,
+        `surfaceY found no ground in the window at (${feet.x},${feet.z}) ref y=${feet.y} | withheld ${crew.join(', ')}`);
+      return;
+    }
+    if (feet.y < ground.y - HUMAN_SURFACE_SLACK) {
+      record.refused(from, 'underground', `${crew.length} launch(es) withheld at y${feet.y}`);
+      trouble(from, 'underground',
+        `you're underground (${ground.y - feet.y}b below the surface) — come up top. Nobody was sent.`,
+        `${from} at y=${feet.y}, surface of that column is y=${ground.y} (${ground.name}) | withheld ${crew.join(', ')}`);
+      return;
+    }
+    if (feet.y > SEA_LEVEL + HUMAN_MAX_ABOVE_SEA) {
+      record.refused(from, 'too_high', `${crew.length} launch(es) withheld at y${feet.y}`);
+      trouble(from, 'too_high',
+        `you're too high up (y${feet.y}) — a base needs ground near sea level (y${SEA_LEVEL}). Head downhill. Nobody was sent.`,
+        `${from} at y=${feet.y}, ceiling is SEA_LEVEL+${HUMAN_MAX_ABOVE_SEA}=${SEA_LEVEL + HUMAN_MAX_ABOVE_SEA} | withheld ${crew.join(', ')}`);
+      return;
+    }
+    // The biome AT THE FEET, judged against the same set `find_buildingspot` gates sites on — so the desk
+    // cannot welcome somebody onto ground the siter will then refuse (Law 16).
+    const biome = getBiomeName(bot, feet.x, feet.y, feet.z);
+    if (!ACCEPTABLE_BIOMES.has(biome)) {
+      record.refused(from, 'biome', `${crew.length} launch(es) withheld in ${biome}`);
+      trouble(from, 'biome',
+        `${String(biome).replace(/_/g, ' ')} won't work — find forest or plains. Nobody was sent.`,
+        `${from} stands in '${biome}', not in ACCEPTABLE_BIOMES | withheld ${crew.join(', ')}`);
+      return;
+    }
+
+    const room = await siteGeometry.standingSpotNear(reader, feet, { radius: CREW_PLACEMENT_RADIUS });
     if (!room.found) {
       record.refused(from, 'no_standing_room', `${crew.length} launch(es) withheld`);
       trouble(from, 'no_standing_room',
         `there's nowhere beside you for anyone to stand — try again on open ground. Nobody was sent.`,
         `${room.why} | withheld ${crew.join(', ')} before launch`);
       return;
+    }
+
+    // ── AND THE WHOLE BASE IS SITED BEFORE ANYBODY IS SPAWNED (Architect 2026-09-12) ─────────────────
+    // *"we can move setting the blueprints to foreman. and if foreman cant set the blueprints then it
+    // refuses to spawn the bots and explains that it cant… once it does then it tells the human where the
+    // homebase will be."*
+    //
+    // THE SAME SITER THE BODY USES, RUN DRY (Law 16). `lock_all_buildspots.run` with `dryRun` surveys every
+    // blueprint and judges the layout as one unit without writing anything. Calling the body's own siter is
+    // the whole point: a desk with its own opinion about buildable ground would let crews through that the
+    // crew then cannot place, which is the failure this gate exists to remove.
+    //
+    // THE DESK CAN READ THIS GROUND BECAUSE IT CAN SEE THE PERSON. `asker_unseen` above already required an
+    // entity in the desk's own player table, and a client is only sent entities inside its loaded chunks —
+    // so "nearby means loaded chunk" is enforced by the branch that already ran, and needs no second test
+    // and no teleport.
+    //
+    // WHAT IS NOT MOVED, SAID PLAINLY: the desk decides, the BODY still writes. `dryRun` locks nothing,
+    // because each bot owns one HQ file on disk and the overseer's in-game door is deliberately not an HQ
+    // writer (`overseer_server.onIngameConnection`). So the body re-runs this same survey from beside the
+    // same person and commits it. The decision has moved; the bookkeeping has not.
+    // SAID FIRST, BECAUSE THE SURVEY IS SLOW. `loadedAreaSettled` waits for the chunk disc to arrive —
+    // measured at 56 s on fresh ground, capped at 120 s — and a person who typed a command and heard
+    // nothing for a minute has been given every reason to think the desk is broken and say it again.
+    reply('checking the ground around you...');
+    const layout = await lockAllBuildspots.run(bot, { dryRun: true, species, unlockedWorld: true });
+    if (layout.transient) {
+      record.refused(from, 'world_streaming', `${crew.length} launch(es) withheld`);
+      trouble(from, 'world_streaming',
+        `the world around you is still loading — try again in a few seconds. Nobody was sent.`,
+        `base-layout dry run hit unloaded chunks | withheld ${crew.join(', ')}`);
+      return;
+    }
+    if (!layout.ok) {
+      record.refused(from, 'no_base_site', `${crew.length} launch(es) withheld`);
+      // ONE PROBLEM IN CHAT, ALL OF THEM IN THE LOG. The survey names a problem per blueprint and the
+      // whole list is a wall in a window drawn over the world; the first one is the one they can act on.
+      // TRIMMED, because a survey problem line carries the blueprint, the reason AND the post-mortem's
+      // first line — useful in a window, a wall in chat. The reason is the part they can act on.
+      const firstProblem = String(layout.problems[0] || 'the ground here will not hold it').slice(0, 90);
+      trouble(from, 'no_base_site',
+        `no room for a base here — ${firstProblem}. Try flatter ground near a river. Nobody was sent.`,
+        `base-layout dry run refused: ${layout.problems.join('; ')}\n  survey:\n  ${layout.report.join('\n  ')}\n  withheld ${crew.join(', ')}`);
+      return;
+    }
+
+    // WHERE THE BASE WILL BE, SAID BEFORE THE CREW IS FETCHED. The order matters and the first live run
+    // had it the other way round: the person read "getting AurenBot and TessaBot" and only then heard
+    // where the base was, so the reason those two walk off arrived after they had started walking. A
+    // contractor's house lands near the person (flat ground is common); a homestead follows the water and
+    // can be a long way out, which is fine and is said rather than left to look like a bot wandering off.
+    const seat = layout.anchor;
+    if (seat) {
+      const far = Math.round(Math.hypot(seat.x - feet.x, seat.z - feet.z));
+      reply(`base goes at (${seat.x}, ${seat.y}, ${seat.z}) — ${far}b ${far > 60 ? 'out, following the water' : 'away'}.`);
     }
 
     // WHAT THEY ARE GETTING IS SAID WHILE THEY WAIT, not after. The two species look identical from here
@@ -1174,6 +1355,15 @@ function firstMeaningfulLine(out) {
 const bot = mineflayer.createBot({
   host: HOST, port: PORT, username: FOREMAN_NAME, version: VERSION, auth: 'offline',
 });
+
+// ARMED HERE AND NOWHERE LATER, because `spawn_position` arrives DURING login: a listener registered from
+// the `spawn` handler below is registered after the only packet it exists to catch, and the latch would
+// read "unknown" for the desk's whole life — so every `get` would be refused for want of a centre that
+// did arrive and was not heard. That is `armSpawnProtection`'s own documented requirement.
+//
+// THE DESK NEEDS THE CENTRE FOR A DIFFERENT REASON THAN A BOT DOES. A bot asks "may I break this cell";
+// the desk asks "is this person standing somewhere a crew can work at all", which is the `get` gate below.
+armSpawnProtection(bot);
 
 bot.on('error', e => log(`ERROR: ${e.message}`));
 bot.on('kicked', r => log(`KICKED: ${JSON.stringify(r)}`));

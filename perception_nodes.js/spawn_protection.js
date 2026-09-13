@@ -138,6 +138,41 @@ function armSpawnProtection(bot) {
   });
 }
 
+// worldSpawnPoint(bot) — WHERE WORLD SPAWN IS, and nothing about the protected square.
+//
+// THE DISTINCTION THIS EXISTS FOR, because reaching for `spawnProtectionBox` instead is the obvious
+// mistake and it fails silently. That function answers "what must I avoid", and it returns null when
+// `SPAWN_PROTECTION_RADIUS` is 0 — a world with protection switched OFF still has a world spawn, and it
+// is still the place a crew must not be raised (a fresh crew sites its base around the asker, and the
+// cluster of players arriving at spawn is the reason to stand clear whether or not the server guards the
+// blocks). A caller asking "how far is this from spawn" through the box reads "no square, so no problem"
+// and measures nothing at all.
+//
+// So: the CENTRE is a sensed world fact, the RADIUS is a declared belief about a server setting, and they
+// are separate questions with separate answers (Law 26 — read the fact, and do not let a config value
+// decide whether the fact gets read). Returns null only when the centre is genuinely unknown, which the
+// caller must handle rather than default (Law 13 — never default a missing field; `bot.spawnPoint` reads
+// (0,0,0) before the packet lands, and worlds this fleet generates spawn at x=0,z=0, so a default here
+// would be a falsehood indistinguishable from the truth).
+function worldSpawnPoint(bot) {
+  const z = zoneFor(bot);
+  if (!z || !z.known) return null;
+  return { x: z.sx, z: z.sz };
+}
+
+// chebyshevFromWorldSpawn(bot, pos) — how far clear of world spawn a cell is, in the square's own metric.
+//
+// CHEBYSHEV AND NOT EUCLIDEAN, for the reason the header gives about the square: the protected region is
+// `max(|dx|,|dz|) <= radius`, so every clearance measured against it has to use the same metric or the
+// two disagree in the corners by up to 41% of the radius. Callers that gate on a distance from spawn are
+// drawing a larger square around the same centre, so they measure the same way (Law 16 — one metric for
+// one geometry). Returns null when the centre is unknown; a number is never invented.
+function chebyshevFromWorldSpawn(bot, pos) {
+  const c = worldSpawnPoint(bot);
+  if (!c || !pos || typeof pos.x !== 'number' || typeof pos.z !== 'number') return null;
+  return Math.max(Math.abs(Math.floor(pos.x) - c.x), Math.abs(Math.floor(pos.z) - c.z));
+}
+
 // spawnProtectionBox(bot) — the square as plain numbers, or null when there is nothing to avoid
 // (rule switched off, or centre not yet known).
 //
@@ -241,6 +276,8 @@ function describeSpawnProtection(bot) {
 
 module.exports = {
   armSpawnProtection,
+  worldSpawnPoint,
+  chebyshevFromWorldSpawn,
   spawnProtectionBox,
   isSpawnProtected,
   isSpawnProtectedAt,

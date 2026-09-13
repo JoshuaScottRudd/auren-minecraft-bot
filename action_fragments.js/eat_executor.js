@@ -176,18 +176,41 @@ module.exports = {
         + ` — food ${before}→${result.foodAfter}/20 ${tail}`);
     }
 
-    // 3) Hungry, pocket empty, NO food anywhere in storage. TWO-TIER: only the MUST-EAT floor throws. Above
-    //    it this is the expected grow-in window — the farms are still producing the first loaf — so
-    //    soft-defer and let the bot keep working (job_board's should-eat gate and eat_manager's stand-down
-    //    mean this executor is normally only reached with food present or at the floor; this path is the
-    //    food-vanished-mid-chain race, handled without a halt). eat_manager re-senses and the loop re-plans.
+    // 3) Hungry, pocket empty, NO food anywhere in storage. TWO-TIER, and both tiers report rather than
+    //    halt — the floor is the LOUD tier (`success:false`, a counted fault) and above it is the quiet one
+    //    (`success:true`, the expected grow-in window while the farms produce the first loaf). job_board's
+    //    should-eat gate and eat_manager's stand-down mean this executor is normally only reached with food
+    //    present or at the floor; this path is the food-vanished-mid-chain race. eat_manager re-senses and
+    //    the loop re-plans either way.
+    // ── AN EMPTY WORLD IS NOT A CODING VIOLATION (Architect 2026-09-12) ─────────────────────────────
+    // *"a code 13 violation should be a true coding violation. meaning i coded something wrong or a
+    // setting is wrong."*
+    //
+    // THIS THREW UNTIL TODAY, AND THE THROW WAS THE WRONG CALL. Its argument was that a bot reaching the
+    // must-eat floor with no food anywhere means the food chain failed, so the fault is systemic. The
+    // premise is true and the CONCLUSION does not follow: "the farms have not produced bread yet" is a
+    // WORLD condition, reachable by any honest run on ground where wheat is slow, seeds are scarce, or the
+    // field was sited somewhere the crew cannot seed it. The 2026-09-11 soak is the proof — a wooded bank
+    // yields leaf litter instead of seeds, one plot of 32 was planted, and `storage bread:0/8` stood for
+    // the whole run. Nothing was miscoded and no setting was wrong; the world simply had no bread in it.
+    //
+    // WHAT THE THROW COST A USER. A Law 13 throw leaves the signal chain dead outside the judge
+    // (`master_core.reportCrash`), so the body stops planning and sits in the world looking alive. The
+    // Architect can read that trace and fix the farm; somebody who downloaded the bot sees a bot that quit,
+    // with the cause in a console they are not reading and no action available to them anyway.
+    //
+    // SO IT REPORTS AND STANDS DOWN, AND THE REPORT IS THE POINT (Law 25 — name the shortfall, do not
+    // fill it). `success:false` is what makes this a counted fault the judge can act on rather than a
+    // fabricated no-op: the bot is genuinely not fed, the readable says so in full, and the loop re-senses
+    // instead of dying. Starvation is survivable in Minecraft — a body at 0 food loses health slowly and
+    // regenerates the moment it eats — so a bot that keeps working while the farm catches up is strictly
+    // better than a bot that stopped, and if it does die, `death_manager` already owns that.
     if (bot.food <= HUNGER_MUST_EAT_THRESHOLD) {
-      throw new Error(
-        `[${TAG}] CODING VIOLATION (Law 13): STARVING (food ${bot.food}/20, at the must-eat floor ` +
-        `${HUNGER_MUST_EAT_THRESHOLD}) with an empty pocket and NO food in any storage chest. The food chain ` +
-        `(wheat farms→wheat→bread in the shared food chest) failed to feed this bot before it emptied — a ` +
-        `system fault requiring inspection, not a world condition to replan around.`
-      );
+      return _routeJudge(payload, false,
+        `${TAG}: STARVING (food ${bot.food}/20, at the must-eat floor ${HUNGER_MUST_EAT_THRESHOLD}) with an empty ` +
+        `pocket and NO food in any storage chest. The food chain (wheat farms→wheat→bread in the shared food chest) ` +
+        `has not produced anything this bot can eat. Standing down hungry rather than halting — the farm is the thing ` +
+        `to look at, and the bot keeps working while it catches up.`);
     }
     return _routeJudge(payload, true,
       `${TAG}: no food reachable yet (food ${bot.food}/20, above must-eat floor ${HUNGER_MUST_EAT_THRESHOLD}) ` +

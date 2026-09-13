@@ -52,7 +52,8 @@ const { lock } = require('@action/set_buildspot');
 const { footprintExtent } = require('@perception/blueprint_survey');   // a plot's reach at its own rotation
 const { scanWheatPlots, plotRotation, loadedAreaSettled, settleLine, describeScan, SETTLE_MAX_MS } = require('@utils/wheat_plot_scanner');
 const { baseSited } = require('@kernel/bot_voice');
-const { MIN_BLUEPRINT_SPACING, FARM_BLUEPRINT_NAME, FARM_PLOT_COUNT, FARM_ROOM_KEYS } = require('@thinking/architect_config');
+const { MIN_BLUEPRINT_SPACING, FARM_BLUEPRINT_NAME, FARM_PLOT_COUNT, FARM_ROOM_KEYS,
+        BOT_MODES } = require('@thinking/architect_config');
 
 const TAG = 'lock_all_buildspots';
 
@@ -105,9 +106,30 @@ const SATELLITES = [
 // places to misspell one string into a silently empty search (Law 7).
 const CONTRACTOR_ROOM_KEY = 'contractor_house';
 
+// ── A CALLER WITH NO HQ TO READ, AND WHY THAT IS A DECLARATION RATHER THAN A FALLBACK ───────────────
+// (Architect 2026-09-12, moving the siting decision to the desk.)
+//
+// THE BOUNDARY IS REAL AND IT IS NOT A BUG. The building conference room is keyed `<structure>|<owner>`,
+// and `hq.readBuildingChair` supplies the owner half from THE CALLING PROCESS'S OWN MANDATE
+// (`bot_mandate.buildingRoomKey`). The foreman has no mandate — it is a desk, not a bot, and
+// `bot_mandate` throws rather than defaulting, correctly. So the desk can survey the WORLD (it has a body
+// and a chunk view) but it cannot read what is already LOCKED (that is owner-scoped memory it has no
+// identity in).
+//
+// SO THE DESK SAYS SO, and `unlockedWorld` is that sentence. It means: *survey as if nothing is placed
+// yet.* It is a declaration by the caller, never inferred from a failed read — a silent fallback here
+// would let a mandate bug in a real body look like an empty base and re-site a base that already exists.
+//
+// WHAT IT COSTS, STATED PLAINLY (Law 25). On a world that already holds buildings, the desk's dry run
+// cannot see them, so it can approve a site that overlaps one. The authoritative check is unchanged and
+// still runs: the BODY re-surveys from beside the same person WITH its HQ, and refuses there. The desk's
+// gate is therefore early-and-usually-right rather than final, which is exactly what a door is for — it
+// stops the common failure (no water, a peak, a cave) before two player slots are spent.
+
 // readLockedCenter — a blueprint's already-locked build_center, or null. Lets the batch be idempotent:
-// a re-run skips whatever is already locked and only fills the gaps.
-function readLockedCenter(roomKey) {
+// a re-run skips whatever is already locked and only fills the gaps. `unlocked` is the declaration above.
+function readLockedCenter(roomKey, unlocked = false) {
+  if (unlocked) return null;
   const spot = hq.readBuildingChair(roomKey, 'set_buildspot');
   return (spot?.build_center && typeof spot.build_center.x === 'number') ? spot.build_center : null;
 }
@@ -150,7 +172,7 @@ function baseLayoutComplete() {
 // so "the first thing it does when a human says start" is a position the ladder already holds, not a
 // priority anything here has to argue for. A second job type would need a band, a rung and a magnet
 // entry to say what the existing one already says.
-async function runContractorLayout(bot, dryRun) {
+async function runContractorLayout(bot, dryRun, unlocked) {
   const spec = SATELLITES.find(s => s.roomKey === CONTRACTOR_ROOM_KEY);
   if (!spec) {
     throw new Error(`[${TAG}] CODING VIOLATION (Law 13): SATELLITES declares no '${CONTRACTOR_ROOM_KEY}' row, so a `
@@ -158,15 +180,15 @@ async function runContractorLayout(bot, dryRun) {
   }
 
   const report = [];
-  if (readLockedCenter(spec.roomKey)) {
-    const c = readLockedCenter(spec.roomKey);
+  if (readLockedCenter(spec.roomKey, unlocked)) {
+    const c = readLockedCenter(spec.roomKey, unlocked);
     report.push(`${spec.blueprint}: already locked at (${c.x},${c.y},${c.z}) — nothing to site.`);
     return finish(dryRun, report, [], [], false);
   }
 
   const stand = bot.entity.position;
   const origin = { x: Math.floor(stand.x), y: Math.floor(stand.y), z: Math.floor(stand.z) };
-  const res = await surveyOne(bot, spec, origin, []);
+  const res = await surveyOne(bot, spec, origin, [], unlocked);
 
   if (res && res.found && res.candidate) {
     const bc = res.candidate.build_center;
@@ -185,9 +207,11 @@ async function runContractorLayout(bot, dryRun) {
 // surveyOne — locate one blueprint from `origin`, folding this-pass PENDING footprints (blueprints
 // surveyed earlier but not yet locked) into the overlap set so siblings never collide. Returns the raw
 // locate result (found candidate + distFromOrigin, or a structured not-found). Never locks.
-async function surveyOne(bot, spec, origin, pendingRaw) {
+async function surveyOne(bot, spec, origin, pendingRaw, unlocked) {
   const { building, dims } = loadBlueprintDims(spec.blueprint);
-  const existing = getExistingFootprints(spec.clearance); // locked-in-HQ buildings, padded by this clearance
+  // locked-in-HQ buildings, padded by this clearance — empty for a caller with no HQ to read, which it
+  // has DECLARED (see `readLockedCenter`); the pending set below still keeps this pass's siblings apart.
+  const existing = unlocked ? [] : getExistingFootprints(spec.clearance);
   for (const p of pendingRaw) {
     existing.push(footprintBox(p.center.x, p.center.z, p.extent, spec.clearance, p.roomKey));
   }
@@ -199,23 +223,47 @@ async function surveyOne(bot, spec, origin, pendingRaw) {
   });
 }
 
-// run(bot, { dryRun }) — the batch core. Surveys all blueprints, judges the whole layout, and (unless
-// dryRun) locks them. Returns { ok, report:[lines], locked:[roomKeys] }. Throws Law 13 on a genuine
-// layout failure (bad seed / too-strict criterion / satellite out of spread). A transient world-not-
-// loaded miss returns { ok:false, transient:true } so the caller can soft-retry instead of hard-stopping.
+// run(bot, { dryRun, species }) — the batch core, and THE ONE SITER for a base (Law 16). Surveys all
+// blueprints, judges the whole layout, and (unless dryRun) locks them.
+// Returns { ok, report:[lines], locked:[roomKeys] } · { ok:false, problems:[...] } when the ground cannot
+// hold the layout · { ok:false, transient:true } when the world is not streamed in yet.
+//
+// TWO CALLERS, AND THE SECOND ONE IS WHY `dryRun` AND `species` EXIST (Architect 2026-09-12):
+//   · the BODY, at startup, with dryRun off — it locks.
+//   · the FOREMAN, before it spawns anybody, with dryRun on — it asks *can a base be raised where this
+//     person stands*, and refuses to launch when the answer is no. *"if foreman cant set the blueprints
+//     then it refuses to spawn the bots and explains that it cant."*
+// One function answers both, so a desk that lets a crew through and a crew that then cannot site itself
+// is not a reachable pair of outcomes.
+//
+// `species` IS PASSED RATHER THAN SENSED, for the desk's sake. The body branch below read
+// `bot_mandate.isContractor()` — its own constitution — which is exactly right for a body and impossible
+// for the desk: the foreman has no mandate (it is not a bot), and the species it needs a layout for is the
+// one the person just asked for, not one it could look up about itself. So the caller states it, and a
+// body states its own by asking its mandate (Invariant B — the body still re-senses, it just does it at
+// the call site).
 async function run(bot, opts = {}) {
   const dryRun = !!opts.dryRun;
   if (!bot?.entity?.position) {
-    throw new Error(`[${TAG}] CODING VIOLATION: global.bot is not set (no bot.entity.position). The bot must be registered before the batch runs.`);
+    throw new Error(`[${TAG}] CODING VIOLATION: run() needs a body with a position. The bot must be registered before the batch runs.`);
   }
+  const species = opts.species
+    || (require('@kernel/bot_mandate').isContractor() ? BOT_MODES.CONTRACTOR : BOT_MODES.HOMESTEADER);
+  // CARRIED AS AN ARGUMENT, NOT A MODULE FLAG. A flag would be process state two callers share, and the
+  // one that forgot to clear it would silently blind a body to its own HQ (Law 8 — nothing outlives its
+  // owner; here the owner is this one call).
+  return _run(bot, { dryRun, species, unlocked: !!opts.unlockedWorld });
+}
+
+async function _run(bot, { dryRun, species, unlocked }) {
 
   // TWO SPECIES, TWO LAYOUTS, ONE JOB. The branch is at the top rather than woven through the sections
   // below because a contractor is not doing a reduced version of this pass — it sites no farm, hangs off
   // no headframe and has no whole-base non-overlap picture to hold. Running it through the estate path
-  // with the farm skipped would leave it hunting a water body it has no use for, and hard-stopping the
-  // run when the seed has none (Law 13's problems list) over a building that needs flat ground.
-  if (require('@kernel/bot_mandate').isContractor()) {
-    return runContractorLayout(bot, dryRun);
+  // with the farm skipped would leave it hunting a water body it has no use for over a building that
+  // needs flat ground.
+  if (species === BOT_MODES.CONTRACTOR) {
+    return runContractorLayout(bot, dryRun, unlocked);
   }
 
   const report = [];
@@ -234,8 +282,8 @@ async function run(bot, opts = {}) {
   // repopulate `centers` from the chairs and skip the scan (finish() would otherwise re-lock and Law-13 throw).
   const centers = {};              // roomKey → build_center, for satellites to hang off
   let anchorCenter = null;         // farm instance 0's stand (the headframe's reference)
-  if (readLockedCenter(FARM_ROOM_KEYS[0])) {
-    for (const key of FARM_ROOM_KEYS) { const locked = readLockedCenter(key); if (locked) centers[key] = locked; }
+  if (readLockedCenter(FARM_ROOM_KEYS[0], unlocked)) {
+    for (const key of FARM_ROOM_KEYS) { const locked = readLockedCenter(key, unlocked); if (locked) centers[key] = locked; }
     anchorCenter = centers[FARM_ROOM_KEYS[0]];
     report.push(`${FARM_BLUEPRINT_NAME}: phase-1 field already locked (${Object.keys(centers).length}/${FARM_PLOT_COUNT} plots) — skipping scan.`);
   } else {
@@ -312,7 +360,7 @@ async function run(bot, opts = {}) {
     const surveyOrigin = { x: originCenter.x, y: originCenter.y, z: originCenter.z };
     const originName   = originKey === FARM_ROOM_KEYS[0] ? 'farm anchor' : originKey;
 
-    const locked = readLockedCenter(spec.roomKey);
+    const locked = readLockedCenter(spec.roomKey, unlocked);
     if (locked) {
       centers[spec.roomKey] = locked;
       const d = Math.hypot(locked.x - originCenter.x, locked.z - originCenter.z);
@@ -320,7 +368,7 @@ async function run(bot, opts = {}) {
       // No pending push — an already-locked building is in HQ, so getExistingFootprints already reserves it.
       continue;
     }
-    const res = await surveyOne(bot, spec, surveyOrigin, pendingRaw);
+    const res = await surveyOne(bot, spec, surveyOrigin, pendingRaw, unlocked);
     if (res.found) {
       // No distance cap: the ONLY building-to-building constraint is non-overlap, enforced inside locate()
       // via the MIN_BLUEPRINT_SPACING reject ring (getExistingFootprints + this pass's pendingRaw). A found
@@ -370,18 +418,37 @@ function finish(dryRun, report, toLock, problems, transient) {
     return { ok: false, transient: true, report, locked: [] };
   }
 
+  // ── GROUND THAT CANNOT HOLD THE LAYOUT IS A VERDICT, NOT A THROW (Architect 2026-09-12) ───────────
+  // This was a Law 13 HARD STOP until today, and every cause it listed was the WORLD: no hydratable
+  // shoreline in the loaded area, no flat ground for the headframe, a seed with nothing this fleet can
+  // settle on. Its own remedy admitted it — *"or relocate the bot's start"* — which is a thing about the
+  // place, not about the code. Under the amended reading of Law 13 (*"a true coding violation. meaning i
+  // coded something wrong or a setting is wrong"*) that makes it environmental.
+  //
+  // AND THE FOREMAN IS WHY IT MATTERS NOW. The desk calls this with `dryRun` BEFORE it spawns anybody, so
+  // this branch is the normal answer for a person standing somewhere unsuitable — it has to be a sentence
+  // the desk can read and pass on, not an exception that kills whoever asked. Default-stopped is
+  // unchanged and is the point: nothing is locked, so there is never a half-placed base.
   if (problems.length > 0) {
-    throw new Error(
-      `[${TAG}] LAW 13 HARD STOP — base layout cannot be locked as a whole:\n  ${problems.join('\n  ')}\n` +
-      `  Full survey:\n  ${report.join('\n  ')}\n` +
-      `  Nothing was locked (default-stopped: no half-placed base). Tune the offending blueprint's ` +
-      `criterion or the spread gate, or relocate the bot's start, then re-run.`
-    );
+    watcher.warn(TAG, `Base layout cannot be placed here:\n  ${problems.join('\n  ')}\n  Nothing was locked.`);
+    return { ok: false, problems, report, locked: [] };
   }
+
+  // WHERE THE BASE WILL SIT, returned rather than only logged — the foreman tells the person before it
+  // spawns anybody (*"once it does then it tells the human where the homebase will be"*), and it can only
+  // do that from a dry run, which by definition has written nothing to read back. The seat is the
+  // headframe for a homestead and the house for a contractor: the one building a person would point at
+  // and call the base. `anchorOf` is used by both branches below so the locking path reports the same
+  // cell the desk promised.
+  const anchorOf = (rows) => {
+    const seat = rows.find(t => t.spec.roomKey === 'headframe') || rows.find(t => t.spec.roomKey === CONTRACTOR_ROOM_KEY) || rows[0];
+    const c = seat && seat.candidate && seat.candidate.build_center;
+    return c ? { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z) } : null;
+  };
 
   if (dryRun) {
     watcher.summary(TAG, `Dry run: all ${toLock.length} blueprint(s) would lock (nothing written).`);
-    return { ok: true, dryRun: true, report, locked: [] };
+    return { ok: true, dryRun: true, report, locked: [], anchor: anchorOf(toLock) };
   }
 
   const locked = [];
@@ -395,7 +462,7 @@ function finish(dryRun, report, toLock, problems, transient) {
   const headframe = toLock.find(t => t.spec.roomKey === 'headframe');
   if (headframe) baseSited(headframe.candidate.build_center);
   watcher.summary(TAG, `✅ Base layout locked as one unit: ${locked.length ? locked.join(', ') : 'nothing new (all already locked)'}.`);
-  return { ok: true, report, locked };
+  return { ok: true, report, locked, anchor: anchorOf(toLock) };
 }
 
 module.exports = {
@@ -412,6 +479,19 @@ module.exports = {
         ...payload,
         result: 'base_layout_pending', success: false,
         readable: `${TAG}: world not loaded yet — retry base-layout lock`,
+      });
+      return;
+    }
+    // GROUND THAT WILL NOT HOLD THE LAYOUT — reported, never thrown (see `finish`). A body should rarely
+    // reach this: the foreman surveys the same ground with `dryRun` before it launches anybody, so an
+    // unsuitable spot is normally refused at the desk with nobody spawned. It stays handled here because
+    // the desk's survey and this one are seconds apart and the world can move between them (a player
+    // walks, water freezes), and because a body raised any other way than by the desk still lands here.
+    if (!result.ok) {
+      routeToJudge(TAG, {
+        ...payload,
+        result: 'base_layout_refused', success: false,
+        readable: `${TAG}: base layout cannot be placed from here — ${result.problems.join('; ')}. Nothing locked.`,
       });
       return;
     }

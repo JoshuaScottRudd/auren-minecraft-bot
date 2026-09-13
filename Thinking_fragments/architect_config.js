@@ -36,11 +36,17 @@ const WORLD_DEPTH_FLOOR_Y = 0;
 // sides can agree is for one number to author both.
 const SPAWN_PROTECTION_RADIUS = 16;
 
-// PERSON_CLEAR_OF_SPAWN — how far from WORLD SPAWN the test harness's person must stand before a crew is
-// fetched to them (Architect 2026-09-11: *"it should be atleast 50 blocks away from world center"*).
+// PERSON_CLEAR_OF_SPAWN — how far from WORLD SPAWN anybody must stand before a crew is fetched to them
+// (Architect 2026-09-11: *"it should be atleast 50 blocks away from world center"*).
 // Chebyshev on X/Z, the same shape as the square above. A crew is teleported to the person and sites its
 // base around them, so a person near the square puts the whole crew's work inside it — where every break
 // and placement is refused and the server says nothing.
+//
+// TWO READERS, AND THEY MUST NOT DRIFT (amended 2026-09-12: *"i dont want a user confused"*). The number
+// began as the harness's: `Auren_Workshop/run.js` checks it against `proxy_human` before typing `foreman
+// get`. It is now also the FOREMAN's gate on `get` for any asker, which is what makes the rule true for a
+// downloaded build rather than only for a run the Architect is watching. One constant authors both, so a
+// user's refusal and a harness check cannot disagree about what "clear" means (Law 16).
 const PERSON_CLEAR_OF_SPAWN = 50;
 
 // SERVER_MINECRAFT_VERSION — the protocol the fleet speaks, and the block registry that answers questions
@@ -902,6 +908,25 @@ const ACCEPTABLE_BIOMES = new Set([
     'flower_forest', 'dark_forest', 'old_growth_birch_forest',
 ]);
 
+// WHERE A PERSON HAS TO BE STANDING FOR A CREW TO BE WORTH RAISING (Architect 2026-09-12).
+// *"we either need to make it so the bots can work from anything including in the middle of the ocean 500
+// blocks from land. in the nether, in the overworld at the peak of a mountain, at the bottom of deepslate
+// or we need to restrict the usage."* Restricting is the choice: this fleet sites a base on the overworld
+// surface against sea-level water, so the two numbers below are the honest statement of that limit rather
+// than a taste. The foreman's `get` gate reads them; nothing else does.
+//
+// SEA_LEVEL is the water plane the wheat field is pinned to (wheat_plot_scanner's seaY) plus the block a
+// body stands on — the shore, not the water. It is the reference both numbers below are measured from,
+// because a farm the river cannot reach is the failure being prevented.
+const SEA_LEVEL = 63;
+// Below the column's OWN topmost ground by more than this = underground (a cave, a mine, a ravine). Small,
+// because a body in a one-block dip is still on the surface and a body under a tree canopy is too —
+// `surfaceY` reads the topmost GROUND, so leaves overhead do not count against a person.
+const HUMAN_SURFACE_SLACK = 4;
+// Above SEA_LEVEL by more than this = a peak. Generous, because plains and forest legitimately roll to the
+// mid-80s; what it excludes is the ground where no sea-level water is within a loaded chunk of the person.
+const HUMAN_MAX_ABOVE_SEA = 20;
+
 // The water a wheat field is sited against: river and ocean biomes (Architect 2026-09-11 — *"it must
 // either be a river or ocean biome tile… water biome only, bank only, cluster only"*). Sea-level water in
 // any other biome is a lake or a pond, and wheat_plot_scanner neither floods it nor counts its banks.
@@ -1377,6 +1402,9 @@ module.exports = {
     STOCK_THRESHOLDS,
     OPTIONAL_BUILD_MATERIALS,
     ACCEPTABLE_BIOMES,
+    SEA_LEVEL,
+    HUMAN_SURFACE_SLACK,
+    HUMAN_MAX_ABOVE_SEA,
     FARM_WATER_BIOMES,
     FUEL_PREFERENCES,
     FUEL_SMELT_YIELD,

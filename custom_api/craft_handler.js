@@ -1032,14 +1032,37 @@ async function craftWithSequence(bot, sequence, ctx) {
         // so the state is recoverable and the honest report is a shortage of ROOM (Law 25 — a craft
         // failure invites a retry, and a retry here costs another log). The two branches below are the
         // whole difference between "the fleet is wedged" and "this order has to wait its turn".
+        // ── AND IT STILL DOES NOT THROW, BECAUSE THE WORLD CAN BUILD THIS STATE (2026-09-12) ────────
+        // *"double check that theres no enviomental throws."* (Architect 2026-09-12.)
+        //
+        // The impossibility argument above is sound about the STATE and wrong about its CAUSE. It says
+        // *"nothing about a normal Minecraft world creates it"* — but two ordinary world events do.
+        // `station_registry.verifyStations` de-registers a chest whose block reads as air, so a player
+        // breaking their own chest, or a creeper taking the wall it sat in, removes the last registered
+        // chest from a fleet whose bots are carrying a full load at the time. And a fleet EARLY in a run
+        // has no chest yet by construction — the first one is a blueprint anchor that has to be built —
+        // so a bot that gathers hard before that anchor lands arrives here with a full pocket and an
+        // empty registry, having done nothing wrong.
+        //
+        // The wedge is real and the diagnosis stays: offloading is not happening, and that is worth
+        // saying loudly every time it is reached. What changes is that saying it does not end the bot's
+        // run. `success:false` makes it a counted fault; the craft is still refused, so no ingredients
+        // are consumed into an output with nowhere to land (which was the actual loss being prevented —
+        // §6's measured 3-log leak); and the bot keeps planning, which is what lets it place the chest
+        // that fixes this the moment it can (Law 25).
         const chests = require('@perception/station_registry').findChests();
         if (!chests.length) {
-          throw new Error(`[${TAG}] CODING VIOLATION (Law 13): DEADLOCK — this bot's inventory is FULL `
-            + `(0 empty slots, no partial ${step.item} stack with room) and there is NO CHEST REGISTERED `
-            + `to dump anything into. It cannot craft ${step.item} because the output would have nowhere `
-            + `to land, and it cannot craft a chest to fix that for the same reason. Offloading is part `
-            + `of ordinary work and it has not been happening — that is the defect, not this craft. `
-            + `The pocket must be emptied by hand, or a chest placed, before this fleet can work.`);
+          const why = `cannot craft ${step.item}: the pocket is FULL (0 empty slots, no partial ${step.item} stack with room) `
+            + `and there is NO CHEST REGISTERED to dump into, so the output would have nowhere to land — and a chest cannot be `
+            + `crafted to fix it for the same reason. NOT crafting: bot.craft would consume the ingredients and lose the result. `
+            + `This clears as soon as a chest exists (the headframe carries one at anchor 0) or the pocket is emptied by hand. `
+            + `If a chest was registered before, check whether it was broken.`;
+          watcher.warn(TAG, why);
+          note(`${step.item}: pocket full and no chest registered — needs a chest or a manual dump, not another craft attempt`);
+          // `break`, the same exit the recoverable branch below uses, for the same reason: the function's
+          // own tail reports what the batch actually made and the caller already handles a short craft.
+          // Inventing a return shape here would be a second contract for one outcome (Law 16).
+          break;
         }
 
         watcher.warn(TAG, `no room to craft ${step.item}: the pocket is FULL (0 empty slots, no partial ` +

@@ -92,7 +92,13 @@ function requireFromHomes(name) {
     const p = path.join(home, name);
     if (fs.existsSync(p)) return require(p);
   }
-  throw new Error(`${name} not found in any module home (checked: ${CANDIDATE_HOMES.join(', ')})`);
+  // THE REMEDY, NOT ONLY THE FAULT (Architect 2026-09-12). This is the first thing that breaks on a
+  // machine where `npm install` has not been run, so it is the most likely message a new downloader ever
+  // sees — and it used to name the directories it searched and stop there, which tells somebody who has
+  // never seen this tree that a package is missing without telling them that installing is the fix.
+  throw new Error(`The package "${name}" is not installed. Run this once, from the folder holding `
+    + `start_auren.js:\n    npm install\n`
+    + `(looked for it in: ${CANDIDATE_HOMES.join(', ')})`);
 }
 
 module.exports = { moduleHomes, bootstrapModulePath, nodePathValue, requireFromHomes, CANDIDATE_HOMES };

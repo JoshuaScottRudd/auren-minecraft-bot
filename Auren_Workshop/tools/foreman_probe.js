@@ -373,7 +373,29 @@ async function main() {
     b.on('messagestr', s => heard.push({ text: s, at: Date.now() }));
     await new Promise(res => b.once('spawn', res));
     await sleep(2500);
-    console.log(`human: ${name} spawned.`);
+
+    // ── AND THEN OUT OF WORLD SPAWN, BEFORE ANYTHING IS SAID (2026-09-12) ─────────────────────────
+    // The desk refuses `get` within `PERSON_CLEAR_OF_SPAWN` of world spawn (foreman.js, the `get`
+    // handler). A client that joins and stays put is standing exactly there, so every question in this
+    // probe that needs a crew — V6/V7, the cap at V9-V11, V14's arrival cell, V15's death round trip —
+    // would be answered by that one refusal, and the probe would read as a broken desk.
+    //
+    // MOVED RATHER THAN EXEMPTED, and that is the whole point. The refusal is a REAL RULE a user meets,
+    // so a bench that switched it off would be grading a fleet nobody can download (Law 26 — a harness
+    // that arranges its own pass measures the harness). `proxy_human` was given this same step on
+    // 2026-09-11 for the same reason; this is that fix reaching the other client that types `foreman get`.
+    //
+    // `/spreadplayers` and not `/tp`, copied from proxy_human's reasoning: the target is ground this
+    // client has never streamed, so the server is asked to pick the top block itself and it refuses water
+    // and lava. Distance is the clearance plus a margin, because spreadplayers scatters within its radius
+    // and the landing has to clear the line even at the near edge of that scatter.
+    const clearOf = require(paths.bot('Thinking_fragments/architect_config.js')).PERSON_CLEAR_OF_SPAWN;
+    const aim = clearOf * 2;
+    await cmd(`/spreadplayers ${aim} ${aim} 8 ${aim + clearOf} false ${name}`);
+    await sleep(1500);
+    const landed = await rconLink.entityPos(name);
+    console.log(`human: ${name} spawned and stepped clear of world spawn -> ${landed ? `(${landed.x},${landed.y},${landed.z})` : 'position unknown'}`
+      + ` (the desk needs ${clearOf}b, or every crew question below reads as a refusal).`);
     // The foreman names the person it is answering, which is what lets two humans share one channel and
     // still read only their own replies. A test that matched any `<Foreman>` line would credit player A
     // with an answer given to player B — the exact confusion these questions exist to detect.

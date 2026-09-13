@@ -158,7 +158,8 @@ async function pick(bot, opts = {}) {
 
     // Unguarded: surfaceFilter is ours. `catch → break` exited the loop with the same shape a genuine
     // "no grass in reach" exit has, so a broken scanner and an exhausted field left identical evidence
-    // (Law 25); the throw below depends on this scan having actually run.
+    // (Law 25); the concede below depends on this scan having actually run — a scanner that throws is
+    // still a defect and still surfaces, which is the half of the old reasoning that survives.
     const scan = surfaceFilter.scan(bot, { type: 'object_group_or_direct', targets: GRASS });
     const candidates = (scan?.objectives || []).filter(
       o => o && o.position && ['x', 'y', 'z'].every(k => typeof o.position[k] === 'number')
@@ -167,11 +168,33 @@ async function pick(bot, opts = {}) {
       // No grass anywhere the surface scan can see (it already looks at the surface from any depth).
       // Ask exploration_api to WALK us to a grass biome, then re-sense — exactly ONCE. NO retry loop:
       // if a re-scan after a real relocation still finds nothing, seek keeps re-picking the biome
-      // we're in and barely moves, which can only scan→seek→scan forever. That is a broken
-      // expectation (a seed gather was dispatched where grass can't be found), so Law 13 says surface
-      // it — throw — rather than soft-loop it. Fix the plan, not this code.
+      // we're in and barely moves, which can only scan→seek→scan forever. So the second failure ends
+      // the pick, and what it ends with is the subject of the note below.
+      //
+      // ── A WORLD WITH NO GRASS IN IT IS NOT A MISCODED FLEET (Architect 2026-09-12) ────────────────
+      // *"a code 13 violation should be a true coding violation. meaning i coded something wrong or a
+      // setting is wrong. double check that theres no enviomental throws."*
+      //
+      // THIS THREW UNTIL TODAY. The old argument: a re-scan after a real relocation that still finds
+      // nothing means the seed job was posted where grass cannot be reached, so the EXPECTATION is wrong
+      // and Law 13 should surface it. The first half is right — the plan was optimistic — but an
+      // optimistic plan meeting a bare world is the most ordinary thing that happens to a bot, not a
+      // defect in the code that wrote it. Measured on the 2026-09-11 soak: the crew sited its field on a
+      // wooded bank, cleared leaf litter instead of grass all run, and had to walk back toward the base's
+      // own grass field to find any. Nothing was miscoded; the ground near the work had no grass on it.
+      //
+      // THE FIX IS NOT A NEW PATHWAY — THIS FUNCTION ALREADY HAD ONE. The return contract carries
+      // `reason: 'no_grass'` (see the tail of this function), so the concede below is the shape the
+      // caller was already written to read, and the throw was a second exit for a state the first exit
+      // already described. `concedeReason` breaks the loop exactly once, which preserves the whole point
+      // of the original guard: no scan→seek→scan forever. What changes is that the bot reports an
+      // empty world and the fleet re-plans, instead of the signal chain dying outside the judge and the
+      // body sitting in the world looking alive with nothing a user could do about it.
       if (exploredForGrass) {
-        throw new Error(`[${TAG}] CODING VIOLATION: no grass in range even after relocating toward a grass biome — a seed gather was dispatched where grass cannot be reached. The expectation is wrong (do not post/keep the seed job here); this must not be retried into an infinite loop.`);
+        watcher.warn(TAG, 'No grass in range even after relocating toward a grass biome — conceding this pick. '
+          + 'The seed job was posted where grass cannot be reached; the fleet re-plans rather than scanning in a circle.');
+        concedeReason = 'no_grass';
+        break;
       }
       exploredForGrass = true;
       watcher.summary(TAG, 'No grass in range — asking exploration to walk me to a grass biome.');
