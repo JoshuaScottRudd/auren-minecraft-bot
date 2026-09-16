@@ -43,8 +43,9 @@
 // ── WHAT IT DOES PER ATTACH, AND WHY EACH STEP IS THE OWNER'S ───────────────────────────────────────
 //   start_cameras.ps1 -Bots <every standing bot> -Add    build + launch the missing clients, then
 //                                                        restart the director and titler over all of them
-//   camera_obs.ps1 up   --bots=<the same set>            create + bind the new captures and their filters
-//   camera_obs.ps1 start                                 (record only) prove every file is really writing
+//   recorder.bindLate   --bots=<the same set>            (record only) bind the new captures and prove every
+//                                                        file is really writing — the recorder is the
+//                                                        Architect's, reached through workstation.findRecorder
 // Not one line of that is implemented here. This file holds the TRIGGER and the ORDER and nothing else;
 // every step is a call to the unit that already owns it (Law 16). The order is the same order a cold
 // filmed run uses and it is not negotiable — a capture bound before its window exists records black and
@@ -116,6 +117,16 @@ const MAX_CAMERAS = parseInt(opt('max-cameras', String(DEFAULT_MAX_CAMERAS)), 10
 // what keeps the first pass from being a needless full converge.
 const SEED = String(opt('seeded', '')).split(',').map(s => s.trim()).filter(Boolean);
 
+// The recorder, on a recorded run only. record_overlay refuses `record` on a machine without one before the
+// warden is ever raised, so a missing one here is a warden started by hand — refused by name, never run as
+// a watch that believes it is recording (Law 13).
+const RECORDER = (() => {
+  if (OVERLAY !== 'record') return null;
+  const file = require(path.join(BOT_DIR, 'js_kernel', 'utils', 'workstation.js')).findRecorder();
+  if (!file) throw new Error("camera_warden: --overlay=record needs a recorder and this machine has none. Use --overlay=watch.");
+  return require(file);
+})();
+
 const PID_FILE = path.join(KERNEL, 'camera_warden.json');
 const CREW_READY_FILE = path.join(KERNEL, 'camera_rig_ready.json');
 
@@ -175,18 +186,14 @@ async function attach(all, added) {
     return false;
   }
 
-  const obsArgs = [`--bots=${all.join(',')}`, `--host=${HOST_ON ? 'on' : 'off'}`, `--architect=${ARCHITECT_ON ? 'on' : 'off'}`];
-  if (!runScript('camera_obs.ps1', ['up', ...obsArgs], 'OBS up (bind the new capture and its filter)')) {
-    say('✗ OBS would not bind the new window(s).');
-    return false;
-  }
-
-  // RECORD ONLY, and this is the step that makes the attach true rather than likely. `start` against an
-  // already-recording OBS skips StartRecord and verifies that every camera in the session is putting
-  // real bytes on disk — which for a mid-take attach is the only moment the new file can be proved.
-  if (OVERLAY === 'record') {
-    if (!runScript('camera_obs.ps1', ['start', ...obsArgs], 'prove every camera is writing')) {
-      say('✗ a camera is not writing — read the line above for which. The rest of the take is unaffected.');
+  // RECORD ONLY. A watched run has nothing to bind: the new window is up and the director is cutting to
+  // it, which is the whole of watching. On a recorded run this is the step that makes the attach true
+  // rather than likely — the recorder binds the new capture and proves every file is putting real bytes
+  // on disk, which for a mid-take attach is the only moment the new file can be proved.
+  if (RECORDER) {
+    const obsArgs = [`--bots=${all.join(',')}`, `--host=${HOST_ON ? 'on' : 'off'}`, `--architect=${ARCHITECT_ON ? 'on' : 'off'}`];
+    if (!RECORDER.bindLate(obsArgs)) {
+      say('✗ the new camera is not recording — read the lines above for which step. The rest of the take is unaffected.');
       return false;
     }
   }
@@ -267,7 +274,7 @@ async function main() {
     // Prism and restarting the director each time: a repair loop with no judge, which is the shape
     // Law 27 names, and it would do more damage than the missing camera. The failure is already stated
     // out loud where it happened; the operator decides whether to act, and the repair path is the same
-    // convergent call by hand — `start_cameras.ps1 -Bots … -Add` then `camera_obs.ps1 up`.
+    // convergent call by hand — `start_cameras.ps1 -Bots … -Add`, then the recorder's own bind on a recorded run.
     await attach([...filmed, ...take], take);
     for (const id of take) filmed.add(id);
   }

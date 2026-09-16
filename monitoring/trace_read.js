@@ -89,7 +89,7 @@ function parseLine(raw, idx, fileBot) {
   }
   // Level markers prefix the [TAG]; the same emoji inside message TEXT (e.g.
   // "📊 ❌ goTo failed…") is content, not level — match marker-before-tag only.
-  if (/❌ \[/.test(raw) || raw.includes('] ERROR:')) line.level = 'error';
+  if (/❌ \[/.test(raw) || /\] ERROR:/.test(raw)) line.level = 'error';
   else if (/⚠️ \[/.test(raw)) line.level = 'warn';
   else if (raw.includes('📊')) line.level = 'summary';
   return line;
@@ -120,13 +120,12 @@ function parseStoryFile(file) {
       story.push(JSON.parse(rows[i]));
     } catch (e) {
       if (i === rows.length - 1) {
-        process.stderr.write(`⚠ ${path.basename(file)}: the final line is torn (the process died mid-append) `
+        process.stderr.write(`⚠ ${path.basename(file)}: the final line did not parse `
           + `— read ${story.length} complete line(s), dropped the last. Any verdict below is PARTIAL.\n`);
         break;
       }
       throw new Error(`${path.basename(file)} line ${i + 1} of ${rows.length} is not a story line `
-        + `(${e.message}). Only the LAST line can be torn by a crash, so this file was written by `
-        + `something that should not have touched it.`);
+        + `(${e.message}). Only the last line of this file is allowed to be unparseable.`);
     }
   }
   return story;
@@ -256,14 +255,21 @@ function readForemanView(dir) {
   return mergeStreams(streamFiles(dir || path.dirname(DEFAULT_TRACE_FILE), { view: STREAM_VIEW.FOREMAN }));
 }
 
+
 // The overseer outlives runs, so one combined story can span several — and each
 // 'start' resets the bots' relative clocks to [0m 0s]. Comparing stamps (or
 // integrity baselines, or repeat counts) across that boundary manufactures
 // anomalies out of history, so every signature's state dies at the boundary.
+// A PATTERN IS A REGEX HERE, NEVER A QUOTED PHRASE (Architect 2026-09-16). This was an `includes()` on a
+// string literal, which reads identically to authored prose to any scanner — and the pass that now forbids
+// prose in a lens flagged it. Every other needle in this folder is already a `*_RE` constant; making this
+// one match that is what lets the guard be a whitelist instead of a list of special cases.
+const RUN_BOUNDARY_RE = /\[OVERSEER\] Broadcast 'start'/;
+
 function segmentRuns(lines) {
   const segments = [[]];
   for (const l of lines) {
-    if (l.raw.includes("[OVERSEER] Broadcast 'start'")) segments.push([]);
+    if (RUN_BOUNDARY_RE.test(l.raw)) segments.push([]);
     segments[segments.length - 1].push(l);
   }
   return segments.filter(s => s.length > 0);
@@ -393,7 +399,7 @@ function buildEpisodes(seg) {
     // attribute it to whichever bot has an open episode if the line names no bot.
     if (STORY_KILL.test(l.raw) && l.level === 'error') {
       const bot = l.bot && open.has(l.bot) ? l.bot : [...open.keys()][0];
-      if (bot) { open.get(bot).events.push({ kind: 'err', text: afterMarker(l.raw) }); close(bot, { ok: false, text: 'KILLED — ' + afterMarker(l.raw) }); }
+      if (bot) { open.get(bot).events.push({ kind: 'err', text: afterMarker(l.raw) }); close(bot, { ok: false, code: 'killed', text: afterMarker(l.raw) }); }
       continue;
     }
     if (!l.bot || OVERSEER_UNITS.has(l.bot)) continue;
@@ -402,7 +408,7 @@ function buildEpisodes(seg) {
     if ((m = l.raw.match(STORY_BOARD_HDR))) { board.set(bot, { count: +m[1], list: '' }); continue; }
     if ((m = l.raw.match(STORY_BOARD_LIST))) { const b = board.get(bot) || { count: 0 }; b.list = m[1].trim(); board.set(bot, b); continue; }
     if ((m = l.raw.match(STORY_CLAIMED))) {
-      if (open.has(bot)) close(bot, { ok: null, text: 'superseded by a new job' });
+      if (open.has(bot)) close(bot, { ok: null, code: 'superseded', text: null });
       open.set(bot, {
         bot, idx: l.idx, relSec: l.relSec, iso: l.iso, endIso: null, endRelSec: null,
         board: board.get(bot) || { count: 0, list: '' },
@@ -418,12 +424,15 @@ function buildEpisodes(seg) {
       // job's real outcome is the strongest present, not whichever the regex lands
       // on, so read them by priority: a completed job is done even though it also
       // released its claim.
-      close(bot, /\bCOMPLETE\b/.test(l.raw) ? { ok: true, text: 'COMPLETE' }
-        : /\bSTUCK\b/.test(l.raw) ? { ok: false, text: 'STUCK' }
-        : { ok: null, text: 'released' });
+      // `code` is the TOKEN a reader filters on; `text` stays the manager's own word. COMPLETE and STUCK
+      // are the manager's, so the two agree there — the codes that differ are the ones this reader
+      // supplies for an episode the record never closed (see `superseded` and `open_at_trace_end`).
+      close(bot, /\bCOMPLETE\b/.test(l.raw) ? { ok: true, code: 'complete', text: 'COMPLETE' }
+        : /\bSTUCK\b/.test(l.raw) ? { ok: false, code: 'stuck', text: 'STUCK' }
+        : { ok: null, code: 'released', text: 'released' });
       continue;
     }
-    if (STORY_JOB_RELEASED.test(l.raw)) { close(bot, { ok: null, text: 'released' }); continue; }
+    if (STORY_JOB_RELEASED.test(l.raw)) { close(bot, { ok: null, code: 'released', text: 'released' }); continue; }
     if (!ep.managerPlan && (m = l.raw.match(STORY_MGR_PLAN))) { ep.managerPlan = m[2].trim(); continue; }
     if ((m = l.raw.match(STORY_JUDGE_FRAG))) {
       // THREE STATES, NOT TWO. 'not stated' is not a failure — it is a report that carried no verdict,
@@ -457,7 +466,9 @@ function buildEpisodes(seg) {
     if (l.level === 'warn') ep.events.push({ kind: 'warn', text: afterMarker(l.raw) });
     else if (l.level === 'error') ep.events.push({ kind: 'err', text: afterMarker(l.raw) });
   }
-  for (const bot of [...open.keys()]) close(bot, { ok: null, text: 'still running at trace end' });
+  // The record never closed these. `open_at_trace_end` is a STATE OF THE FOLD, named as a token rather
+  // than described in a sentence the reader would take for something the fleet said.
+  for (const bot of [...open.keys()]) close(bot, { ok: null, code: 'open_at_trace_end', text: null });
   return episodes;
 }
 
@@ -473,30 +484,45 @@ const DOING_CAP = 14;   // keep a pathological job from flooding the block
 // the evidence is suppressed precisely when it is the answer. Trouble and interest are different
 // questions and the reader picks which one it is asking (Law 25 — a view that can only show failures
 // must not be read as a view of the run).
-function renderEpisode(ep, full = false) {
+// ── IT RETURNS ROWS NOW, AND COMPOSES NOTHING (Architect 2026-09-16) ────────────────────────────────
+// This used to build the block itself — `━━ AurenBot ━━`, `▸ PLAN`, `▸ DOING`, `▸ VERDICT`, a glyph per
+// event — which is the lens narrating a run it did not take part in. Every one of those labels was
+// authored here; none of them is in the record.
+//
+// WHAT SURVIVES UNTOUCHED IS THE PART THAT WAS NEVER OURS: `text` on every row is the bot's own line,
+// carried through verbatim. A bot may say why it did something and this is the envelope that delivers it
+// (Architect: *"the bot has the right to interpret its own data because it's the one doing the
+// reasoning… who cannot is the lens"*). The framing went; the testimony stayed.
+//
+// The `phase` column replaces the three `▸` headings, and `kind` replaces the glyph table — both are
+// tokens the caller can filter on, which the drawn block never was.
+function episodeRows(ep, full = false) {
   const dirty = full || ep.events.some(e => EPISODE_DIRTY.has(e.kind));
-  const okCount = ep.events.filter(e => e.kind === 'ok').length;
+  const at = relativeTime(ep.relSec);
+  const rows = [];
+  // `text` is LAST because it is the one cell with no bound — it carries a bot's whole line. A ragged
+  // column at the end of a row costs nothing; one in the middle unaligns every column after it.
+  const push = (phase, kind, text, n) => rows.push([at, ep.bot, jobToken(ep.claimed), phase, kind, n, text]);
+
   if (!dirty) {
-    // One line: the job worked start to finish, nothing to investigate.
-    const tail = okCount ? ` (${okCount} step${okCount === 1 ? '' : 's'})` : '';
-    return `${VERDICT_GLYPH(ep.verdict)} [${relativeTime(ep.relSec)}] ${ep.bot}  ${jobToken(ep.claimed)} → ${ep.verdict.text}${tail}`;
+    // A job that ran clean start to finish: one row, its step count, and the judge's own verdict text.
+    push('verdict', ep.verdict.code, ep.verdict.text, ep.events.filter(e => e.kind === 'ok').length);
+    return rows;
   }
-  const L = [];
-  L.push(`━━ ${ep.bot} ━━ [${relativeTime(ep.relSec)}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-  L.push(`▸ PLAN    job board (${ep.board.count}): ${ep.board.list || '(not captured)'}`);
-  L.push(`          dispatcher claimed → ${ep.claimed}`);
-  if (ep.managerPlan) L.push(`          ${ep.manager} → ${ep.managerPlan}`);
+  push('plan', 'board', ep.board.list || null, ep.board.count);
+  push('plan', 'claimed', ep.claimed, null);
+  if (ep.managerPlan) push('plan', ep.manager, ep.managerPlan, null);
+
   const collapsed = collapseEvents(ep.events);
-  const shown = collapsed.slice(0, DOING_CAP);
-  L.push('▸ DOING');
-  for (const e of shown) {
-    const times = e.n > 1 ? ` ×${e.n}` : '';
-    L.push(`          ${EVENT_GLYPH[e.kind] || '·'} ${e.text}${times}`);
-  }
-  if (collapsed.length > shown.length) L.push(`          … +${collapsed.length - shown.length} more`);
-  L.push(`▸ VERDICT ${VERDICT_GLYPH(ep.verdict)} ${ep.verdict.text}`);
-  return L.join('\n');
+  for (const e of collapsed.slice(0, DOING_CAP)) push('doing', e.kind, e.text, e.n > 1 ? e.n : null);
+  // The cap is a rendering limit, so the number it hid is reported rather than left as a silent cut.
+  if (collapsed.length > DOING_CAP) push('doing', 'not_listed', null, collapsed.length - DOING_CAP);
+
+  push('verdict', ep.verdict.code, ep.verdict.text, null);
+  return rows;
 }
+
+const EPISODE_FIELDS = ['at', 'bot', 'job_key', 'phase', 'kind', 'n', 'text'];
 
 // ── PASSIVE_LINE — a line a bot emits while INERT, which is not a life sign ──────────────────────────
 // Substrate rather than judgment, which is why it may live here under this file's own rule: it states a
@@ -522,5 +548,5 @@ module.exports = {
   CAMERA_STREAM_RE, FOREMAN_STREAM_RE, STREAM_VIEW,
   segmentRuns,
   afterMarker, relativeTime,
-  jobToken, collapseEvents, buildEpisodes, renderEpisode,
+  jobToken, collapseEvents, buildEpisodes, episodeRows, EPISODE_FIELDS,
 };

@@ -52,12 +52,15 @@ const TRACE_FILE = args.find(a => !a.startsWith('--'))
 const OUT_FILE = opt('out', path.join(require(paths.bot('js_kernel/utils/record_homes')).TRACE_DIR, 'dashboard.json'));
 const ALERT_CONTEXT = 6;   // raw trace lines kept above each posted anomaly (the "like normal" slice)
 
+// AN ELAPSED SPAN, AND NOTHING ELSE. The word "ago" it used to carry now lives in the FIELD NAME that
+// holds this value (`*_ago`), which is where a unit belongs — a value that explains itself is a value
+// with a sentence stuck to it (Architect 2026-09-16).
 function agoShort(ms) {
   if (!ms) return '—';
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (s < 60) return `${s}s ago`;
+  if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
-  return m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h`;
 }
 
 // ── Build the state object ──────────────────────────────────────────────────────
@@ -78,11 +81,18 @@ function buildState() {
     // REUSES trace_monitor's detect() (Law 16) rather than letting trace_monitor write the file too —
     // one file, one owner (Law 6/9, Invariant D). A clean run → []; the whole set is re-snapshotted
     // each tick (no stream/dedup — the file always shows the current outstanding anomalies).
-    alerts = trace.detect(seg).map(f => ({
-      sig: f.sig,
-      bot: f.bot,
-      reason: f.reason,
-      context: lines.slice(Math.max(0, f.idx - ALERT_CONTEXT), f.idx + 1).map(l => l.raw),
+    // ── A FLAG CARRIES FIELDS, NOT A `reason` SENTENCE (2026-09-16) ────────────────────────────────
+    // `reason: f.reason` until this date. trace_monitor's signatures stopped composing prose about
+    // their own measurements, so the field is gone at the source — and a JSON key that reads `reason:
+    // undefined` on every alert would be this file quietly losing the detail rather than carrying it.
+    // Each signature's own fields are spread in beside sig/bot instead: `count`/`text` for an error,
+    // `gap_sec`/`threshold_sec` for a silence, `from`/`to`/`drop`/`tolerance` for a regression. The
+    // shape is the flag's, which means a signature that learns a new field posts it here with nobody
+    // editing this file (Law 16 — trace_monitor owns what a flag says, this file only places it).
+    // `idx` stays out: it is an offset into a trace parse this JSON's reader does not have.
+    alerts = trace.detect(seg).map(({ idx, ...f }) => ({
+      ...f,
+      context: lines.slice(Math.max(0, idx - ALERT_CONTEXT), idx + 1).map(l => l.raw),
     }));
   } catch (_) { /* trace not present yet */ }
 
@@ -101,7 +111,9 @@ function buildState() {
   const bots = roster.map(id => {
     const s = stats.get(id) || { s: 0, w: 0, e: 0, lastRel: 0 };
     const isHalted = halted.has(id);
-    const doing = doingById[id] && doingById[id] !== 'idle' ? doingById[id] : null;
+    // `doing` is now null when a bot holds no magnet — progress_tracker stopped substituting the word
+    // 'idle' for an absent task (2026-09-16), so the check for that literal went with it.
+    const doing = doingById[id] || null;
     // status = the Architect's "active or not" cue: a judge-killed bot is inert; a bot with an HQ task
     // is working; otherwise alive but idle. No error TEXT — `errors` is the only error signal, a number.
     const status = isHalted ? 'halted' : (doing ? 'active' : 'idle');
@@ -129,7 +141,8 @@ function buildState() {
         items: snap.structures.items.map(s => ({
           name: s.name,
           complete: s.complete,
-          state: s.complete ? 'complete' : s.state,
+          state: s.state,
+        materials: s.materials,
         })),
       }
       : null,
@@ -146,12 +159,15 @@ function write() {
 // ── Run ─────────────────────────────────────────────────────────────────────────
 if (ONCE) {
   write();
-  console.log(`dashboard: wrote one snapshot → ${OUT_FILE}`);
+  // OPERATIONAL CHATTER GOES TO stderr (Architect 2026-09-16). This daemon's ANSWER is dashboard.json,
+  // which is already pure data; these three lines are the process telling you it is alive, and stdout is
+  // reserved for the answer so nothing can smuggle a sentence onto that channel.
+  console.error(`dashboard: wrote one snapshot → ${OUT_FILE}`);
   process.exit(0);
 }
 
-console.log(`dashboard → overwriting ${OUT_FILE} every ${INTERVAL}s. Open it in the editor to watch. Ctrl-C to stop.`);
-process.on('SIGINT', () => { console.log('\ndashboard: stopped.'); process.exit(0); });   // Law 8: clean end
+console.error(`dashboard → overwriting ${OUT_FILE} every ${INTERVAL}s. Open it in the editor to watch. Ctrl-C to stop.`);
+process.on('SIGINT', () => { console.error('\ndashboard: stopped.'); process.exit(0); });   // Law 8: clean end
 
 const tick = () => { write(); setTimeout(tick, INTERVAL * 1000); };
 tick();

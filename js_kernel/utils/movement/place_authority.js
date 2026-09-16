@@ -100,15 +100,10 @@ async function performPlace(bot, pos, anchor, face, itemName, tag = 'place_autho
     return { ok: false, after: null, reason: 'no item name resolved for this cell' };
   }
 
-  // ── THE SPAWN-PROTECTED SQUARE ─────────────────────────────────────────────────────────────────
-  // Placements are refused inside it exactly as breaks are. Enacted at the one place a block can be
-  // laid, so no pathway — present or future — can route around it (Law 27).
-  const { spawnProtectionVerdict } = require('@perception/spawn_protection');
-  const spawnVerdict = spawnProtectionVerdict(bot, pos, 'place');
-  if (!spawnVerdict.allowed) {
-    watcher.warn(tag, spawnVerdict.why);
-    return { ok: false, after: null, reason: 'spawn_protected' };
-  }
+  // THE SPAWN-PROTECTED SQUARE IS NOT CHECKED HERE ANY MORE (Architect 2026-09-15). Every cell inside it
+  // reads as BEDROCK through `spawn_protection.maskWorldReads`, so the cell is never empty, never a
+  // candidate, and never reaches a placement: the occupancy check below refuses it as an occupied cell,
+  // which is the truth the mask installs rather than a second rule about spawn.
 
   // ── THE COMBAT CHECKPOINT ──────────────────────────────────────────────────────────────────────
   // Same placement and same argument as dig_authority's: BEFORE the equip, because the equip and the

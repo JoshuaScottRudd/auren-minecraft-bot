@@ -207,29 +207,6 @@ function overlapsStaircase(anchor, stairDecls) {
 function scanCell(bot, anchor) {
   const gMargin = CELL_HALF + GRAVITY_MARGIN; // 3 → 7×7
 
-  // ── THE SPAWN-PROTECTED SQUARE ───────────────────────────────────────────────────────────────────
-  // A HARD REJECT, alongside fluid and the gravity conduit, and for the same reason those two are hard:
-  // the cell cannot be carved at all. Every block of the 5×5×5 body would have to be broken, and inside
-  // the square none of them can be — so this is not a cell that is expensive or awkward, it is a cell
-  // that does not exist for this fleet.
-  //
-  // NOT a 'defer' like `unloaded`. An unloaded chunk is a fact about what the client has streamed in and
-  // resolves by waiting; this resolves by never. Marking it deferred would put the cell back in the
-  // graph every sweep and re-scan it forever (Law 13 — the two categories have different answers).
-  //
-  // THE CELL BODY ONLY, not the gravity/fluid margin: the margin exists to sense what could flow or fall
-  // INTO the carve, and sensing costs the world nothing. Only cells that get broken are gated.
-  {
-    const { firstSpawnProtectedCell } = require('@perception/spawn_protection');
-    const body = [];
-    for (let dx = -CELL_HALF; dx <= CELL_HALF; dx++) {
-      for (let dz = -CELL_HALF; dz <= CELL_HALF; dz++) body.push({ x: anchor.x + dx, z: anchor.z + dz });
-    }
-    if (firstSpawnProtectedCell(bot, body)) {
-      return { safe: false, halt_reason: 'spawn_protected', picket_voxels: [] };
-    }
-  }
-
   // From APPROACH_DEPTH below the floor up through the cell ceiling: water/lava under or around
   // the descent floods the carve, so it is scanned even though it sits outside the cell body.
   for (let dy = CELL_Y_MIN - APPROACH_DEPTH; dy <= CELL_Y_MAX; dy++) {

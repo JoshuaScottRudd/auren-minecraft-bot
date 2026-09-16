@@ -37,6 +37,7 @@ require('../js_kernel/utils/developer_door').enter('monitoring/progress_tracker.
 
 const fs = require('fs');
 const path = require('path');
+const out = require('./data_out');
 
 const HQ_DIR = require('./lens_paths').bot('js_kernel');
 const HQ_RE = /^corporate_headquarters\.(.+)\.json$/;
@@ -46,7 +47,9 @@ function loadHqFiles() {
   let names;
   try { names = fs.readdirSync(HQ_DIR); }
   catch { return []; }
-  const out = [];
+  // Named `mirrors`, not `out` — `out` is the data_out writer at module scope now, and a local array of
+  // that name would shadow it.
+  const mirrors = [];
   for (const name of names) {
     const m = name.match(HQ_RE);
     if (!m) continue;
@@ -54,18 +57,21 @@ function loadHqFiles() {
     let data;
     try { data = JSON.parse(fs.readFileSync(full, 'utf8')); }
     catch { continue; } // a half-written file mid-flush parses next tick; skip, never guess (Law 13)
-    out.push({ botId: m[1], data, updatedAt: Date.parse(data.updated_at) || 0 });
+    mirrors.push({ botId: m[1], data, updatedAt: Date.parse(data.updated_at) || 0 });
   }
-  return out;
+  return mirrors;
 }
 
 // ── Small formatters ─────────────────────────────────────────────────────────
+// An elapsed span, and nothing else. The word "ago" it used to carry is now in the FIELD NAME
+// (`hq_updated_ago`), and an unreadable stamp returns null so data_out prints its ABSENT mark rather
+// than the word "unknown" — a value the reader could mistake for something HQ wrote.
 const ago = ms => {
-  if (!ms) return 'unknown';
+  if (!ms) return null;
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (s < 60) return `${s}s ago`;
+  if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
-  return m < 60 ? `${m}m ${s % 60}s ago` : `${Math.floor(m / 60)}h ${m % 60}m ago`;
+  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
 };
 // {planks:64, chest:4} -> "planks×64, chest×4"; {} -> ''
 const items = obj => Object.entries(obj || {}).map(([k, v]) => `${k}×${v}`).join(', ');
@@ -101,12 +107,12 @@ function computeSnapshot(files) {
     const complete = !!(it && (it.all_complete || it.structure_complete));
     const missing = it ? items(it.materials_missing) : '';
     const need = it ? items(it.materials_needed) : '';
-    let state;
-    if (complete) state = 'COMPLETE';
-    else if (missing) state = `building — short: ${missing}`;
-    else if (need) state = `building — needs: ${need}`;
-    else state = 'building';
-    return { name: displayName, vox: vox != null ? vox : null, locked, complete, state, mark: complete ? '✅' : '⋯' };
+    // STATE IS A TOKEN AND THE MATERIALS ARE THEIR OWN FIELD (Architect 2026-09-16). This composed
+    // `building — short: planks×64` into one cell, which welded a status to a list and forced every
+    // reader — dashboard.js included — to split a sentence back apart to use either half.
+    const state = complete ? 'complete' : missing ? 'short' : need ? 'needs' : 'building';
+    return { name: displayName, vox: vox != null ? vox : null, locked, complete, state,
+      materials: missing || need || null };
   });
   const done = structItems.filter(s => s.complete).length;
 
@@ -114,18 +120,19 @@ function computeSnapshot(files) {
   const bots = botIds.map(id => {
     const self = (ownFile[id] && ownFile[id].data.bot_boardroom && ownFile[id].data.bot_boardroom[id]) || boardroom[id];
     const mag = self && self.magnet;
-    let doing = 'idle';
-    if (mag) {
-      // A single at-a-glance number per bot, so this quotes `need` — the amount still to obtain — rather
-      // than a fraction. The old `have/target` form read as one ratio across two containers (job_board,
-      // THE QUANTITY CONTRACT); a status line has no room to say which, so it states one honest figure.
-      const qty = mag.need != null ? ` need ${mag.need}`
-                : mag.batch_quantity != null ? ` batch ${mag.batch_quantity}`
-                : '';
-      const where = mag.where ? ` @ (${mag.where.x},${mag.where.y},${mag.where.z})` : '';
-      doing = `${mag.type}/${mag.what}${qty}${where}`;
-    }
-    return { id, doing };
+    // THE TASK IS FIELDS, NOT A STATUS LINE (Architect 2026-09-16). This composed
+    // `supply/wheat_seeds need 5 @ (24,65,-1)` — one cell a reader had to take apart to use any part of.
+    // `doing` is now HQ's own `type/what` token and the quantity keeps the distinction that mattered:
+    // `need` is the amount still to obtain and `batch` is a batch size, so they stay SEPARATE fields
+    // rather than one number whose meaning depended on a word beside it.
+    const doing = mag ? `${mag.type}/${mag.what}` : null;
+    return {
+      id,
+      doing,
+      need: mag && mag.need != null ? mag.need : null,
+      batch: mag && mag.batch_quantity != null ? mag.batch_quantity : null,
+      where: mag && mag.where ? `${mag.where.x},${mag.where.y},${mag.where.z}` : null,
+    };
   });
 
   const jobs = (hq.job_board_room && hq.job_board_room.jobs) || [];
@@ -136,23 +143,26 @@ function computeSnapshot(files) {
     list: jobs.map(j => `[${j.asker && j.stage ? `${j.asker}/${j.stage}` : (j.asker ?? '?')}] ${j.type}/${j.what}`).join(' · '),
   };
 
+  // EACH SITE FACT IS A NAMED FIELD AND A VALUE, never a phrase. These were sentences
+  // (`shaft: 3 segment(s) built`) that a reader had to parse to get one number back out of.
   const site = [];
   const segs = hq.mining_confrence_room && hq.mining_confrence_room.built_segments;
-  if (segs) site.push(`shaft: ${Object.keys(segs).length} segment(s) built`);
+  if (segs) site.push({ fact: 'shaft_segments_built', value: Object.keys(segs).length });
   // Cells are the fractal mining rooms fanned off the shaft. The `cells` registry holds EVERY
   // registered cell — including complete:false neighbours the frontier grew but hasn't dug yet —
   // so count only complete ones; Object.keys would over-report unbuilt frontier as "built".
   const cells = hq.mining_confrence_room && hq.mining_confrence_room.cells;
-  if (cells) site.push(`cells: ${Object.values(cells).filter(c => c && c.complete).length} built`);
+  if (cells) site.push({ fact: 'mining_cells_built', value: Object.values(cells).filter(c => c && c.complete).length });
   const seeker = hq.exploration_confrence_room && hq.exploration_confrence_room.biome_seeker;
   if (seeker) {
-    const d = seeker.target_distance != null ? ` (${seeker.target_distance} away)` : '';
-    site.push(`biome: ${seeker.current_biome} → ${seeker.target_biome}${d}`);
+    site.push({ fact: 'biome_current', value: seeker.current_biome });
+    site.push({ fact: 'biome_target', value: seeker.target_biome });
+    if (seeker.target_distance != null) site.push({ fact: 'biome_target_distance', value: seeker.target_distance });
   }
   const stations = hq.logistics_confrence_room && hq.logistics_confrence_room.stations;
   if (stations) {
-    const chests = Object.values(stations).filter(s => s.type === 'chest').length;
-    site.push(`stations: ${Object.keys(stations).length} (${chests} chest)`);
+    site.push({ fact: 'stations', value: Object.keys(stations).length });
+    site.push({ fact: 'stations_chest', value: Object.values(stations).filter(s => s.type === 'chest').length });
   }
 
   return {
@@ -165,47 +175,62 @@ function computeSnapshot(files) {
 }
 
 // ── Render one snapshot (the CLI formatter over computeSnapshot) ──────────────
+// OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16). Field names and values only; every space, separator
+// and column width belongs to data_out. Strings that reach a value cell here are COPIED — a structure
+// name, a bot id, a job coordinate, a material list — never composed by this observer.
+//
+// DELETED, not translated: the `(read-only observer of HQ — never writes…)` banner, which is a claim
+// about what this tool is rather than a reading of HQ (it lives in the header comment above), the
+// `(none locked yet)` phrase for an empty ledger (now `structures_total 0`), and the ✅/⋯ mark per
+// structure (now the `complete` boolean it was drawn from).
 function render(files) {
   const snap = computeSnapshot(files);
-  const out = [];
-  out.push(`progress_tracker · corporate HQ snapshot · ${snap.bots.length} bot(s) · updated ${ago(snap.updatedAt)}`);
-  out.push('(read-only observer of HQ — never writes, never alters, touches no bot)');
-  out.push('');
 
-  // STRUCTURES — the standing "what's built" ledger
-  out.push(`STRUCTURES  (${snap.structures.done}/${snap.structures.total} complete)`);
-  if (!snap.structures.total) out.push('  (none locked yet)');
-  for (const s of snap.structures.items) {
-    out.push(`  ${s.mark} ${s.name}`);
-    out.push(`       ${s.vox != null ? s.vox + ' vox · ' : ''}${s.locked} · ${s.state}`);
+  out.kv('lens', 'progress_tracker');
+  out.kv('source', 'corporate_headquarters');
+  out.kv('bots', snap.bots.length);
+  out.kv('hq_updated_ago', ago(snap.updatedAt));
+
+  // STRUCTURES — the standing "what's built" ledger. `state` and `materials` arrive already separate
+  // from computeSnapshot, so nothing is split back apart here: the one derivation emits two fields
+  // rather than one sentence, and every reader (this lens and dashboard.js) takes the half it wants.
+  out.section('structures');
+  out.kv('structures_complete', snap.structures.done);
+  out.kv('structures_total', snap.structures.total);
+  if (snap.structures.total) {
+    out.table(['structure', 'complete', 'voxels', 'buildspot', 'state', 'materials'],
+      snap.structures.items.map(s => [s.name, s.complete, s.vox, s.locked, s.state, s.materials]));
   }
-  out.push('');
 
-  // BOTS — what each is doing right now
-  out.push('BOTS  (doing now)');
-  for (const b of snap.bots) out.push(`  ${b.id.padEnd(9)} ${b.doing}`);
-  out.push('');
+  // BOTS — what each is doing right now. `doing` is HQ's own magnet coordinates, copied whole.
+  out.section('bots_doing_now');
+  out.table(['bot', 'doing', 'need', 'batch', 'where'],
+    snap.bots.map(b => [b.id, b.doing, b.need, b.batch, b.where]));
 
-  // QUEUE — outstanding jobs not yet finished
-  out.push(`QUEUE  (${snap.queue.count} job(s))`);
-  if (snap.queue.count) out.push('  ' + snap.queue.list);
-  out.push('');
+  // QUEUE — outstanding jobs not yet finished. The board's own `[asker/stage] type/what` coordinates.
+  out.section('queue');
+  out.kv('jobs', snap.queue.count);
+  if (snap.queue.count) out.list('job', snap.queue.list.split(' · '));
 
-  // SITE — supporting standing state (mining, exploration, logistics)
-  if (snap.site.length) { out.push('SITE'); out.push('  ' + snap.site.join(' · ')); }
-
-  return out.join('\n');
+  // SITE — supporting standing state (mining, exploration, logistics), each already a named fact and a
+  // value from computeSnapshot.
+  if (snap.site.length) {
+    out.section('site');
+    out.table(['fact', 'value'], snap.site.map(s => [s.fact, s.value]));
+  } else {
+    out.zero('site_facts');
+  }
 }
 
 // ── Main (CLI only; guarded so monitoring/dashboard.js can require the readers inert) ──
 if (require.main === module) {
   const files = loadHqFiles();
   if (!files.length) {
-    console.error('progress_tracker: no readable corporate_headquarters.*.json in ' + HQ_DIR +
-      ' — is the fleet up and past a first HQ write?');
+    console.error('progress_tracker: no readable corporate_headquarters.*.json in ' + HQ_DIR);
     process.exit(1);
   }
-  console.log(render(files));
+  // render writes every field through data_out; there is nothing left for this line to print.
+  render(files);
   process.exit(0);
 }
 

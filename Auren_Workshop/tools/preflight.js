@@ -1186,6 +1186,254 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
   console.log('Developer door OK — nothing in the workshop or the lenses runs without it.');
 }
 
+// ── PASS: A LENS PRINTS FIELD NAMES AND VALUES. IT HAS NO GRAMMAR TO STATE A CONCLUSION WITH ────────
+//
+// THE ASK (Architect 2026-09-16, replacing a vocabulary guard written earlier the same day):
+// *"First of all the bot has the right to interpret its own data because it's the one doing the
+// reasoning. Just like I can tell you why I made a choice so can the bot. Who cannot is the lens who had
+// no participation within the decision making process. The purpose of the lens is to extract data from
+// large files without reading it.*
+//
+// *So back to the guard. How about this. Each lens answers a question without any string… there's no
+// longer any sentences or grammar in the output of the monitor. It answers a question directly and
+// outputs the data directly. Then we can guard against it by checking to see if there's ever a string?…
+// The purpose is that if you prevent trace monitor from saying anything except variables and timestamps
+// then it can never interpret data right?"*
+//
+// ── WHY THE PREVIOUS SHAPE WAS WRONG, KEPT BECAUSE THE MISTAKE IS INSTRUCTIVE ───────────────────────
+// The first guard scanned printed strings for interpretive WORDS — `because`, `likely`, `not a fault`.
+// That is a BLACKLIST across an open field, and Law 29 names exactly what is wrong with one: it permits
+// everything it forgot to name. It could be walked around by a synonym, it argued with its own author
+// over `may` meaning PERMITTED rather than PERHAPS, and no list of words could ever catch an
+// interpretation phrased in words nobody thought of. It also could not say WHY a word was forbidden
+// except by asserting it.
+//
+// THE STRUCTURAL SHAPE NEEDS NO LIST. A lens that cannot form a SENTENCE cannot state a CONCLUSION.
+// Take prose out of the instrument and interpretation has nowhere to live — not because the words are
+// banned, but because there is no grammar left to carry them. That is a whitelist: field names, values,
+// timestamps, and by omission nothing else.
+//
+// ── WHERE INTERPRETATION IS STILL LEGAL, AND WHY THAT IS THE POINT RATHER THAN A HOLE ───────────────
+// THE BOT MAY INTERPRET ITSELF. `farm_manager` writing `[STUCK — nothing worked]` into the record is a
+// participant reporting its own reasoning, and it is the only thing in the system that was present for
+// that decision. A lens reproducing that text VERBATIM as a VALUE is copying, not claiming. What a lens
+// may never do is compose a sentence of its own ABOUT a value, because it was not there. So this pass
+// does not look at values at all — it looks at whether the lens AUTHORED any prose.
+//
+// ── THE RULE, AS TWO CHECKS (Law 29: one topic, one list, each check its own topic) ─────────────────
+// A. ONE PATHWAY TO THE ANSWER (Law 16). Nothing under `monitoring/` writes to stdout except
+//    `data_out.js`. Every lens hands it field names and values.
+// B. NO AUTHORED PROSE. No string literal containing a SPACE, outside the two files that own
+//    presentation. A literal without a space is a field name, a key, a flag or a bot name.
+//
+// ── THE EXEMPTIONS, NAMED HERE AND NOWHERE ELSE ─────────────────────────────────────────────────────
+// `data_out.js` and `report_formatting.js` are THE FORMATTING LAYER: they own every space, separator,
+// column width and timestamp shape in the output, which is precisely why no other file needs one.
+// `throw` text and `console.error` are a CRASH and an IO failure, not an answer about a run — they
+// report that the instrument could not read, never what a reading means.
+//
+// ── THE COSTS, NAMED RATHER THAN DISCOVERED ─────────────────────────────────────────────────────────
+// 1. A sentence could still be smuggled in as `rows_laid_far_too_few` — a field name with underscores
+//    for spaces. `data_out.field()` caps a name at 48 characters, but the real answer is that this is a
+//    thing somebody would have to do on purpose, and a guard's job is to stop the mistake that happens
+//    by accident while feeling helpful.
+// 2. A lens could route a report to `console.error` and escape check A. Same category: deliberate.
+// 3. Output stops reading like a report and starts reading like a table. That is the intended trade —
+//    a report is persuasive and a table is not, and the reader is meant to do the persuading.
+{
+  const LENS_DIR = 'monitoring';
+  const FORMATTING_LAYER = new Set(['data_out.js', 'report_formatting.js']);
+  const stdoutOffenders = [];
+  const proseOffenders = [];
+
+  for (const rel of shipped) {
+    const parts = rel.split(/[\\/]/);
+    if (parts[0] !== LENS_DIR || !/\.js$/.test(rel)) continue;
+    const base = parts[parts.length - 1];
+    const src = fs.readFileSync(path.join(BOT_DIR, rel), 'utf8');
+    let ast;
+    try { ast = espree.parse(src, { ecmaVersion: 'latest', loc: true }); } catch { continue; }
+
+    // ── CHECK A: who is allowed to write the answer ──────────────────────────────────────────────
+    if (base !== 'data_out.js') {
+      _walkNode(ast, (n) => {
+        if (n.type !== 'CallExpression') return;
+        const c = n.callee;
+        if (c.type !== 'MemberExpression' || c.computed) return;
+        const obj = c.object.name, prop = c.property.name;
+        if (obj === 'console' && prop === 'log') stdoutOffenders.push({ rel, line: n.loc.start.line, what: 'console.log' });
+        if (obj === 'stdout' && prop === 'write') stdoutOffenders.push({ rel, line: n.loc.start.line, what: 'stdout.write' });
+        if (c.object.type === 'MemberExpression' && c.object.object.name === 'process'
+          && c.object.property.name === 'stdout' && prop === 'write') {
+          stdoutOffenders.push({ rel, line: n.loc.start.line, what: 'process.stdout.write' });
+        }
+      });
+    }
+
+    // ── CHECK B: did the lens author prose ───────────────────────────────────────────────────────
+    if (FORMATTING_LAYER.has(base)) continue;
+
+    // A crash message and an IO failure are not an answer about a run. Marked, then skipped.
+    const exempt = new Set();
+    const markSubtree = (node) => {
+      if (!node || typeof node.type !== 'string') return;
+      exempt.add(node);
+      for (const k of Object.keys(node)) {
+        if (k === 'loc' || k === 'range') continue;
+        const ch = node[k];
+        if (Array.isArray(ch)) ch.forEach(markSubtree);
+        else if (ch && typeof ch.type === 'string') markSubtree(ch);
+      }
+    };
+    _walkNode(ast, (n) => {
+      if (n.type === 'ThrowStatement') markSubtree(n.argument);
+      if (n.type === 'NewExpression' && n.callee.name === 'Error') n.arguments.forEach(markSubtree);
+      if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && !n.callee.computed
+        && n.callee.object.name === 'console'
+        && (n.callee.property.name === 'error' || n.callee.property.name === 'warn')) {
+        n.arguments.forEach(markSubtree);
+      }
+      // `fail(...)` is trace_monitor's own abort — it prints to stderr and exits. A helper that WRAPS
+      // the error channel is still the error channel, and the alternative is every usage message being
+      // rewritten as fields, which would make a broken flag harder to diagnose rather than easier.
+      // Named here rather than inferred: a function is exempt because it is on this list, not because
+      // of what its body happens to do.
+      if (n.type === 'CallExpression' && n.callee.type === 'Identifier' && n.callee.name === 'fail') {
+        n.arguments.forEach(markSubtree);
+      }
+      // `process.stderr.write` is the same channel as console.error and was missed on the first cut:
+      // stderr carries what the instrument could not do, stdout carries what it read.
+      if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && !n.callee.computed
+        && n.callee.property.name === 'write' && n.callee.object.type === 'MemberExpression'
+        && n.callee.object.object.name === 'process' && n.callee.object.property.name === 'stderr') {
+        n.arguments.forEach(markSubtree);
+      }
+    });
+
+    // ── WHAT COUNTS AS PROSE, SHARPENED BY WHAT THE FIRST CUT CAUGHT ───────────────────────────────
+    // "Contains a space" was too blunt and its false positives were all one thing: PUNCTUATION. A lens
+    // legitimately holds `', '` to split the record on, `' · '` and `'|'` to join a value with, and
+    // `` `${m}m ${s}s` `` to shape a timestamp. None of those can carry a claim, because a claim needs
+    // WORDS. So the test is a space PLUS a run of two or more letters — which still catches every
+    // authored fragment (`'fed '`, `'queued behind '`, `'still running at trace end'`) and stops
+    // arguing with the separators. `'use strict'` is a directive to the engine, not output, and is the
+    // one worded literal named here.
+    const WORDED = /[A-Za-z]{2,}/;
+    _walkNode(ast, (n) => {
+      if (exempt.has(n)) return;
+      let text = null;
+      if (n.type === 'Literal' && typeof n.value === 'string') text = n.value;
+      else if (n.type === 'TemplateElement') text = n.value.cooked || '';
+      if (text === null || !/ /.test(text) || !WORDED.test(text)) return;
+      if (text === 'use strict') return;
+      proseOffenders.push({ rel, line: n.loc.start.line, text: text.trim().slice(0, 72) });
+    });
+  }
+
+  if (stdoutOffenders.length || proseOffenders.length) {
+    console.error('\nA LENS IS AUTHORING PROSE — the instrument can form a sentence, so it can state a conclusion.');
+    console.error('  A lens EXTRACTS data; it did not participate in the decision it is reporting on, so it has');
+    console.error('  no standing to say what the data means. The bot does, and a bot\'s own words copied into a');
+    console.error('  VALUE are fine. What is not fine is the lens writing a sentence of its own.');
+    if (stdoutOffenders.length) {
+      console.error(`\n  ${stdoutOffenders.length} write(s) to stdout outside data_out.js — route them through it:`);
+      console.error("      const out = require('./data_out');   out.section('...'); out.kv('field', value);");
+      for (const o of stdoutOffenders) console.error(`      ${o.rel}:${o.line}   ${o.what}`);
+    }
+    if (proseOffenders.length) {
+      console.error(`\n  ${proseOffenders.length} authored string(s) containing a space — a field name has none:`);
+      for (const o of proseOffenders) console.error(`      ${o.rel}:${o.line}   "${o.text}"`);
+    }
+    process.exit(1);
+  }
+  console.log('Lens output OK — field names and values only; no lens can author a sentence.');
+}
+
+// ── PASS: THE FLEET NEVER REACHES FOR A LENS (Architect 2026-09-16, STANDING) ────────────────────────
+//
+//   "Nothing should be using trace monitor while the bot is online, its post Mortem only. Run.js should
+//    be talking directly to the program it needs... It should skip that and talk directly. Make sure no
+//    live code program uses a lens or monitor and talks directly to the system needed"
+//
+// ── WHAT THIS PASS CAN PROVE, AND WHAT IT DELIBERATELY LEAVES TO THE GATE ───────────────────────────
+// "Live" is a property of WHEN a program runs, and no static scan can see when. So this pass proves the
+// half that IS structural — the half where "live" is not a moment but an identity.
+//
+// THE CONSTRUCT IS LIVE BY DEFINITION. Everything under `Auren_Bot/` that is not `monitoring/` and not
+// `Auren_Workshop/` exists only to be a running bot: the kernel, the thinking and action fragments, the
+// perception nodes, the overseer, the foreman, master_core. There is no hour of the day at which one of
+// those files is doing a post-mortem. So a require or a spawn of a lens from any of them is wrong in
+// every possible execution, which makes it exactly the kind of thing a file scan can settle (Law 13).
+//
+// The workshop is NOT scanned here and that is not an oversight. A bench legitimately does both — it
+// drives a fleet and then reports on it — so its lens reads are governed by WHEN, which is the gate's
+// job (`monitoring/post_mortem_gate.js`): a captured read of a record that is still being written is
+// refused at the instrument, whoever is asking. Two mechanisms, one for each half of the rule, and
+// neither pretending to cover the other's (Law 29 — one topic, one list).
+//
+// WHY A FLEET REACHING FOR A LENS IS A FAULT AND NOT A SHORTCUT. `record_homes` states the shape the
+// records were given: the traces are EXHAUST, and *"nothing in the running fleet reads it."* A bot that
+// read one would be deriving its own behaviour from a description of its own past behaviour — a loop
+// through a file, where a direct question to the owning module is one call (Law 16). It also breaks the
+// records room's one guarantee: a start empties it whole, so a bot reading it mid-run reads a file that
+// may have been deleted underneath it.
+{
+  const lensOffenders = [];
+  // The permitted readers, named positively: the lenses themselves, and the workshop, whose live reads
+  // the gate governs instead. Everything not on this list is the construct.
+  const LENS_READERS = ['monitoring', 'Auren_Workshop'];
+  // A path is a lens reach when it names either lens directory. Matched on the require STRING rather
+  // than resolved, because a resolver would follow `paths.bot(...)` into a computed value and the thing
+  // being forbidden is the reach itself, however it is spelled.
+  const REACHES_LENS = /(^|[\\/])(monitoring)[\\/]/;
+  const SPAWNERS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
+
+  for (const rel of shipped) {
+    const parts = rel.split(/[\\/]/);
+    if (LENS_READERS.includes(parts[0]) || !/\.js$/.test(rel)) continue;
+    const src = fs.readFileSync(path.join(BOT_DIR, rel), 'utf8');
+    let ast;
+    try { ast = espree.parse(src, { ecmaVersion: 'latest', loc: true }); } catch { continue; }
+
+    // Every string literal that names a lens, wherever it sits in a call — this catches
+    // `require('../monitoring/x')`, `spawnSync(node, [paths.bot('monitoring', 'trace_monitor.js')])`
+    // and `paths.bot('monitoring/trace_read')` alike, because all three spell the reach out loud.
+    _walkNode(ast, (n) => {
+      if (n.type !== 'CallExpression') return;
+      const c = n.callee;
+      const name = c.type === 'Identifier' ? c.name
+        : (c.type === 'MemberExpression' && !c.computed ? c.property.name : null);
+      const isReach = name === 'require' || SPAWNERS.has(name) || name === 'bot' || name === 'join';
+      if (!isReach) return;
+      for (const a of n.arguments) {
+        if (a.type !== 'Literal' || typeof a.value !== 'string') continue;
+        // `'monitoring'` as a bare segment counts too: `paths.bot('monitoring', 'trace_monitor.js')`
+        // splits the reach across two arguments and would otherwise read as innocent.
+        if (REACHES_LENS.test(a.value) || a.value === 'monitoring') {
+          lensOffenders.push({ rel, line: n.loc.start.line, what: `${name}(… '${a.value}' …)` });
+          return;
+        }
+      }
+    });
+  }
+
+  if (lensOffenders.length) {
+    console.error('\nTHE CONSTRUCT IS REACHING FOR A LENS — live code reading its own exhaust.');
+    console.error('  A lens reconstructs a run that is OVER. A running bot asking one is reading a description');
+    console.error('  of its own past behaviour out of a file, when the module that owns the fact is one call');
+    console.error('  away (Law 16) — and that file is emptied whole by the next start, so it may vanish mid-read.');
+    console.error('  Architect 2026-09-16: "Make sure no live code program uses a lens or monitor and talks');
+    console.error('  directly to the system needed."');
+    console.error(`\n  ${lensOffenders.length} reach(es) from inside the construct:`);
+    for (const o of lensOffenders) console.error(`      ${o.rel}:${o.line}   ${o.what}`);
+    console.error('\n  The repair is to ask the owner directly. Whoever WROTE the line you were going to read');
+    console.error('  out of the record still has the fact in memory — take it from there, or have it state');
+    console.error('  the fact as a field the way job_board now states `dead` on the boardroom chair.');
+    process.exit(1);
+  }
+  console.log('Lens reach OK — nothing in the construct reads a run record; the fleet answers for itself.');
+}
+
 const shape = scanCatchShape();
 if (shape.total === 0) {
   console.log('Catch shape OK — every boundary goes through external_library_guard.');

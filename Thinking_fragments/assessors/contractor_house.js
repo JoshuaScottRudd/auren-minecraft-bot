@@ -61,11 +61,12 @@ function assess() {
     // build_center in one pass, and it is the only thing holding the whole layout's non-overlap picture
     // at once — a locate call from here would see the locked buildings but not the ones that batch is
     // still surveying. Unsited is therefore an ordinary early state, not a fault: ask, and post nothing.
+    // `built` is this structure's verdict for the setup gate (architect_config SETUP_ORDER). Unsited is not built.
     const center = readBuildCenter(BLUEPRINT);
-    if (!center) return { jobs };
+    if (!center) return { jobs, built: { [BLUEPRINT]: false } };
 
     const result = buildingIntegrity.scan(bot, BLUEPRINT, BLUEPRINT);
-    if (result.all_complete === true) return { jobs };
+    if (result.all_complete === true) return { jobs, built: { [BLUEPRINT]: true } };
 
     // ONE credited pool for the gate and the order alike — the same set preconstruction withdraws from
     // (Law 16). Three pools would order material the build is already standing on.
@@ -85,7 +86,7 @@ function assess() {
 
     // Anchors exist and none of them blocks: every remaining voxel is optional, so the buildable work is
     // done even though the scan will keep reporting incomplete. Posting here would spin.
-    if (anchors.length > 0 && !nextAnchor) return { jobs };
+    if (anchors.length > 0 && !nextAnchor) return { jobs, built: { [BLUEPRINT]: true } };
 
     const materialsNeeded = nextAnchor ? (nextAnchor.materials_needed || {}) : (result.materials_needed || {});
     const remaining = Object.fromEntries(
@@ -115,6 +116,7 @@ function assess() {
             jobs.push(supplyJob({
                 id: `contractor_house_supply_${raw}`, what: raw, need: gap,
                 where: null,
+                structure: BLUEPRINT,
                 job_type: JOB_TYPE.resource_baseline,
                 claimed_by: null,
                 hold_goal: countInInventory(raw, inventory) + gap,
@@ -129,7 +131,7 @@ function assess() {
             `— order (short): ${ordered.join(', ')}`);
         // buildClaim: material this build has spoken for, so the storage layer above does not count it
         // twice. It is the SHORTFALL and not the requirement — what the build already holds is in the pool.
-        return { jobs, pullNeeded, buildClaim: { ...pullNeeded, ...shortRaw } };
+        return { jobs, pullNeeded, buildClaim: { ...pullNeeded, ...shortRaw }, built: { [BLUEPRINT]: false }, claim_structure: BLUEPRINT };
     }
 
     // ── FULLY STAGED — POST THE BUILD ──────────────────────────────────────────────────────────────
@@ -142,10 +144,11 @@ function assess() {
         job_type: JOB_TYPE.building_contractor_house,
         claimed_by: null,
         step: TYPE_STRUCTURE_COMPLETE,
+        structure: BLUEPRINT,
         scope: 'shared',
         ...(nextAnchor ? { anchor_index: nextAnchor.anchor_index } : {}),
     });
-    return { jobs };
+    return { jobs, built: { [BLUEPRINT]: false } };
 }
 
 module.exports = { name: 'contractor_house', assess };

@@ -37,7 +37,6 @@
 require('../js_kernel/utils/developer_door').enter('Auren_Workshop/host_and_run.js');
 
 const fs = require('fs');
-const net = require('net');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
@@ -46,7 +45,19 @@ paths.registerAliases();
 const workstation = require(paths.bot('js_kernel/utils/workstation'));
 const consoleWindow = require(paths.bot('js_kernel/utils/console_window'));
 const rcon = require(paths.bot('js_kernel/utils/rcon_link'));
+const serverSettings = require(paths.bot('js_kernel/utils/server_settings'));
 const { guardExternal } = require(paths.bot('js_kernel/utils/external_library_guard'));
+// The run's own report of itself. THIS script needs it as much as `run.js` does, and for a sharper
+// reason: a bring-up failure never reaches `run.js` at all, so without this the only record of what went
+// wrong is console text. That is exactly the case the Architect named on 2026-09-16 — no Java on the
+// PATH, surfacing as a node stack trace wrapped in a PowerShell error, with the one line that mattered
+// four screens up. What this file writes is BLOCKED: nothing was measured, which is a different answer
+// from a run that measured a failure (see run_outcome.js).
+const outcome = require('./run_outcome');
+const HOST_STARTED_AT = new Date().toISOString();
+const blocked = (stage, reason) => process.exit(outcome.write({
+  outcome: 'BLOCKED', stage, reason, startedAt: HOST_STARTED_AT, reportedBy: 'host_and_run', exitCode: 1,
+}));
 
 // ONLY THE `hosting` BLOCK. `run.js` owns the other one and validates it for itself; this file never
 // reads it, so a fault in the run's settings is reported by the run's own refusal, in the run's own words.
@@ -59,7 +70,7 @@ function refuse(lines) {
   console.error(`\n  host_and_run: NOTHING WAS STARTED — the world was not touched.\n`);
   for (const l of lines) console.error(`    ${l}`);
   console.error(``);
-  process.exit(1);
+  blocked('preconditions', lines[0] || 'a precondition refused the run');
 }
 
 // ── EVERYTHING IS PROVED BEFORE THE SERVER IS STOPPED, NOT DURING THE ROLLBACK (Law 13) ─────────────
@@ -119,15 +130,6 @@ function fleetControl(args) {
   return r.status === 0;
 }
 
-function portAnswers(port) {
-  return new Promise(resolve => {
-    const s = net.connect({ host: '127.0.0.1', port, timeout: 1500 });
-    s.once('connect', () => { s.destroy(); resolve(true); });
-    s.once('timeout', () => { s.destroy(); resolve(false); });
-    s.once('error', () => resolve(false));
-  });
-}
-
 function propsValue(key) {
   if (!fs.existsSync(PROPS_FILE)) return '';
   const m = new RegExp(`^${key.replace(/\./g, '\\.')}=(.*)$`, 'm').exec(fs.readFileSync(PROPS_FILE, 'utf8'));
@@ -151,17 +153,14 @@ function propsValue(key) {
 // and the port never opens, so blanking it removes the console rather than the password. Minting removes
 // it from HIS side instead — nothing to choose, nothing to remember, nothing typed, and no credential
 // sitting in a tracked file for the extract to carry.
+//
+// THE MINT ITSELF IS `server_settings.prepare` — the same writer a stranger's `start_auren.js` uses, so
+// the settings the fleet needs and the one-time password have one author (Law 16). `serverUp: false` is a
+// sensed fact at the one call site: the start refuses above if any world is answering.
 function mintConsolePassword() {
-  // Random per run, so it is never a shared secret and never the same twice. Not cryptographic and it does
-  // not need to be: it authenticates this machine to a loopback port on a world it just created.
-  const token = `auren-${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 6)}`;
-  const before = fs.readFileSync(PROPS_FILE, 'utf8');
-  const after = /^rcon\.password=.*$/m.test(before)
-    ? before.replace(/^rcon\.password=.*$/m, `rcon.password=${token}`)
-    : `${before.replace(/\s*$/, '')}\nrcon.password=${token}\n`;
-  // Written before the server BOOTS, because the server reads this file once at boot.
-  fs.writeFileSync(PROPS_FILE, after);
-  return token;
+  const prep = serverSettings.prepare(SERVER_FOLDER, { serverUp: false });
+  for (const c of prep.changes) say(`server.properties  ${c.key}  — ${c.why}`);
+  return prep.password;
 }
 
 (async () => {
@@ -179,7 +178,7 @@ function mintConsolePassword() {
   phase('every terminal closed?');
   const open = consoleWindow.openWindows();
   const serverPort = Number(propsValue('server-port')) || 25565;
-  const worldUp = await portAnswers(serverPort);
+  const worldUp = await serverSettings.serverAnswers(serverPort);
   if (open.length || worldUp) {
     refuse([
       `${consoleWindow.describeWindows(open)}.`,
@@ -199,7 +198,7 @@ function mintConsolePassword() {
     if (!fleetControl(['snapshot-restore', `--world=${CONFIG.worldName}`, `--snapshot=${CONFIG.snapshot}`])) {
       console.error(`\n  host_and_run: the world could not be rolled back to '${CONFIG.snapshot}'. NOTHING was`);
       console.error(`  started — a fresh run on last run's world is not the run that was asked for.\n`);
-      process.exit(1);
+      blocked('world_rollback', `the world could not be rolled back to '${CONFIG.snapshot}'`);
     }
     say(`rolled back to '${CONFIG.snapshot}'`);
   } else {
@@ -209,7 +208,7 @@ function mintConsolePassword() {
   phase('start the world');
   if (!fleetControl(['server-start'])) {
     console.error(`\n  host_and_run: the server did not come up, so nothing joined it.\n`);
-    process.exit(1);
+    blocked('server_start', 'the server did not come up, so nothing joined it — the server-start output above carries the reason it gave');
   }
   say('the world is up');
 
@@ -265,5 +264,28 @@ function mintConsolePassword() {
   }
 
   console.log(`\n══ host_and_run finished — the run ${code === 0 ? 'PASSED' : `exited ${code}`} ══\n`);
-  process.exit(code);
+
+  // ── THE INNERMOST THING THAT ACTUALLY RAN OWNS THE OUTCOME ────────────────────────────────────────
+  // `run.js` writes the full record — every check, the wake, the timings — so this file must not
+  // overwrite it with the thinner view it has from out here (Law 16: one writer per fact). It reads that
+  // record back and echoes the headline instead.
+  //
+  // THE ONE CASE IT DOES WRITE is the gap that would otherwise swallow the worst failure of all: a child
+  // that died without stating anything — killed, out of memory, a hard exit past its own handlers. An
+  // exit code alone is not an outcome, and a reader finding LAST run's file sitting there would read a
+  // stale answer as this run's (Invariant B). The `started_at` comparison is what makes the difference
+  // between "it reported" and "something old is lying here" observable rather than assumed.
+  const file = outcome.outcomeFile();
+  const stated = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null;
+  const fresh = stated && stated.started_at && Date.parse(stated.started_at) >= Date.parse(HOST_STARTED_AT);
+  if (fresh) {
+    console.log(`  the run stated its own outcome: ${stated.outcome} — ${stated.reason || 'no reason given'}`);
+    console.log(`  read it whole at: ${file}\n`);
+    process.exit(code);
+  }
+  process.exit(outcome.write({
+    outcome: 'CRASHED', stage: 'run_js',
+    reason: `run.js exited ${code} without stating an outcome — it died past its own reporting`,
+    startedAt: HOST_STARTED_AT, reportedBy: 'host_and_run', exitCode: code || 1,
+  }));
 })();

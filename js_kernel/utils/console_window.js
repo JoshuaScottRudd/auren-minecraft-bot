@@ -239,14 +239,32 @@ function followFile({ title, logFile, style }) {
 // returned false, `closeStale` filtered every pid out of its own result, and `down` printed nothing
 // while actually reaping four windows. The reap was never broken. From the outside a reaper that does
 // nothing and a reaper that does not say so are the same picture, and only a probe separates them.
+//
+// THE WINDOW IS A TREE, AND THE LEDGER HOLDS ONLY ITS ROOT. A window opened here is a `powershell` that
+// runs the real work as its CHILD — `fleet-console` runs `trace.ps1`, which runs `node trace_monitor.js
+// --follow`. Windows does not end a child with its parent, so killing the root alone left that node alive
+// with no ledger entry: the teardown printed `closed`, the next start gate printed `no terminals open`,
+// and three such followers from earlier runs were found still running days later (Law 8 zombies). So the
+// close walks the root's descendants first — each one started no earlier than its parent, because Windows
+// recycles pids and a stale ParentProcessId can name a stranger — ends them deepest-first and then the
+// root, and reports `gone` only when every process in the tree is gone.
 const CLOSE_WAIT_MS = 5000;
 function closeWindow(pid) {
   if (!isWindows() || !Number.isInteger(pid)) return false;
   const res = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
-    `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; `
-    + `if ($p) { $p.Kill(); $null = $p.WaitForExit(${CLOSE_WAIT_MS}) }; `
-    + `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { [Console]::Out.Write('alive') } `
-    + `else { [Console]::Out.Write('gone') }`], { encoding: 'utf8' });
+    `$all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate); `
+    + `$root = $all | Where-Object { $_.ProcessId -eq ${pid} }; `
+    + `$tree = @(); if ($root) { $tree = @($root) }; `
+    + `for ($i = 0; $i -lt $tree.Count; $i++) { `
+    + `  $parent = $tree[$i]; `
+    + `  $tree += @($all | Where-Object { $_.ParentProcessId -eq $parent.ProcessId -and $_.CreationDate -ge $parent.CreationDate }) }; `
+    + `$ids = @($tree | ForEach-Object { $_.ProcessId }); `
+    + `[array]::Reverse($ids); `
+    + `foreach ($id in $ids) { $p = Get-Process -Id $id -ErrorAction SilentlyContinue; `
+    + `  if ($p) { $p.Kill(); $null = $p.WaitForExit(${CLOSE_WAIT_MS}) } }; `
+    + `$left = @(@($ids) + ${pid} | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }); `
+    + `if ($left.Count) { [Console]::Out.Write('alive') } else { [Console]::Out.Write('gone') }`],
+    { encoding: 'utf8' });
   return (res.stdout || '').trim() === 'gone';
 }
 

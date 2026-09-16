@@ -42,7 +42,7 @@ const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const { requirementTree } = require('@utils/calculators/build_material_calculator');
 const { routeSignal } = require('@utils/signal_utils');
 const stationRegistry  = require('@perception/station_registry');
-const { applyGates } = require('@thinking/job_gates');
+const { applyGates, setupWaitingOn } = require('@thinking/job_gates');
 const jobRanking = require('@thinking/job_ranking');
 const inventoryLens = require('@kernel/inventory_lens');
 const overseerLink = require('@kernel/overseer_link');
@@ -114,6 +114,23 @@ function _readInventory() {
 // compete for a bot will always lose; the fix was to stop needing one, not to re-rank it. The bin waits for
 // the next dump, which the fleet does constantly. See compost_executor's header.
 
+// ── A STRUCTURE BECOMING BUILT IS AN EVENT, AND IT IS SAID ONCE (Architect 2026-09-15) ──
+// The headframe clock (architect_config HEADFRAME_CLOCK) needs the moment the whole structure first stood, and
+// `built` is recomputed every sweep, so only its CHANGES are written: false→true is BUILT, true→false is a warning
+// that it was damaged and every structure waiting on it is held again. A structure already standing at this
+// process's first sweep is written as found standing — a continued world, never a build this crew timed.
+// The last sweep's verdicts are the one piece of memory here, and they exist only to find an edge (Law 5).
+let _builtLastSweep = null;
+function _announceBuiltChanges(built) {
+  for (const [name, isBuilt] of Object.entries(built)) {
+    const was = _builtLastSweep ? _builtLastSweep[name] : undefined;
+    if (was === undefined && isBuilt) watcher.summary(TAG, `🏠 STRUCTURE STANDING AT FIRST SWEEP: '${name}' — found built, not timed`);
+    else if (was === false && isBuilt) watcher.summary(TAG, `🏁 STRUCTURE BUILT: '${name}'`);
+    else if (was === true && !isBuilt) watcher.warn(TAG, `STRUCTURE UN-BUILT: '${name}' — damaged; structures waiting on it are held again`);
+  }
+  _builtLastSweep = { ...built };
+}
+
 // ── THE MAIN SWEEP ──
 // Assessments run in the registry's EVALUATE order, which is not the order the board prints in — the
 // sort at the end is for the READER, and reordering the assessors to "match" it would silently break the
@@ -156,6 +173,24 @@ function _sweep() {
         delete boardroom.request_progress;
         delete boardroom.request_progress_at;
     }
+    // ── WHETHER THERE IS A BODY, SAID OUT LOUD ON THE SAME CHANNEL (Architect 2026-09-16) ────────────
+    // *"Run.js should be talking directly to the program it needs… not asking trace monitor who checks
+    // the file which was written by the program that it needs its answer from."*
+    //
+    // A supervisor watching a run has always needed to know that a bot died, and until this date the
+    // only route to that fact was a lens matching the ☠️ line below out of the trace FILE while the
+    // fleet was still running. The predicate is right here, one line above the warning, and the chair is
+    // already the channel by which everything a body knows reaches the overseer — so the fact travels as
+    // a field instead of as a sentence somebody else has to find. Same argument as request_progress
+    // above: a second sync for one more fact would be the parallel route Law 16 refuses.
+    //
+    // WRITTEN ON EVERY SWEEP, NOT ONLY WHEN IT IS TRUE. A flag that is only ever set stays set after the
+    // respawn, and a run would report a bot dead for the rest of its window on the strength of one bad
+    // minute it fully recovered from (Invariant B). `dead_at` is kept only while dead, for the same
+    // reason the measurements beside it carry their age.
+    boardroom.dead = require('@kernel/body_recovery').isDead(global.bot);
+    if (boardroom.dead) boardroom.dead_at = boardroom.dead_at || now;
+    else delete boardroom.dead_at;
     hq.writeBoardroomChair(botId, boardroom);
 
     const invList = Object.entries(inventory)
@@ -209,15 +244,34 @@ function _sweep() {
     // the announcement, and the evaluate order is the phasing).
     // Passed rather than published: a chair would make it remembered state read a sweep late, and the
     // one number that must be fresh is the one everything above it subtracts (Invariant B).
+    //
+    // A STRUCTURE THAT MAY NOT START CLAIMS NOTHING AND PULLS NOTHING (Architect 2026-09-15: *"the whole process
+    // should be gated... no part of any other blueprint can start like craft gather or build"*). The setup gate
+    // holds its jobs; this holds the two things an assessor declares outside a job — the build claim (stock the
+    // storage layer must not count) and the mining pull. An assessor names the structure both belong to in
+    // `claim_structure`; `built` travels forward like the claim, so the evaluate order runs the setup structures
+    // (building → farming → contractorHouse) before anything that subtracts their claim.
     const results = new Map();
     const buildClaim = {};
+    const built = {};
+    const claimWaits = (result) => !!result.claim_structure && !!setupWaitingOn(result.claim_structure, built);
     for (const assessor of registry.EVALUATE_ORDER) {
         const result = assessor.assess({ inventory, buildClaim });
         results.set(assessor, result);
+        // WHICH STRUCTURES ARE BUILT, as each structure's own assessor measured it this sweep. Two assessors
+        // reporting one structure differently is a wiring fault, not a tie to break.
+        for (const [name, isBuilt] of Object.entries(result.built || {})) {
+            if (name in built && built[name] !== (isBuilt === true)) {
+                throw new Error(`[${TAG}] CODING VIOLATION (Law 13): two assessors disagree whether '${name}' is built.`);
+            }
+            built[name] = isBuilt === true;
+        }
+        if (claimWaits(result)) continue;
         for (const [item, count] of Object.entries(result.buildClaim || {})) {
             buildClaim[item] = (buildClaim[item] || 0) + count;
         }
     }
+    _announceBuiltChanges(built);
 
     // Law 18 counter-directional phasing: assemble order runs most-urgent → most-stable. Hunger (survival)
     // leads — a starving bot eats before anything (Law 17). It decides nothing about what is CLAIMED (the
@@ -242,8 +296,9 @@ function _sweep() {
     // difference is only that the list can no longer go stale (Law 16).
     const mergedPull = {};
     for (const assessor of registry.EVALUATE_ORDER) {
-        const src = results.get(assessor).pullNeeded;
-        for (const [item, count] of Object.entries(src || {})) {
+        const result = results.get(assessor);
+        if (claimWaits(result)) continue;   // a waiting structure sends nobody mining for it
+        for (const [item, count] of Object.entries(result.pullNeeded || {})) {
             mergedPull[item] = Math.max(mergedPull[item] || 0, count);
         }
     }
@@ -252,6 +307,7 @@ function _sweep() {
         inventory,
         allStations: stationRegistry.getStations(),
         pullNeeded: mergedPull,
+        built,
     });
 
     // ── SECTION 4.5c — THE RANK IS COMPOSED HERE, AFTER THE GATES, AND ONLY HERE ─────────────────────

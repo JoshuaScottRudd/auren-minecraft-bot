@@ -327,6 +327,11 @@ function handleRegister(ws, msg) {
     return;
   }
 
+  // A BOT THAT CAME BACK IS NOT A DEPARTED BOT. death_manager relaunches a body deliberately, and a
+  // reconnect that left its own departure standing would wake a run for a recovery that WORKED — a
+  // false alarm, which costs more than the alarm is worth (Law 25). The departure is the fact that a
+  // bot left and did not return; this line is what makes that true rather than approximately true.
+  departedBots.delete(botId);
   botClients.set(botId, {
     ws,
     mode: mode.trim().toLowerCase(),
@@ -438,10 +443,72 @@ function handlePlanningRelease(ws, msg) {
 // Print a bot's forwarded log line so both bots can be watched in one place. The line already
 // carries its own runtime tag + stage; we splice the bot id in right after the tag so the stream
 // reads uniformly:  [0m 35s] [AurenBot] [LOCOMOTION_DISPATCHER] 📊 …  (printed raw, not via log()).
+// ── THE LIVE FAULT TALLY (Architect 2026-09-16) ─────────────────────────────────────────────────────
+// *"Nothing should be using trace monitor while the bot is online, its post Mortem only. Run.js should
+// be talking directly to the program it needs… not asking trace monitor who checks the file which was
+// written by the program that it needs its answer from."*
+//
+// Until this date the only way for a supervisor to learn that the fleet had errored was to read the
+// trace file through a lens WHILE THE FLEET WAS STILL RUNNING — three hops (bot writes → file → lens
+// reads → parses its own prose) to recover a fact that passed through this very function, live, and was
+// thrown away. This is the first hop, and it is the only one that has a witness: every bot's error()
+// forwards here the instant it fires.
+//
+// IT IS A COUNT OF A FIELD, NOT A READING OF A LINE (Law 3 — the overseer stays passive). The watcher
+// states which channel it used and that word arrives as `level`; nothing here inspects the text, decides
+// what a fault is, or ranks one line above another. A line whose level is absent is counted as
+// `unlabelled` rather than guessed at, so an old bot build talking to a new overseer under-reports
+// visibly instead of being silently scored as clean (Law 25).
+//
+// `last_error` is the bot's OWN line, carried verbatim. The bot participated in the decision it is
+// reporting and may say why; this process did not and only relays it (the emitter-authority rule).
+const LOG_LEVELS = ['summary', 'warn', 'error', 'context', 'unlabelled'];
+const logTally = new Map();   // bot_id → { summary, warn, error, context, unlabelled, last_error }
+
+// ── A BOT THAT LEAVES IS REMEMBERED AS HAVING LEFT (Architect 2026-09-16) ───────────────────────────
+// *"if bots crash it should still end the run and wake you to investigate."*
+//
+// `botClients.delete(botId)` on close is correct and stays: a chair is a live bot's inventory and must
+// die with the connection, or the foreman hires a corpse and the camera warden films an empty chair.
+// But deleting the CLIENT deleted the only evidence the bot was ever here, so a crashed bot did not read
+// as a fault — it read as a smaller fleet. A supervisor polling the roster saw one bot where there had
+// been two and had nothing to compare against; the run soaked out its whole window beside a dead crew.
+//
+// AN ABSENCE IS ONLY A FAULT AGAINST A MEMORY OF PRESENCE. That memory is this map, and it is the whole
+// mechanism: the departure is a FACT the overseer witnessed (it held the socket that closed), not an
+// inference anybody downstream has to make by diffing two polls of their own.
+//
+// It rides in `fleet_state` as its own key rather than inside `bots`, because every existing reader of
+// that array treats a member as a bot it may act on — hire it, film it, send it a verb. A departed bot
+// appearing among them would be a ghost in all three (Law 8). One question, one answer, and the new fact
+// beside the old one instead of hidden inside it.
+const departedBots = new Map();   // bot_id → { gone_at, last_error }
+
+function _tallyFor(botId) {
+  let t = logTally.get(botId);
+  if (!t) {
+    t = { last_error: null };
+    for (const k of LOG_LEVELS) t[k] = 0;
+    logTally.set(botId, t);
+  }
+  return t;
+}
+
+// Handed to the fleet-state answer. A bot with no forwarded line yet reads as all-zero rather than
+// absent: it is registered, so silence from it is a measurement and not a gap.
+function tallyOf(botId) {
+  const t = logTally.get(botId) || _tallyFor(botId);
+  return { ...t };
+}
+
 function handleLog(msg) {
   const botId = msg.bot_id;
   const line = msg.payload && msg.payload.line;
   if (typeof line !== 'string') return;
+  const level = (msg.payload && msg.payload.level) || null;
+  const t = _tallyFor(botId);
+  t[LOG_LEVELS.includes(level) ? level : 'unlabelled']++;
+  if (level === 'error') t.last_error = line;
   const idx = line.indexOf('] ');
   const tagged = idx >= 0
     ? `${line.slice(0, idx + 1)} [${botId}]${line.slice(idx + 1)}`
@@ -762,6 +829,13 @@ function handleOperatorCommand(ws, msg, origin) {
 // A NULL IS AN ANSWER. No magnet is a bot holding no job — genuinely idle — and no body_cell is a bot
 // that has not reported a position yet. Both are facts, and the desk says so in words rather than
 // printing a zero for either (Law 25 — the absence is not a failure, and inventing a figure to fill it is).
+//
+// IT CARRIES THE LIVE FAULT TALLY TOO, and that is why a supervisor no longer needs a lens (Architect
+// 2026-09-16). The counts are spread in beside the roster fields rather than answered by a second
+// question, because "how is the fleet" is one question and splitting it would give a caller two
+// answers taken at two different instants (Law 16). A bot that has died still appears here — the
+// registry holds connection rather than life — so its error count survives its body, which is exactly
+// what a run verdict needs.
 function handleFleetQuery(ws, msg) {
   const bots = [...botClients.entries()].map(([id, c]) => ({
     id,
@@ -769,9 +843,17 @@ function handleFleetQuery(ws, msg) {
     owner: c.owner,
     body_cell: (c.boardroom_chair && c.boardroom_chair.body_cell) || null,
     magnet: (c.boardroom_chair && c.boardroom_chair.magnet) || null,
+    // The body's own answer about whether it has a body, written by job_board every sweep. `null` is
+    // "it has not said yet" and is a different answer from `false` — a bot that has never swept cannot
+    // be reported alive on this process's guess (Law 25).
+    dead: (c.boardroom_chair && typeof c.boardroom_chair.dead === 'boolean') ? c.boardroom_chair.dead : null,
+    ...tallyOf(id),
   }));
+  // Departed bots ride beside the roster, never inside it — see departedBots' header for why that
+  // separation is load-bearing for the foreman and the camera warden.
+  const departed = [...departedBots.entries()].map(([id, d]) => ({ id, ...d, ...tallyOf(id) }));
   if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(createEnvelope('fleet_state', 'overseer', { bots })));
+    ws.send(JSON.stringify(createEnvelope('fleet_state', 'overseer', { bots, departed })));
   }
 }
 
@@ -932,6 +1014,10 @@ function onConnection(ws) {
     for (const [botId, client] of botClients) {
       if (client.ws === ws) {
         log(`Bot '${botId}' disconnected.`);
+        // Recorded BEFORE the delete, so the tally this bot accumulated travels with the departure —
+        // a crash usually says something on its way out, and that last line is the first thing anyone
+        // investigating will want. See departedBots' header.
+        departedBots.set(botId, { gone_at: new Date().toISOString(), last_error: tallyOf(botId).last_error });
         botClients.delete(botId);
         brain.releaseForBot(botId);
         broadcastBoardroom();

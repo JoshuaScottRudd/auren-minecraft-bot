@@ -84,7 +84,7 @@ const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const { sleep, getBotInventory, group_to_item } = require('@utils/fragment_utils');
 const { STONE_PROSPECT } = require('@thinking/architect_config');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
-const overseerLink = require('@kernel/overseer_link');
+const { claimFirst, releaseTarget } = require('@utils/target_claims');
 
 const TAG = 'stone_prospect_executor';
 
@@ -197,32 +197,27 @@ module.exports = {
 
         const held0 = countInInventory(YIELD_ITEM, getBotInventory());
 
-        let column = null, columnKey = null, peerHeld = 0, unreachable = 0, skipped = 0;
-        for (const candidate of columns) {
-            if (unreachable >= STONE_PROSPECT.max_approaches) break;
-            const key = _columnKey(candidate);
-            // Skipped BEFORE the claim: claiming a column this job has already proved unworkable takes
-            // it away from a peer whose approach might succeed where this body's did not.
-            if (spent.includes(key)) { skipped++; continue; }
-            const claim = await overseerLink.requestClaim(key);
-            if (!claim?.granted) { peerHeld++; continue; }
-
-            // Stand on top of the column before opening it. goToStand converts "this block" into "the
-            // cell above it", which is the one place the descent can begin from.
-            const approach = await locomotion.goToStand({ x: candidate.x, y: candidate.surfaceY, z: candidate.z });
-            const stood = bot.entity.position.floored();
-            // ARRIVAL IS RE-SENSED, NEVER TRUSTED: goTo resolves successfully at the CLOSEST reachable
-            // cell when the exact one is not reachable, so `arrived` alone would let the bot open a
-            // shaft at whatever XZ it happened to stop at — a column nothing scanned (Law 25: a success
-            // flag is not a measurement).
-            if (approach?.arrived && stood.x === candidate.x && stood.z === candidate.z) {
-                column = candidate; columnKey = key; break;
-            }
-            // Claimed but not reached: free it immediately so a peer standing nearer than this body can
-            // take it. Holding it until the trip ends would make one bot's bad route another's outage.
-            overseerLink.releaseClaim(key);
-            unreachable++;
-        }
+        // Claim-reach-release through target_claims, the one walk trees, stone columns and grass share (Law 16).
+        // A column this job already proved unworkable is skipped BEFORE the claim, so a peer whose approach might
+        // succeed where this body's did not is not locked out.
+        const walk = await claimFirst(columns, {
+            keyOf: _columnKey,
+            skip: (candidate, key) => spent.includes(key),
+            maxUnreachable: STONE_PROSPECT.max_approaches,
+            approach: async (candidate) => {
+                // Stand on top of the column before opening it. goToStand converts "this block" into "the
+                // cell above it", which is the one place the descent can begin from.
+                const approach = await locomotion.goToStand({ x: candidate.x, y: candidate.surfaceY, z: candidate.z });
+                const stood = bot.entity.position.floored();
+                // ARRIVAL IS RE-SENSED, NEVER TRUSTED: goTo resolves successfully at the CLOSEST reachable
+                // cell when the exact one is not reachable, so `arrived` alone would let the bot open a
+                // shaft at whatever XZ it happened to stop at — a column nothing scanned (Law 25: a success
+                // flag is not a measurement).
+                return { ok: !!approach?.arrived && stood.x === candidate.x && stood.z === candidate.z };
+            },
+        });
+        const column = walk.pick, columnKey = walk.key;
+        const { peerHeld, unreachable, skipped } = walk;
 
         if (!column) {
             return _routeIdle(payload, `no reachable unclaimed column `
@@ -269,7 +264,7 @@ module.exports = {
         // Law 8: whoever raised the lifecycle ends it. A signal killed mid-descent skips this, which is
         // what overseer_link's releaseAllClaims exists to sweep — it is not a reason to release early.
         if (!climb.out) {
-            overseerLink.releaseClaim(columnKey);
+            releaseTarget(columnKey);
             // Environmental, not a defect: the filler ran out or a placement was refused. Reported as
             // a failure with the reason attached rather than dressed as a partial success — the board
             // must be able to tell this apart from a completed trip (Law 25).
@@ -290,7 +285,7 @@ module.exports = {
         // column that cannot be worked to its resting block, which is precisely what the list is for.
         if (bottom.y === column.standFeetY) capsule.failed_columns = spent;
 
-        overseerLink.releaseClaim(columnKey);
+        releaseTarget(columnKey);
         const readable = `${TAG}: ${gained}x ${YIELD_ITEM} from ${column.x},${column.z} `
             + `(asked ${asked}, shaft ${column.depth} deep, sealed ${climb.placed})`;
         watcher.summary(TAG, readable);

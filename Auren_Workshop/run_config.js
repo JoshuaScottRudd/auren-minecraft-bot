@@ -122,7 +122,7 @@ module.exports = {
     //   1   the old `test scan` — is the base sited at all, nothing more asked.
     //   15  the old `test standard` — a full daylight window.
     //   60+ the old soak profile — long enough for the second and third job to matter.
-    soak: 15,
+    soak: 30,
 
     // ═══ THE OVERLAYS — LAID ON TOP, NEVER A DIFFERENT RUN ══════════════════════════════════════════
     //
@@ -136,19 +136,30 @@ module.exports = {
     // false the run soaks blind and the trace is read once at the end.
     watch: true,
 
-    // WHICH SIGNATURES WAKE. His standing rule is errors wake, warnings sleep, and this is that rule as
-    // a value you can see. Permitted: 'error' (a ❌ line), 'halt' (a bot parked inert for inspection),
-    // 'death'. Nothing else is wake-worthy; every other signature still PRINTS and wakes no one.
-    // An empty list means nothing wakes it — a watch that only narrates.
-    wake: ['error', 'halt', 'death'],
+    // WHICH FACTS WAKE. His standing rule is errors wake, warnings sleep, and this is that rule as a
+    // value you can see. Permitted: 'error' (a bot wrote a ❌ line) and 'death' (a bot has no body).
+    // Both are asked of the LIVE FLEET while it works — nothing reads a file to answer them — so this
+    // list names things the fleet says about itself rather than patterns an instrument matches.
+    // An empty list means nothing wakes it: the run soaks its whole window whatever happens.
+    //
+    // 'halt' WAS HERE AND IS GONE (2026-09-16). It was a pattern that had stopped matching anything the
+    // fleet writes, so it sat in this file looking armed while waking nothing. See run.js's WAKE_SIGS.
+    wake: ['error', 'death'],
 
     // Fragment tags echoed live while watching, as running commentary. [] for a silent watch.
     // Example: ['dispatcher', 'siting']
+    //
+    // NOTHING READS THIS WHILE THE WATCH IS THE FLEET'S OWN REPORT (2026-09-16). It used to be handed to
+    // `trace_monitor --watch --stream=…`, which tailed the trace file and echoed matching lines; that
+    // subprocess is gone, and the live commentary window is `fleet-console`, which run.js opens for
+    // every watched run. Kept on the page rather than deleted because the setting is the right one to
+    // own the day the desk can stream a tag on request — see §7 of the bugsquashing record.
     stream: [],
 
-    // 'off'      no camera clients, no OBS. What almost every run wants.
-    // 'cameras'  the camera clients join and follow the crew. Nothing is written to disk.
-    // 'film'     cameras plus OBS recording. The old `test record`.
+    // 'off'      no camera clients. What almost every run wants.
+    // 'cameras'  the camera clients join and follow the crew, in windows titled Cam_<Bot>. Nothing is written.
+    // 'film'     cameras plus a recorder writing every window to a file. Needs a recorder on this machine;
+    //            a download has none, and refuses 'film' before anything starts.
     record: 'off',
 
     // ═══ WHAT HAPPENS WHEN IT ENDS ══════════════════════════════════════════════════════════════════

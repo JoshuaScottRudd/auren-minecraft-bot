@@ -80,8 +80,7 @@ paths.registerAliases();
 process.env.BOT_ID = process.env.BOT_ID || 'proxy_human';
 
 const { guardExternalSync } = require('@utils/external_library_guard');
-const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX, ACCEPTABLE_BIOMES, PERSON_CLEAR_OF_SPAWN,
-        SEA_LEVEL, HUMAN_MAX_ABOVE_SEA } = require('@thinking/architect_config');
+const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX } = require('@thinking/architect_config');
 
 // ── THE FLEET'S OWN EYES, NOT A SECOND OPINION (Law 16, and seed_scanner's own rule) ────────────────
 // `--stand=biome` reads the biome with `@perception/biome_scanner` — the same node the bots survey with
@@ -89,6 +88,7 @@ const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX, ACCEPTABLE_BIOMES, PERSON_C
 // here with anything else would be vetted with an opinion the fleet does not hold. The scanner REPORTS
 // and decides nothing (Law 0); the choosing is this file's and is written out in `placeInBiome`.
 const { getBiomeName } = require('@perception/biome_scanner');
+const { personSpotTest, landingFloor } = require('./person_spot');
 const watcher = require('@kernel/watcher');
 const { armSpawnProtection, spawnProtectionBox } = require('@perception/spawn_protection');
 
@@ -395,7 +395,7 @@ async function waitForChunk(reader, cell) {
 // block is not enough; the clearance has to cover the base's own footprint. The digs above reached ~16
 // blocks from the person, so the margin is that again with room over. Chebyshev, because the protected
 // region is a SQUARE — using Euclidean distance here would pass cells that sit inside a corner of it.
-const BASE_MARGIN = 32;
+// The number itself (BASE_MARGIN) and the floor it sets live in person_spot.landingFloor.
 
 // ── WHERE THE PERSON MUST END (Architect 2026-09-11) ────────────────────────────────────────────────
 // *"it should be atleast 50 blocks away from world center"* — `floorFrom` is where the body must END,
@@ -404,7 +404,7 @@ const BASE_MARGIN = 32;
 // the floor itself. `clearanceFrom` adds PLACEMENT_RADIUS for the one BLIND move, `stepClearOfSpawn`:
 // the ground there is unread, and the ground test that follows may still move the body that far back
 // toward spawn.
-function floorFrom(box) { return Math.max(PERSON_CLEAR_OF_SPAWN, box.radius + BASE_MARGIN); }
+function floorFrom(box) { return landingFloor(box.radius); }
 function clearanceFrom(box) { return floorFrom(box) + PLACEMENT_RADIUS; }
 function fromSpawn(box, x, z) { return Math.max(Math.abs(x - box.centerX), Math.abs(z - box.centerZ)); }
 
@@ -449,7 +449,7 @@ async function waitForSurveyArea(reader, at) {
 }
 
 async function placeInBiome(reader, at) {
-  const { ringScan, formatRejections, evaluateOpenBox, surfaceY, REASON } =
+  const { ringScan, formatRejections } =
     require(path.join(paths.bot('js_kernel', 'utils'), 'site_geometry.js'));
   const box = spawnProtectionBox(bot);
   const area = await waitForSurveyArea(reader, at);
@@ -487,21 +487,11 @@ async function placeInBiome(reader, at) {
   // nearest the reference height — and the only reference here is the body's height back at spawn, so a
   // cave floor at that level would beat grass 20 blocks above it. `surfaceY` (topmost ground) gives the
   // reference the box then reads from.
-  const isSpot = (x, z) => {
-    const top = surfaceY(reader, x, z, at.y);
-    if (!top) return { valid: false, reason: reader.blockAt(x, at.y, z) === null ? REASON.UNLOADED : REASON.NO_FLOOR };
-    const biome = getBiomeName(bot, x, top.y + 1, z);
-    if (!ACCEPTABLE_BIOMES.has(biome)) return { valid: false, reason: 'wrong_biome' };
-    // ── AND NOT UP A HILL, BECAUSE THE DESK NOW REFUSES ONE (2026-09-12) ──────────────────────────
-    // The foreman's `get` gate turns down a person standing more than HUMAN_MAX_ABOVE_SEA above sea
-    // level: a base is sited against sea-level water and there is none within a loaded chunk of a peak.
-    // Plains and forest legitimately roll into the 80s, so this search could and did land its body on
-    // ground the desk then refuses — and a harness whose person gets turned away at the door measures
-    // nothing. Held to the same ceiling from the same constant, so the two cannot drift (Law 16).
-    if (top.y + 1 > SEA_LEVEL + HUMAN_MAX_ABOVE_SEA) return { valid: false, reason: 'too_high' };
-    const standing = evaluateOpenBox(reader, x, z, top.y, { size: 3, height: 2, occupancy: 'as-is' });
-    return standing.valid ? { ...standing, biome } : standing;
-  };
+  // THE SPOT TEST ITSELF lives in person_spot, shared with voxel_snapshot, which captures the area around the
+  // same spot for scanner tests — two copies would place two different people (Law 16). It carries the
+  // too-high ceiling too: the desk refuses a person above SEA_LEVEL + HUMAN_MAX_ABOVE_SEA, and a harness
+  // whose person is turned away at the door measures nothing.
+  const isSpot = personSpotTest(reader, (x, y, z) => getBiomeName(bot, x, y, z), at.y);
   const sweep = await ringScan(reader, { origin: { x: box.centerX, z: box.centerZ }, step: 1, minRadius: from }, isSpot);
   if (!sweep.found) {
     record(`--stand=biome found no spot ${from}+ blocks from world spawn in an acceptable biome with a clear `

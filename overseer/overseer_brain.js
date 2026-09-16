@@ -52,7 +52,10 @@ const { BOT_SENIORITY } = require('../Thinking_fragments/architect_config');
 // rejection now carries `fault: 'claimant'` and overseer_link throws on it: the refusal must arrive as
 // the coding violation it is, not as a world condition (Law 13).
 // 'stone_column:' — stone_prospect_executor, one key per surface column it opens.
-const OBJECT_KEY_PREFIXES = ['anchor:', 'tree:', 'cell:', 'stone_column:'];
+// 'grass:' — seed_picker, one key per tuft, held for a single punch (Architect 2026-09-15). Exact-block:
+// peers punch neighbouring tufts of one patch without interfering, so no footprint.
+// tree/stone_column/grass are taken through js_kernel/utils/target_claims, the one claim-reach-release walk.
+const OBJECT_KEY_PREFIXES = ['anchor:', 'tree:', 'cell:', 'stone_column:', 'grass:'];
 const TREE_KEY_PREFIX = 'tree:';
 
 // Object claims: object key → { bot_id, claimed_at, footprint }

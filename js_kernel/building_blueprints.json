@@ -753,31 +753,43 @@
       ],
       "unassigned_voxels": []
     },
-    "wheat_plot_pair": {
-      "name": "Wheat_Plot_Pair",
-      "description": "Ad-hoc Phase-1 wheat plot as a 2-voxel mini-blueprint (round 49). ONE structural_fill is the mini-anchor the bot stands ON; ONE dirt is the crop cell it digs+places, tills and sows; 'growing' is external (the field subsystem owns the wheat above the dirt). No fence, no water bucket, no iron — the deliberately minimal Phase-1 payload. NOT sited by find_buildingspot's water-site overlay: the round-49 scanner (scenario_find_wheatplots) is the siting authority — it alone enforces hydration AND cross-plot penalty-free spacing, neither of which find_buildingspot knows — so this blueprint carries NO water voxel and is a pure BUILD payload. One instance = one plot; ~32 instances (each its own locked build_center, plus a quarter-turn rotation to aim the crop at the scanner's chosen cardinal) = one ad-hoc field. 'only care about the construction block being correct' → only the anchor cell must be valid land (requires_land); the dirt cell is dug+placed regardless. WHY THE ANCHOR IS 'stand_ground' AND EXTERNAL (Architect 2026-07-21): it used to be 'structural_fill', which made it a BUILD payload — and sand and gravel are deliberately NOT members of that group (they fall, so they must never satisfy a wall), so a plot sited on a sandy bank classified its own anchor as a group_mismatch and dug the sand out to place PLANKS in it. The anchor is not a structure; it is whatever ground the scanner already proved standable at siting time. External means the survey never places it and NEVER DIGS IT — 'its not supposed to mine anchors like gravel or sand. just the plot block.' Its own type name rather than adding 'structural_fill' to the external list, so a future genuine structural voxel added here is not silently ignored. The trade, stated: a vanished anchor is no longer repaired by the structural pass — acceptable because resolveStandableAnchor already relocates the bot to a standable lip at runtime.",
+    "wheat_tine_row": {
+      "name": "Wheat_Tine_Row",
+      "description": "Phase-1 wheat field as TRIDENT ROWS (Architect 2026-09-15). ONE instance = ONE row of a tine built from the bank out into sea-level water: a four-block anchor — the block the bot stands on (stand_ground, external: the bank for row 0, the previous row's land block for every other row) and, in front of it, plot · land · plot. The land block is the NEXT row's stand, so the anchors overlap: stand on A(k), place A(k+1), then its two plots against it, and repeat outward. Repair runs the same way — a broken land block is rebuilt by the row behind it, which is why row 0 stands on the bank. Crop cells are the dirt voxels with a 'growing' voxel above (farmland_site); the land block is dirt with air above, so it is walked on and never tilled. The land block is listed before the plots so the place pass lays it first — a plot placed into open water has nothing else to attach to. stand_fallback false: a row whose stand does not exist yet is stranded, never tended from some other nearby block (that other block could be farmland or the wrong row). Sited only by wheat_trident_scanner (hydration, penalty-free spacing, open tip, a walking route to row 0's bank block); no water voxel, no fence.",
       "dimensions": {
         "w": 2,
         "h": 3,
-        "l": 1,
+        "l": 3,
         "yMin": 0,
         "yMax": 2
+      },
+      "build_center": {
+        "x": 0,
+        "y": 0,
+        "z": 1
       },
       "external_voxel_types": [
         "growing",
         "stand_ground"
       ],
+      "stand_fallback": false,
       "anchors": [
         {
-          "position": [0, 0, 0],
+          "position": [0, 0, 1],
           "requires_land": true,
           "voxels": [
-            [0, 0, 0, "stand_ground"],
+            [0, 0, 1, "stand_ground"],
+            [0, 1, 1, "air"],
+            [0, 2, 1, "air"],
+            [1, 0, 1, "dirt"],
             [1, 0, 0, "dirt"],
-            [0, 1, 0, "air"],
+            [1, 0, 2, "dirt"],
             [1, 1, 0, "growing"],
-            [0, 2, 0, "air"],
-            [1, 2, 0, "air"]
+            [1, 1, 2, "growing"],
+            [1, 1, 1, "air"],
+            [1, 2, 0, "air"],
+            [1, 2, 1, "air"],
+            [1, 2, 2, "air"]
           ]
         }
       ],

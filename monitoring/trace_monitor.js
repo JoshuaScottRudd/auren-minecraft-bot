@@ -50,6 +50,9 @@
 //                                                                       --deadline scores each anchor
 //                                                                       MET/MISSED/PENDING against the
 //                                                                       ASKER's number, from run start)
+//   node trace_monitor.js --farm [--bot=AurenBot] [--all] [traceFile]   (the wheat field: rows sited, gates,
+//                                                                       each row laid, crop census, work done,
+//                                                                       seed trips — also the tail of --milestones)
 //   node trace_monitor.js --torch [--bot=AurenBot] [--deadline=10m] [traceFile]
 //                                                                      (when the FIRST torch was crafted,
 //                                                                       the order that asked for it, and
@@ -145,6 +148,8 @@ const path = require('path');
 //                          answers whether it closed.
 //   build_lenses.js        --milestones, --torch. The establishment clocks — the build sites, and the
 //                          fleet's first torch.
+//   farm_lens.js           --farm, and the farm block of --milestones. The wheat field as one structure:
+//                          rows sited → gated → rows laid → crop in the ground → built, plus work done.
 //   locomotion_lenses.js   --pathfinding, --route-cost, --jumps. All read the navigator's own lines;
 //                          --route-cost reads the per-SEARCH path line (the only one carrying cost),
 //                          the other two read the per-trip census.
@@ -159,9 +164,16 @@ const path = require('path');
 // file is the CLI — it owns the flags, reads the trace once, and hands the segment down.
 const {
   DEFAULT_TRACE_FILE, botFromFilename, parseLine, readTrace, readCameraView, segmentRuns,
-  afterMarker, relativeTime, buildEpisodes, renderEpisode, PASSIVE_LINE, OVERSEER_UNITS,
+  afterMarker, relativeTime, buildEpisodes, episodeRows, EPISODE_FIELDS, PASSIVE_LINE, OVERSEER_UNITS,
 } = require('./trace_read');
 const { makeArgs, parseDuration } = require('./command_line_arguments');
+// ── THE ANSWER CHANNEL IS DATA, NOT PROSE (Architect 2026-09-16) ────────────────────────────────────
+// Every answer this CLI gives about a run goes through data_out: field names it declares and values it
+// COPIED. It composes no sentence of its own, because it was not present for any decision it reports —
+// see data_out.js's header for the ask and the whole reasoning. `console.error` and `throw` are the
+// exceptions and are not answers: they are this process talking about ITSELF (a trace it cannot read, a
+// flag that reads equipment this download does not carry, a malformed criterion).
+const out = require('./data_out');
 const chainLenses = require('./chain_lenses');
 const buildLenses = require('./build_lenses');
 const locomotionLenses = require('./locomotion_lenses');
@@ -251,6 +263,19 @@ const QUIET = has('quiet');
 // silently fell through to the one-shot digest would print a snapshot and exit, which reads exactly like
 // a fleet that has nothing to say.
 const WATCH = has('watch') || has('follow');
+// ── THIS IS A POST-MORTEM INSTRUMENT, AND THE GATE IS WHAT MAKES THAT TRUE (Architect 2026-09-16) ────
+// *"Nothing should be using trace monitor while the bot is online, its post Mortem only."* Placed here,
+// above every reducer, so no measurement of a moving record can be taken at all — not merely not
+// printed. The streaming modes declare themselves live and pass straight through: tailing a record that
+// is still being written is what `--watch` and `--follow` are FOR, and `fleet-console` is `--follow`.
+// The gate's own header carries the reasoning and the two conditions it refuses on.
+//
+// ONLY WHEN THIS FILE IS THE COMMAND BEING RUN. `require.main === module` is load-bearing: this module's
+// top level IS its CLI, so anything that requires it for its reducers — `dashboard.js` composes
+// computeBotStats/sigJudgeHalt/detect, and does it on a live fleet by design — would otherwise be
+// refused for asking a question it never asked. The gate governs the INSTRUMENT being pointed at a
+// moving record, not the library being linked (Law 26: the CLI is the reader, the module is parts).
+if (require.main === module) require('./post_mortem_gate').refuseIfLive(TRACE_FILE, { live: WATCH });
 // 2s under --follow rather than 5: a console a human is reading over the fleet's shoulder is a different
 // instrument from a wake-on-error watch, and three seconds of lag is the difference between watching and
 // reviewing. Still cheap - a re-read of the trace, no per-line cost.
@@ -303,6 +328,9 @@ const MILESTONES = has('milestones');
 // stock, not a site. It shares --deadline with --milestones: one criterion flag, whichever clock is
 // being asked (Law 16 — a second spelling of the asker's number is a second place for it to differ).
 const TORCH = has('torch');
+// --farm — the wheat field alone: rows sited, gates, rows laid in order, crop census, work done, seed trips.
+// --milestones prints the same block after the structures; this flag is for when the farm is the question.
+const FARM = has('farm');
 // --jobs — the run as a sequence of claimed jobs with what each one cost (Architect 2026-08-13: "i want
 // to know everytime a bot picks a job, and how long it takes in order"). It is a lens rather than a
 // signature for the same reason --story is: it flags nothing and wakes nobody. --story renders the same
@@ -408,23 +436,41 @@ const LASTPOST = has('last');
 
 
 // ── Signatures ───────────────────────────────────────────────────────────────
-// Each returns flags: { sig, bot, idx, reason }. idx anchors the context slice.
+// Each returns flags: { sig, bot, idx, …fields }. idx anchors the context slice.
 // All of them dedupe into one flag per EPISODE, not one per line — the reader
 // gets each distinct problem once.
+//
+// ── A FLAG CARRIES FIELDS, NEVER A SENTENCE (Architect 2026-09-16) ──────────────────────────────────
+// Every signature below used to build a prose `reason` — "same warn 3x: …", "correct-count fell 135 →
+// 40 (drop 95 > tolerance 2)", "judge halted the bot for inspection after killing X — inert". Those
+// were this file EXPLAINING its own measurement, which is the one thing a lens that was not present for
+// the decision may not do. What each signature measured is unchanged; it is now named per field, and
+// the verdict's threshold rides beside it as its own field so the reader does the concluding.
+//
+// THE ONE STRING THAT SURVIVES IS THE BOT'S OWN. `text`/`readable`/`signal` are copied VERBATIM out of
+// the line the bot wrote — the bot was there and may say why. This file is the envelope.
+//
+// FIELD NAMES ARE THE TABLE'S COLUMNS. printFlags renders whatever keys the flags carry, so a key here
+// must be a legal data_out field (lower-case, digits, underscore, dot) or the render throws.
 
 // (a) Any ❌ error. The watcher error dump is multi-line; consecutive error
 // lines from one bot collapse into a single flag anchored at the first.
 function sigErrors(lines) {
   const flags = [];
-  let open = null;   // { bot, lastIdx }
+  let open = null;   // { bot, lastIdx, flag }
   for (const l of lines) {
     if (l.level !== 'error') continue;
     if (open && open.bot === l.bot && l.idx - open.lastIdx <= 2) {
       open.lastIdx = l.idx;
+      // `count` is how many error lines the episode collapsed. It was never reported before — the dump
+      // was one flag and its size was invisible — and it costs nothing now that the flag is a row.
+      open.flag.count++;
       continue;
     }
-    flags.push({ sig: 'error', bot: l.bot, idx: l.idx, reason: afterMarker(l.raw) });
-    open = { bot: l.bot, lastIdx: l.idx };
+    // `text` is the bot's OWN error line after its marker, copied. It is what isDeathClass reads.
+    const flag = { sig: 'error', bot: l.bot, idx: l.idx, count: 1, text: afterMarker(l.raw) };
+    flags.push(flag);
+    open = { bot: l.bot, lastIdx: l.idx, flag };
   }
   return flags;
 }
@@ -439,9 +485,11 @@ function sigJudgeRepeat(lines) {
   const close = (key) => {
     const e = episodes.get(key);
     if (e && e.peak >= JUDGE_REPEAT_MIN) {
+      // The peak, the threshold it passed, and the judge's OWN readable text — three fields where one
+      // sentence used to weld them together.
       flags.push({
         sig: 'judge-repeat', bot: e.bot, idx: e.idx,
-        reason: `${e.fragment} repeated ${e.peak}x without progress — "${e.readable}"`,
+        fragment: e.fragment, contiguous: e.peak, threshold: JUDGE_REPEAT_MIN, readable: e.readable,
       });
     }
     episodes.delete(key);
@@ -473,9 +521,12 @@ function sigWarnRepeat(lines) {
     const n = (seen.get(key) || 0) + 1;
     seen.set(key, n);
     if (n === WARN_REPEAT_COUNT) {
+      // `count` and `threshold` are the same number here by construction (the flag fires ON the Nth
+      // repeat). Both are printed anyway: the threshold is the criterion and the count is the
+      // measurement, and collapsing them would leave a reader unable to see which is which.
       flags.push({
         sig: 'warn-repeat', bot: l.bot, idx: l.idx,
-        reason: `same warn ${WARN_REPEAT_COUNT}x: ${afterMarker(l.raw)}`,
+        count: n, threshold: WARN_REPEAT_COUNT, text: afterMarker(l.raw),
       });
     }
   }
@@ -501,9 +552,14 @@ function sigWarnBurst(lines) {
       const kth = warns[i + WARN_BURST_COUNT - 1];
       if (first.relSec < suppressUntil) continue;
       if (kth.relSec - first.relSec <= WARN_BURST_WINDOW_SEC) {
+        // window_sec is the MEASURED span the burst landed in; threshold_sec is the window it had to
+        // beat and threshold_count how many warns it took. `text` is the last warn of the burst, the
+        // bot's own words, carried so the row is readable without opening the slice.
         flags.push({
           sig: 'warn-burst', bot, idx: kth.idx,
-          reason: `${WARN_BURST_COUNT}+ warns within ${kth.relSec - first.relSec}s`,
+          count: WARN_BURST_COUNT, window_sec: kth.relSec - first.relSec,
+          threshold_count: WARN_BURST_COUNT, threshold_sec: WARN_BURST_WINDOW_SEC,
+          text: afterMarker(kth.raw),
         });
         suppressUntil = kth.relSec + WARN_BURST_WINDOW_SEC;
       }
@@ -527,6 +583,10 @@ function sigWarnBurst(lines) {
 // numeric form alone goes blind at exactly the moment the work succeeds, so completion is matched
 // here once and shared (Law 16) rather than re-derived per call site.
 const BUILD_DONE_RE = /"([^"]+)" matches the blueprint/;
+// Needles into the two integrity scans. Regexes, not quoted phrases: a PATTERN must never be
+// indistinguishable from authored prose, to a reader or to the guard (Architect 2026-09-16).
+const BUILD_SCAN_RE = /voxels correct/;
+const MINE_SCAN_RE = /excavate frontier/;
 
 function sigSilence(lines) {
   const lastByBot = new Map();
@@ -541,9 +601,13 @@ function sigSilence(lines) {
     if (PASSIVE_LINE.test(l.raw)) continue;
     const prev = lastByBot.get(l.bot);
     if (prev && l.relSec - prev.relSec > SILENCE_GAP_SEC) {
+      // `form` separates the two shapes this signature has always had, which the two different prose
+      // sentences used to carry: a gap that CLOSED (a later line exists, and the flag anchors on it)
+      // versus a bot that never came back. The reader needs to know which, and it is not a conclusion.
       flags.push({
-        sig: 'silence', bot: l.bot, idx: l.idx,
-        reason: `no output for ${l.relSec - prev.relSec}s (silent since [${relativeTime(prev.relSec)}])`,
+        sig: 'silence', bot: l.bot, idx: l.idx, form: 'gap',
+        gap_sec: l.relSec - prev.relSec, threshold_sec: SILENCE_GAP_SEC,
+        silent_since: relativeTime(prev.relSec), silent_since_sec: prev.relSec,
       });
     }
     lastByBot.set(l.bot, l);
@@ -551,9 +615,13 @@ function sigSilence(lines) {
   for (const [bot, last] of lastByBot) {
     if (disconnected.has(bot)) continue;
     if (maxRel - last.relSec > SILENCE_GAP_SEC) {
+      // The trailing form: no later line from this bot exists, so the anchor IS its last line and the
+      // gap is measured against the newest line any bot logged.
       flags.push({
-        sig: 'silence', bot, idx: last.idx,
-        reason: `silent for ${maxRel - last.relSec}s while the fleet kept running (last line shown)`,
+        sig: 'silence', bot, idx: last.idx, form: 'trailing',
+        gap_sec: maxRel - last.relSec, threshold_sec: SILENCE_GAP_SEC,
+        silent_since: relativeTime(last.relSec), silent_since_sec: last.relSec,
+        fleet_span_sec: maxRel,
       });
     }
   }
@@ -576,9 +644,12 @@ function sigRegression(lines) {
   const check = (l, key, val) => {
     const prev = best.get(key);
     if (prev !== undefined && val < prev - REGRESSION_TOLERANCE) {
+      // `structure` is the key the tracker built ("build:headframe", "mine:staircase -35|34|6") — a
+      // value this file composed from the bot's own capture, and the identity the from/to numbers belong
+      // to. from/to/drop are the measurement; tolerance is the criterion it was measured against.
       flags.push({
         sig: 'regression', bot: l.bot, idx: l.idx,
-        reason: `${key} correct-count fell ${prev} → ${val} (drop ${prev - val} > tolerance ${REGRESSION_TOLERANCE})`,
+        structure: key, from: prev, to: val, drop: prev - val, tolerance: REGRESSION_TOLERANCE,
       });
     }
     best.set(key, Math.max(prev ?? val, val));
@@ -606,10 +677,9 @@ function sigJudgeHalt(lines) {
   const flags = [];
   for (const l of lines) {
     const m = l.raw.match(HALT_RE);
-    if (m) flags.push({
-      sig: 'halt', bot: l.bot, idx: l.idx,
-      reason: `judge halted the bot for inspection after killing "${m[1]}" — inert, needs a code fix`,
-    });
+    // `signal` is the killed signal's own name, copied out of the judge's line. The "— inert" the old
+    // reason ended on was this file restating what a halt IS; the halt signature is the statement.
+    if (m) flags.push({ sig: 'halt', bot: l.bot, idx: l.idx, signal: m[1] });
   }
   return flags;
 }
@@ -647,7 +717,9 @@ const DEATH_ERROR_RE = /☠️ DIED/;
 function isDeathClass(flag) {
   if (!flag) return false;
   if (flag.sig === 'death') return true;
-  return flag.sig === 'error' && DEATH_ERROR_RE.test(flag.reason || '');
+  // Reads `text` since 2026-09-16 — the error flag's verbatim copy of the bot's own line, which is what
+  // `reason` carried here before the flag became fields. Same bytes, same marker, named for what it is.
+  return flag.sig === 'error' && DEATH_ERROR_RE.test(flag.text || '');
 }
 function sigDeath(lines) {
   const flags = [];
@@ -658,11 +730,9 @@ function sigDeath(lines) {
     const prev = lastPerBot.get(l.bot);
     lastPerBot.set(l.bot, t);
     if (prev !== undefined && t - prev <= DEATH_EPISODE_SEC) continue;
-    flags.push({
-      sig: 'death', bot: l.bot, idx: l.idx,
-      reason: `bot DIED at [${relativeTime(t)}] — it respawns on its own, so read the fight it died in: ` +
-              `trace_monitor.js --engagement --bot=${l.bot}`,
-    });
+    // Nothing beyond WHEN: the signature name already says what happened, and everything else about a
+    // death is another lens's (--engagement owns the fight).
+    flags.push({ sig: 'death', bot: l.bot, idx: l.idx, at: relativeTime(t), at_sec: t });
   }
   return flags;
 }
@@ -740,16 +810,20 @@ const KERNEL_DIR = args.some(a => !a.startsWith('--'))
 function recordingLens(name, flag) {
   const dir = require('./lens_paths').recordingLensDir();
   if (dir) return require(path.join(dir, name));
-  console.log(`${flag} reads the CAMERA STACK's records, and the camera stack is not part of this `
+  // ON stderr SINCE 2026-09-16. This is not an answer about a run — it is the tool describing its own
+  // controls to somebody who typed a flag this download cannot serve. stdout carries data only, and a
+  // paragraph is the right shape for this reader, so it moves channel rather than becoming fields.
+  console.error(`${flag} reads the CAMERA STACK's records, and the camera stack is not part of this `
     + `download — it lives in the Architect's workshop beside the bot. Every other flag reads this `
     + `bot's own trace and works here.`);
   process.exit(0);
 }
 
+// `beats` rather than `out`: `out` is the data_out emitter now, module-wide (2026-09-16).
 function readBotHeartbeats() {
-  const out = new Map();
+  const beats = new Map();
   let files = [];
-  try { files = fs.readdirSync(KERNEL_DIR); } catch (_) { return out; }
+  try { files = fs.readdirSync(KERNEL_DIR); } catch (_) { return beats; }
   for (const f of files) {
     const m = /^watcher_(.+)\.jsonl$/.exec(f);
     if (!m || m[1] === 'overseer') continue;
@@ -766,25 +840,31 @@ function readBotHeartbeats() {
         const lead = raw[0] === '[' ? raw.slice(1, raw.indexOf(']')) : null;
         const ms = lead ? Date.parse(lead) : NaN;
         if (Number.isNaN(ms)) continue;
-        out.set(bot, { at: new Date(ms), iso: lead, ageSec: Math.max(0, Math.round((Date.now() - ms) / 1000)), story: raw });
+        beats.set(bot, { at: new Date(ms), iso: lead, ageSec: Math.max(0, Math.round((Date.now() - ms) / 1000)), story: raw });
         break;
       }
     } catch (_) { /* a file being appended to on this pass is not a fault — the next pass reads it */ }
   }
-  return out;
+  return beats;
 }
 
-// One line per bot, deliberately flat and grep-friendly (`trace.ps1 --last | grep TessaBot`). Stale is
-// stated as a word, not left to the reader to compute from a timestamp.
-function lastPostLines() {
+// One ROW per bot, still flat and still grep-friendly (`trace.ps1 --last | grep TessaBot` finds its row
+// by the bot's name in the first column). It was a hand-built `LASTPOST <bot> <STATE> age=…` line until
+// 2026-09-16; the state word is now the `posting` boolean beside the age it was derived from, and the
+// threshold that decides it is printed as its own field rather than hidden in the word (Law 6 — the
+// reader can check the verdict against its source). `story` is the bot's own last line, copied.
+function printLastPost() {
   const hb = readBotHeartbeats();
-  if (!hb.size) return ['LASTPOST (no per-bot watcher files found — is the fleet up?)'];
-  const out = [];
-  for (const [bot, h] of [...hb.entries()].sort()) {
-    const state = h.ageSec <= SILENCE_GAP_SEC ? 'POSTING' : 'STALE';
-    out.push(`LASTPOST ${bot} ${state} age=${h.ageSec}s at=${h.iso} story=${JSON.stringify(afterMarker(h.story) || h.story)}`);
-  }
-  return out;
+  out.kv('lens', 'lastpost');
+  out.kv('trace_dir', KERNEL_DIR);
+  out.kv('bots_with_watcher_files', hb.size);
+  out.kv('posting_threshold_sec', SILENCE_GAP_SEC);
+  if (!hb.size) return;
+  out.section('lastpost');
+  out.table(['bot', 'posting', 'age_sec', 'at', 'story'],
+    [...hb.entries()].sort().map(([bot, h]) => [
+      bot, h.ageSec <= SILENCE_GAP_SEC, h.ageSec, h.iso, afterMarker(h.story) || h.story,
+    ]));
 }
 
 function computeBotStats(lines) {
@@ -811,51 +891,85 @@ function computeBotStats(lines) {
     }
     // Both integrity lines carry their scan time: the header is a snapshot, and a snapshot that hides
     // its age lies by omission. AurenBot's build line was 21 minutes stale and read as live (Law 6).
-    if (l.raw.includes('voxels correct') || BUILD_DONE_RE.test(l.raw)) { b.latestBuild = afterMarker(l.raw); b.latestBuildT = l.relSec ?? b.latestBuildT; }
-    if (l.raw.includes('excavate frontier')) { b.latestMine = afterMarker(l.raw); b.latestMineT = l.relSec ?? b.latestMineT; }
+    if (BUILD_SCAN_RE.test(l.raw) || BUILD_DONE_RE.test(l.raw)) { b.latestBuild = afterMarker(l.raw); b.latestBuildT = l.relSec ?? b.latestBuildT; }
+    if (MINE_SCAN_RE.test(l.raw)) { b.latestMine = afterMarker(l.raw); b.latestMineT = l.relSec ?? b.latestMineT; }
     const hm = HALT_RE.exec(l.raw);
     if (hm) { b.haltedAt = l.relSec; b.haltedOn = hm[1]; }
   }
   return bots;
 }
 
-function digest(lines) {
+// ── THE DIGEST IS THREE TABLES, NOT A PARAGRAPH PER BOT (Architect 2026-09-16) ──────────────────────
+// It returned an array of composed lines — `AurenBot: 📊 41 · ⚠️ 3 · ❌ 0 · last activity [12m 4s]`,
+// then an indented `own file:` line, then `build:`/`mine:`. Every one of those was this file writing a
+// sentence about numbers it had just counted. The numbers are all still here, one column each.
+//
+// WHAT WAS DELETED AS INTERPRETATION, named so nobody looks for it:
+//   · `⏸ HALTED … — inert 4m 12s`  → `halted`, `halted_at`, `halted_on`, `inert_sec`. The word "inert"
+//     was the restatement; the span is the fact.
+//   · `⚠️ MERGE-LAG — the merged view above is Ns behind this bot's own watcher` → `merge_lag` (the
+//     verdict) beside `merge_age_sec`, `own_file_age_sec` and `posting_threshold_sec` (what it was
+//     computed FROM). The whole reason that line existed — a disagreement between two clocks — is now
+//     readable by comparing two columns, which is what it was asking the reader to do anyway.
+//   · `(absent from merged trace)` → its own table, which IS the statement of absence.
+//   · `(no bot lines in trace)` → `bots` = 0. A zero is the honest form of an empty answer (data_out).
+// POSTING/STALE became the `posting` boolean, and the threshold it is decided by is printed once.
+function printDigest(lines) {
   const bots = computeBotStats(lines);
   const hb = readBotHeartbeats();   // ground truth, independent of the merge (see readBotHeartbeats)
   // Run end = the newest work line ANY bot logged; a halted bot's own clock stopped, so its inert
   // span can only be measured against a peer that kept working.
   let runEnd = 0;
   for (const b of bots.values()) runEnd = Math.max(runEnd, b.lastRel);
-  const out = [];
-  for (const [bot, b] of bots) {
-    // A halt is the single most load-bearing fact in the header: the bot is inert by design and will
-    // never recover on its own. Reporting only "last activity [t]" made a halted bot and a healthy one
-    // render identically — the reader had to already suspect the death to find it. State first.
-    const state = b.haltedAt !== null
-      ? `⏸ HALTED [${relativeTime(b.haltedAt)}] on "${b.haltedOn}" — inert ${relativeTime(Math.max(0, runEnd - b.haltedAt))}, needs a code fix`
-      : `last activity [${relativeTime(b.lastRel)}]`;
-    out.push(`${bot}: 📊 ${b.s} · ⚠️ ${b.w} · ❌ ${b.e} · ${state}`);
-    // The merge-derived number above can only ever be as fresh as the merge. The bot's own file is the
-    // authority on whether it is posting, so print it beside — and when the two disagree, say so in the
-    // one place the reader is standing, rather than leaving them to notice the discrepancy themselves.
-    const h = hb.get(bot);
-    if (h) {
-      const mergeAgeSec = b.lastIso ? Math.max(0, Math.round((Date.now() - Date.parse(b.lastIso)) / 1000)) : null;
-      const lag = h.ageSec <= SILENCE_GAP_SEC && mergeAgeSec !== null && mergeAgeSec > SILENCE_GAP_SEC;
-      out.push(`  own file: ${h.ageSec <= SILENCE_GAP_SEC ? 'POSTING' : 'STALE'} age=${h.ageSec}s` +
-        (lag ? `  ⚠️ MERGE-LAG — the merged view above is ${mergeAgeSec}s behind this bot's own watcher; TRUST THIS LINE, not the one above` : ''));
-    }
-    if (b.latestBuild) out.push(`  build: [${relativeTime(b.latestBuildT)}] ${b.latestBuild}`);
-    if (b.latestMine) out.push(`  mine:  [${relativeTime(b.latestMineT)}] ${b.latestMine}`);
+
+  out.kv('bots', bots.size);
+  out.kv('run_end', relativeTime(runEnd));
+  out.kv('run_end_sec', runEnd);
+  out.kv('posting_threshold_sec', SILENCE_GAP_SEC);
+  if (!bots.size && !hb.size) return;
+
+  if (bots.size) {
+    out.section('bot_vitals');
+    out.table(
+      ['bot', 'summaries', 'warns', 'errors', 'last_activity', 'last_activity_sec', 'halted',
+        'halted_at', 'halted_on', 'inert_sec', 'own_file', 'own_file_age_sec', 'posting',
+        'merge_age_sec', 'merge_lag'],
+      [...bots].map(([bot, b]) => {
+        const h = hb.get(bot);
+        // The merge-derived clock can only ever be as fresh as the merge; the bot's own file is the
+        // authority on whether it is posting. Both are columns, and their disagreement is the diagnosis.
+        const mergeAgeSec = b.lastIso ? Math.max(0, Math.round((Date.now() - Date.parse(b.lastIso)) / 1000)) : null;
+        const lag = !!h && h.ageSec <= SILENCE_GAP_SEC && mergeAgeSec !== null && mergeAgeSec > SILENCE_GAP_SEC;
+        return [bot, b.s, b.w, b.e, relativeTime(b.lastRel), b.lastRel,
+          b.haltedAt !== null,
+          b.haltedAt !== null ? relativeTime(b.haltedAt) : null,
+          b.haltedOn,
+          b.haltedAt !== null ? Math.max(0, runEnd - b.haltedAt) : null,
+          !!h, h ? h.ageSec : null, h ? h.ageSec <= SILENCE_GAP_SEC : null,
+          mergeAgeSec, h ? lag : null];
+      }));
   }
+
+  // Both integrity lines carry their scan time: a snapshot that hides its age lies by omission. `text`
+  // is the bot's own scan line after its marker, copied.
+  const integrity = [];
+  for (const [bot, b] of bots) {
+    if (b.latestBuild) integrity.push([bot, 'build', relativeTime(b.latestBuildT), b.latestBuildT, b.latestBuild]);
+    if (b.latestMine) integrity.push([bot, 'mine', relativeTime(b.latestMineT), b.latestMineT, b.latestMine]);
+  }
+  if (integrity.length) {
+    out.section('latest_integrity_scan');
+    out.table(['bot', 'kind', 'at', 'at_sec', 'text'], integrity);
+  }
+
   // A bot with a live watcher file but no line in the merge is invisible to every merge-derived stat —
   // the most misleading case of all, because absence reads as "not running".
-  for (const [bot, h] of hb) {
-    if (bots.has(bot)) continue;
-    out.push(`${bot}: (absent from merged trace) own file: ${h.ageSec <= SILENCE_GAP_SEC ? 'POSTING' : 'STALE'} age=${h.ageSec}s — ${afterMarker(h.story) || h.story}`);
+  const absent = [...hb].filter(([bot]) => !bots.has(bot));
+  if (absent.length) {
+    out.section('absent_from_merged_trace');
+    out.table(['bot', 'own_file_age_sec', 'posting', 'story'],
+      absent.map(([bot, h]) => [bot, h.ageSec, h.ageSec <= SILENCE_GAP_SEC, afterMarker(h.story) || h.story]));
   }
-  if (out.length === 0) out.push('(no bot lines in trace)');
-  return out;
 }
 
 // The ONE-LINE status the quiet watch shows between flags (Architect 2026-09-11: *"this is super noisy.
@@ -874,21 +988,37 @@ function digest(lines) {
 // ONLY THE ROSTER'S BOTS. The stand-in player writes into the same merge and stands still by design, so it
 // read as a permanently SILENT unit on every tick. The roster (`architect_config.BOT_SENIORITY`, which
 // requires nothing) is the one list of who a crew bot can be.
-function watchStatus(lines, elapsedMin) {
+//
+// IT RETURNS ROWS NOW, NOT A SENTENCE (Architect 2026-09-16). It used to compose
+// `[watch 3m] quiet · AurenBot 4s ago, 2 warn, 0 err` — a clause per bot with the word "quiet" in
+// front, which is the instrument telling the reader what the tick MEANT. The same six numbers come back
+// as columns; the two renderers below place them, because the TTY field and the log file want the same
+// data in two different shapes and neither may re-derive it (Law 16).
+const WATCH_FIELDS = ['bot', 'halted', 'own_file', 'age_sec', 'posting', 'warns', 'errors',
+  'last_activity_sec'];
+function watchStatusRows(lines) {
   const roster = require(require('./lens_paths').bot('Thinking_fragments/architect_config.js')).BOT_SENIORITY;
   const bots = computeBotStats(lines);
   const hb = readBotHeartbeats();
-  const ago = s => (s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`);
-  const parts = [];
+  const rows = [];
   for (const [bot, b] of bots) {
     if (!(bot in roster)) continue;
-    if (b.haltedAt !== null) { parts.push(`${bot} HALTED`); continue; }
     const h = hb.get(bot);
-    const alive = !h ? `last ${relativeTime(b.lastRel)}`
-      : h.ageSec <= SILENCE_GAP_SEC ? `${ago(h.ageSec)} ago` : `SILENT ${ago(h.ageSec)}`;
-    parts.push(`${bot} ${alive}, ${b.w} warn, ${b.e} err`);
+    rows.push([bot, b.haltedAt !== null, !!h, h ? h.ageSec : null,
+      h ? h.ageSec <= SILENCE_GAP_SEC : null, b.w, b.e, b.lastRel]);
   }
-  return `[watch ${Math.floor(elapsedMin)}m] quiet · ${parts.length ? parts.join(' · ') : 'no bot lines yet'}`;
+  return rows;
+}
+
+// The TTY field: ONE line, because `\r\x1b[2K` clears only the row the cursor is on — a status that
+// wrapped would leave its tail behind, which is the 2026-09-11 complaint this line already answers.
+// field=value pairs comma-joined; no separator carries a space, so nothing here can become a phrase.
+function watchStatusLine(rows, elapsedMin) {
+  const cells = [`watch_min=${Math.floor(elapsedMin)}`, `bots=${rows.length}`];
+  for (const r of rows) {
+    WATCH_FIELDS.forEach((f, i) => { if (r[i] !== null) cells.push(`${f}=${out.value(r[i])}`); });
+  }
+  return cells.join(',');
 }
 
 // Every warning in the latest run, deduped by bot+text with a repeat count and first-seen time.
@@ -912,24 +1042,64 @@ function warningsDigest(lines) {
 
 function fail(msg) { console.error(`trace_monitor: ${msg}`); process.exit(1); }
 
+// ── THE FLAG TABLE ───────────────────────────────────────────────────────────────────────────────
+// Every flag is a ROW. The three columns every signature has (`at`, `bot`, `signature`) are declared
+// first and fixed; after them come the SPECIFICS, which differ per signature — so the column set is the
+// union of the keys the flags actually carry, in the order they first appear. A flag that does not
+// carry a column leaves that cell absent (data_out prints ABSENT), which is the honest rendering of "no
+// such measurement here" and never a zero.
+const FLAG_FIXED = ['n', 'at', 'bot', 'signature', 'idx'];
+// THE BOT'S OWN SENTENCES GO LAST, and that is a layout fact rather than a judgement about them. A copied
+// line runs to 200 characters, data_out sizes every column from its widest cell, and only the LAST column
+// is left unpadded — so a verbatim column in the middle pads every measurement behind it off the screen.
+// Ordered narrowest-first among themselves for the same reason when a row carries more than one.
+const FLAG_TEXT_FIELDS = ['signal', 'readable', 'text'];
+function flagTable(lines, flags) {
+  const extra = [];
+  for (const f of flags) {
+    for (const k of Object.keys(f)) {
+      if (k === 'sig' || k === 'bot' || k === 'idx') continue;
+      if (!extra.includes(k)) extra.push(k);
+    }
+  }
+  extra.sort((a, b) => FLAG_TEXT_FIELDS.indexOf(a) - FLAG_TEXT_FIELDS.indexOf(b));
+  const fields = [...FLAG_FIXED, ...extra];
+  const rows = flags.map((f, i) => {
+    const at = lines[f.idx] && lines[f.idx].relSec != null ? relativeTime(lines[f.idx].relSec) : null;
+    return [i + 1, at, f.bot, f.sig, f.idx, ...extra.map(k => (k in f ? f[k] : null))];
+  });
+  out.table(fields, rows);
+}
+
 // Overlapping slices don't reprint: each flag's slice starts no earlier than
 // one past the previously printed line, so a cluster of flags around one
 // incident reads as one continuous excerpt with flag headers interleaved.
+//
+// THE SLICE IS A TABLE TOO, and `anchor` is the column that used to be the `>>` gutter mark. What was
+// deleted: `(line N already shown above)` and `(continues from previous slice)` — both were this file
+// narrating its own de-duplication. The first is now `context_shown_at`, a line number the reader can
+// scroll to; the second is `context_continues_from`, the index the slice picks up at.
 function printFlags(lines, flags) {
+  out.section('flags');
+  out.kv('flags', flags.length);
+  out.kv('context_lines', CONTEXT);
+  flagTable(lines, flags);
   let printedThrough = -1;
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i];
-    console.log('');
-    console.log(`── FLAG ${i + 1}/${flags.length} · ${f.sig} · ${f.bot || '?'} ─ ${f.reason}`);
     const start = Math.max(0, f.idx - CONTEXT, printedThrough + 1);
+    out.section('flag_context');
+    out.kv('n', i + 1);
+    out.kv('signature', f.sig);
+    out.kv('bot', f.bot);
     if (f.idx <= printedThrough) {
-      console.log(`   (line ${f.idx} already shown above)`);
+      out.kv('context_shown_at', f.idx);
       continue;
     }
-    if (start > 0 && start === printedThrough + 1 && i > 0) console.log('   (continues from previous slice)');
-    for (let j = start; j <= f.idx; j++) {
-      console.log(`   ${j === f.idx ? '>>' : '  '} ${lines[j].raw}`);
-    }
+    if (start > 0 && start === printedThrough + 1 && i > 0) out.kv('context_continues_from', start);
+    const slice = [];
+    for (let j = start; j <= f.idx; j++) slice.push([j, j === f.idx, lines[j].raw]);
+    out.table(['idx', 'anchor', 'line'], slice);
     printedThrough = f.idx;
   }
 }
@@ -943,32 +1113,37 @@ function runOnce() {
     process.exit(1);
   }
   const flags = detect(lines);
-  console.log(`trace_monitor · ${path.basename(TRACE_FILE)} · ${lines.length} lines`);
-  for (const d of digest(lines)) console.log(d);
+  out.kv('lens', 'digest');
+  out.kv('record', path.basename(TRACE_FILE));
+  out.kv('lines_read', lines.length);
+  printDigest(lines);
 
-  // Full warning list (every ⚠️ in the latest run, not just the ones a signature flagged).
+  // Full warning list (every ⚠️ in the latest run, not just the ones a signature flagged). `text` is the
+  // bot's own warn after its marker, copied; `count` is how many times it repeated.
   const warns = warningsDigest(lines);
-  if (warns.length) {
-    const total = warns.reduce((a, w) => a + w.n, 0);
-    console.log(`\n⚠️  warnings (${total} total, ${warns.length} distinct):`);
-    for (const w of warns) {
-      console.log(`   [${relativeTime(w.firstRel || 0)}] ${w.bot}: ${w.text}${w.n > 1 ? ` ×${w.n}` : ''}`);
-    }
-  }
+  out.section('warnings');
+  out.kv('warnings', warns.reduce((a, w) => a + w.n, 0));
+  out.kv('warnings_distinct', warns.length);
+  if (warns.length) out.table(['at', 'at_sec', 'bot', 'count', 'text'],
+    warns.map(w => [relativeTime(w.firstRel || 0), w.firstRel || 0, w.bot, w.n, w.text]));
 
-  if (flags.length === 0) {
-    console.log('\nNo anomalies. All signatures quiet.');
-    process.exit(0);
-  }
-  console.log(`\n${flags.length} flag(s): ` + summarizeFlags(flags));
+  // `No anomalies. All signatures quiet.` is deleted — a count of 0 says it, and the sentence was the
+  // instrument congratulating the run. summarizeFlags always prints, so the zero is always stated.
+  summarizeFlags(flags);
+  if (flags.length === 0) process.exit(0);
   if (!QUIET) printFlags(lines, flags);
   process.exit(2);
 }
 
+// The per-signature tally. Two fields and a table where a `error×3 · silence×1` line used to be; the
+// table is empty of rows on a clean run and `flags` reads 0, which is the whole answer.
 function summarizeFlags(flags) {
-  const counts = {};
-  for (const f of flags) counts[f.sig] = (counts[f.sig] || 0) + 1;
-  return Object.entries(counts).map(([s, n]) => `${s}×${n}`).join(' · ');
+  const counts = new Map();
+  for (const f of flags) counts.set(f.sig, (counts.get(f.sig) || 0) + 1);
+  out.section('flag_counts');
+  out.kv('flags', flags.length);
+  out.kv('signatures_fired', counts.size);
+  if (counts.size) out.table(['signature', 'count'], [...counts]);
 }
 
 // ── Activity view (context channel, never flags) ─────────────────────────────
@@ -1001,11 +1176,18 @@ function runActivity() {
     (!BOT_FILTER || l.bot === BOT_FILTER) &&
     ACTIVITY_PATTERNS.some(p => p.test(l.raw)));
 
-  console.log(`trace_monitor · activity · ${path.basename(TRACE_FILE)}`
-    + `${BOT_FILTER ? ` · ${BOT_FILTER}` : ''} · latest run · ${rows.length} decision line(s)`);
-  console.log('(context only — this view never flags and never wakes a watcher)\n');
-  for (const l of rows) console.log(l.raw);
-  if (rows.length === 0) console.log('(no job-board / dispatch activity in the latest run yet)');
+  // `lines_matched` is the count this header has always carried (it read `N decision line(s)`), now
+  // addressable by NAME rather than by scraping a sentence. The `(context only — never flags…)`
+  // disclaimer is deleted: it described the tool's own policy, not the run.
+  out.kv('lens', 'activity');
+  out.kv('record', path.basename(TRACE_FILE));
+  out.kv('bot_filter', BOT_FILTER);
+  out.kv('run', 'latest');
+  out.kv('lines_matched', rows.length);
+  if (rows.length) {
+    out.section('activity');
+    out.list('line', rows.map(l => l.raw));
+  }
   process.exit(0);
 }
 
@@ -1031,14 +1213,22 @@ function runStory() {
   const seg = segs[segs.length - 1] || [];
   const episodes = buildEpisodes(seg).filter(ep => !BOT_FILTER || ep.bot === BOT_FILTER);
 
-  console.log(`trace_monitor · story · ${path.basename(TRACE_FILE)}`
-    + `${BOT_FILTER ? ` · ${BOT_FILTER}` : ''} · latest run · ${episodes.length} job episode(s)`);
   const full = has('all');
-  console.log(full
-    ? '(context only — never flags, never wakes a watcher; --all: every episode in full, board included)\n'
-    : '(context only — never flags, never wakes a watcher; clean jobs shown as one line — --all shows every board)\n');
-  for (const ep of episodes) console.log(renderEpisode(ep, full));
-  if (episodes.length === 0) console.log('(no dispatched jobs in the latest run yet)');
+  // The episode is a TABLE of the bot's own lines — `text` on every row is what the fleet wrote, carried
+  // through untouched; `phase` and `kind` are tokens replacing the `▸ PLAN`/`▸ DOING`/`▸ VERDICT`
+  // headings and the glyph table that trace_read used to draw. What was deleted here is the two-line
+  // disclaimer about what this view does and does not do; `--all` is now a field, so the reader can see
+  // which mode produced the rows below instead of being told about it in a parenthesis.
+  out.kv('lens', 'story');
+  out.kv('record', path.basename(TRACE_FILE));
+  out.kv('bot_filter', BOT_FILTER);
+  out.kv('run', 'latest');
+  out.kv('episodes', episodes.length);
+  out.kv('every_episode_in_full', full);
+  if (episodes.length) {
+    out.section('story');
+    out.table(EPISODE_FIELDS, episodes.flatMap(ep => episodeRows(ep, full)));
+  }
   process.exit(0);
 }
 
@@ -1106,33 +1296,51 @@ function runProgress() {
     }
   }
 
-  console.log(`trace_monitor · progress · ${path.basename(TRACE_FILE)} · latest run · span [${relativeTime(maxRel)}] · tail window ${relativeTime(PROGRESS_TAIL_SEC)}`);
-  console.log('(context only — never flags, never wakes; "progressing vs looping" ledger)\n');
-  if (struct.size === 0) { console.log('(no build/mine integrity lines in the latest run yet)'); process.exit(0); }
+  // ── THE LEDGER IS COLUMNS AND ITS VERDICTS ARE VALUES (Architect 2026-09-16) ────────────────────
+  // Each structure was one composed line ending in `■ STALLED 18m 47s (peak at [6m 35s])  ⚠ MIXED
+  // OUTCOMES AFTER PEAK: 3× all_complete / 4× blocked`. The verdict survives as the `verdict` value
+  // (COMPLETE | RISING | STALLED) and every number it was computed from is its own column — including
+  // `progress_tail_sec`, the criterion, which the sentence carried only in the header (Rule: a verdict
+  // against a threshold keeps BOTH). `mixed_outcomes_after_peak` is the boolean that the ⚠ clause was,
+  // with the two tallies beside it.
+  out.kv('lens', 'progress');
+  out.kv('record', path.basename(TRACE_FILE));
+  out.kv('run', 'latest');
+  out.kv('span', relativeTime(maxRel));
+  out.kv('span_sec', maxRel);
+  out.kv('progress_tail_sec', PROGRESS_TAIL_SEC);
+  out.kv('structures', struct.size);
+  if (struct.size === 0) process.exit(0);
 
   let lastProgressT = 0, lastProgressKey = null;
   const rows = [];
   for (const [key, s] of struct) {
     const done = s.last.c >= s.total;
     const rising = s.peak.t >= maxRel - PROGRESS_TAIL_SEC;
-    const verdict = done ? '✔ COMPLETE'
-      : rising ? '↑ RISING'
-      : `■ STALLED ${relativeTime(maxRel - s.peak.t)} (peak at [${relativeTime(s.peak.t)}])`;
-    const osc = (!done && s.complete > 0 && s.blocked > 0)
-      ? `  ⚠ LIVELOCK: ${s.complete}× all_complete / ${s.blocked}× blocked after peak (judge-blind: outcome alternates)` : '';
-    rows.push(`${key}  ${s.first.c}/${s.total} [${relativeTime(s.first.t)}] → peak ${s.peak.c} [${relativeTime(s.peak.t)}] → last ${s.last.c} [${relativeTime(s.last.t)}]  ${verdict}${osc}`);
+    rows.push([key, s.total, s.first.c, relativeTime(s.first.t), s.peak.c, relativeTime(s.peak.t),
+      s.last.c, relativeTime(s.last.t),
+      done ? 'COMPLETE' : rising ? 'RISING' : 'STALLED',
+      done || rising ? null : maxRel - s.peak.t,
+      s.complete, s.blocked, !done && s.complete > 0 && s.blocked > 0]);
     if (s.peak.t > lastProgressT) { lastProgressT = s.peak.t; lastProgressKey = key; }
   }
-  for (const r of rows) console.log(r);
+  out.section('structure_ledger');
+  out.table(['structure', 'total', 'first', 'first_at', 'peak', 'peak_at', 'last', 'last_at',
+    'verdict', 'stalled_sec', 'all_complete_after_peak', 'blocked_after_peak',
+    'mixed_outcomes_after_peak'], rows);
 
+  // The decisive pair: how long since anything anywhere advanced, against the tail window it is judged
+  // by. `looping` is the verdict the ▸ VERDICT sentence carried; the percentage it quoted is a field.
   const idle = maxRel - lastProgressT;
-  console.log('');
-  console.log(`▸ last net-new progress: [${relativeTime(lastProgressT)}] (${lastProgressKey})`);
-  if (idle > PROGRESS_TAIL_SEC) {
-    console.log(`▸ VERDICT: LOOPING — ${relativeTime(idle)} of the ${relativeTime(maxRel)} run produced zero net progress (${Math.round(100 * idle / (maxRel || 1))}% of the run spent not advancing any structure).`);
-  } else {
-    console.log(`▸ VERDICT: PROGRESSING — advanced within the last ${relativeTime(idle)}.`);
-  }
+  out.section('net_progress');
+  out.kv('last_net_new_progress', relativeTime(lastProgressT));
+  out.kv('last_net_new_progress_sec', lastProgressT);
+  out.kv('last_net_new_progress_structure', lastProgressKey);
+  out.kv('idle', relativeTime(idle));
+  out.kv('idle_sec', idle);
+  out.kv('idle_percent_of_run', Math.round(100 * idle / (maxRel || 1)));
+  out.kv('progress_tail_sec', PROGRESS_TAIL_SEC);
+  out.kv('looping', idle > PROGRESS_TAIL_SEC);
   process.exit(0);
 }
 
@@ -1204,7 +1412,11 @@ function runQuery() {
   const filtered = scope.filter(l => preds.every(p => p(l)));
   const aroundTok = opt('around', null), fromTok = opt('from', null), toTok = opt('to', null);
   const timeWindowGiven = args.some(a => /^--(window|before|after)=/.test(a));
-  let rows, desc = '';
+  // `desc` was a composed clause — `±25 lines around [1m 1s] (anchor = match #7 at [1m 0s])` — printed
+  // in the header. It is now a list of [field, value] pairs describing HOW the slice was cut: `mode`
+  // names the cut, and every number that shaped it rides beside it under its own name. Nothing about
+  // the slice is inferred from the mode, so a reader never has to know the grammar to read the answer.
+  let rows; const slice = [];
 
   if (aroundTok != null) {
     const a = parseTimeToken(aroundTok);
@@ -1212,7 +1424,8 @@ function runQuery() {
     const useIso = a.isoMs != null;
     const anchorVal = useIso ? a.isoMs : a.relSec;
     const pos = l => (useIso ? lineIsoMs(l) : l.relSec);     // this line's position on the chosen axis
-    const anchorLabel = useIso ? new Date(anchorVal).toISOString() : `[${relativeTime(anchorVal)}]`;
+    const anchorLabel = useIso ? new Date(anchorVal).toISOString() : relativeTime(anchorVal);
+    slice.push(['anchor', anchorLabel], ['anchor_axis', useIso ? 'absolute' : 'relative']);
 
     if (timeWindowGiven) {
       const before = parseDurationSec(opt('before', opt('window', null)), 60);
@@ -1220,7 +1433,7 @@ function runQuery() {
       const lo = anchorVal - before * (useIso ? 1000 : 1);
       const hi = anchorVal + after * (useIso ? 1000 : 1);
       rows = filtered.filter(l => { const v = pos(l); return v != null && v >= lo && v <= hi; });
-      desc = `around ${anchorLabel} (−${before}s / +${after}s of matches)`;
+      slice.push(['mode', 'time_window'], ['before_sec', before], ['after_sec', after]);
     } else {
       // Count window (default): N matching lines each side of the anchor LINE — the match closest to
       // the moment. Bounded regardless of fleet size/speed. Filters above pinpoint which line anchors.
@@ -1232,11 +1445,16 @@ function runQuery() {
         const d = Math.abs(v - anchorVal);
         if (d < best) { best = d; idx = i; }
       }
-      if (idx < 0) { rows = []; desc = `±${N} lines around ${anchorLabel} (no line carries that axis)`; }
-      else {
+      slice.push(['mode', 'line_count'], ['lines_each_side', N]);
+      if (idx < 0) {
+        // `(no line carries that axis)` was the explanation; `anchor_found` is the fact, and the zero
+        // count below is the rest of it.
+        rows = [];
+        slice.push(['anchor_found', false]);
+      } else {
         rows = filtered.slice(Math.max(0, idx - N), Math.min(filtered.length, idx + N + 1));
-        const at = filtered[idx].relSec != null ? `[${relativeTime(filtered[idx].relSec)}]` : (filtered[idx].iso || '?');
-        desc = `±${N} lines around ${anchorLabel} (anchor = match #${idx} at ${at})`;
+        const at = filtered[idx].relSec != null ? relativeTime(filtered[idx].relSec) : filtered[idx].iso;
+        slice.push(['anchor_found', true], ['anchor_match_index', idx], ['anchor_match_at', at]);
       }
     }
   } else if (fromTok != null || toTok != null) {
@@ -1249,26 +1467,43 @@ function runQuery() {
       const lo = f && f.isoMs != null ? f.isoMs : -Infinity;
       const hi = t && t.isoMs != null ? t.isoMs : Infinity;
       rows = filtered.filter(l => { const m = lineIsoMs(l); return m != null && m >= lo && m <= hi; });
-      desc = `from ${fromTok || 'start'} to ${toTok || 'end'} (absolute)`;
+      // An omitted bound is ABSENT, never the words "start"/"end" — the bound genuinely was not given.
+      slice.push(['mode', 'range'], ['range_axis', 'absolute'],
+        ['range_from', fromTok], ['range_to', toTok]);
     } else {
       const lo = f ? f.relSec : -Infinity, hi = t ? t.relSec : Infinity;
       rows = filtered.filter(l => l.relSec != null && l.relSec >= lo && l.relSec <= hi);
-      desc = `from [${f ? relativeTime(f.relSec) : '0m 0s'}] to [${t ? relativeTime(t.relSec) : 'end'}]`;
+      slice.push(['mode', 'range'], ['range_axis', 'relative'],
+        ['range_from', f ? relativeTime(f.relSec) : null], ['range_from_sec', f ? f.relSec : null],
+        ['range_to', t ? relativeTime(t.relSec) : null], ['range_to_sec', t ? t.relSec : null]);
     }
   } else {
     rows = filtered;
+    slice.push(['mode', 'whole_run']);
   }
-  const filters = [
-    BOT_FILTER && `bot=${BOT_FILTER}`,
-    tags.length && `tag=${tags.join(',')}`,
-    level && `level=${level}`,
-    grep && `grep=/${grep}/i`,
-    desc,
-  ].filter(Boolean).join(' · ');
-  console.log(`trace_monitor · query · ${path.basename(TRACE_FILE)} · run=${runSel} · ${filters || '(no filter)'} · ${rows.length} line(s)`);
-  console.log('(read-only slice — never flags, never wakes)\n');
-  for (const l of rows) console.log(l.raw);
-  if (rows.length === 0) console.log('(no lines match — widen the window, check --run, or the tag/bot spelling)');
+  // ── `lines_matched` IS THE NAME ANOTHER PROGRAM READS ───────────────────────────────────────────
+  // `Auren_Workshop/run.js` takes the error-line count off this header to decide whether the run record
+  // is clean. It used to scrape `· N line(s)` out of a sentence — a machine parsing prose, which is the
+  // joint Law 26 forbids even when both ends are ours. The count is now a FIELD with a name, and the
+  // only way for it to move is for somebody to rename it here on purpose.
+  out.kv('lens', 'query');
+  out.kv('record', path.basename(TRACE_FILE));
+  out.kv('run', runSel);
+  out.kv('bot_filter', BOT_FILTER);
+  out.kv('tag_filter', tags.length ? tags.join(',') : null);
+  out.kv('level_filter', level);
+  out.kv('grep_filter', grep);
+  for (const [k, v] of slice) out.kv(k, v);
+  // THREE COUNTS, EACH NAMED FOR WHAT IT ACTUALLY COUNTS. This printed `lines_scanned` for the
+  // post-filter set, which in whole-run mode equals `lines_matched` exactly — two fields, one number,
+  // and a name promising a denominator it never held. `lines_in_run` is that denominator.
+  out.kv('lines_in_run', scope.length);
+  out.kv('lines_after_filters', filtered.length);
+  out.kv('lines_matched', rows.length);
+  if (rows.length) {
+    out.section('lines');
+    out.list('line', rows.map(l => l.raw));
+  }
   process.exit(0);
 }
 
@@ -1282,16 +1517,22 @@ function runWatch() {
   let knownLines = null;      // null until the baseline read — history is never "new"
   let reported = new Set();   // `${sig}:${bot}:${idx}` already shown
   let flagged = false;
-  console.log(`trace_monitor · watching ${path.basename(TRACE_FILE)} every ${WATCH_INTERVAL_SEC}s (max ${MAX_MINUTES}m)`);
+  out.kv('lens', 'watch');
+  out.kv('record', path.basename(TRACE_FILE));
+  out.kv('interval_sec', WATCH_INTERVAL_SEC);
+  out.kv('max_minutes', MAX_MINUTES);
+  out.kv('exit_on_flag', EXIT_ON_FLAG);
+  out.kv('exit_on_signatures', [...EXIT_ON_SIGS].join(','));
 
   // Live status field: on a TTY (the Architect watches trace_monitor in its own terminal window)
   // the quiet heartbeat OVERWRITES one status line in place every tick — a live dashboard, not an
   // ever-growing log — and shows ALL bots, not just the first (the "where's Auren?" miss). Off a TTY
   // (fleet_logs/trace.log, no terminal) it stays an append-once-a-minute line so the file doesn't
   // fill with carriage returns. A flag or an exit ends the live line first so nothing clobbers it.
+  // The in-place redraw and its escape codes moved into data_out (2026-09-16) so this file owns no part
+  // of how a line reaches the terminal — the same reason every other print here goes through it.
   const TTY = !!process.stdout.isTTY;
-  let liveLine = false;
-  const endLiveLine = () => { if (liveLine) { process.stdout.write('\n'); liveLine = false; } };
+  const endLiveLine = () => out.tickerEnd();
 
   let lastHeartbeat = Date.now();
   let freezeAt = null;   // newestBotMs already flagged as frozen; cleared when a newer line lands
@@ -1300,7 +1541,13 @@ function runWatch() {
     const elapsedMin = (Date.now() - t0) / 60000;
     if (elapsedMin >= MAX_MINUTES) {
       endLiveLine();
-      console.log(`\nWatch window over (${MAX_MINUTES}m). ${flagged ? 'Flags were raised — see above.' : 'No anomalies.'}`);
+      // `Flags were raised — see above.` / `No anomalies.` deleted: `flagged` is the same fact, and the
+      // pointer at the scrollback was this instrument narrating its own transcript.
+      out.section('watch_end');
+      out.kv('elapsed_min', Math.floor(elapsedMin));
+      out.kv('max_minutes', MAX_MINUTES);
+      out.kv('window_served', true);
+      out.kv('flagged', flagged);
       process.exit(flagged ? 2 : 0);
     }
     let lines;
@@ -1318,7 +1565,10 @@ function runWatch() {
       // of baselining the crash away (the Architect's policy, and the 2026-07-07 miss).
       knownLines = lines.length;
       streamedThrough = lines.length;   // stream FORWARD from launch — don't dump pre-watch history
-      console.log(`[watch] baseline at line ${knownLines} — errors wake even if already present; other anomalies only from here.`);
+      // The clause about which signatures are baseline-exempt is deleted — it is this file's POLICY,
+      // stated in the comment above and in WAKE_SIGS, not a measurement of the run. The baseline itself
+      // is the measurement.
+      out.kv('baseline_line', knownLines);
       // Hand-off suppression works by seeding `reported` — the SAME dedupe that already stops one episode
       // firing twice — rather than a second counter beside it (Law 16). An episode the caller says it has
       // already seen is simply an episode already reported. Nothing downstream needs to know why.
@@ -1340,12 +1590,16 @@ function runWatch() {
         const prior = detect(lines).filter(f => WAKE_SIGS.has(f.sig)).slice(0, ERRORS_KNOWN);
         const kinds = [...new Set(prior.map(f => f.sig))].join('/') || 'wake';
         for (const f of prior) reported.add(`${f.sig}:${f.bot}:${f.idx}`);
-        console.log(`  the first ${prior.length} waking episode(s) of this trace (${kinds}) are already handed off`
-          + `${prior.length < ERRORS_KNOWN ? ` (only ${prior.length} present; asked for ${ERRORS_KNOWN})` : ''}`
-          + ' — waking on the next one.');
+        out.kv('handed_off_episodes', prior.length);
+        out.kv('handed_off_asked', ERRORS_KNOWN);
+        out.kv('handed_off_signatures', kinds);
       }
     } else if (lines.length < knownLines) {
-      console.log(`[watch] trace reset (${knownLines} → ${lines.length} lines) — overseer restarted, state cleared.`);
+      // `— watch state cleared.` deleted: the two line counts are the event, and what this loop does
+      // about a shrinking trace is code, not a finding about the fleet.
+      out.section('trace_reset');
+      out.kv('lines_before', knownLines);
+      out.kv('lines_after', lines.length);
       reported = new Set();
       knownLines = 0;
       streamedThrough = 0;
@@ -1362,7 +1616,8 @@ function runWatch() {
         if (streamMatch(lines[i].raw)) fresh.push(lines[i].raw);
       }
       streamedThrough = lines.length;
-      if (fresh.length) { endLiveLine(); for (const r of fresh) console.log(r); }
+      // The echoed lines are the bots' own, verbatim, under one declared field name.
+      if (fresh.length) { endLiveLine(); out.list('line', fresh); }
     }
     // Total-freeze arm of the silence signature (wall-clock, watch-only). sigSilence is RELATIVE —
     // it needs SOME bot still logging to notice another went quiet, so a WHOLE-fleet freeze (every
@@ -1390,13 +1645,22 @@ function runWatch() {
         freezeAt = newestBotMs;
         const lagSec = Math.round((Date.now() - newestBotMs) / 1000);
         endLiveLine();
-        console.log(`\n❌ [watch] FLEET FROZEN — no bot has logged for ${lagSec}s (last bot line ${new Date(newestBotMs).toISOString()}). No error was raised: this is the silent-hang fingerprint.`);
+        // The verdict is `fleet_frozen`; the measurement it was made from (`silence_gap_sec`) and the
+        // threshold it was measured against (`silence_threshold_sec`) are printed beside it, so the
+        // reader can check the call rather than take it. `; no error line in that window` is deleted —
+        // that was this file inferring what the silence MEANT.
+        out.section('fleet_freeze');
+        out.kv('fleet_frozen', true);
+        out.kv('silence_gap_sec', lagSec);
+        out.kv('silence_threshold_sec', SILENCE_GAP_SEC);
+        out.kv('last_bot_line_at', new Date(newestBotMs).toISOString());
         flagged = true;
         // The freeze detector is not one of the `detect` signatures, so it has no `sig` to match. It
         // rides with `error`: the line it just printed IS a ❌, and a fleet that has stopped logging
         // entirely is the same class of thing as a crash to anyone deciding whether to keep running.
         if (EXIT_ON_FLAG && EXIT_ON_SIGS.has('error')) {
-          console.log('[watch] wake-worthy anomaly (silence/total-freeze) — exiting for handoff.');
+          out.kv('exit_for_handoff', 'fleet_freeze');
+          out.kv('exit_code', EXIT_EARLY_CODE);
           process.exit(EXIT_EARLY_CODE);
         }
       }
@@ -1435,7 +1699,8 @@ function runWatch() {
         flagged = true;
         const enders = wake.filter(f => EXIT_ON_SIGS.has(f.sig));
         if (EXIT_ON_FLAG && enders.length > 0) {
-          console.log(`\n[watch] wake-worthy anomaly (${[...new Set(enders.map(f => f.sig))].join(', ')}) — exiting for handoff.`);
+          out.kv('exit_for_handoff', [...new Set(enders.map(f => f.sig))].join(','));
+          out.kv('exit_code', EXIT_EARLY_CODE);
           process.exit(EXIT_EARLY_CODE);
         }
       }
@@ -1443,15 +1708,19 @@ function runWatch() {
       // Quiet: refresh the all-bots status field (watchStatus). TTY overwrites in place every tick; a
       // file appends at most once a minute. On a TTY it is CUT TO THE TERMINAL'S WIDTH, because the
       // overwrite clears only the row the cursor is on — a line that wraps leaves its tail behind.
-      const status = watchStatus(lines, elapsedMin);
+      // Same rows, two placements. The TTY gets the one-line field=value field it has to get (the
+      // overwrite clears one row only); the log file gets the table, which is the same numbers with
+      // their column names on top. `quiet` was a word this file added and is deleted — the absence of a
+      // flag block above IS the quiet, and `watch_min` is the tick it is quiet at.
+      const rows = watchStatusRows(lines);
       if (TTY) {
-        const width = process.stdout.columns || 0;
-        const fit = width && status.length >= width ? `${status.slice(0, width - 2)}…` : status;
-        process.stdout.write('\r\x1b[2K' + fit);
-        liveLine = true;
+        out.ticker(watchStatusLine(rows, elapsedMin));
       } else if (Date.now() - lastHeartbeat >= 60000) {
         lastHeartbeat = Date.now();
-        console.log(status);
+        out.section('watch_quiet');
+        out.kv('watch_min', Math.floor(elapsedMin));
+        out.kv('bots', rows.length);
+        if (rows.length) out.table(WATCH_FIELDS, rows);
       }
     }
     setTimeout(tick, WATCH_INTERVAL_SEC * 1000);
@@ -1510,7 +1779,7 @@ if (require.main === module) {
 
   // --last first: it reads only the per-bot watcher files, so it answers "is this bot alive?" even when
   // the merged trace is absent, empty, or lagging — precisely the conditions that make the question urgent.
-  if (LASTPOST) { for (const l of lastPostLines()) console.log(l); process.exit(0); }
+  if (LASTPOST) { printLastPost(); process.exit(0); }
   else if (STORY) runStory();
   else if (PROGRESS) runProgress();
   else if (PATHFINDING) runLens(locomotionLenses.runPathfinding);
@@ -1518,6 +1787,7 @@ if (require.main === module) {
   else if (JUMPS) runLens(locomotionLenses.runJumps);
   else if (MILESTONES) runLens(buildLenses.runMilestones, { deadlineSec: MS_DEADLINE_SEC, verbose });
   else if (TORCH) runLens(buildLenses.runTorchClock, { deadlineSec: MS_DEADLINE_SEC });
+else if (FARM) runLens(require('./farm_lens').runFarm, { verbose });
   else if (JOBS) runLens(require('./job_timeline_lens').runJobTimeline, { verbose });
   // The lens takes its inputs as arguments; reading --bot/--all is the CLI's job, not the lens's.
   else if (WITNESS) { recordingLens('combat_witness_lens', '--witness').runWitness({ bot: BOT_FILTER, verbose }); process.exit(0); }

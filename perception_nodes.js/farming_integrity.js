@@ -35,7 +35,8 @@ const hq      = require('@kernel/corporate_headquarters');
 const blueprintSurvey = require('@perception/blueprint_survey');
 const { getFarmState } = require('@perception/farmland_site');
 const { blueprintToRawMaterials } = require('@utils/calculators/build_material_calculator');
-const { hasHomeChest, readBuildCenter } = require('@utils/fragment_utils');
+const { hasHomeChest, readBuildCenter, getBotInventory } = require('@utils/fragment_utils');
+const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const inventoryLens = require('@kernel/inventory_lens');
 
 const TAG = 'farming_integrity';
@@ -47,9 +48,16 @@ const TAG = 'farming_integrity';
 // over duplicate-named blueprints, reusing the mining-cell instance pattern (Law 16). Grow the farm count
 // by editing FARM_ROOM_KEYS in config, never here. The blueprint-derived needs below (SEED_NEED/HOE_LOGS)
 // are per-DESIGN, so they are identical across instances — computed once.
-const { FARM_BLUEPRINT_NAME: FARM_BLUEPRINT, FARM_ROOM_KEYS } = require('@thinking/architect_config');
+const { FARM_BLUEPRINT_NAME: FARM_BLUEPRINT, FARM_ROOM_KEYS, FARM_DIRT_MIN_GATHER } = require('@thinking/architect_config');
 
 let _lastScan = null;
+
+// THE SOIL A ROW IS BUILT FROM COMES OUT OF THE POCKET (Architect 2026-09-15). A tine row is three dirt blocks
+// placed into water, and the bot carries them there — nothing pulls dirt from a chest for the farm. So dirt is
+// not gated against the fleet pool per plot (a chest full of dirt would clear a build the bot cannot lay); it
+// is funded at the cluster from the bot's own pocket, after seeds, and what a seed-funded row is short of
+// becomes the farm's dirt order (assessors/farming).
+const POCKET_SOIL = 'dirt';
 
 // ── Blueprint-derived needs (the farm is one fixed design → compute once at load) ──
 //   SEED_NEED = one seed per crop cell = the 'growing' voxel count (a full planting).
@@ -63,18 +71,25 @@ let _lastScan = null;
 // the live diff. Two axes survive as constants because they are genuinely per-design and survey-invisible:
 // seeds (the crop cells are declared external, so the survey never emits them) and the hoe (a tool, not a
 // voxel). Anything the survey CAN see must be priced from the survey (Law 16 — one answer per question).
-const { SEED_NEED, HOE_LOGS } = (() => {
+//   DIRT_PER_ROW = the 'dirt' voxels one instance places — a whole row, priced for a row not yet standable.
+//   STRUCT_PER_ROW = the structural voxels one row owns (every voxel that is not air and not a declared external
+//                    type) — the denominator of the farm census's "placed" count, the farm's equivalent of
+//                    building_integrity's structure total.
+const { SEED_NEED, HOE_LOGS, DIRT_PER_ROW, STRUCT_PER_ROW } = (() => {
   // tryGetBuilding answers a missing blueprint with null, which is the only condition the removed guard
   // named — everything below is arithmetic over our own registry, so a throw there is a malformed
   // blueprint and must stop the load rather than start the run on a zero seed need (Law 13).
-  const fallback = { SEED_NEED: 0, HOE_LOGS: 2 };
+  const fallback = { SEED_NEED: 0, HOE_LOGS: 2, DIRT_PER_ROW: 0, STRUCT_PER_ROW: 0 };
   {
     const b = blueprintRegistry.tryGetBuilding(FARM_BLUEPRINT);
     if (!b) return fallback;
     const voxels = blueprintSurvey.collectAllVoxels(b);
+    const external = new Set(b.external_voxel_types || []);
     const seeds  = voxels.filter(v => v.raw && v.raw[3] === 'growing').length;
+    const dirt   = voxels.filter(v => v.raw && v.raw[3] === POCKET_SOIL).length;
+    const struct = voxels.filter(v => v.raw && v.raw[3] !== 'air' && !external.has(v.raw[3])).length;
     const hoeLogs = blueprintToRawMaterials({ wooden_hoe: 1 }).logs || 2;
-    return { SEED_NEED: seeds, HOE_LOGS: hoeLogs };
+    return { SEED_NEED: seeds, HOE_LOGS: hoeLogs, DIRT_PER_ROW: dirt, STRUCT_PER_ROW: struct };
   }
 })();
 
@@ -141,7 +156,7 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   const center = readBuildCenter(roomKey);
   const located = !!center;
 
-  // Stand-standability gate. A decomposed wheat_plot_pair's stand is a single block the bot must
+  // Stand-standability gate. A farm row's stand is a single block the bot must
   // stand ON to tend the adjacent crop. Dynamic water can flood that block AFTER siting; the bot
   // then bobs where it should stand, battle_stations yanks it to land, the manager re-dispatches,
   // and it livelocks until recursive_judge halts it. Re-validate the locked stand EVERY scan
@@ -150,8 +165,12 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   // never dispatches into the loop. A reachable alternate keeps it actionable (farm_executor tends from
   // that alternate via the same resolveStandableAnchor helper, Law 16). Lazy require — anchored_repair
   // pulls in locomotion, and this perception node is required early by the job board.
+  // The blueprint says whether a nearby lip may stand in for its stand (wheat_tine_row: no — see its description).
   let stranded = false;
-  if (located) stranded = require('@api/anchored_repair').resolveStandableAnchor(bot, center) === null;
+  if (located) {
+    const fallback = blueprintRegistry.getBuilding(blueprintSurvey.geometryOf(roomKey), TAG).stand_fallback !== false;
+    stranded = require('@api/anchored_repair').resolveStandableAnchor(bot, center, { fallback }) === null;
+  }
 
   let structure = null, field = null;
   let structureComplete = false, structureSteps = [];
@@ -225,6 +244,7 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
 
   const materialsMissing = {};
   for (const [tok, cnt] of Object.entries(materialsNeeded)) {
+    if (tok === POCKET_SOIL) continue;                   // the pocket's to fund, at the cluster (THE DIRT BUDGET)
     const have = inventoryLens.reachableByFleet(tok);   // group-aware (logs variants, etc.)
     if (cnt - have > 0) materialsMissing[tok] = cnt - have;
   }
@@ -237,6 +257,10 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
     located,
     structure_complete: structureComplete,
     structure_steps: structureSteps,
+    // Placed = the row's structural voxels less the ones the survey still has a place step for. Null until
+    // sited: an unsited row has no cells to count, and a zero would read as "sited, nothing placed" (Law 25).
+    structure_placed: located ? Math.max(0, STRUCT_PER_ROW - structureSteps.filter(s => s.action === 'place').length) : null,
+    structure_digs_left: located ? structureSteps.filter(s => s.action === 'dig').length : null,
     field,
     phase,
     stranded,
@@ -363,6 +387,8 @@ function scanCluster(bot) {
     const plot = {
       roomKey, center, phase: v.phase, actionable, materials_ready: v.materials_ready,
       seeds_needed: (v.materials_needed && v.materials_needed.wheat_seeds) || 0,
+      dirt_needed: (v.materials_needed && v.materials_needed[POCKET_SOIL]) || 0,
+      structure_placed: v.structure_placed, structure_digs_left: v.structure_digs_left, field: v.field,
     };
     // Funded below, not here — a build plot's own verdict cannot see its 31 siblings (see THE SEED BUDGET).
     if (v.phase === 'build' && v.materials_ready === true) buildQueue.push(plot);
@@ -388,14 +414,73 @@ function scanCluster(bot) {
   const plantDemand = plots.reduce((n, p) => n + (p.phase === 'plant' ? p.seeds_needed : 0), 0);
   let seedBudget = inventoryLens.reachableByFleet('wheat_seeds') - plantDemand;
   let unfundedBuilds = 0;
-  for (const p of buildQueue) {
+  // ── THE DIRT BUDGET: the pocket, after the seeds ── A seed-funded row is laid only if the pocket holds its
+  // dirt too. Rows go in key order, which is anchor order, so a short pocket holds back the OUTER rows and
+  // never leaves a gap behind a row it did fund. `dirtGap` is what the held-back seed-funded rows still need:
+  // the farm's dirt order, sized to what the seeds can actually plant (never the whole field).
+  // The ORDER is sized over every row the seeds can plant, not only the rows buildable this instant: a row
+  // further out is stranded until the row behind lays its stand, so counting only today's buildable rows would
+  // fetch one row of dirt per trip. A stranded row the seeds reach is priced at a whole row (DIRT_PER_ROW).
+  const pocketDirt = countInInventory(POCKET_SOIL, getBotInventory());
+  let dirtBudget = pocketDirt;
+  let dirtShortBuilds = 0;
+  const seedsForBuilding = seedBudget;
+
+  // ── ONE ROW AT A TIME, AND IT IS ALWAYS THE LOWEST UNLAID ONE (Architect 2026-09-15) ──────────────
+  // *"it should work like building… it should only be able to do the lowest unbuilt anchor. thats how
+  // building works."* A tine row is laid by a body STANDING ON THE ROW BEHIND IT — one of the voxels this
+  // row places is the next row's stand, like overlapping scales. So the row order is not a preference, it
+  // is the only way any row past the bank can be reached at all, and offering row k+2 while k+1 is unlaid
+  // offers a cell with no floor to work from.
+  //
+  // WHY THE BUDGET ALONE DID NOT ENFORCE THIS, which is the bug this closes. A row is `stranded` only when
+  // `resolveStandableAnchor` finds no standable block AT its own anchor — a LOCAL test. A row whose land
+  // block exists but which sits across open water reads `build`, passes its own materials check, and gets
+  // funded; the body then walks out, finds nothing to stand on, and tries to pillar off a water source.
+  // The 2026-09-15 run: 1,724 warnings on one bot against 18 on the other, every one of them
+  // `pillarStep fail reason=no_solid_support support=water`, repeating for thirteen minutes.
+  // **Standable is not reachable, and only the chain makes it so** — from the row behind, the next anchor is
+  // one block away and cannot fail to be reached.
+  //
+  // The manager re-senses every iteration, so this is not a throttle: lay the lowest row, and the next scan
+  // hands back the one after it. That IS the fast build loop — manager asks, executor lays one row, manager
+  // asks again — and it costs the visit nothing, because the body is already standing on the row it just laid.
+  const lowestUnlaid = plots.find(p => p.phase === 'build' || p.phase === 'stranded') || null;
+  const buildable = buildQueue.filter(p => p === lowestUnlaid);
+  const chainHeld = buildQueue.length - buildable.length;
+  for (const p of buildable) {
     // seeds_needed === 0 funds unconditionally: a blueprint with no 'growing' voxel costs no seeds, and
     // a negative budget from plant demand must not veto a plot that spends nothing.
-    if (p.seeds_needed === 0 || p.seeds_needed <= seedBudget) {
-      p.actionable = true;
-      seedBudget -= p.seeds_needed;
-    } else unfundedBuilds++;
+    if (!(p.seeds_needed === 0 || p.seeds_needed <= seedBudget)) { unfundedBuilds++; continue; }
+    seedBudget -= p.seeds_needed;
+    if (p.dirt_needed <= dirtBudget) { p.actionable = true; dirtBudget -= p.dirt_needed; }
+    else dirtShortBuilds++;
   }
+  let dirtPlanned = 0, seedsLeft = seedsForBuilding;
+  for (const p of plots) {
+    if (p.phase !== 'build' && p.phase !== 'stranded') continue;
+    const seeds = p.phase === 'build' ? p.seeds_needed : SEED_NEED;
+    if (seeds > seedsLeft) break;
+    seedsLeft -= seeds;
+    dirtPlanned += p.phase === 'build' ? p.dirt_needed : DIRT_PER_ROW;
+  }
+  // THE POCKET IS SPENT FIRST AND IT IS SPENT HERE — `dirtPlanned - pocketDirt` is what the body cannot
+  // already lay from what it carries, so a pocket that covers the plan orders NOTHING. Only once it does not
+  // is the order floored at FARM_DIRT_MIN_GATHER, so the fleet makes one trip worth making instead of
+  // fetching three blocks at a time (architect_config carries the measurement that set the number). The
+  // chest is the next claimant and needs nothing here: supply_manager withdraws against a pocket order
+  // before it digs, so a floored order is served from a stocked chest without a gather at all.
+  const dirtGap = dirtPlanned > pocketDirt ? Math.max(FARM_DIRT_MIN_GATHER, dirtPlanned - pocketDirt) : 0;
+
+  // ── THE FARM'S SEED ORDER AND ITS "BUILT" VERDICT (Architect 2026-09-15) ── The field asks for exactly the seeds
+  // it cannot yet sow — every plant cell waiting plus every row not yet laid — less what the fleet already reaches.
+  // Built = sited and no row left to lay; the setup gate reads it (architect_config SETUP_ORDER). Tending a built
+  // field is upkeep, not construction, so replanting never un-builds it — a broken row does, until it is relaid.
+  const unbuiltRows = plots.filter(p => p.phase === 'build' || p.phase === 'stranded');
+  const seedDemand = plantDemand + unbuiltRows.reduce((n, p) => n + (p.phase === 'build' ? p.seeds_needed : SEED_NEED), 0);
+  const seedsReachable = inventoryLens.reachableByFleet('wheat_seeds');
+  const seedGap = Math.max(0, seedDemand - seedsReachable);
+  const built = anyLocated && unbuiltRows.length === 0;
 
   const actionablePlots = plots.filter(p => p.actionable);
   const anyActionable = actionablePlots.length > 0;
@@ -408,7 +493,18 @@ function scanCluster(bot) {
   // The seed budget is reported wherever it BIT, because a plot held back by it is otherwise
   // indistinguishable in the trace from a plot with nothing to do (Law 6) — and those two want
   // opposite responses: one is waiting on supply, the other on growth.
-  const seedStr = unfundedBuilds ? ` — ${unfundedBuilds} build plot(s) unseeded, held back` : '';
+  const seedStr = (unfundedBuilds ? ` — ${unfundedBuilds} build plot(s) unseeded, held back` : '')
+    // Said out loud, because a row held by the CHAIN and a row held by SUPPLY look identical from outside
+    // and want opposite responses (Law 6): one is waiting on the row behind it, the other on a delivery.
+    + (chainHeld ? ` — ${chainHeld} row(s) ready but held behind ${lowestUnlaid ? _rowLabel(lowestUnlaid.roomKey) : 'the unlaid row'} (laid lowest-first, each stood on the one before)` : '')
+    + (dirtShortBuilds ? ` — ${dirtShortBuilds} seeded row(s) waiting on pocket dirt` : '')
+    // Says WHICH number produced the order, because with a floor in play the shortfall and the order size
+    // are no longer the same figure, and a reader who saw only "15 ordered" against "3 to plant" would read
+    // it as a bug rather than as one trip instead of five (Law 25).
+    + (dirtGap ? ` — ${dirtGap} dirt ordered (${dirtPlanned} for the rows the seeds can plant, ${pocketDirt} held`
+        + (dirtGap > dirtPlanned - pocketDirt ? `, short ${dirtPlanned - pocketDirt} but floored at the ${FARM_DIRT_MIN_GATHER}-block minimum trip` : '') + ')' : '')
+    + (seedGap ? ` — ${seedGap} seeds ordered (${seedDemand} to sow, ${seedsReachable} reachable)` : '')
+    + (anyLocated ? (built ? ' — farm BUILT' : ` — farm not built (${unbuiltRows.length} row(s) to lay)`) : '');
   if (!anyLocated) {
     watcher.summary(TAG, 'cluster: no plots located yet — base-layout lock pending.');
   } else if (!anyActionable) {
@@ -416,6 +512,7 @@ function scanCluster(bot) {
   } else {
     watcher.summary(TAG, `cluster: ${plots.length} plots, ${actionablePlots.length} actionable (${phaseStr}) — materials ${materialsReady ? 'ready' : 'GATED'}${seedStr}.`);
   }
+  if (anyLocated) _emitCensus(plots, unbuiltRows.length);
 
   return {
     schema: 'auren.farming_integrity_cluster.v1',
@@ -427,7 +524,44 @@ function scanCluster(bot) {
     materials_ready: materialsReady,
     materials_missing: missingAgg,
     unfunded_builds: unfundedBuilds,
+    // Rows materially ready to lay that the chain holds back this sweep, and which row they wait on.
+    chain_held: chainHeld,
+    lowest_unlaid: lowestUnlaid ? lowestUnlaid.roomKey : null,
+    dirt_gap: dirtGap,
+    dirt_short_builds: dirtShortBuilds,
+    seed_gap: seedGap,
+    seeds_reachable: seedsReachable,
+    built,
+    // Seeds one visit can sow: every plant cell waiting, plus every row the seeds reach — rows further out only
+    // become buildable DURING the visit (each is stood on the row before it), so prep must pull for them too.
+    seeds_for_visit: Math.max(0, plantDemand) + (seedsForBuilding - seedsLeft),
   };
+}
+
+// ── THE FARM CENSUS — the farm's building_integrity scan line ───────────────────────────────────────────────
+// The cluster line above answers "what can be dispatched"; nothing answered "how much of the farm stands", so the
+// milestones lens could time the headframe block by block and the farm not at all. These two lines are that
+// reading, taken off the same per-row scan the cluster verdict already ran (no second census, Law 16), every sweep
+// like building_integrity (Law 5), and shaped for monitoring/farm_lens.js to parse:
+//   farm census "wheat_farm" — L/S row(s) laid of N · structure P/T placed, D to dig · crop cells C: G growing, M mature, E tilled unsown, U untilled, B blocked
+//     rows: #0=harvest 3/3 g2 m0 | #1=build 1/3 | …
+// A row counts as LAID when its phase is past build (not build, not stranded) — the same test the built verdict uses.
+// `#k` is the row's index in FARM_ROOM_KEYS ('wheat_tine_row' is #0, 'wheat_tine_row#3' is #3).
+const { FARM_STRUCTURE } = require('@thinking/architect_config');
+function _rowLabel(roomKey) {
+  const i = FARM_ROOM_KEYS.indexOf(roomKey);
+  return `#${i}`;
+}
+function _emitCensus(plots, unbuiltCount) {
+  const sum = (f) => plots.reduce((n, p) => n + (f(p) || 0), 0);
+  const placed = sum(p => p.structure_placed);
+  const digs = sum(p => p.structure_digs_left);
+  const cell = (k) => sum(p => p.field && p.field[k]);
+  watcher.summary(TAG, `farm census "${FARM_STRUCTURE}" — ${plots.length - unbuiltCount}/${plots.length} row(s) laid of ${FARM_ROOM_KEYS.length}`
+    + ` · structure ${placed}/${plots.length * STRUCT_PER_ROW} placed, ${digs} to dig`
+    + ` · crop cells ${cell('total')}: ${cell('growing')} growing, ${cell('mature')} mature, ${cell('emptyTilled')} tilled unsown, ${cell('untilled')} untilled, ${cell('blocked')} blocked`);
+  watcher.summary(TAG, `  rows: ${plots.map(p => `${_rowLabel(p.roomKey)}=${p.phase} ${p.structure_placed}/${STRUCT_PER_ROW}`
+    + (p.field ? ` g${p.field.growing} m${p.field.mature}` : '')).join(' | ')}`);
 }
 
 function getState() { return _lastScan; }

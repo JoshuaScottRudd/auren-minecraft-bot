@@ -19,7 +19,7 @@
 # It covers the scripts in this folder that DO THEIR OWN WORK: `start_cameras.ps1`, which launches
 # Minecraft clients, and `world_rollback.ps1`, which deletes and restores a world folder.
 #
-# It is NOT called by `trace.ps1`, `dashboard.ps1`, `progress.ps1` or `camera_obs.ps1`. Each of those is
+# It is NOT called by `trace.ps1`, `dashboard.ps1`, or `progress.ps1`. Each of those is
 # three lines that resolve node and hand the arguments to a JavaScript tool that already asks the door
 # itself, so the refusal already prints and the exit code already propagates. Adding a check here would
 # ask the same question twice and print the same refusal twice.

@@ -299,6 +299,10 @@ async function executePunchPath(bot, payload, requestedTargets, orderQuantity) {
   let scanCycles = 0;
   let scanMsTotal = 0;   // cumulative melee-cube sweep time across all cycles â€” reported at completion
   let pickedUpTotal = 0; // drops swept mid-run + at completion
+  // Cells whose dig did not take this errand. digAttempts counts only digs that TOOK, so a refused cell
+  // moved nothing and came back as nearest every cycle until hardLoopCap — the seed_picker loop shape.
+  // Each refusal shrinks the pool by one, so the loop always reaches the empty-cube halt instead.
+  const failedHere = new Set();
 
   watcher.summary(TAG, `Incremental gather: have ${startingCount}, need +${orderQuantity} -> target ${targetTotal}`);
 
@@ -315,7 +319,7 @@ async function executePunchPath(bot, payload, requestedTargets, orderQuantity) {
     const scanOrigin = bot.entity.position.offset(0, 1.5, 0);
     const feet = bot.entity.position.floored();   // re-sensed each cycle; the underfoot cell moves with the bot
     const cubeStart = Date.now();
-    let targets = [];
+    const targets = [];
     for (let dx = -scanRadius; dx <= scanRadius; dx++) {
       for (let dy = -scanRadius; dy <= scanRadius; dy++) {
         for (let dz = -scanRadius; dz <= scanRadius; dz++) {
@@ -331,6 +335,7 @@ async function executePunchPath(bot, payload, requestedTargets, orderQuantity) {
           // cycle from a re-sensed position, so a block skipped while standing on it is picked up on a
           // later cycle from beside it, at no cost.
           if (bx === feet.x && by === feet.y - 1 && bz === feet.z) continue;
+          if (failedHere.has(`${bx},${by},${bz}`)) continue;
           const b = bot.blockAt(new Vec3(bx, by, bz));
           if (b && objectiveBlocks.includes(b.name)) {
             targets.push({ x: bx, y: by, z: bz, type: b.name });
@@ -375,7 +380,8 @@ async function executePunchPath(bot, payload, requestedTargets, orderQuantity) {
       if (obstructionPos) {
         const obstructionBlock = bot.blockAt(new Vec3(obstructionPos.x, obstructionPos.y, obstructionPos.z));
         if (obstructionBlock && obstructionBlock.name !== 'air') {
-          await digBlock(bot, obstructionBlock, `obstruction ${obstructionBlock.name}`);
+          // A refused obstruction leaves this target unreachable from here for the rest of the errand.
+          if (!(await digBlock(bot, obstructionBlock, `obstruction ${obstructionBlock.name}`))) failedHere.add(`${target.x},${target.y},${target.z}`);
           continue;
         }
       }
@@ -383,7 +389,10 @@ async function executePunchPath(bot, payload, requestedTargets, orderQuantity) {
 
     // Only the aim is a boundary; everything under it is ours and reports. A refused aim skips this
     // target rather than digging at whatever the body happened to be facing.
-    if (!(await guardExternal(TAG, `lookAt harvest target (${pos.x},${pos.y},${pos.z})`, () => bot.lookAt(pos.offset(0.5, 0.5, 0.5)))).ok) continue;
+    if (!(await guardExternal(TAG, `lookAt harvest target (${pos.x},${pos.y},${pos.z})`, () => bot.lookAt(pos.offset(0.5, 0.5, 0.5)))).ok) {
+      failedHere.add(`${target.x},${target.y},${target.z}`);
+      continue;
+    }
     {
       let block = bot.blockAt(pos);
 
@@ -399,6 +408,7 @@ async function executePunchPath(bot, payload, requestedTargets, orderQuantity) {
       if (block && objectiveBlocks.includes(block.name)) {
         const dugOk = await digBlock(bot, block);
         if (dugOk) digAttempts++;
+        else failedHere.add(`${block.position.x},${block.position.y},${block.position.z}`);
 
         bot.setControlState('forward', true);
         await sleep(PUNCH_CONFIG.forwardTapDuration);

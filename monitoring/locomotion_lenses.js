@@ -13,6 +13,9 @@
 'use strict';
 
 const { relativeTime } = require('./trace_read');
+// Every line this file prints goes through data_out: field names and values, nothing else. No console.log
+// survives here (Architect 2026-09-16 — a lens that cannot form a sentence cannot state a conclusion).
+const out = require('./data_out');
 
 // ── --pathfinding : what the fleet spent on searching ────────────────────────────────────────────
 // Architect 2026-08-04: "calculate the time each pathfinding takes and post it for watcher tracer to
@@ -73,16 +76,24 @@ function runPathfinding({ seg = [], traceName = '?', bot: botFilter = null } = {
     }
   }
 
-  console.log(`trace_monitor · pathfinding · ${traceName} · latest run · span [${relativeTime(maxRel)}]`);
-  console.log('(context only — never flags, never wakes)\n');
+  // The header was a prose banner; it is now four fields. `flags`/`wakes` carry what the parenthetical
+  // "(context only — never flags, never wakes)" used to assert, as booleans.
+  out.kv('lens', 'pathfinding');
+  out.kv('trace', traceName);
+  out.kv('span', relativeTime(maxRel));
+  out.kv('flags', false);
+  out.kv('wakes', false);
   if (per.size === 0) {
-    // Named as absent rather than reported as zero: a run with no navigation and a build that never
-    // posts its census are different facts, and a "0ms" would read as the first while meaning either.
-    console.log('(no [PATHFINDING] census lines in the latest run — either no navigation ran, or this trace predates the census)');
+    // The absence is the count itself. The old line spelled out "0 [PATHFINDING] census lines in the
+    // latest run"; the distinction it was protecting (no navigation vs. a build that posts no census)
+    // is not this lens's to draw, so only the measured zero remains.
+    out.zero('census_lines');
     return;
   }
 
   const total = blank();
+  const botRows = [];
+  const ownerRows = [];
   for (const [bot, s] of per) {
     // `worst` is a MAXIMUM, not a sum — summing two bots' worst searches invents a single search that
     // never ran, and it is the one number here a reader would take straight to a deadline decision.
@@ -93,46 +104,72 @@ function runPathfinding({ seg = [], traceName = '?', bot: botFilter = null } = {
       t.searches += o.searches; t.ms += o.ms; t.timedOut += o.timedOut;
     }
     const avg = s.searches ? Math.round(s.ms / s.searches) : 0;
-    const share = maxRel > 0 ? (100 * s.ms / 1000 / maxRel).toFixed(1) : '?';
-    console.log(`${bot}: ${s.trips} trip(s), ${s.searches} search(es), ${(s.ms / 1000).toFixed(1)}s total (${share}% of the run), ${avg}ms avg, ${s.worst}ms worst, ${s.nodes} nodes`);
-    console.log(`   partial ${s.partial} (${s.searches ? Math.round(100 * s.partial / s.searches) : 0}%) · cutoff ${s.cutoff} · timedOut ${s.timedOut} · noRoute ${s.failed}`);
-    console.log(`   searches per trip ${s.trips ? (s.searches / s.trips).toFixed(2) : '0'} — 1.00 means every navigation planned once and walked it`);
+    const share = maxRel > 0 ? +(100 * s.ms / 1000 / maxRel).toFixed(1) : null;
+    botRows.push([bot, s.trips, s.searches, +(s.ms / 1000).toFixed(1), share, avg, s.worst, s.nodes,
+      s.partial, s.searches ? Math.round(100 * s.partial / s.searches) : 0,
+      s.cutoff, s.timedOut, s.failed,
+      s.trips ? +(s.searches / s.trips).toFixed(2) : 0]);
     // Printed only when the process had more than one searching caller. With one owner the split repeats
-    // the line above it, and a reducer that pads every run with a restatement teaches the reader to skip.
+    // the row above it, and a reducer that pads every run with a restatement teaches the reader to skip.
+    // The trailing note "(each owner searches under its own deadline)" is deleted — the owner name is
+    // the field, and which deadline it runs under is not this lens's to say.
     if (s.owners.size > 1) {
-      const rows = [...s.owners.entries()].sort((a, b) => b[1].ms - a[1].ms)
-        .map(([n, o]) => `${n} ${o.searches}× ${(o.ms / 1000).toFixed(1)}s${o.timedOut ? ` (${o.timedOut} timedOut)` : ''}`);
-      console.log(`   by owner: ${rows.join(' · ')} — each owner searches under its OWN deadline; hold a row against that one, never against the total`);
+      for (const [n, o] of [...s.owners.entries()].sort((a, b) => b[1].ms - a[1].ms)) {
+        ownerRows.push([bot, n, o.searches, +(o.ms / 1000).toFixed(1), o.timedOut]);
+      }
     }
   }
-  console.log('');
+  out.section('per_bot');
+  out.table(['bot', 'trips', 'searches', 'total_s', 'pct_of_run', 'avg_ms', 'worst_ms', 'nodes',
+    'partial', 'partial_pct', 'cutoff', 'timed_out', 'no_route', 'searches_per_trip'], botRows);
+
+  if (ownerRows.length) {
+    out.section('per_bot_by_search_owner');
+    out.table(['bot', 'owner', 'searches', 'total_s', 'timed_out'], ownerRows);
+  }
+
   const avgAll = total.searches ? Math.round(total.ms / total.searches) : 0;
   // Divided by bot count as well as span: the denominator is BOT-seconds, not wall-clock seconds, or two
   // bots each spending 10% would read as 20% of a clock that only ever ran once.
-  const pctRun = maxRel > 0 ? (100 * total.ms / 1000 / (maxRel * per.size)).toFixed(1) : '?';
-  console.log(`▸ FLEET: ${total.searches} search(es) over ${per.size} bot(s), ${(total.ms / 1000).toFixed(1)}s of search across a ${relativeTime(maxRel)} run.`);
-  console.log(`▸ ${avgAll}ms average per search, ${total.worst}ms worst single search, ${pctRun}% of each bot's wall clock spent inside A*.`);
-  console.log(`▸ SEARCHES PER TRIP: ${total.trips ? (total.searches / total.trips).toFixed(2) : '0'} (1.00 = plan once, walk it; higher = re-planning mid-walk).`);
-  console.log(`▸ BINARY-ANSWER CHECK: ${total.cutoff} of ${total.searches} searches were CUT OFF by the node budget — only those cannot support a verdict. A partial that ran the frontier dry (${Math.max(0, total.partial - total.cutoff)}) is a proven "no route exists".`);
+  const pctRun = maxRel > 0 ? +(100 * total.ms / 1000 / (maxRel * per.size)).toFixed(1) : null;
+  out.section('fleet');
+  out.kv('bots', per.size);
+  out.kv('trips', total.trips);
+  out.kv('searches', total.searches);
+  out.kv('total_s', +(total.ms / 1000).toFixed(1));
+  out.kv('run_span', relativeTime(maxRel));
+  out.kv('avg_ms_per_search', avgAll);
+  out.kv('worst_ms', total.worst);
+  out.kv('pct_of_bot_wall_clock', pctRun);
+  out.kv('searches_per_trip', total.trips ? +(total.searches / total.trips).toFixed(2) : 0);
+  out.kv('partial', total.partial);
+  // The old line narrated this split ("stopped at the node budget" / "ended with an empty frontier");
+  // the two counts are kept as their own fields and the narration is gone.
+  out.kv('partial_at_node_budget', total.cutoff);
+  out.kv('partial_empty_frontier', Math.max(0, total.partial - total.cutoff));
+  out.kv('timed_out', total.timedOut);
+  out.kv('no_route', total.failed);
 
   if (oddTrips.length) {
-    console.log('\n── EVERY TRIP BEHIND THOSE COUNTS ────────────────────────────────────────────');
-    console.log('(one row per trip that reported a partial, a timeout, or no route — the sums above are these rows added up)\n');
+    // One row per trip that reported a partial, a timeout, or no route. The banner and its explanation
+    // of what the rows are for are deleted; so is the TIME-vs-COUNT paragraph, which was an arithmetic
+    // argument about deadlines. The counts and the per-trip time it reasoned over are all still here.
+    out.section('trips_with_partial_timeout_or_no_route');
+    out.table(['at', 'bot', 'searches', 'total_ms', 'worst_ms', 'nodes', 'partial', 'cutoff', 'timed_out', 'no_route'],
+      oddTrips.map(t => [relativeTime(t.relSec), t.bot, t.searches, t.ms, t.worst, t.nodes,
+        t.partial, t.cutoff, t.timedOut, t.failed]));
+    // The owner split rides in its own table rather than as a column above: the trace's own owner string
+    // runs past data_out's 60-character column cap and would be silently truncated, which loses a
+    // measurement. Split on the record's own separator, one copied segment per row — no re-parsing.
+    const splits = [];
     for (const t of oddTrips) {
-      const tags = [];
-      if (t.timedOut) tags.push(`timedOut ${t.timedOut}`);
-      if (t.partial) tags.push(`partial ${t.partial}`);
-      if (t.cutoff) tags.push(`cutoff ${t.cutoff}`);
-      if (t.failed) tags.push(`noRoute ${t.failed}`);
-      console.log(`  [${relativeTime(t.relSec)}] ${t.bot}: ${t.searches} search(es), ${t.ms}ms total, ${t.worst}ms worst, ${t.nodes} nodes — ${tags.join(' · ')}`);
-      if (t.owners) console.log(`        by owner: ${t.owners}`);
+      if (!t.owners) continue;
+      for (const part of t.owners.split(', ')) splits.push([relativeTime(t.relSec), t.bot, part]);
     }
-    // The arithmetic a reader would otherwise do by eye, and the reason these rows are printed at all.
-    // A timeout means the search ran until its own deadline expired, so N timeouts cost at least N of
-    // THAT owner's deadline — and a trip mixing owners mixes deadlines, which is why the check is stated
-    // per owner. Read against a single assumed deadline it reports a contradiction that is not there.
-    console.log('\n▸ TIME-vs-COUNT: a timeout costs a FULL deadline, so N timeouts by one owner must show at least N × that OWNER\'s deadline of search time.');
-    console.log('  Check each owner against its own deadline. A row still under its floor means the count is inflated, not that timeouts got cheap.');
+    if (splits.length) {
+      out.section('trip_search_owner_splits');
+      out.table(['at', 'bot', 'owner_search'], splits);
+    }
   }
 }
 
@@ -185,45 +222,54 @@ function runJumps({ seg = [], traceName = '?', bot: botFilter = null } = {}) {
     s.lateAxial += +(m[4] || 0); s.lateDiag += +(m[6] || 0);
   }
 
-  console.log(`trace_monitor · jumps · ${traceName} · latest run · span [${relativeTime(maxRel)}]`);
-  console.log('(context only — never flags, never wakes)\n');
+  out.kv('lens', 'jumps');
+  out.kv('trace', traceName);
+  out.kv('span', relativeTime(maxRel));
+  out.kv('flags', false);
+  out.kv('wakes', false);
   if (per.size === 0) {
-    if (!fusedTrips) {
-      console.log('(no fused navigator runs at all in the latest run — nothing walked far enough to fuse, so there was nothing to press jump for)');
-    } else if (!fusedPrejumps) {
-      console.log(`(${fusedTrips} fused trip(s), and ZERO jump presses across all of them — the ground the fleet walks is flat.`);
-      console.log(' Not a defect and not a gap in this reducer: there is genuinely no diagonal-vs-axial evidence to be had');
-      console.log(' until the fleet walks terrain that climbs. The mine staircase and the canopy are the candidates.)');
-    } else {
-      console.log(`(${fusedTrips} fused trip(s) with ${fusedPrejumps} press(es), but no bearing line — this trace predates the split; restart the fleet)`);
-    }
+    // The three prose branches said WHICH emptiness this was. The three counts they were built from are
+    // printed instead, and the reader draws the same distinction from them.
+    out.kv('bearing_lines', 0);
+    out.kv('fused_trips', fusedTrips);
+    out.kv('fused_prejumps', fusedPrejumps);
     return;
   }
 
   const total = blank();
+  const rows = [];
   for (const [bot, s] of per) {
     for (const k of Object.keys(total)) total[k] += s[k];
-    const pct = (a, b) => (b ? `${Math.round(100 * a / b)}%` : '—');
-    console.log(`${bot}: ${s.axial + s.oblique + s.diagonal} press(es) over ${s.trips} trip(s) — ${s.axial} axial, ${s.oblique} oblique, ${s.diagonal} diagonal`);
-    console.log(`   not certified: axial ${s.lateAxial}/${s.axial} (${pct(s.lateAxial, s.axial)}) · diagonal ${s.lateDiag}/${s.diagonal} (${pct(s.lateDiag, s.diagonal)})`);
+    const pct = (a, b) => (b ? Math.round(100 * a / b) : null);
+    rows.push([bot, s.axial + s.oblique + s.diagonal, s.trips, s.axial, s.oblique, s.diagonal,
+      s.lateAxial, pct(s.lateAxial, s.axial), s.lateDiag, pct(s.lateDiag, s.diagonal)]);
   }
-  console.log('');
+  out.section('per_bot');
+  out.table(['bot', 'presses', 'trips', 'axial', 'oblique', 'diagonal',
+    'axial_not_certified', 'axial_not_certified_pct',
+    'diagonal_not_certified', 'diagonal_not_certified_pct'], rows);
+
   const aR = total.axial ? total.lateAxial / total.axial : null;
   const dR = total.diagonal ? total.lateDiag / total.diagonal : null;
-  console.log(`▸ FLEET: ${total.axial} axial, ${total.oblique} oblique, ${total.diagonal} diagonal press(es) over ${total.trips} trip(s).`);
-  // Both populations need enough presses to say anything. Named as insufficient rather than printed as a
-  // ratio, because a 1-of-1 rate reads as 100% and would be quoted as a finding.
-  if (total.axial < 10 || total.diagonal < 10) {
-    console.log(`▸ NOT YET ANSWERABLE — need ≥10 presses per bearing (have ${total.axial} axial / ${total.diagonal} diagonal). Let the fleet walk more.`);
-  } else if (dR > aR + 0.15) {
-    console.log(`▸ ⭐ CONVICTED: diagonal ${Math.round(dR * 100)}% not certified against axial ${Math.round(aR * 100)}%.`);
-    console.log('▸ This is the predicted signature of riseAhead\'s flat 0.5 face offset. A corner is ~0.707 away, so the');
-    console.log('▸ trigger believes the body is ~0.33b further out than it is and fires ~1.2 ticks late at sprint.');
-  } else {
-    console.log(`▸ NO BEARING-LINKED DIFFERENCE in the certified rate (diagonal ${Math.round(dR * 100)}% vs axial ${Math.round(aR * 100)}%).`);
-    console.log('▸ NOT an all-clear: the verdict is computed from the suspect distance, so it cannot see an error in it.');
-    console.log('▸ Read the OUTCOME split (re-jumps / stuck-at-level, per bearing) in --combat before clearing the offset.');
-  }
+  out.section('fleet');
+  out.kv('axial', total.axial);
+  out.kv('oblique', total.oblique);
+  out.kv('diagonal', total.diagonal);
+  out.kv('trips', total.trips);
+  out.kv('axial_not_certified', total.lateAxial);
+  out.kv('diagonal_not_certified', total.lateDiag);
+  // Both populations need enough presses before the rates mean anything: a 1-of-1 rate reads as 100%.
+  // That used to be a NOT-YET-ANSWERABLE sentence; it is now the sample floor and a boolean against it.
+  out.kv('min_presses_per_bearing', 10);
+  const enough = total.axial >= 10 && total.diagonal >= 10;
+  out.kv('sample_sufficient', enough);
+  out.kv('axial_not_certified_pct', aR == null ? null : Math.round(aR * 100));
+  out.kv('diagonal_not_certified_pct', dR == null ? null : Math.round(dR * 100));
+  // The verdict survives as a value with its threshold beside it (OVER/UNDER THE DECLARED GAP was the
+  // sentence; the gap and the threshold are the measurement it was made of).
+  out.kv('diagonal_axial_gap_pts', (aR == null || dR == null) ? null : Math.round((dR - aR) * 100));
+  out.kv('threshold_gap_pts', 15);
+  out.kv('over_threshold', enough ? (dR > aR + 0.15) : null);
 }
 
 // ── --route-cost : what the fleet's routes actually PRICED, so a cost tier can be set from evidence ──
@@ -264,14 +310,19 @@ const RC_REPLANNED_RE = /Re-planned: (\d+) step\(s\), cost ([-\d.]+), (\d+) node
 // by node count, which is effectively unique at these magnitudes.
 const RC_TRIPWIRE_RE = /Route search took (\d+)ms \((\d+) nodes\) for \((-?\d+),(-?\d+),(-?\d+)\) . \((-?\d+),(-?\d+),(-?\d+)\), hop distance (\d+) blocks/;
 
+// The `label` field ('   11 –   25' and friends) is gone: it was a hand-padded phrase, and the bounds it
+// spelled out are already the two numbers the band is made of. They print as `band_lo`/`band_hi`; the top
+// band's open end is `hi: null`, which data_out renders as absent.
 const RC_BANDS = [
-  { label: '        ≤ 10', lo: 0,   hi: 10 },
-  { label: '   11 –   25', lo: 10,  hi: 25 },
-  { label: '   26 –   60', lo: 25,  hi: 60 },
-  { label: '   61 –  150', lo: 60,  hi: 150 },
-  { label: '  151 –  250', lo: 150, hi: 250 },
-  { label: '       > 250', lo: 250, hi: Infinity },
+  { lo: 0,   hi: 10 },
+  { lo: 10,  hi: 25 },
+  { lo: 25,  hi: 60 },
+  { lo: 60,  hi: 150 },
+  { lo: 150, hi: 250 },
+  { lo: 250, hi: null },
 ];
+// Band membership, with the top band's null upper bound read as unbounded.
+const inBand = (r, b) => r.cost > b.lo && (b.hi == null || r.cost <= b.hi);
 
 function _percentile(sorted, p) {
   if (!sorted.length) return 0;
@@ -314,29 +365,40 @@ function runRouteCost({ seg = [], traceName = '?', bot: botFilter = null, over =
     }
   }
 
-  console.log(`trace_monitor · route cost · ${traceName} · latest run · span [${relativeTime(maxRel)}]`);
-  console.log('(context only — never flags, never wakes)\n');
+  out.kv('lens', 'route_cost');
+  out.kv('trace', traceName);
+  out.kv('span', relativeTime(maxRel));
+  out.kv('flags', false);
+  out.kv('wakes', false);
   if (!routes.length) {
-    // Named as absent rather than reported as zero, for the same reason --pathfinding names it: "no
-    // navigation ran" and "this trace predates the cost field" send a reader to opposite places.
-    console.log('(no A* path lines in the latest run — either nothing navigated, or this trace predates the cost field)');
+    // The absence is the count. The old parenthetical drew a distinction between "no navigation ran" and
+    // "this trace predates the cost field" — that reading is the reader's, not the lens's.
+    out.zero('a_star_path_lines');
     return;
   }
 
   const complete = routes.filter(r => !r.partial);
   const sorted = complete.map(r => r.cost).sort((a, b) => a - b);
   const maxComplete = sorted.length ? sorted[sorted.length - 1] : 0;
-  const widest = Math.max(...RC_BANDS.map(b => routes.filter(r => r.cost > b.lo && r.cost <= b.hi).length), 1);
 
-  console.log(`WHAT A ROUTE COST — ${routes.length} priced route(s), ${complete.length} complete, ${routes.length - complete.length} partial:`);
-  for (const b of RC_BANDS) {
-    const n = routes.filter(r => r.cost > b.lo && r.cost <= b.hi).length;
-    const bar = '█'.repeat(Math.round(28 * n / widest));
-    console.log(`  ${b.label} : ${String(n).padStart(4)} (${String(Math.round(100 * n / routes.length)).padStart(3)}%) ${bar}`);
-  }
-  console.log('');
-  console.log(`  p50 ${_percentile(sorted, 0.50).toFixed(1)} · p90 ${_percentile(sorted, 0.90).toFixed(1)} · p99 ${_percentile(sorted, 0.99).toFixed(1)} · max ${maxComplete.toFixed(1)}  (complete routes only)`);
-  console.log('');
+  out.section('routes');
+  out.kv('priced', routes.length);
+  out.kv('complete', complete.length);
+  out.kv('partial', routes.length - complete.length);
+
+  // The ASCII bar is gone with the prose: it drew the same count the `routes` column carries.
+  out.section('cost_bands');
+  out.table(['band_lo', 'band_hi', 'routes', 'pct_of_routes'],
+    RC_BANDS.map(b => {
+      const n = routes.filter(r => inBand(r, b)).length;
+      return [b.lo, b.hi, n, Math.round(100 * n / routes.length)];
+    }));
+
+  out.section('cost_percentiles_complete_routes');
+  out.kv('p50', +_percentile(sorted, 0.50).toFixed(1));
+  out.kv('p90', +_percentile(sorted, 0.90).toFixed(1));
+  out.kv('p99', +_percentile(sorted, 0.99).toFixed(1));
+  out.kv('max', +maxComplete.toFixed(1));
 
   // The mechanism, made visible rather than asserted: group the SAME routes by price and show what each
   // band cost to search. If expansion tracked distance this would be flat; it is not, and the shape of
@@ -345,20 +407,23 @@ function runRouteCost({ seg = [], traceName = '?', bot: botFilter = null, over =
   // is a search that hit its deadline mid-flood, so it carries a huge examined-count beside whatever
   // fragment of a price it had reached — which lands it in a CHEAP band and makes the cheapest band read
   // as the most expensive to search. One partial among 88 cheap routes was enough to do it here.
-  console.log('WHAT EACH PRICE BAND COST TO SEARCH (places examined per route — the flood, measured; complete routes only):');
+  // The heading that said all of that in prose is deleted; the section name and the fields carry it.
+  const searchRows = [];
   for (const b of RC_BANDS) {
-    const rs = complete.filter(r => r.cost > b.lo && r.cost <= b.hi);
+    const rs = complete.filter(r => inBand(r, b));
     if (!rs.length) continue;
-    const avgNodes = Math.round(rs.reduce((s, r) => s + r.nodes, 0) / rs.length);
-    const avgSteps = Math.round(rs.reduce((s, r) => s + r.steps, 0) / rs.length);
-    console.log(`  ${b.label} : ${String(avgNodes).padStart(7)} places examined on average, for a route of ${avgSteps} step(s)`);
+    searchRows.push([b.lo, b.hi, rs.length,
+      Math.round(rs.reduce((s, r) => s + r.nodes, 0) / rs.length),
+      Math.round(rs.reduce((s, r) => s + r.steps, 0) / rs.length)]);
   }
-  console.log('');
+  out.section('places_examined_per_cost_band_complete_routes');
+  out.table(['band_lo', 'band_hi', 'routes', 'avg_places_examined', 'avg_steps'], searchRows);
 
-  if (edges.size) {
-    const line = [...edges.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t}×${n}`).join('  ');
-    console.log(`EDGES THE FLEET ACTUALLY WALKED: ${line}`);
-    console.log('');
+  out.section('edges_walked');
+  if (!edges.size) {
+    out.zero('edge_types');
+  } else {
+    out.table(['edge_type', 'count'], [...edges.entries()].sort((a, b) => b[1] - a[1]).map(([t, n]) => [t, n]));
   }
 
   // EVERY EXPENSIVE ROUTE, ONE PER LINE. The bands answer "how are prices distributed"; they cannot
@@ -367,31 +432,24 @@ function runRouteCost({ seg = [], traceName = '?', bot: botFilter = null, over =
   // something that describes neither. The tail is small by construction (that is the finding), so it is
   // listed rather than summarised.
   const tail = routes.filter(r => r.cost > over).sort((a, b) => b.cost - a.cost);
-  console.log(`EVERY ROUTE PRICED OVER ${over} — ${tail.length} of ${routes.length} (${Math.round(100 * tail.length / routes.length)}%):`);
-  if (!tail.length) {
-    console.log(`  (none — no route this run priced over ${over})`);
-  } else {
-    console.log('   cost   steps      places      time   per step   what it was');
-    for (const r of tail) {
+  out.section('routes_priced_over_threshold');
+  out.kv('threshold_cost', over);
+  out.kv('routes_over', tail.length);
+  out.kv('routes_total', routes.length);
+  out.kv('pct_over', Math.round(100 * tail.length / routes.length));
+  // The `what it was` column was a phrase per route ('≥1000 places/step, <100 steps', 'PARTIAL — search
+  // stopped, no route proven'). It is now the two comparisons it was made of, as booleans, with both
+  // thresholds printed as their own fields so the reader can check them. `ms_from_tripwire` replaces the
+  // footnote about times matched by node count; an absent `ms` replaces the `?` legend.
+  out.kv('threshold_places_per_step', 1000);
+  out.kv('threshold_steps', 100);
+  out.table(['cost', 'steps', 'places', 'ms', 'places_per_step', 'partial',
+    'places_per_step_over_1000', 'steps_at_least_100', 'ms_from_tripwire'],
+    tail.map(r => {
       const perStep = r.steps ? Math.round(r.nodes / r.steps) : 0;
-      // The discriminator, stated per route rather than left to the reader: places-examined per step of
-      // route is high only when the search flooded for a route that goes nowhere. A genuinely long walk
-      // examines many cells AND produces many steps, so its ratio stays low.
-      const kind = r.partial ? 'PARTIAL — search stopped, no route proven'
-        : perStep > 1000 ? 'SHORT route, huge search — priced by ONE expensive edge'
-        : r.steps >= 100 ? 'LONG walk — earned its price in distance'
-        : 'moderate';
-      const t = r.ms == null ? '     ?' : `${String(r.ms).padStart(5)}ms`;
-      console.log(`  ${String(r.cost.toFixed(0)).padStart(5)} ${String(r.steps).padStart(7)} ${String(r.nodes).padStart(11)} ${t} ${String(perStep).padStart(10)}   ${kind}`);
-    }
-    if (tail.some(r => r.msFromTripwire)) {
-      console.log('  (times marked from the slow-nav tripwire line, matched by node count — the same search, two lines)');
-    }
-    if (tail.some(r => r.ms == null)) {
-      console.log('  (? = this trace predates search time on the path line; a fresh run fills these in)');
-    }
-  }
-  console.log('');
+      return [Math.round(r.cost), r.steps, r.nodes, r.ms, perStep, r.partial,
+        perStep > 1000, r.steps >= 100, !!r.msFromTripwire];
+    }));
 
   // ── DEADLINE EVIDENCE ────────────────────────────────────────────────────────────────────────────
   // NAV_SEARCH_DEADLINE_MS bounds how long a BODY may stand still, and its whole risk is cutting a search
@@ -405,27 +463,24 @@ function runRouteCost({ seg = [], traceName = '?', bot: botFilter = null, over =
   // copy of a fleet constant in this file is a second home for one number, and it would go stale silently
   // the next time that constant moves. This prints the evidence; the constant is read where it lives.
   const msKnown = complete.map(r => r.ms).filter(v => v != null).sort((a, b) => a - b);
-  console.log('DEADLINE EVIDENCE — how long the searches that SUCCEEDED actually took:');
-  if (!msKnown.length) {
-    console.log('  (no search times on complete routes — this trace predates ms on the path line; a fresh run fills it in)');
-  } else {
-    console.log(`  p50 ${_percentile(msKnown, 0.50)}ms · p90 ${_percentile(msKnown, 0.90)}ms · p99 ${_percentile(msKnown, 0.99)}ms · worst ${msKnown[msKnown.length - 1]}ms`
-      + `   (over ${msKnown.length} of ${complete.length} complete route(s))`);
-    console.log(`  ▸ NAV_SEARCH_DEADLINE_MS must sit clear of ${msKnown[msKnown.length - 1]}ms — that is the longest a search`);
-    console.log('    took and still found a route, so anything at or below it would have cut a good plan short.');
-    if (msKnown.length < complete.length) {
-      console.log('    (some complete routes carry no time — an older line format; the figure is a floor, not the maximum)');
-    }
+  // The section name is the question. The prose that framed these numbers as deadline evidence, the
+  // restatement of `worst` as "longest search that returned a route", and the caveat calling the figure
+  // a floor are all deleted — `routes_with_time` against `complete_routes` is that caveat, measured.
+  out.section('search_ms_of_completed_routes');
+  out.kv('routes_with_time', msKnown.length);
+  out.kv('complete_routes', complete.length);
+  if (msKnown.length) {
+    out.kv('p50_ms', _percentile(msKnown, 0.50));
+    out.kv('p90_ms', _percentile(msKnown, 0.90));
+    out.kv('p99_ms', _percentile(msKnown, 0.99));
+    out.kv('worst_ms', msKnown[msKnown.length - 1]);
   }
-  console.log('');
 
-  console.log(`▸ THE TUNING NUMBER: the most expensive COMPLETE route this run was ${maxComplete.toFixed(1)}.`);
-  console.log(`▸ A tier set anywhere above ${maxComplete.toFixed(1)} preserves EVERY routing choice in this run — the order`);
-  console.log('▸ (walk < dig < place < protected) is what decides a route; the magnitude only decides how long a');
-  console.log('▸ detour is accepted before the expensive edge wins. Above the longest real route, it decides nothing.');
-  console.log(`▸ p99 is ${_percentile(sorted, 0.99).toFixed(1)}, so ${maxComplete > _percentile(sorted, 0.99) * 2 ? 'the max is an outlier — read p99 as the working number' : 'the max and p99 agree; either serves'}.`);
-  console.log('▸ ONE RUN IS ONE WORLD. This is evidence from this base at this size, not a universal constant —');
-  console.log('▸ re-read it after the base grows, and treat a tier as a decision to revisit, never a settled fact.');
+  // "THE TUNING NUMBER" and what it was for is deleted; the two figures and their ratio remain.
+  out.section('cost_tier_evidence');
+  out.kv('max_complete_cost', +maxComplete.toFixed(1));
+  out.kv('p99_complete_cost', +_percentile(sorted, 0.99).toFixed(1));
+  out.kv('max_over_p99', +(maxComplete / (_percentile(sorted, 0.99) || 1)).toFixed(1));
 }
 
 module.exports = { runPathfinding, runJumps, runRouteCost };

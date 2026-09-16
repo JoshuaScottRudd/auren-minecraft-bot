@@ -125,25 +125,70 @@ function needServerDir() {
   return r.dir;
 }
 
+// ── THE CAMERA CREW'S GAME LAUNCHER (Prism) ─────────────────────────────────────────────────────────
+// A download keeps Prism INSIDE the bot, at PRISM_HOME, because that is the only folder a stranger's copy
+// owns. Until 2026-09-14 start_cameras computed three hops up and downloaded 1.1 GB into `tools/` beside
+// the bot folder — somebody else's disk on a stranger's machine, and the Architect's layout written into
+// shipped code. The stranger's way is that home, then a normally installed Prism; his way is the exact
+// folder his workstation file names.
+const PRISM_HOME = path.join(BOT_ROOT, 'Auren_Workshop', 'camera', 'clients', 'PrismLauncher');
+const PRISM_EXE = 'prismlauncher.exe';
+
+// findPrism() → { exe: string|null, tried: string[] }.
+function findPrism() {
+  const tried = [];
+  const candidates = [[path.join(PRISM_HOME, PRISM_EXE), 'the bot\'s Prism home']];
+  if (process.env.LOCALAPPDATA) {
+    candidates.push([path.join(process.env.LOCALAPPDATA, 'Programs', 'PrismLauncher', PRISM_EXE), 'installed Prism']);
+  }
+  for (const dir of architectPaths('prism')) candidates.push([path.join(dir, PRISM_EXE), dir]);
+  for (const [exe, label] of candidates) {
+    if (fs.existsSync(exe)) return { exe, tried };
+    tried.push(`${label} (none)`);
+  }
+  return { exe: null, tried };
+}
+
+// ── THE RECORDER — THE ARCHITECT'S WAY ONLY ─────────────────────────────────────────────────────────
+// Recording camera windows to files is his equipment and does not ship (Architect 2026-09-14: *"i want obs
+// removed at best they should be able to watch"*). A download watches through the cameras and records with
+// whatever it chooses, so there is no stranger's leg to try here: the answer is the module his workstation
+// file names, or null.
+// findRecorder() → absolute path of the recorder module, or null.
+function findRecorder() {
+  for (const file of architectPaths('recorder')) {
+    if (fs.existsSync(file)) return file;
+  }
+  return null;
+}
+
 module.exports = {
-  findJava, needJava, findServerDir, needServerDir, architectPaths,
-  JAVA_FLOOR, ARCHITECT_FILE,
+  findJava, needJava, findServerDir, needServerDir, findPrism, findRecorder, architectPaths,
+  JAVA_FLOOR, ARCHITECT_FILE, PRISM_HOME,
 };
 
 // ── CLI — how PowerShell asks the same question without a second resolver ───────────────────────────────
 //   node Auren_Bot/js_kernel/utils/workstation.js java     → prints the java executable, or refuses (exit 1)
 //   node Auren_Bot/js_kernel/utils/workstation.js server   → prints the server folder, or refuses (exit 1)
+//   node Auren_Bot/js_kernel/utils/workstation.js prism    → prints prismlauncher.exe, or names what was tried (exit 1)
+//   node Auren_Bot/js_kernel/utils/workstation.js prism-home → prints the folder a missing Prism is downloaded into
 // The answer goes to stdout alone so a caller can capture it whole; a refusal goes to stderr.
 if (require.main === module) {
   const what = process.argv[2];
-  const found = what === 'java' ? findJava() : what === 'server' ? findServerDir() : null;
+  if (what === 'prism-home') {
+    console.log(PRISM_HOME);
+    process.exit(0);
+  }
+  const found = what === 'java' ? findJava() : what === 'server' ? findServerDir() : what === 'prism' ? findPrism() : null;
   if (!found) {
-    console.error('usage: node workstation.js java|server');
+    console.error('usage: node workstation.js java|server|prism|prism-home');
     process.exit(2);
   }
-  const answer = what === 'java' ? found.exe : found.dir;
+  const answer = what === 'server' ? found.dir : found.exe;
   if (!answer) {
-    console.error(what === 'java' ? javaRefusal(found.tried) : serverRefusal(found.tried));
+    console.error(what === 'java' ? javaRefusal(found.tried)
+      : what === 'server' ? serverRefusal(found.tried)
+      : `No Prism Launcher was found.\n  tried: ${found.tried.join(', ')}`);
     process.exit(1);
   }
   console.log(answer);

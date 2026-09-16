@@ -135,7 +135,13 @@ function query(timeoutMs = 5000) {
   return _ask(
     createEnvelope('fleet_query', 'foreman', {}),
     'fleet_state',
-    (p) => ({ bots: Array.isArray(p.bots) ? p.bots : [] }),
+    // `departed` is bots that REGISTERED AND THEN LEFT, kept out of `bots` on purpose: every caller of
+    // that array acts on its members (hire, film, send a verb) and a departed bot among them is a ghost.
+    // A caller that only wants the roster reads `bots` and is unaffected by this existing at all.
+    (p) => ({
+      bots: Array.isArray(p.bots) ? p.bots : [],
+      departed: Array.isArray(p.departed) ? p.departed : [],
+    }),
     timeoutMs,
   );
 }

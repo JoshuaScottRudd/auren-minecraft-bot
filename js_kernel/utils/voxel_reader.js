@@ -59,6 +59,46 @@ const F = {
 // and a search would plan confident routes through them (Law 23).
 const UNLOADED = -1;
 
+// How many reads a reader may take before it re-reads the spawn latch. Bounded staleness with no per-read
+// cost: the latch lands during login, long before any scan, and the chunk-change hook below refreshes on
+// every move as well — so this only matters for a reader that sits still through a `/setworldspawn`.
+const MASK_RECHECK_READS = 4096;
+
+// THE SPAWN MASK, HELD AS FOUR NUMBERS PER READER (Law 16 — the rule is spawn_protection's; only the
+// arithmetic is copied here, and only because of where it is asked).
+//
+// This is the read path: one A* search asks it hundreds of thousands of times against a 0.25s deadline, so
+// a module call per read is not affordable and an ALLOCATION per read is fatal — the first live run after
+// the mask went in had every one of 677 route searches give up. The square changes at most twice in a run
+// (the packet, and a `/setworldspawn`), so the bounds are cached and re-read only when spawn_protection's
+// integer latch version moves. Lazily required: this is a leaf utility and spawn_protection pulls in the
+// watcher and the config, which would close a load-time cycle through pathfinding_utils.
+//
+// AND IT FOLLOWS THE DOOR, NOT THE PROCESS. `spawn_protection.maskWorldReads(bot)` is the one place a body
+// is enrolled, and this path must answer to that same enrolment — a mask keyed only on the latch masks
+// every reader in the process, including bodies that never asked. Two bodies arm the latch without being
+// masked: the Architect's own proxy, which is a person and must see the real world, and any bench holding a
+// body to measure one. `_spawnMaskInstalled` is the flag `maskWorldReads` sets, so the two doors open and
+// close together (Law 16). It is re-read on the same schedule as the bounds, because enrolment happens at
+// login and a reader built before it must not cache "unmasked" for the rest of the run.
+let _spawnProtection = null;
+function makeMask(bot) {
+    const m = { version: -1, enrolled: false, on: false, minX: 0, maxX: 0, minZ: 0, maxZ: 0, stateId: -1 };
+    m.refresh = () => {
+        if (!_spawnProtection) _spawnProtection = require('@perception/spawn_protection');
+        const enrolled = !!bot._spawnMaskInstalled;
+        const v = _spawnProtection.latchVersion();
+        if (v === m.version && enrolled === m.enrolled) return;
+        m.version = v; m.enrolled = enrolled;
+        const box = enrolled ? _spawnProtection.spawnProtectionBox(bot) : null;
+        m.on = !!box;
+        if (!box) return;
+        m.minX = box.minX; m.maxX = box.maxX; m.minZ = box.minZ; m.maxZ = box.maxZ;
+        m.stateId = _spawnProtection.maskStateId(bot);
+    };
+    return m;
+}
+
 let _tables = null;   // per mc version; the fleet runs one, but keyed anyway rather than assumed
 function tableFor(version) {
     if (!_tables) _tables = new Map();
@@ -134,6 +174,8 @@ function makeVoxelReader(bot, opts = {}) {
             _version: version,
             unmetNeeds: unmet,
             worldless: !hasWorld,
+            // The body's own wrapper masks this path already (`spawn_protection.maskWorldReads`); the call
+            // is left plain so there is one masking site per read path and not two answering in sequence.
             blockAt(x, y, z) { stats.reads++; const b = bot.blockAt(new Vec3(x, y, z)); if (!b) stats.unloaded++; return b; },
             flagsAt(x, y, z) { const b = slow.blockAt(x, y, z); return b ? tableFor(version).flags(b.stateId) : UNLOADED; },
             stats, FLAGS: F, UNLOADED,
@@ -173,7 +215,14 @@ function makeVoxelReader(bot, opts = {}) {
     // space as solid terrain, the verdict Law 23 forbids most. It matters concretely because computeAStar
     // YIELDS to the cooperative pacer mid-search, so an unload genuinely can land between two reads of
     // one search.
-    const onColumnChange = () => { cx = 0x7fffffff; cz = 0x7fffffff; col = null; };
+    // The mask's bounds ride along with the held column: both are per-reader state that a move can
+    // invalidate, and a chunk edge is the cheapest moment in the run to re-read a latch that changes twice.
+    // The read counter below is the backstop for a reader that never crosses one.
+    const mask = makeMask(bot);
+    mask.refresh();
+    let sinceMaskCheck = 0;
+
+    const onColumnChange = () => { cx = 0x7fffffff; cz = 0x7fffffff; col = null; mask.refresh(); };
     const world = bot.world;
     world.on('chunkColumnUnload', onColumnChange);
     world.on('chunkColumnLoad', onColumnChange);
@@ -186,6 +235,11 @@ function makeVoxelReader(bot, opts = {}) {
         stats, FLAGS: F, UNLOADED,
         stateIdAt(x, y, z) {
             stats.reads++;
+            // THE SPAWN MASK IS READ HERE AND NOT ONLY ON THE BODY, because this path never calls
+            // bot.blockAt: it reads mineflayer's ChunkColumn directly, so the body's wrapper cannot see it.
+            // One answer, two paths (Law 16) — a masked cell is the same block whichever door asked.
+            if (++sinceMaskCheck > MASK_RECHECK_READS) { sinceMaskCheck = 0; mask.refresh(); }
+            if (mask.on && x >= mask.minX && x <= mask.maxX && z >= mask.minZ && z <= mask.maxZ) return mask.stateId;
             const qx = x >> 4, qz = z >> 4;   // arithmetic shift: correct for negatives, unlike /16|0
             if (qx !== cx || qz !== cz) {
                 stats.columnMisses++;

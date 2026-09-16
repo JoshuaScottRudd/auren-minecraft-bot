@@ -68,6 +68,12 @@ moduleAlias.addAliases({
   // must refuse exactly the ground the crew would fail on, which means calling the crew's own surveyor.
   // It still writes nothing — `dryRun` is what keeps this a read.
   '@action':     path.join(BOT_DIR, 'action_fragments.js'),
+  // AND WHAT THAT SURVEYOR LOADS WHILE IT SCANS (2026-09-14). The siting scan yields through
+  // `voxel_scan_throttle`, which reaches `@api/battle_stations` for its combat checkpoint, and that file
+  // requires `@locomotion/survival_instincts` at load. Missing here, every `get` died ~60 s in with
+  // "Cannot find module '@locomotion/survival_instincts'" once the scan reached the checkpoint (the
+  // 20-minute soak of 2026-09-14). It is loaded, never driven: the desk still commands no body.
+  '@locomotion': path.join(BOT_DIR, 'custom_api', 'locomotion'),
 });
 
 // ── THE DESK KEEPS A RECORD, AND IT IS THE FLEET'S OWN WRITER ────────────────────────────────────
@@ -427,7 +433,7 @@ const siteGeometry = require('@utils/site_geometry');
 // The desk's spawn-clearance gate on `get`. `armSpawnProtection` is called at createBot; the two readers
 // are used in the gate itself. One module owns the world-spawn latch and the Chebyshev metric, so the
 // desk's refusal and a body's own dig refusal cannot disagree about where spawn is (Law 16).
-const { armSpawnProtection, chebyshevFromWorldSpawn, worldSpawnPoint } = require('@perception/spawn_protection');
+const { armSpawnProtection, maskWorldReads, chebyshevFromWorldSpawn, worldSpawnPoint } = require('@perception/spawn_protection');
 const { getBiomeName } = require('@perception/biome_scanner');      // the one biome read (Law 16)
 // THE BODY'S OWN SITER, called dry. The desk asks whether a base can be placed where a person stands
 // BEFORE it spawns anybody; running the crew's own surveyor is what makes the desk's answer and the
@@ -824,8 +830,14 @@ async function handle(from, text, reply) {
     // SAID FIRST, BECAUSE THE SURVEY IS SLOW. `loadedAreaSettled` waits for the chunk disc to arrive —
     // measured at 56 s on fresh ground, capped at 120 s — and a person who typed a command and heard
     // nothing for a minute has been given every reason to think the desk is broken and say it again.
+    //
+    // AND IT SURVEYS FROM THE PERSON'S FEET, NOT THE DESK'S. The desk's post is wherever the server drops
+    // it, which is world spawn — inside the spawn-protected square, whose every cell reads as bedrock. A
+    // survey rooted there roots its route searches in solid rock and reaches nothing. `origin` is the cell
+    // the crew will be spawned beside and re-survey from, so the desk's answer and the body's answer are
+    // computed from the same ground (Law 16), which is what the paragraph above has always claimed.
     reply('checking the ground around you...');
-    const layout = await lockAllBuildspots.run(bot, { dryRun: true, species, unlockedWorld: true });
+    const layout = await lockAllBuildspots.run(bot, { dryRun: true, species, unlockedWorld: true, origin: feet });
     if (layout.transient) {
       record.refused(from, 'world_streaming', `${crew.length} launch(es) withheld`);
       trouble(from, 'world_streaming',
@@ -1370,6 +1382,16 @@ bot.on('kicked', r => log(`KICKED: ${JSON.stringify(r)}`));
 bot.on('end', r => { log(`disconnected (${r}) — the foreman does not self-restart; start it again from the terminal.`); process.exit(1); });
 
 bot.once('spawn', () => {
+  // THE DESK READS THE SAME MASKED WORLD ITS CREW WILL (Architect 2026-09-15: *"a spawn block shall never
+  // be a part of any decisions"*). The desk decides where a whole base goes, so it is exactly the body that
+  // must not see buildable ground inside the square — an unmasked desk sites a row the masked crew then
+  // cannot place. Its own post stays inside that square, because what the survey walks outward from is no
+  // longer the desk but the person's feet (see the `get` gate).
+  //
+  // AT SPAWN AND NOT BESIDE THE ARM: `maskWorldReads` wraps `bot.blockAt`, which mineflayer has not
+  // attached when `createBot` returns — wrapping there threw at module load and the desk never joined.
+  // Nothing here reads a block before the listener below is registered, so the later wrap leaves no window.
+  maskWorldReads(bot);
   log(`standing by at ${bot.entity.position.floored()} on the '${FOREMAN_CHANNEL}' channel.`);
 
   const ch = channel.active();

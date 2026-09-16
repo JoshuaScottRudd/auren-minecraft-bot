@@ -47,6 +47,7 @@ const { pillarStep } = require('@utils/movement/scaffold_movement');
 const { collectNearby } = require('@api/drop_collector.js');
 const { HEADFRAME_SAFE_RADIUS } = require('@thinking/architect_config');
 const { guardExternal } = require('@utils/external_library_guard');
+const { claimFirst, releaseTarget } = require('@utils/target_claims');
 
 const TAG = 'tree_feller';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -154,8 +155,8 @@ function collectTreeLogs(bot, base, inObjective) {
 // Open a line of sight to a log by clearing only the leaves on its faces that are in reach
 // — enough for the dig to land, not a canopy strip.
 async function clearBlockingLeaves(bot, logPos) {
-  for (const [dx, dy, dz] of SIX) {
-    const lp = new Vec3(logPos.x + dx, logPos.y + dy, logPos.z + dz);
+  const faces = SIX.map(([dx, dy, dz]) => new Vec3(logPos.x + dx, logPos.y + dy, logPos.z + dz));
+  for (const lp of faces) {
     if (!withinReach(bot, lp)) continue;
     const b = bot.blockAt(lp);
     if (b && LEAF_REGEX.test(b.name)) await digBlock(bot, b);
@@ -167,16 +168,17 @@ async function clipGroundVegetation(bot) {
   const feet = bot.entity.position.floored();
   const r = CONFIG.vegetationClipRadius;
   let clipped = 0;
+  const cells = [];
   for (let dx = -r; dx <= r; dx++) {
     for (let dz = -r; dz <= r; dz++) {
-      for (let dy = -1; dy <= 2; dy++) {
-        const p = new Vec3(feet.x + dx, feet.y + dy, feet.z + dz);
-        const b = bot.blockAt(p);
-        if (!b || b.name === 'air') continue;
-        if (!isClippableVegetation(b.name)) continue;
-        if (await performDig(bot, p, b, TAG)) { clipped++; await sleep(30); }   // only count vegetation that actually went
-      }
+      for (let dy = -1; dy <= 2; dy++) cells.push(new Vec3(feet.x + dx, feet.y + dy, feet.z + dz));
     }
+  }
+  for (const p of cells) {
+    const b = bot.blockAt(p);
+    if (!b || b.name === 'air') continue;
+    if (!isClippableVegetation(b.name)) continue;
+    if (await performDig(bot, p, b, TAG)) { clipped++; await sleep(30); }   // only count vegetation that actually went
   }
   return clipped;
 }
@@ -496,14 +498,14 @@ async function standAtTreeBase(bot, dispatcher, base) {
 // Object lock (arbiter flavor a — physical exclusivity, see overseer_brain.js taxonomy):
 // a felled tree is one object, claimed by its base block. Chosen at EXECUTION time from
 // live perception, so the planning token can't cover it — this claim is what stops two
-// bots working the same trunk. Returns true if this bot holds the tree. In single-bot
-// mode requestClaim always grants, so this is a no-op gate.
-// Unguarded: the claim is ours and answers in `granted`. A catch here reports "a peer holds this tree"
-// for a defect, and the sweep above then walks past every tree in turn for the same non-reason.
-async function _claimTree(overseerLink, key) {
-  const res = await overseerLink.requestClaim(key);
-  return !!(res && res.granted);
-}
+// bots working the same trunk. Taken through target_claims, the one claim-reach-release walk
+// trees, stone columns and grass share (Law 16). In single-bot mode every claim is granted.
+const treeKeyOf = (pos) => `tree:${pos.x},${pos.y},${pos.z}`;
+// standAtTreeBase answered in its own shape; the walk reads { ok, reason }.
+const approachTree = (bot, dispatcher) => async (pos) => {
+  const approach = await standAtTreeBase(bot, dispatcher, pos);
+  return { ok: !!(approach && approach.arrived), reason: approach && approach.reason === 'no_skirt' ? 'no_skirt' : 'path_failed' };
+};
 
 // ── Candidate selection + unstick (self-scan mode) ───────────────────────────
 const DIRS8 = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
@@ -530,21 +532,19 @@ function rankByProximity(candidates, origin, preferSpecies = null) {
 // the bot can stand beside. Claim-BEFORE-walk stops two bots converging on one tree; a claimed but
 // unreachable tree is released and the sweep continues. Bounded by MAX_UNREACHABLE_APPROACHES so a
 // truly boxed bot doesn't churn the whole list. Returns { pick|null, peerHeld, unreachable, spent }.
-async function selectReachableTree(bot, dispatcher, overseerLink, ranked, excludeTrees) {
-  let peerHeld = 0, boxed = 0, pathFailed = 0, spent = 0;
-  for (const { c } of ranked) {
-    const key = `tree:${c.position.x},${c.position.y},${c.position.z}`;
-    if (excludeTrees && excludeTrees.has(key)) { spent++; continue; }
-    if (!(await _claimTree(overseerLink, key))) { peerHeld++; continue; }
-    const approach = await standAtTreeBase(bot, dispatcher, c.position);
-    if (approach && approach.arrived) {
-      return { pick: { chosenPos: c.position, chosenName: c.name, treeKey: key }, peerHeld, boxed, pathFailed, spent };
-    }
-    overseerLink.releaseClaim(key);   // claimed but couldn't reach — free it, try the next
-    if (approach && approach.reason === 'no_skirt') boxed++; else pathFailed++;
-    if (boxed + pathFailed >= MAX_UNREACHABLE_APPROACHES) break;
-  }
-  return { pick: null, peerHeld, boxed, pathFailed, spent };
+async function selectReachableTree(bot, dispatcher, ranked, excludeTrees) {
+  const approach = approachTree(bot, dispatcher);
+  const walk = await claimFirst(ranked.map(r => r.c), {
+    keyOf: c => treeKeyOf(c.position),
+    skip: (c, key) => !!(excludeTrees && excludeTrees.has(key)),
+    approach: c => approach(c.position),
+    maxUnreachable: MAX_UNREACHABLE_APPROACHES,
+  });
+  const boxed = walk.failures.no_skirt || 0;
+  const tally = { peerHeld: walk.peerHeld, boxed, pathFailed: walk.unreachable - boxed, spent: walk.skipped };
+  return walk.pick
+    ? { pick: { chosenPos: walk.pick.position, chosenName: walk.pick.name, treeKey: walk.key }, ...tally }
+    : { pick: null, ...tally };
 }
 
 function openStanceColumn(bot, x, z, yGuess) {
@@ -703,7 +703,6 @@ async function fell(bot, target, opts = {}) {
   const protectedSet = opts.protectedBlocks || loadBlueprintProtected();
   const excludeTrees = (Array.isArray(opts.excludeTrees) && opts.excludeTrees.length)
     ? new Set(opts.excludeTrees) : null;
-  const overseerLink = require('@kernel/overseer_link');
   const dispatcher = require('@locomotion/locomotion_dispatcher');
 
   let chosenPos, chosenName, treeKey;
@@ -715,19 +714,17 @@ async function fell(bot, target, opts = {}) {
       watcher.summary(TAG, `Target (${pos.x},${pos.y},${pos.z}) is a blueprint block — refusing to fell the build.`);
       return { success: false, reason: 'target_is_blueprint', position: pos };
     }
-    treeKey = `tree:${pos.x},${pos.y},${pos.z}`;
-    if (!(await _claimTree(overseerLink, treeKey))) {
+    watcher.summary(TAG, `Claiming and approaching trunk at (${pos.x},${pos.y},${pos.z})`);
+    const walk = await claimFirst([pos], { keyOf: treeKeyOf, approach: approachTree(bot, dispatcher), maxUnreachable: 1 });
+    if (walk.peerHeld) {
       watcher.summary(TAG, `Tree at (${pos.x},${pos.y},${pos.z}) held by a peer — abandoning target`);
       return { success: false, reason: 'tree_claimed_by_peer', position: pos };
     }
-
-    watcher.summary(TAG, `Approaching claimed trunk at (${pos.x},${pos.y},${pos.z})`);
-    const approach = await standAtTreeBase(bot, dispatcher, pos);
-    if (!approach || !approach.arrived) {
-      overseerLink.releaseClaim(treeKey);   // don't hold a tree we never reached
+    if (!walk.pick) {   // claimed, not reached — the walk already handed the claim back
       watcher.warn(TAG, `Could not reach target (${pos.x},${pos.y},${pos.z})`);
       return { success: false, reason: 'approach_failed', position: pos };
     }
+    treeKey = walk.key;
 
     const block = bot.blockAt(pos);
     chosenName = (block && LOG_REGEX.test(block.name)) ? block.name : 'unknown_log';
@@ -773,7 +770,7 @@ async function fell(bot, target, opts = {}) {
     // (claim-before-walk; see selectReachableTree). Skip trees this chain already reached-but-
     // couldn't-fell (opts.excludeTrees).
     let ranked = rankByProximity(candidates, rankOrigin, preferSpecies);
-    let sel = await selectReachableTree(bot, dispatcher, overseerLink, ranked, excludeTrees);
+    let sel = await selectReachableTree(bot, dispatcher, ranked, excludeTrees);
 
     // Nearest trees all blocked → we're probably boxed where we stand, not out of trees. Step to
     // open ground and rescan ONCE before conceding: a fresh A* from a clear cell reaches trees the
@@ -789,7 +786,7 @@ async function fell(bot, target, opts = {}) {
         const fresh = applyCanopyZone(freshUnprotected, opts.canopyZone);
         if (fresh.length) {
           ranked = rankByProximity(fresh, rankOrigin, preferSpecies);
-          sel = await selectReachableTree(bot, dispatcher, overseerLink, ranked, excludeTrees);
+          sel = await selectReachableTree(bot, dispatcher, ranked, excludeTrees);
         }
       }
     }
@@ -817,7 +814,7 @@ async function fell(bot, target, opts = {}) {
   watcher.summary(TAG, `drops: ${dropResult.picked_up} collected`);
 
   // Work at this tree is over either way — release the object lock.
-  overseerLink.releaseClaim(treeKey);
+  releaseTarget(treeKey);
 
   if (minedCount === 0) {
     watcher.warn(TAG, `No blocks mined at (${chosenPos.x},${chosenPos.y},${chosenPos.z})`);

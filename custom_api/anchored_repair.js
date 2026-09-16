@@ -241,6 +241,11 @@ function evaluatePlacement(bot, step, stand) {
 // own standability predicate (classifyFloor: solid walkable floor + clear feet/head) and reachFromStand
 // (Law 16 — one standability metric, one reach metric). A wheat_plot_pair is one anchor + an adjacent
 // crop, so a cell within BLOCK_REACH of the anchor reaches the whole plot; the small ring reflects that.
+//
+// opts.fallback === false — the anchor's own floor or nothing. A blueprint whose anchors are BUILT BY EACH OTHER
+// (wheat_tine_row: the next row stands on this row's land block) declares `stand_fallback: false`: a missing
+// stand there means "the row behind has not laid it yet", and the nearest dry lip would be farmland or another
+// row's anchor, so the row waits stranded until the row behind rebuilds it.
 function resolveStandableAnchor(bot, anchorFloor, opts = {}) {
   const reach = opts.reach || BLOCK_REACH;
   const af = new Vec3(anchorFloor.x, anchorFloor.y, anchorFloor.z);
@@ -250,6 +255,7 @@ function resolveStandableAnchor(bot, anchorFloor, opts = {}) {
   if (standableAt(af.x, af.y, af.z)) {
     return { floor: { x: af.x, y: af.y, z: af.z }, feet: feetOf(af.x, af.y, af.z), alternate: false };
   }
+  if (opts.fallback === false) return null;
   // Fallback: nearest standable floor in an expanding ring (±1 in Y for a stepped bank) whose feet-eye
   // still reaches the anchor cell — the dry lip beside the water-damaged plot.
   for (let r = 1; r <= 2; r++) {

@@ -267,29 +267,13 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
     watcher.warn(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} is a station and stations are never dug: a station is always a blueprint voxel. Whatever wanted this cell must route around it, not through it.`);
     return false;
   }
-  // ── THE SPAWN-PROTECTED SQUARE, and it is the one refusal here that the world will not confirm ────
-  // Every other gate above refuses something the world would also stop, loudly, if we swung anyway. This
-  // one refuses something the SERVER refuses SILENTLY: inside the square it drops the break and sends
-  // nothing back, so the re-sense at the bottom of this function reads the same client model that
-  // already wrote optimistic AIR and returns a false `true`. That is the KNOWN LIMIT named in this
-  // function's header, and this is the gate that closes it — not by sensing harder, which is
-  // impossible from the client, but by knowing the rule and not swinging.
-  //
-  // AT THE SWING, because this function is the whole dig surface (Law 16) and a refusal here binds every
-  // caller including ones not yet written (Law 27 — the failing case cannot form inside the thing that
-  // would have to form it). The selection layers above also drop protected candidates, which is what
-  // makes the fleet plan around the square rather than repeatedly discover it; this is the floor beneath
-  // all of them, for the digs that consult no scanner at all — a combat terrain errand, a harvest, a
-  // navigator clearing a cell.
-  //
-  // NOT KEYED ON OP STATUS. The server would let an op'd bot through; the fleet does not (Invariant E,
-  // Law 19). The argument lives on the module.
-  const { spawnProtectionVerdict } = require('@perception/spawn_protection');
-  const spawnVerdict = spawnProtectionVerdict(bot, pos, 'dig');
-  if (!spawnVerdict.allowed) {
-    watcher.warn(tag, spawnVerdict.why);
-    return false;
-  }
+  // THE SPAWN-PROTECTED SQUARE IS NOT CHECKED HERE ANY MORE, AND THAT IS THE SIMPLIFICATION, NOT A GAP
+  // (Architect 2026-09-15: *"prevent the spawn point from ever making it into any scan for any reason…
+  // it doesent even make it past the scan"*). `spawn_protection.maskWorldReads` makes every cell inside
+  // the square read as BEDROCK to every reader in the fleet, so a protected cell reaches this function
+  // only as an undiggable block and is refused by the diggability gate above — the same refusal a real
+  // bedrock cell gets, from one mechanism instead of two. The silent-server problem the old gate existed
+  // for is solved a layer earlier: there is nothing to swing at, because there is nothing to select.
   // No work-dig while the body bobs. A dig at the water surface is unreliable —
   // the bob moves the body between look and swing (the chop-the-tree-while-bouncing failure) — so a
   // work-dig-in-water takes battle_stations over, swims to land, and abandons the caller to replan from

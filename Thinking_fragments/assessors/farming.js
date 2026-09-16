@@ -5,10 +5,15 @@
 const farmingIntegrity = require('@perception/farming_integrity');
 const requestedWork = require('@thinking/requested_work');
 const inventoryLens = require('@kernel/inventory_lens');
+const { countInInventory } = require('@utils/calculators/inventory_calculator');
+const watcher = require('@kernel/watcher');
+const { getBotInventory, homeChest } = require('@utils/fragment_utils');
+const { TAG, supplyJob, deliverScope } = require('@thinking/assessors/shared');
 
 // Architect-owned tables, imported never restated (Law 16 — one source).
 const {
     JOB_TYPE,
+    FARM_STRUCTURE,
 } = require('@thinking/architect_config');
 // ── SECTION 4b — Farming (its own assessment, dispatched to farm_manager) ──
 // Thin by design: farming_integrity owns the whole verdict including the seed/structure/hoe MATERIALS gate,
@@ -61,11 +66,49 @@ function assess() {
 
     const cluster = farmingIntegrity.scanCluster(bot);
 
+    // EVERY FARM JOB IS STAMPED WITH THE FARM, so the setup gate holds all of it — tend, dirt and seeds — until
+    // the structures before the farm are built (architect_config SETUP_ORDER). `built` is the farm's own verdict.
     if (cluster.located && cluster.any_actionable && cluster.materials_ready) {
         jobs.push({ id: 'farm_tend#cluster', type: 'farm', what: 'farm_tend', where: cluster.anchor,
-            job_type: JOB_TYPE.farm_tend, scope: 'shared', claimed_by: null });
+            job_type: JOB_TYPE.farm_tend, structure: FARM_STRUCTURE, scope: 'shared', claimed_by: null });
     }
-    return { jobs };
+
+    // ── THE FARM'S DIRT ORDER (Architect 2026-09-15) ──────────────────────────────────────────────────
+    // A tine row is built from pocket dirt. When the seeds can plant rows the pocket cannot lay, gather exactly
+    // that gap INTO THE POCKET — the same shape as a build's bootstrap gather (assessors/building), because the
+    // bot carries it to the water rather than banking it. A chest that holds dirt is drawn first (supply_manager
+    // withdraws for a pocket order before it digs). It is posted even while no row is actionable — dirt is what
+    // makes one so.
+    if (cluster.located && cluster.dirt_gap > 0) {
+        const held = countInInventory('dirt', getBotInventory());
+        jobs.push(supplyJob({
+            id: 'farm_supply_dirt', what: 'dirt', need: cluster.dirt_gap, where: null,
+            job_type: JOB_TYPE.farm_supply_dirt, structure: FARM_STRUCTURE, claimed_by: null,
+            hold_goal: held + cluster.dirt_gap, at_destination: held,
+            category: 'resource', scope: 'local',
+        }));
+    }
+
+    // ── THE FARM'S SEED ORDER (Architect 2026-09-15) ──────────────────────────────────────────────────
+    // *"remove seed job from the request system and instead build it into the farm building. so it requests the
+    // exact number of seeds it needs."* Delivered to the home chest the tend visit pulls from, the headframe
+    // order's shape (assessors/building). Raw, so `local`: while the field wants seeds, every idle bot may go
+    // out for them. `at_destination` is what the fleet already reaches — spoken for by this same field.
+    if (cluster.located && cluster.seed_gap > 0) {
+        const chest = homeChest();
+        if (chest) {
+            jobs.push(supplyJob({
+                id: 'farm_supply_seeds', what: 'wheat_seeds', need: cluster.seed_gap,
+                where: chest.station.pos, station_id: chest.id, destination: 'storage',
+                job_type: JOB_TYPE.farm_supply_seeds, structure: FARM_STRUCTURE, claimed_by: null,
+                hold_goal: cluster.seed_gap, at_destination: cluster.seeds_reachable,
+                category: 'resource', action: 'deliver', scope: deliverScope('wheat_seeds'),
+            }));
+        } else {
+            watcher.summary(TAG, `farm wants ${cluster.seed_gap} seeds but no home chest is registered to deliver them to — no seed order.`);
+        }
+    }
+    return { jobs, built: { [FARM_STRUCTURE]: cluster.built === true } };
 }
 
 module.exports = { name: 'farming', assess };

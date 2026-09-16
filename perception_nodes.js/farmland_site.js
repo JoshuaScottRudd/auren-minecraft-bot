@@ -29,7 +29,7 @@ function loadBuilding(blueprintName) {
 }
 
 // getFarmlandCells(bot, roomKey) -> { waterCell: {x,y,z}, rowCells: [{x,y,z}], growingSlots: Set<"x|y|z"> }
-// rowCells are the GROUND 'dirt' voxels (the y that the blueprint tills), in whatever
+// rowCells are the GROUND 'dirt' voxels under a 'growing' voxel (the y that the blueprint tills), in whatever
 // state they're currently in (dirt/grass pre-till, farmland post-till) — callers decide
 // what to do from the live world block, this node only locates the cells. The crop grows
 // one block ABOVE each rowCell, marked in the blueprint with voxel type 'growing' (not
@@ -37,10 +37,9 @@ function loadBuilding(blueprintName) {
 //
 // growingSlots is the SET of those crop-slot positions, returned so the 'clear' action can prove
 // a block it is about to dig sits in a blueprint-declared crop slot and therefore can never be
-// structure. Today the blueprint guarantees the voxel above every 'dirt' cell is
-// 'growing' — this set is what keeps that a checked fact rather than an assumption a future
-// blueprint edit could silently break, turning 'clear' into a fence-eater.
-// roomKey is the farm INSTANCE's conference-room key (32 wheat_plot_pair plots each have a distinct locked
+// structure. The same set now decides which dirt IS a row cell (the tine row's land block is dirt
+// with no slot above it), so 'clear' and 'till' can never reach a cell the blueprint does not crop.
+// roomKey is the farm INSTANCE's conference-room key (16 wheat_tine_row rows each have a distinct locked
 // center). Defaults to the phase-1 blueprint name — instance 0's key and every single-farm caller — so this
 // stays backward-compatible. WHICH geometry an instance uses is read per-instance from the locked chair (see
 // below), NOT from a module const — so instances of DIFFERENT geometries can coexist under one subsystem.
@@ -62,15 +61,19 @@ function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
   const voxels = transposeVoxelsForCandidate(building, setBuildspot.build_center, setBuildspot.rotation || 0);
 
   let waterCell = null;
-  const rowCells = [];
+  const dirtCells = [];
   const growingSlots = new Set();
   for (const v of voxels) {
     if (v.type === 'water') waterCell = { x: v.x, y: v.y, z: v.z };
-    else if (v.type === 'dirt') rowCells.push({ x: v.x, y: v.y, z: v.z });
+    else if (v.type === 'dirt') dirtCells.push({ x: v.x, y: v.y, z: v.z });
     else if (v.type === 'growing') growingSlots.add(slotKey(v.x, v.y, v.z));
   }
+  // A ROW CELL IS DIRT WITH A CROP SLOT ON IT. Not every dirt voxel is one: a wheat_tine_row's land block is dirt
+  // with air above — the next row's stand — and tilling it would turn the walkway into farmland (Architect
+  // 2026-09-15, the trident). The crop slot is what makes soil a field cell, so that is what is read.
+  const rowCells = dirtCells.filter(c => growingSlots.has(slotKey(c.x, c.y + 1, c.z)));
   // waterCell is OPTIONAL. A blueprint MAY declare its own water voxel (a source the builder places by bucket);
-  // a wheat_plot_pair plot does NOT — the wheat_plot_scanner only ever sites a plot already adjacent to NATURAL
+  // a wheat_tine_row does NOT — the wheat_trident_scanner only ever sites plots into open NATURAL
   // water, so hydration is guaranteed by the siter, not by a declared voxel. Absent water is therefore a valid
   // phase-1 field, not a coding violation: it is returned null and no field phase reads it (grep-confirmed:
   // waterCell has no consumers — the field phases use only rowCells + growingSlots).

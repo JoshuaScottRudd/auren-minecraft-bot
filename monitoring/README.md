@@ -102,6 +102,7 @@ folder a new file goes in, and it no longer decides who is allowed to see it.
 | `engagement_lens.js` | a run's lines | **the fight as a story** — one mob from aggro to off-the-board, joined out of the three crew seats' event streams (`--engagement`). Decodes lines through `custom_api/crew_log.parse`, the same grammar module the seats emit through; it carries **no regexes of its own** for those lines, because a second copy of the grammar drifts the first time a field is added. Exports `reduceEngagements()` for machine callers beside the rendered `runEngagement()` |
 | `chain_lenses.js` | a run's lines | did a multi-owner chain close — `--compost` |
 | `build_lenses.js` | a run's lines | when establishment happened — the first-occurrence clocks. `--milestones` times the build sites (site lock → anchor gate → first placement → anchor complete); `--torch` times the fleet's first torch craft and, when there was none, the order that asked for it and every gate that held it. Two flags in one file because the verb is one: when did this first happen, and what was it waiting on |
+| `farm_lens.js` | a run's lines | the wheat field as one structure — `--farm`, and the farm block `--milestones` ends with. Its own file because the farm is sixteen row sites making one structure, tended as well as built, measured off lines no building writes (farming_integrity's census, farm_executor's per-row tend line, seed trips) |
 | `job_timeline_lens.js` | a run's lines | **the run as a sequence of jobs** — every claim in order with its duration, the gaps between them, and where the run's time went by job type (`--jobs`). Added nothing to the watcher: both ends of a job were already summary lines, so it extended `buildEpisodes` and did the arithmetic. Exports `reduceJobTimeline()` for machine callers beside the rendered `runJobTimeline()` |
 | `locomotion_lenses.js` | a run's lines | what walking cost — `--pathfinding`, `--route-cost`, `--jumps` |
 | `narration_lens.js` | a run's lines | **what one unit SAID, in order** (`--narration --bot=<unit>`; no `--bot` lists who posted). The only lens here that is not a fold — every other one measures something and discards the rest, so a unit whose output is prose rather than events (a director narrating its cuts, a preflight narrating what it verified) could be *counted* by the merged view and *shown* by nothing. **It states its window instead of applying it silently:** the trace segments on the overseer's `start` broadcast, so anything that comes up before the fleet thinks has its whole bring-up in an earlier segment — the render reports how many lines fall outside and `--full` includes them (Law 25 — a subset presented as the whole is a false verdict with a clean exit) |
@@ -157,6 +158,104 @@ bench is deleted with all the others, and nothing can cheaply replace it — a l
 across the process boundary, and no pass of `preflight` can compare two strings in two files. **If you
 edit `bucketRetirement` or `KILL_VERDICT`, edit the other in the same commit.** It is the fleet's one
 live claim with no enforcement.
+
+## A LENS PRINTS FIELD NAMES AND VALUES. IT HAS NO GRAMMAR TO INTERPRET WITH (Architect 2026-09-16, STANDING)
+
+> *"A lens isn't supposed to interpret data. We are supposed to interpret data… **the bot has the right to
+> interpret its own data because it's the one doing the reasoning. Just like I can tell you why I made a
+> choice so can the bot. Who cannot is the lens who had no participation within the decision making
+> process.** The purpose of the lens is to extract data from large files without reading it.*
+>
+> *Each lens answers a question without any string… there's no longer any sentences or grammar in the
+> output of the monitor. It answers a question directly and outputs the data directly… if you prevent trace
+> monitor from saying anything except variables and timestamps then it can never interpret data right?"*
+
+**WHO MAY INTERPRET IS SETTLED BY WHO WAS THERE.** `farm_manager` writing `[STUCK — nothing worked]` into
+the record is a participant reporting its own reasoning, and it is the only thing in the system that was
+present for that decision. **The bot may explain itself. The lens may not explain the bot** — it arrived
+afterward, read a file, and has no standing to say what any of it meant.
+
+**So a lens reproducing a bot's sentence VERBATIM as a VALUE is correct**, and expected. It is copying, not
+claiming; the sentence belongs to the bot and the lens is the envelope. What a lens may never do is compose
+a sentence of its own ABOUT a value.
+
+### The rule
+
+**Every string a lens prints is either a FIELD NAME it declared or a VALUE it copied. There is no third
+kind.** Output is a table, not a report.
+
+### How it is enforced — structurally, not by vocabulary
+
+**`data_out.js` is the only file in this folder that writes to stdout.** Every lens hands it field names and
+values; it owns every space, separator, column width and timestamp shape in the output. `out.kv(field,
+value)`, `out.section(field)`, `out.table(fields, rows)`, `out.list(field, values)`. A field name must match
+`/^[a-z0-9][a-z0-9_.]*[a-z0-9]$/` and `data_out.field()` throws on anything else.
+
+`preflight`'s **"Lens output"** pass makes it a gate, as two checks:
+
+- **A — one pathway to the answer (Law 16).** Nothing under `monitoring/` calls `console.log` or
+  `process.stdout.write` except `data_out.js`.
+- **B — no authored prose.** No string literal containing a SPACE, outside the formatting layer. A literal
+  without a space is a field name, a key, a flag or a bot name.
+
+**Exempt, named here and nowhere else:** `data_out.js` and `report_formatting.js` are the formatting layer
+and own every space, which is exactly why no other file needs one. `throw` text and `console.error` are a
+crash and an IO failure, not an answer about a run. **Comments are exempt by construction** and that is the
+intent — a comment's audience is the next developer, who is owed the whole why (Law 14).
+
+### Why the first attempt was the wrong shape, kept because the mistake is instructive
+
+The guard written earlier that same day scanned printed strings for interpretive WORDS — `because`,
+`likely`, `not a fault`. **That is a BLACKLIST across an open field, and Law 29 names exactly what is wrong
+with one: it permits everything it forgot to name.** It could be walked around by a synonym, it argued with
+its own author over `may` meaning PERMITTED rather than PERHAPS, and no word list could ever catch an
+interpretation phrased in words nobody thought of.
+
+**The structural shape needs no list. A lens that cannot form a SENTENCE cannot state a CONCLUSION.** Take
+prose out of the instrument and interpretation has nowhere to live — not because the words are banned, but
+because there is no grammar left to carry them. That is a whitelist: field names, values, timestamps, and by
+omission nothing else.
+
+### Grading survives, as fields
+
+A verdict is a comparison against a number somebody authored in `architect_config`, so it stays — **as a
+value, printed beside the threshold it was measured against**, so the reader can check it:
+
+```
+shell_closed            11m 36s
+shell_grade             ok
+threshold_green_sec     690
+threshold_ok_sec        720
+```
+
+The one case where a grade WAS a violation: `CONVICTED: diagonal 71% against axial 40%`, graded against a
+`+0.15` that appeared nowhere in the output. Not wrong for grading — wrong because the ruler was invisible.
+
+### THIS IS NOT A CONTRADICTION OF THE 2026-08-07 STAMP ABOVE, and a successor will think it is
+
+That entry has him saying *"raw data is read through a monitor and interpreted by a deterministic system"* —
+the word is the same and the act is not. That stamp ratified **TRANSLATION**: a record reduced, folded, keyed
+and rendered, so a reader gets `13/16 rows laid` instead of 40,000 lines. Translation is the lens's whole
+job, and `data_out` is how it is now done. **EXPLANATION** — why only 13, whether 13 is bad, what to fix —
+is the reader's, and was never in that stamp. Both sentences are law and they govern different halves.
+
+### The costs, named rather than discovered
+
+1. A sentence could still be smuggled in as `rows_laid_far_too_few`. `data_out.field()` caps a name at 48
+   characters, but the real answer is that this is a thing somebody would have to do on purpose, and a
+   guard's job is to stop the mistake that happens by accident while feeling helpful.
+2. A lens could route a report to `console.error` and escape check A. Same category: deliberate.
+3. **Output stops reading like a report and starts reading like a table. That is the intended trade** — a
+   report is persuasive and a table is not, and the reader is meant to do the persuading.
+
+### What the conversion found (2026-09-16)
+
+Every lens was rewritten to this shape in one pass. The prose that came out had two recurring shapes worth
+knowing before writing the next one. **EXPLAINING A ZERO:** the instrument measures a not-happened
+correctly, then supplies a reason for it — `no lock line in this run (the site was already locked before it
+started)`. Every empty-state branch in the folder had drifted that way. **PREDICTING A REMEDY:** `this is
+what a consolidation pass would return`, `NAV_SEARCH_DEADLINE_MS must sit clear of 5000ms`. In every case
+the measurement survived deleting the clause, intact.
 
 ## The rule that keeps the split from collapsing back
 

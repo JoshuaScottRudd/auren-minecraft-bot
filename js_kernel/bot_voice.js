@@ -69,7 +69,7 @@
 //
 // ── THE ONE LINE A HOMESTEAD SPEAKS: WHERE ITS BASE IS (Architect 2026-09-11) ──────────────────────
 // *"also announce when it places its headframe in chat. where the location is set so players dont see
-// anything wrong."* A homestead sites its base at the biggest river or ocean bank in view, which can be a
+// anything wrong."* A homestead sites its base at the biggest sea-level water bank in view, which can be a
 // long walk from where anybody is standing, and a crew that walks 150 blocks away without a word looks
 // like a crew that has broken. So the bot that locks the headframe says where, once, as coordinates a
 // person can type. It is one line per base, so it takes no part in the availability state machine or its

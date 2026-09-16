@@ -10,8 +10,8 @@
 // A rung × overlay table is N + 2 declarations; a rung-per-combination is 2N, and the second copy is the
 // one that ages (Law 16).
 //
-//   run_config.js  run.record: 'film'                      a run with cameras + OBS writing files
-//   run_config.js  run.record: 'cameras'                    cameras only, nothing written
+//   run_config.js  run.record: 'film'                      a run with cameras + a recorder writing files
+//   run_config.js  run.record: 'cameras'                    cameras only, nothing written — what a download has
 //   node tools/lanista_conductor.js ladder record          the combat bench, which still takes the word
 //   node tools/record_overlay.js    stop                   THE closer, whichever caller raised it
 //
@@ -21,15 +21,19 @@
 // ── WHAT IT ADDS TO A RUN, IN THIS ORDER (every step an existing owner) ─────────────────────────────
 //   start_cameras.ps1 -Framing              N bot cameras + director + titler (+ the eye on --architect)
 //   wait on camera_rig_ready.json           every client CONFIRMED standing in the world, not just spawned
-//   camera_obs.ps1 configure                boot-time OBS config — legal only while OBS is STOPPED
-//   camera_obs.ps1 up                       launch OBS, bind one capture per window
-//   camera_obs.ps1 start                    one call records every camera
-// and reaps it in the mirrored order: recording stopped, OBS quit, clients killed, and only then does
-// the conductor take the fleet down. The ordering is the entire value and it is not guessable — OBS
-// must be configured while it is stopped (Law 26: build while off, drive while on), `up` binds nothing
-// if the windows do not exist yet, and a client killed before the recording is stopped leaves a file no
-// muxer ever closed. One step out of order yields footage that looks fine and is black, which is the
-// expensive failure because it is only discovered after the run.
+//   recorder.raise                          ('record' only) bind a capture per window and start writing
+// and reaps it in the mirrored order: recording finalised, clients killed, and only then does the
+// conductor take the fleet down. The ordering is the entire value and it is not guessable — a capture
+// binds nothing if the windows do not exist yet, and a client killed before the recording is stopped
+// leaves a file no muxer ever closed. One step out of order yields footage that looks fine and is black,
+// which is the expensive failure because it is only discovered after the run.
+//
+// ── THE RECORDER IS NOT IN THIS COPY'S CODE, AND THAT IS THE DESIGN (Architect 2026-09-14) ─────────────
+// *"i want obs removed at best they should be able to watch."* The camera crew ships so anybody can watch a
+// run through it; recording those windows is the Architect's equipment. So `record` reaches its recorder
+// through ONE hook, `workstation.findRecorder()`, which answers only on a machine whose workstation file
+// names one. Everywhere else `record` refuses before it raises anything and points at `cameras`, which is
+// the same crew with nothing written — each window is titled Cam_<Bot>, so any screen recorder can bind it.
 //
 // ── WHERE IT SITS IN THE RUN, AND WHY THERE ───────────────────────────────────────────────────────
 // AFTER the bring-up, BEFORE the work starts. That is one insertion point for every rung, which is what
@@ -41,7 +45,7 @@
 // ── THE ARCHITECT'S EYE — OFF UNLESS ASKED FOR ─────────────────────────────────────────────────────
 // One more spectator client, built and launched exactly like a bot camera, that the director arms
 // (spectator + night vision) and then never commands — it is absent from the rig's shot list, so a
-// human flies it. It gets its own OBS capture and its own file, so what he chooses to look at is on
+// human flies it. On a recorded run it gets its own capture and its own file, so what he chooses to look at is on
 // disk beside what the directed cameras chose. Its name is declared once, in camera_configure.
 //
 // It is the ONLY seat in the crew that produces nothing unless a human flies it for the entire run,
@@ -53,7 +57,7 @@
 // name into its accepted set (OVERLAY_FLAGS). Two parses would be two answers to one question the
 // moment either drifted (Law 16), and the eye belongs to the overlay — it exists only on a filmed run.
 //
-// THE SAME VALUE GOES TO BOTH RAISERS. The launcher builds the window, camera_obs binds the capture,
+// THE SAME VALUE GOES TO BOTH RAISERS. The launcher builds the window, the recorder binds the capture,
 // and a disagreement is silent in both directions — an unbound window records nothing, and a capture
 // bound to a client that never launched reports a clean start over a black file. Neither throws, and
 // both are only discovered after the run.
@@ -103,6 +107,15 @@ const REPO_ROOT = paths.REPO_ROOT;
 const SCRIPTS   = paths.workshop('scripts');
 const KERNEL    = paths.bot('js_kernel');
 
+const workstation = require(paths.bot('js_kernel', 'utils', 'workstation.js'));
+
+// recorder() → the recorder module, or null on a machine that has none. Asked when a recording step is
+// reached rather than at load, so `cameras`, `stop` and `status` never touch it on a copy without one.
+function recorder() {
+  const file = workstation.findRecorder();
+  return file ? require(file) : null;
+}
+
 const SESSION_FILE = path.join(KERNEL, 'record_overlay_session.json');
 const STOP_FILE    = path.join(KERNEL, 'record_overlay_stop.json');
 // Written by camera_rig, read and cleared here. Never written by this unit (Law 9).
@@ -129,11 +142,11 @@ const STALE_MS = SLICE_SECONDS * 3 * 1000 + 20000;
 // differ in exactly one field rather than in two code paths.
 const OVERLAYS = {
   record: {
-    obs: true,
-    blurb: 'cameras for every bot, and OBS recording every one of them to its own file.',
+    records: true,
+    blurb: 'cameras for every bot, and a recorder writing every one of them to its own file (needs a recorder on this machine).',
   },
   watch: {
-    obs: false,
+    records: false,
     blurb: 'cameras for every bot, and NO recording — lenses to watch through, nothing written.',
   },
 };
@@ -153,7 +166,7 @@ function architectEye() { return seatSwitch('architect', c => c.architect); }
 // Read here, once, exactly as the eye is and for the same reason: both conductors and `fleet_control
 // run` run this overlay in their own process, so one parse serves every caller and the same value is
 // handed to BOTH raisers. That last part is the whole hazard. The launcher builds the window and
-// camera_obs binds the capture and routes the voice into its file; if only one of them hears the
+// the recorder binds the capture and routes the voice into its file; if only one of them hears the
 // switch, nothing throws — an unbound window records nothing, and a capture bound to a client that
 // never launched reports a clean start over a black file, with the presenter's commentary nowhere.
 function hostSeat() { return seatSwitch('host', c => c.host); }
@@ -263,31 +276,6 @@ function stopSampler() {
   return r.status === 0;
 }
 
-// ── Wrapping the take ────────────────────────────────────────────────────────────────────────────
-// The last debt a filmed run owes, and the only one whose deadline is the NEXT run rather than this
-// one: every bot's trace is overwritten when the fleet is raised again. The footage survives that and
-// the record that explains it does not, and footage nobody can index is footage nobody can cut. So the
-// captures are folded into `footage/<takeKey>/` alongside a copy of each trace and a manifest, and
-// after this a take is one folder that can be opened, moved or deleted whole.
-//
-// It belongs in the teardown rather than in an operator's memory because the run is what raised the
-// lifecycle and is therefore what closes it (Law 8). As a verb somebody had to remember, the record's
-// survival depended on nobody forgetting once, and the failure was silent, total and only discovered
-// weeks later when a take turned out to be unreadable.
-//
-// A CHILD PROCESS, not a require, and that is the Law 26 joint rather than a convenience: the clipper
-// refuses and exits non-zero on an unverified anchor, so importing it would put its refusal on this
-// process's stack and abort a teardown mid-way. Across a process boundary the refusal is an exit code
-// this reads, which is the same shape every other step here already uses.
-//
-// ORDER: after OBS has finalised the files (their duration is what the anchor is checked against) and
-// after the sampler has stopped (its record is otherwise still being written while it is copied).
-function wrapTheTake() {
-  const r = spawnSync(process.execPath, [path.join(TOOLS_DIR, 'footage_clipper.js'), 'wrap'],
-    { stdio: 'inherit', cwd: REPO_ROOT });
-  return r.status === 0;
-}
-
 // Block this process without spinning a core. `raise` is synchronous top to bottom — every step is a
 // spawnSync — so the wait below is a plain blocking pause rather than a promise; Atomics.wait on a
 // throwaway buffer is the only sleep that actually yields the thread in synchronous code.
@@ -353,7 +341,7 @@ function waitForCrew(expected, relaunch) {
       const why = `only some of the ${expected} camera client(s) ever joined the world ` +
         `(${Math.round(CREW_READY_TIMEOUT_MS / 1000)}s ceiling) — camera_rig never published a ready crew · ` +
         (alive === 0
-          ? `NO client process is alive${relaunched ? ' even after one relaunch' : ''} — they exited rather than hung; read tools\\camera_launch_logs\\*.err.log`
+          ? `NO client process is alive${relaunched ? ' even after one relaunch' : ''} — they exited rather than hung; read Auren_Workshop\\camera\\clients\\camera_launch_logs\\*.err.log`
           : `${alive} client process(es) ARE alive${relaunched ? ' (one relaunch was issued)' : ''} — they are loading or stuck, not dead`);
       console.error(`${stamp()} ✗ ${why}`);
       return { ok: false, why };
@@ -365,7 +353,7 @@ function waitForCrew(expected, relaunch) {
 }
 
 // ── Raise ────────────────────────────────────────────────────────────────────────────────────────
-// Every step gated on the last: a camera crew that did not come up must never reach `up`, because an OBS
+// Every step gated on the last: a camera crew that did not come up must never reach `up`, because a recorder
 // that binds nothing records black and reports a clean start (Law 13 — default stopped).
 // `host` is the RUN's answer when the caller has one, and undefined when it does not — the conductors
 // have no `host` field to read and pass nothing, so the flag-then-config order below still decides for
@@ -376,6 +364,19 @@ function waitForCrew(expected, relaunch) {
 function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
   const decl = OVERLAYS[overlay];
   if (!decl) return { ok: false, why: `'${overlay}' is not a declared overlay` };
+
+  // A RUN THAT WRITES FILES NEEDS SOMETHING TO WRITE THEM, and that is known before a single window opens.
+  // Refused here, first, so a copy without a recorder never raises a crew it would then have to reap
+  // (Law 13 — default stopped). The refusal names what this copy CAN do, which is the same run watched.
+  const rec = decl.records ? recorder() : null;
+  if (decl.records && !rec) {
+    return {
+      ok: false,
+      why: `'${overlay}' writes every camera to a file, and this copy has no recorder — the camera crew ` +
+        `ships for watching. Set record: 'cameras' in run_config.js to watch the same run through the same ` +
+        `windows; each is titled Cam_<Bot>, so your own screen recorder can capture any of them.`,
+    };
+  }
 
   // ── THE CAMERAS ARE HARDWIRED TO THIS BOX, SO THE FLEET HAD BETTER BE TOO ─────────────────────
   // Every camera client is launched `--server 127.0.0.1:25565`; the FLEET goes wherever
@@ -436,11 +437,11 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
     return { ok: false, why: 'the camera crew did not come up' };
   }
 
-  // Recorded the moment the crew is up, whether or not OBS follows: the clients and the director are
-  // already ours to reap from here, and a session file written only on full success would strand them
-  // if OBS failed (Law 8 — what is raised is reaped, and the record is how the closer finds it).
+  // Recorded the moment the crew is up, whether or not the recording follows: the clients and the director
+  // are already ours to reap from here, and a session file written only on full success would strand them
+  // if the recorder failed (Law 8 — what is raised is reaped, and the record is how the closer finds it).
   writeSession({
-    overlay, test: test || null, count, obs: decl.obs, architect: eye, host,
+    overlay, test: test || null, count, records: decl.records, architect: eye, host,
     conductor_pid: conductorPid || null,
     raised_at: Date.now(),
     alive_at: conductorPid ? Date.now() : null,
@@ -450,7 +451,7 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
   //
   // Launching a game client and having one standing in the world are separated by tens of seconds of
   // loading, and the launcher owns only the first — it returns when the process starts. Every step after
-  // this one is void without the wait: OBS binds by WINDOW, so binding before the windows finish loading
+  // this one is void without the wait: a capture binds by WINDOW, so binding before the windows finish loading
   // captures a loading screen and reports a clean start, and the fleet's opening minute is filmed by
   // cameras that are not there yet. Both failures report success, which is the only kind worth a gate
   // (Law 13 — prove it is safe to continue).
@@ -461,7 +462,7 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
   // The bot cameras, plus the Architect's eye only when it was actually launched. Counting a seat that
   // was never raised turns the gate into a guaranteed timeout, which reads as "the crew never arrived"
   // on a crew that is standing complete (Law 25 — the criterion has to be the one that was asked for).
-  // The host seat is counted here too. It is not a camera, but it IS a window OBS must bind, and the
+  // The host seat is counted here too. It is not a camera, but it IS a window a recorder must bind, and the
   // rig confirms it standing on its `--present` list for exactly this gate — the one window carrying
   // the presenter and his voice must not be the one window nobody proved had finished loading.
   // The one repair the wait is allowed to make, and it is handed in rather than reached for: the same
@@ -472,10 +473,10 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
     () => runScript('start_cameras.ps1', [...camArgs, '-Add'], 'camera crew — relaunching what died on its first start'));
   if (!crew.ok) return { ok: false, why: crew.why };
 
-  if (!decl.obs) {
+  if (!decl.records) {
     console.log(`\n${stamp()} OVERLAY   '${overlay}': cameras only — nothing is being recorded, by definition.`);
     if (!raiseWarden(overlay, count, eye, host)) return { ok: false, why: 'the camera warden did not start' };
-    return { ok: true, obs: false };
+    return { ok: true, records: false };
   }
 
   // The same set the launcher was given, in the same form — an explicitly empty `--bots=` where the
@@ -483,31 +484,15 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
   // meant none or meant everything.
   const setArgs = count === 0 ? ['--bots='] : [`--count=${count}`];
   const seatArgs = [`--architect=${eye ? 'on' : 'off'}`, `--host=${host ? 'on' : 'off'}`];
-  if (!runScript('camera_obs.ps1', ['configure', ...setArgs, ...seatArgs],
-      'OBS configure (boot-time config — legal only while OBS is stopped)')) {
-    return { ok: false, why: 'OBS could not be configured' };
-  }
-  // ONE announced retry, on `up` alone: OBS accepts the websocket a moment before it can serve requests,
-  // so a cold launch can answer "not ready" and an immediate re-run succeeds. An environmental startup
-  // race, not an uncertain outcome — and printed rather than swallowed, because a silent retry would
-  // hide a genuinely broken OBS behind a second attempt that also failed for a real reason.
-  if (!runScript('camera_obs.ps1', ['up', ...setArgs, ...seatArgs], 'OBS up (bind one capture per window)')) {
-    console.log(`\n${stamp()} OVERLAY   OBS 'up' failed on the cold launch (known startup race) — retrying once.`);
-    if (!runScript('camera_obs.ps1', ['up', ...setArgs, ...seatArgs], 'OBS up (retry)')) {
-      return { ok: false, why: 'OBS would not bind the camera windows' };
-    }
-  }
-  // No count: `start` inherits the roster `up` recorded, which is where the camera set was decided.
-  if (!runScript('camera_obs.ps1', ['start'], 'OBS start (one call records every camera)')) {
-    return { ok: false, why: 'the recording did not start' };
-  }
+  const started = rec.raise({ setArgs, seatArgs });
+  if (!started.ok) return { ok: false, why: started.why };
 
   // THE WARDEN GOES UP LAST, AFTER THE RECORDING IS PROVEN. It attaches a camera to every bot that
   // appears for the rest of the run, and each attach ends by proving the new file is really writing —
-  // a check that can only be made against a live output. Raised before `start`, its first attach would
-  // land on an OBS that is not recording yet and would have nothing true to verify.
+  // a check that can only be made against a live output. Raised before the recording starts, its first
+  // attach would have nothing true to verify.
   if (!raiseWarden(overlay, count, eye, host)) return { ok: false, why: 'the camera warden did not start' };
-  return { ok: true, obs: true };
+  return { ok: true, records: true };
 }
 
 // ── The warden ───────────────────────────────────────────────────────────────────────────────────
@@ -572,11 +557,13 @@ function reap(why) {
   // here would strand exactly what a failed raise produces. `-Down` reports finding nothing when there
   // is nothing, so the cost of asking is a line of output (Law 8: reap what was raised, and a raise that
   // failed halfway still raised something).
-  // The OBS half is skipped without a session, because OBS is only ever raised AFTER the session is
-  // recorded — asking a machine that was never started to stop is a step that can only report noise.
-  if (session && session.obs) {
-    if (!runScript('camera_obs.ps1', ['stop'], 'OBS stop (finalise every per-camera file)')) failed.push('OBS stop');
-    if (!runScript('camera_obs.ps1', ['down'], 'OBS down (quit OBS)')) failed.push('OBS down');
+  // The recording half is skipped without a session, because the recorder is only ever raised AFTER the
+  // session is recorded — asking a machine that was never started to stop is a step that can only report
+  // noise. It runs before any window disappears, so every file is finalised while its source still exists.
+  const rec = session && session.records ? recorder() : null;
+  if (session && session.records) {
+    if (rec) failed.push(...rec.finalise(false));
+    else failed.push('finalise the recording (this session recorded, and no recorder is on this machine now)');
   }
   // Unconditional, like the crew teardown below and for the same reason: the sampler is raised before the
   // session is recorded, so a raise that failed early leaves one running with nothing on record naming it.
@@ -586,13 +573,13 @@ function reap(why) {
     failed.push('camera crew down');
   }
 
-  // Only a run that RECORDED has anything to pair — a `watch` overlay wrote no footage, so there is no
-  // capture for a record to sit beside and the step would be asking a question about files that do not
-  // exist. Same gate the OBS half above uses, for the same reason.
-  if (session && session.obs) {
-    console.log(`\n${stamp()} OVERLAY → wrap this take (its traces die with the next fleet run)`);
-    if (!wrapTheTake()) failed.push('wrap the take');
-  }
+  // WRAPPING THE TAKE — the last debt a filmed run owes, and the only one whose deadline is the NEXT run:
+  // every bot's trace is overwritten when the fleet is raised again, and footage nobody can index is
+  // footage nobody can cut. It belongs in the teardown rather than in an operator's memory because the run
+  // raised the lifecycle and is therefore what closes it (Law 8). Only a run that RECORDED has anything to
+  // pair — a `watch` overlay wrote no footage. ORDER: after the files are finalised and after the sampler
+  // has stopped (its record is otherwise still being written while it is copied).
+  if (rec && !rec.wrapTake()) failed.push('wrap the take');
 
   // Deleted, never rewritten: the session and the request both die with the run they describe, so a
   // later `stop` cannot find a session that no longer exists and reap a stack it never raised.
@@ -604,7 +591,7 @@ function reap(why) {
 
   if (failed.length) {
     console.error(`\n${stamp()} ⚠ the overlay teardown did not report clean: ${failed.join(', ')}. ` +
-      `Check for stray camera windows and an OBS still running before the next filmed run.`);
+      `Check for stray camera windows${session && session.records ? ' and a recorder still running' : ''} before the next run.`);
   }
   return { ok: failed.length === 0, reaped: true, failed };
 }
@@ -675,8 +662,8 @@ function stopCommand(force, why) {
     const quiet = Math.round((Date.now() - session.alive_at) / 1000);
     console.log(`\nrecord_overlay: STOP REQUESTED — the '${session.test || 'conducted'}' run's conductor ` +
       `(pid ${session.conductor_pid}, last heard ${quiet}s ago) holds this run and is its one reaper.`);
-    console.log(`  It reads this between soak slices, so it closes within about ${SLICE_SECONDS}s: it will stop ` +
-      `the recording, quit OBS, close the cameras, capture and triage the run, and take the fleet down.`);
+    console.log(`  It reads this between soak slices, so it closes within about ${SLICE_SECONDS}s: it will ` +
+      `${session.records ? 'finalise the recording, ' : ''}close the cameras, capture and triage the run, and take the fleet down.`);
     console.log(`  NOTHING HAS BEEN TORN DOWN YET — this is a request, and the run's own terminal reports the close.`);
     return REQUESTED_NOT_REAPED;
   }
@@ -689,14 +676,14 @@ function stopCommand(force, why) {
           `treating it as gone and reaping here`
         : ` with no conductor behind it — reaping here`}.`);
   } else {
+    const rec = recorder();
     console.log(`\nrecord_overlay: --force with no session on record — reaping the film crew blind. ` +
-      `This stops any OBS and any camera client it finds and reports what it actually found.`);
-    // With no session there is nothing to read, so both halves are attempted and each reports for itself.
-    // OBS is asked to stop first for the same ordering reason the recorded path uses — and the warden
-    // before either, so nothing is launching cameras into a teardown.
+      `This stops ${rec ? 'any recording and ' : ''}any camera client it finds and reports what it actually found.`);
+    // With no session there is nothing to read, so every half this machine has is attempted and each
+    // reports for itself. The recording is asked to stop first for the same ordering reason the recorded
+    // path uses — and the warden before either, so nothing is launching cameras into a teardown.
     stopWarden();
-    runScript('camera_obs.ps1', ['stop'], 'OBS stop (blind — may be nothing to stop)');
-    runScript('camera_obs.ps1', ['down'], 'OBS down (blind)');
+    if (rec) rec.finalise(true);
     const ok = runScript('start_cameras.ps1', ['-Down'], 'camera crew down (blind)');
     try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch (e) { /* already gone */ }
     console.log(`\nrecord_overlay: blind teardown ${ok ? 'completed' : 'did NOT report clean — read above'}.`);
@@ -718,8 +705,8 @@ function usage() {
   for (const [k, v] of Object.entries(OVERLAYS)) console.log(`    ${k.padEnd(8)} ${v.blurb}`);
   console.log(`\n  START one (the overlay is never invoked directly — a run asks for it):`);
   console.log(`  A RUN RAISES THIS OVERLAY BY BEING CONFIGURED TO. Set it on the one page and run it:`);
-  console.log(`    Auren_Workshop/run_config.js   record: 'film'      cameras and OBS writing files`);
   console.log(`    Auren_Workshop/run_config.js   record: 'cameras'   cameras only, nothing written`);
+  console.log(`    Auren_Workshop/run_config.js   record: 'film'      cameras and a recorder writing files (a machine with a recorder)`);
   console.log(`    then:  node Auren_Workshop/run.js`);
   console.log(`       …which run is filmed is a FIELD now, not a word typed after the name. Set film on any`);
   console.log(`       run in Auren_Bot/Thinking_fragments/architect_fleetrunbook_config.js.`);
@@ -742,20 +729,18 @@ function statusCommand() {
   // SENSED, never read off the declaration — the same discipline the warden line below already uses,
   // and it is here because the declaration was WRONG in exactly the case a reader most needs this line.
   // The session is written the moment the camera crew comes up, which is BEFORE the crew-ready gate and
-  // therefore before OBS is launched at all: a raise that failed at that gate left `obs: true` on disk,
-  // and this line reported "YES — OBS is writing one file per camera" over a run that recorded nothing
-  // and had said so in its own terminal minutes earlier (Law 25 — a success flag nobody earned).
-  // What is sensed is that an OBS process EXISTS, which is not the same as bytes reaching a file — so
-  // the line says which of the two it knows, and the assay for the other is printed at the end.
-  if (session.obs) {
-    const r = spawnSync('powershell', ['-NoProfile', '-Command',
-      "(Get-CimInstance Win32_Process -Filter \"Name = 'obs64.exe'\" -ErrorAction SilentlyContinue | Measure-Object).Count"],
-      { encoding: 'utf8' });
-    const obsUp = (parseInt(String(r.stdout || '0').trim(), 10) || 0) > 0;
-    console.log(`  recording : ${obsUp
-      ? 'OBS IS RUNNING — this run asked it for one file per camera (bytes on disk are the assay below)'
-      : 'NOTHING IS BEING RECORDED — this run asked for OBS and NO OBS PROCESS EXISTS. The raise never ' +
-        'reached it; read the run\'s own terminal for where it stopped.'}`);
+  // therefore before the recorder is raised at all: a raise that failed at that gate left the recording
+  // flag on disk, and this line reported "YES — writing one file per camera" over a run that recorded
+  // nothing and had said so in its own terminal minutes earlier (Law 25 — a success flag nobody earned).
+  // What is sensed is that the recorder's process EXISTS, which is not the same as bytes reaching a file —
+  // so the line says which of the two it knows, and the assay for the other is printed at the end.
+  const rec = session.records ? recorder() : null;
+  if (session.records) {
+    const up = rec && rec.isRunning();
+    console.log(`  recording : ${up
+      ? 'THE RECORDER IS RUNNING — this run asked it for one file per camera (bytes on disk are the assay below)'
+      : 'NOTHING IS BEING RECORDED — this run asked for a recording and NO RECORDER PROCESS EXISTS. The raise ' +
+        'never reached it; read the run\'s own terminal for where it stopped.'}`);
   } else {
     console.log('  recording : no (watch overlay)');
   }
@@ -778,9 +763,9 @@ function statusCommand() {
     : 'none behind this session — `stop` will reap here'}`);
   const req = stopRequested();
   if (req) console.log(`  stop      : REQUESTED ${Math.round((Date.now() - req.at) / 1000)}s ago (${req.why})`);
-  // What OBS is really doing is OBS's to state, and it has its own reader. Pointing at it beats
-  // restating a claim this file cannot verify (Law 23).
-  if (session.obs) console.log(`\n  Is it really writing bytes?  .\\Auren_Workshop\\scripts\\camera_obs.ps1 status\n`);
+  // What the recorder is really doing is the recorder's to state, and it has its own reader. Pointing at
+  // it beats restating a claim this file cannot verify (Law 23).
+  if (rec) console.log(`\n  Is it really writing bytes?  ${rec.STATUS_COMMAND}\n`);
   return 0;
 }
 

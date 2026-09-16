@@ -10,6 +10,12 @@ const miningIntegrity = require('@perception/mining_integrity');
 const {
     JOB_TYPE,
 } = require('@thinking/architect_config');
+
+// THE MINE IS ITS OWN STRUCTURE, and it waits its turn like any other (Architect 2026-09-15: *"mining isnt done in
+// the mineshaft anymore... no part of any other blueprint can start"*). The headframe's stone comes from the
+// column pierce (stone_prospect_executor), so nothing the setup structures need is behind this stamp — every
+// mining job carries it and job_gates.setupGate holds both phases until SETUP_ORDER is built.
+const MINE_STRUCTURE = 'mineshaft';
 // ── SECTION 1 — Mining (evaluates FIRST, Law 18; no deps on other assessments) ──
 function assess() {
     const jobs = [];
@@ -72,7 +78,7 @@ function assess() {
         jobs.push({
             id: 'mine_dig_shaft', type: 'mine', what: 'dig_shaft',
             where: shaftCenter,
-            job_type: JOB_TYPE.mining_dig_shaft,
+            job_type: JOB_TYPE.mining_dig_shaft, structure: MINE_STRUCTURE,
             claimed_by: null, scope: 'shared',
         });
     }
@@ -91,7 +97,7 @@ function assess() {
             jobs.push({
                 id: 'mine_dig_cell', type: 'mine', what: 'dig_cell',
                 where: shaftCenter,
-                job_type: JOB_TYPE.mining_dig_cell,
+                job_type: JOB_TYPE.mining_dig_cell, structure: MINE_STRUCTURE,
                 claimed_by: null, scope: 'local',
             });
         }

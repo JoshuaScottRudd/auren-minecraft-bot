@@ -211,8 +211,7 @@ function assess({ inventory, buildClaim }) {
                     // Per-row override, default shared restock tier. GUARDRAIL: only a good NO build
                     // consumes may be lifted above building_structure — lifting a build input (logs/
                     // iron_ingot) would make the bot fill the chest before building the thing that
-                    // input feeds. wheat_seeds opts in via job_type:'supply_seeds' (feeds farm PLANT,
-                    // starves no build).
+                    // input feeds.
                     job_type: restockJobType,
                     claimed_by: null,
                     // SEEK TO `deficit_below`. It is the level that must be sought and the only target in

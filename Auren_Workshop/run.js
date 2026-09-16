@@ -77,6 +77,15 @@ const consoleWindow = require(paths.bot('js_kernel/utils/console_window'));
 // rather than merely separated (Law 1). Destructured here so there is no `CONFIG.hosting` in scope to
 // reach for by accident.
 const { run: CONFIG } = require('./run_config');
+// The run's own report of itself, stated at every exit path - see run_outcome.js.
+const outcome = require('./run_outcome');
+const RUN_STARTED_AT = new Date().toISOString();
+// WHETHER THE WATCH FIRED, AND ON WHAT. Module scope because the SOAK learns it and the VERDICT states
+// it, and those are two different functions. A fact discovered in one place and reported in another is
+// exactly what a local hides: this was read into the closing sentence only, and a run whose watch fired
+// ten seconds in still printed PASS with every check green.
+let woke = false;
+let wokeOn = null;
 
 // ── THE CONFIG IS PROVED WHOLE BEFORE ANYTHING IS TOUCHED (Law 13) ──────────────────────────────────
 // Every field is checked against the values it permits, and an unknown field is an error rather than
@@ -90,7 +99,19 @@ const PERMITTED = {
   record:   ['off', 'cameras', 'film'],
   teardown: ['down', 'leave-up'],
 };
-const WAKE_SIGS = ['error', 'halt', 'death'];
+// WHAT CAN WAKE A WATCH, AND WHY THE LIST SHRANK (Architect 2026-09-16). These used to be
+// `trace_monitor` SIGNATURE names, because the watch was a lens reading the trace file. The watch now
+// asks the live fleet, so the list names facts THE FLEET STATES ABOUT ITSELF: `error` is the watcher's
+// own error level, counted by the overseer as it arrives; `death` is job_board's own answer about
+// whether there is a body, carried on the boardroom chair.
+//
+// `halt` IS GONE BECAUSE IT HAD ALREADY STOPPED WORKING, not because the watch changed. Its signature
+// matched `HALTED for inspection after killing "…"`, and nothing in the fleet has written that line in
+// a long time — recursive_judge writes `⏸️ <bot> PLANNER HALTED after killing "…"`, which that pattern
+// does not match. It was a wake condition that could never fire, sitting in his config looking armed.
+// Removing it is what makes the list true; the planner halt is still visible in the record afterwards,
+// and if it should wake a run that is a fact for the fleet to state, the same way death now does.
+const WAKE_SIGS = ['error', 'death'];
 const SHAPE = {
   memory: 'enum', clock: 'enum', person: 'string',
   standing: 'string', crew: 'enum', soak: 'number', watch: 'boolean', wake: 'list',
@@ -155,6 +176,13 @@ function validate(c) {
     wrong.push(`standing: '${c.standing}' is not 'biome', not 'spawn', and not three whole numbers like '72 63 -116'`);
   }
   if (typeof c.soak === 'number' && c.soak <= 0) wrong.push(`soak: ${c.soak} minutes is not a run`);
+  // 'film' needs a recorder ON THIS MACHINE, which is a fact about the machine rather than the page, and it
+  // is asked here so the answer arrives before the world is joined rather than after the crew is up. The
+  // camera crew ships for watching; recording its windows is the Architect's equipment (2026-09-14).
+  if (c.record === 'film' && !require(paths.bot('js_kernel', 'utils', 'workstation.js')).findRecorder()) {
+    wrong.push(`record: 'film' writes every camera to a file, and this copy has no recorder. 'cameras' is the ` +
+      `same run watched through the same windows — each is titled Cam_<Bot>, so your own screen recorder can capture it.`);
+  }
 
   // THERE ARE NO CROSS-FIELD RULES LEFT, and their absence is the shape of the change rather than a gap
   // (2026-09-11). The only one this file ever had was "a fresh world cannot be rolled back under a running
@@ -706,7 +734,7 @@ function teardown(why) {
     phase(`the ${CONFIG.record} overlay`);
     const overlay = require('./tools/record_overlay.js');
     // THE CONFIG'S WORDS AND THE OVERLAY'S WORDS ARE DIFFERENT ON PURPOSE, AND THIS IS THE SEAM.
-    // `record_overlay` declares two overlays, `record` (cameras + OBS writing files) and `watch`
+    // `record_overlay` declares two overlays, `record` (cameras + a recorder writing files) and `watch`
     // (cameras, nothing written). The config page cannot reuse `watch`, because `watch:` there already
     // means the wake-on-error TRACE watch — two unrelated things under one word on the page a person
     // edits is the expensive kind of collision. So the page says `film` / `cameras` and the
@@ -766,10 +794,26 @@ function teardown(why) {
   }
 
   // ── THE SOAK, WATCHED OR BLIND ────────────────────────────────────────────────────────────────────
-  // Watched, the lens owns the clock and ENDS the run when something wakes it, so a fault is read at the
-  // moment it happens. Blind, the run sleeps out its window and the trace is read once at the end. The
-  // wake list is his — `errors wake, warnings sleep` — and it is a config value rather than a constant
-  // here because the criterion belongs to the asker (Law 25).
+  // Watched, this polls the LIVE FLEET and ENDS the run when a bot reports a fault, so it is read at the
+  // moment it happens. Blind, the run sleeps out its window. The wake list is his — `errors wake,
+  // warnings sleep` — and it is a config value rather than a constant here because the criterion
+  // belongs to the asker (Law 25).
+  //
+  // ── THIS USED TO SPAWN `trace_monitor --watch`, AND THAT WAS THE DEFECT (Architect 2026-09-16) ─────
+  // *"Nothing should be using trace monitor while the bot is online, its post Mortem only. Run.js should
+  // be talking directly to the program it needs… not asking trace monitor who checks the file which was
+  // written by the program that it needs its answer from. It should skip that and talk directly."*
+  //
+  // The old shape was four hops for one fact: a bot errored → its watcher wrote a line to a file → a
+  // lens tailed that file → this script parsed the lens's output. Every hop was a place for the answer
+  // to go stale or be misread, and the last one had already shipped a regression that failed every run
+  // (§6.10). A lens is a POST-MORTEM instrument — it reconstructs a run that is over — and pointing one
+  // at a fleet that is still moving asks it to be something it is not.
+  //
+  // What replaces it is the first hop and nothing after it: the overseer receives every bot's error()
+  // the instant it fires (that forward has always existed; it just threw the fact away), so it now keeps
+  // the count, and `overseer_door.query()` is the proper function for asking it. One process, one
+  // question, no file and no record in between.
   phase(`letting the crew work for ${CONFIG.soak} min${CONFIG.watch ? ' — watched' : ''}`);
   // ── AND THE ONE WINDOW HE ACTUALLY READS IS OPENED WITH IT (Architect 2026-09-10) ─────────────────
   // *"i cant see whats going on and help at all"*, and 2026-09-03 already named the window that answers
@@ -785,15 +829,34 @@ function teardown(why) {
   // windows carry raw stdout and remain the fallback when the question is about one body. Read-only, so
   // closing it stops nothing, and `down` already reaps it — it is in `FLEET_PROCESSES`.
   fleetControl(['fleet-console']);
-  let woke = false;
   if (CONFIG.watch) {
-    const args = [paths.bot('monitoring', 'trace_monitor.js'), TRACE, '--watch',
-      `--max-minutes=${CONFIG.soak}`];
-    if (CONFIG.wake.length) args.push(`--exit-on-flag=${CONFIG.wake.join(',')}`);
-    if (CONFIG.stream.length) args.push(`--stream=${CONFIG.stream.join(',')}`);
+    auditWakeList();
     const started = Date.now();
-    const w = spawnSync(process.execPath, args, { stdio: ['ignore', 'inherit', 'inherit'] });
-    woke = w.status !== 0;
+    const endAt = started + CONFIG.soak * 60 * 1000;
+    let missed = 0;
+    // Asked on a cadence rather than pushed, because the door is a request/response socket and this is
+    // the one shape it already serves (Law 16 — `camera_warden` polls the same door for the same
+    // reason). Six seconds is the warden's interval and the cost is one short-lived local socket.
+    while (Date.now() < endAt) {
+      await sleep(Math.min(WATCH_POLL_MS, Math.max(0, endAt - Date.now())));
+      const state = await fleetFaults();
+      // AN UNREACHABLE FLEET IS NOT A CLEAN FLEET — but one missed ask is not a dead desk either. A
+      // single failure is ordinary churn and is skipped; a RUN of them is the desk itself having
+      // crashed, which is the one crash no bot can ever report, because the thing that reports is what
+      // died. Counted rather than tolerated forever: without this the run would sit out its whole
+      // window talking to nothing and fail the verdict as unproven thirty minutes late (Law 25).
+      if (!state.ok) {
+        if (++missed >= DESK_SILENT_POLLS) {
+          woke = true;
+          wokeOn = `the desk stopped answering — ${missed} polls over ~${Math.round(missed * WATCH_POLL_MS / 1000)}s, last reason: ${state.error || 'none given'}`;
+          break;
+        }
+        continue;
+      }
+      missed = 0;
+      wokeOn = wakeReason(state);
+      if (wokeOn) { woke = true; break; }
+    }
     const ranMin = (Date.now() - started) / 60000;
     // A WAKE IS A FINDING, AND IT HAS TO REACH THE VERDICT (Law 25). This first read `woke` into the
     // closing sentence only, so a run whose watch fired ten seconds in still printed PASS with every
@@ -801,58 +864,183 @@ function teardown(why) {
     // most consequential thing such a run has to say, and a verdict that omits it is the run grading
     // itself on the questions it happens to have asked.
     check('the crew worked its window out', !woke,
-      woke ? `the watch woke after ${ranMin.toFixed(1)} of ${CONFIG.soak} min and ended the run — read its ❌ line above`
+      woke ? `the watch woke after ${ranMin.toFixed(1)} of ${CONFIG.soak} min and ended the run — ${wokeOn}`
            : `${CONFIG.soak} min served with nothing waking the watch`);
   } else {
     await sleep(CONFIG.soak * 60 * 1000);
   }
 
-  // ── THE RUN IS JUDGED BY AN INSTRUMENT THIS SCRIPT DID NOT WRITE (Law 26) ─────────────────────────
-  // `trace_monitor` decides what a fault is, so this file never enumerates fault types and a class the
-  // lens learns next month is caught here with nobody editing this. The bar is ERROR-level lines: the
-  // digest's exit code cannot serve, because it also returns non-zero for a warn burst, and the first
-  // run of a fresh download is legitimately full of warnings (the loudest being that a bot's
-  // headquarters file does not exist yet, which is the correct state of a bot that has never seen a
-  // world). Gating on those would make a clean install permanently unreadable.
-  phase('the lens reads the run record');
-  if (!fs.existsSync(TRACE)) {
-    check('the run record is clean (no errors)', false, 'no trace was written at all — nothing ran');
-    return finish('nothing was recorded');
+  // ── THE RUN IS JUDGED BY THE FLEET'S OWN REPORT OF ITSELF (Architect 2026-09-16) ──────────────────
+  // The bar is the watcher's ERROR level, asked of the live overseer rather than reconstructed from the
+  // record afterwards. Warnings are deliberately NOT the bar: the first run of a fresh download is
+  // legitimately full of them (the loudest being that a bot's headquarters file does not exist yet,
+  // which is the correct state of a bot that has never seen a world), and gating on those would make a
+  // clean install permanently unreadable.
+  //
+  // WHAT THIS REPLACED, and why it was wrong even though it worked: `lens(['--level=error'])`, a
+  // subprocess that read the trace FILE and printed a count this script then matched out of its output
+  // with a regex. Three parties for one number, and the fleet — which held that number the whole time —
+  // was not one of them. Both hops are gone; the count comes from the process the errors were reported
+  // to (Law 26 — the party with the witness answers).
+  phase('the fleet reports its own run');
+  const final = await fleetFaults();
+  // AN UNANSWERED FLEET IS NOT A CLEAN FLEET. The door resolves rather than throwing, so an unreachable
+  // desk arrives as ok:false — and it FAILS this check as unproven rather than passing on silence
+  // (Law 13 — prove it is safe to continue, never assume it).
+  // A DEPARTED BOT'S ERRORS COUNT TOO, and this is where forgetting them would hurt most: a bot that
+  // errored and then crashed is absent from the roster, so counting only what is still connected would
+  // let the worst run of all — the one that lost a body — report zero errors (Law 25). The overseer
+  // keeps a crashed bot's tally, so both lists are read as one.
+  const present = final.ok ? final.bots : [];
+  const gone = final.ok ? (final.departed || []) : [];
+  const errBots = [...present, ...gone].filter(b => (b.error || 0) > 0);
+  const errTotal = errBots.reduce((n, b) => n + b.error, 0);
+  check('the run record is clean (no errors)', final.ok && errTotal === 0,
+    !final.ok ? `the desk did not answer, so this run is UNPROVEN rather than clean — ${final.error || 'no reason given'}`
+      : errTotal === 0 ? `the desk reports 0 error-level lines across ${present.length + gone.length} bot(s)`
+      : `${errTotal} error(s) across ${errBots.length} bot(s); ${errBots[0].id} said: ${errBots[0].last_error || 'its line was not carried'}`);
+
+  // ── THE CREW IS STILL THE CREW, CHECKED SEPARATELY FROM WHAT IT SAID (Architect 2026-09-16) ────────
+  // *"if bots crash it should still end the run and wake you to investigate."* A crash that says nothing
+  // on its way out leaves every counter at zero, so the error check above would pass it. Losing a body
+  // is its own failure whatever the logs hold, and it gets its own check rather than being folded into
+  // the one above — two different faults reported as one is a verdict that cannot be acted on (Law 29).
+  check('the crew that started is the crew that finished', final.ok && gone.length === 0,
+    !final.ok ? 'the desk did not answer, so whether the crew is intact is UNPROVEN'
+      : gone.length === 0 ? `all ${present.length} bot(s) that registered are still connected`
+      : `${gone.length} bot(s) left and did not come back: ${gone.map(d => `${d.id} at ${d.gone_at}`).join(', ')}`);
+
+  // For information, and never a check: warnings are normal and a count of them is context for whoever
+  // reads the verdict, not a verdict of its own.
+  for (const b of present) {
+    say(`${b.id}: ${b.summary} summary, ${b.warn} warning(s), ${b.error} error(s)`
+      + `${b.unlabelled ? `, ${b.unlabelled} line(s) whose level did not travel` : ''}`
+      + `${b.dead === true ? ', and it is DEAD right now' : ''}`);
   }
-  const errs = lens(['--level=error']);
-  const n = errorLines(errs.out);
-  // AN UNREADABLE ANSWER IS A FAILURE, NOT A PASS. If the lens stops stating its count, this must not
-  // read that silence as "no errors" (Law 13 — prove it is safe to continue).
-  check('the run record is clean (no errors)', n === 0,
-    n === null ? `could not read a line count out of the lens — unproven: ${errs.out.slice(0, 200)}`
-      : n === 0 ? 'the lens found no error-level lines'
-      : `the lens found ${n} error line(s): ${firstProblem(errs.out)}`);
-  const digest = lens([]);
-  say(`for information, the full digest: ${digest.code === 0 ? 'clean' : firstProblem(digest.out)}`);
+  for (const d of gone) {
+    say(`${d.id}: GONE at ${d.gone_at} — ${d.summary} summary, ${d.warn} warning(s), ${d.error} error(s)`
+      + `${d.last_error ? `; its last error line: ${d.last_error}` : '; it logged no error on the way out'}`);
+  }
 
   return finish(woke ? 'the watch woke' : 'the window closed');
 })().catch(e => {
   console.error(`\n  run stopped on an error it could not grade: ${e && e.message}`);
   if (e && e.stack) console.error(e.stack.split('\n').slice(1, 4).join('\n'));
   teardown('an ungraded error');
-  process.exit(1);
+  // THE CRASH PATH STATES ITS OUTCOME TOO, and it is the path that needed it most: before this, an
+  // ungraded error left a stack trace and exit 1, and a reader had to scroll a console to learn whether
+  // the fleet had even started. CRASHED is its own value — a run that fell over is not a run that
+  // measured a failure, and reporting them alike sends the next reader to debug the wrong thing.
+  process.exit(outcome.write({
+    outcome: 'CRASHED', stage: 'ungraded', reason: (e && e.message) || String(e),
+    checks, woke, wokeOn, startedAt: RUN_STARTED_AT,
+    ranMin: (Date.now() - Date.parse(RUN_STARTED_AT)) / 60000, exitCode: 1,
+  }));
 });
 
-function lens(flags) {
-  const r = spawnSync(process.execPath, [paths.bot('monitoring', 'trace_monitor.js'), TRACE, ...flags],
+// ── ASKING THE LIVE FLEET, WHICH IS THE ONLY THING THIS SCRIPT DOES WHILE BOTS ARE UP ───────────────
+// (Architect 2026-09-16) *"Make sure no live code program uses a lens or monitor and talks directly to
+// the system needed."* This is that one door. `overseer_door` is the fleet's own request/response
+// channel — the same one `camera_warden` and the foreman use, so there is no second route to keep in
+// step (Law 16) — and it resolves rather than throwing, which is why every caller above tests `ok`.
+const WATCH_POLL_MS = 6000;
+// Five polls — half a minute of silence. Above the longest ordinary hiccup (a boardroom broadcast under
+// load, a socket re-open) and far below the window it protects, so a desk that genuinely died is caught
+// in seconds while a desk that merely stuttered is not accused of dying.
+const DESK_SILENT_POLLS = 5;
+let _door = null;
+function fleetDoor() {
+  if (!_door) _door = require(paths.bot('foreman', 'overseer_door.js'));
+  return _door;
+}
+// The fleet's answer about itself: who is registered, what each is holding, how many lines of each
+// level each has written, and whether it has a body. One question, one instant (Law 16) — a caller that
+// asked for the counts separately from the roster would be comparing two different moments.
+function fleetFaults() {
+  return fleetDoor().query();
+}
+
+// WHICH FACTS END A RUN EARLY, read off his list rather than decided here (Law 25 — the criterion
+// belongs to the asker). `CONFIG.wake` used to name trace_monitor SIGNATURES; it now names facts the
+// fleet states about itself, because the fleet is who this asks. A name in the list that nothing here
+// knows how to test is REPORTED rather than ignored, so a typo cannot silently disarm the watch.
+// Said once, before the first poll, so a name nothing tests is reported even on a run that wakes
+// immediately — a check that only runs on the quiet path is not a check (Law 25).
+function auditWakeList() {
+  const unknown = CONFIG.wake.filter(w => w !== 'error' && w !== 'death');
+  if (!unknown.length) return;
+  say(`run_config wake lists ${unknown.join(', ')}, which the fleet states no fact for — those wake nothing`);
+  CONFIG.wake = CONFIG.wake.filter(w => w === 'error' || w === 'death');
+}
+
+function wakeReason(state) {
+  // ── A CRASH IS AN ABSENCE, AND AN ABSENCE HAD TO BE MADE VISIBLE (Architect 2026-09-16) ────────────
+  // *"if bots crash it should still end the run and wake you to investigate."* A bot that dies hard
+  // stops logging, so the error count it never wrote cannot wake anything; it simply stopped being in
+  // the fleet. The overseer holds the socket that closed and now remembers the departure, so this reads
+  // a stated FACT rather than diffing two polls of its own and guessing which absence is new.
+  for (const d of state.departed || []) {
+    return `${d.id} left the fleet at ${d.gone_at} and did not come back`
+      + `${d.last_error ? `; its last error line: ${d.last_error}` : ' — it logged no error on the way out'}`;
+  }
+  for (const b of state.bots) {
+    // The bot's own words for what went wrong, carried through untouched — it participated in the
+    // decision it is describing and may say why; this script did not (the emitter-authority rule).
+    if (CONFIG.wake.includes('error') && (b.error || 0) > 0) {
+      return `${b.id} reported ${b.error} error(s); its own line: ${b.last_error || 'not carried'}`;
+    }
+    if (CONFIG.wake.includes('death') && b.dead === true) return `${b.id} is dead`;
+  }
+  return null;
+}
+// ── THE HEADFRAME CLOCK — A GRADE, PRINTED, NEVER A CHECK (Architect 2026-09-15) ────────────────────
+// *"it should never end the run... its just a grade. it shouldnt pass or fail the run."* The milestones
+// lens times the headframe from the start command and grades it against his bands
+// (architect_config.HEADFRAME_CLOCK). This prints the lens's own block and adds nothing to `checks`, so
+// no grade can move the verdict.
+//
+// ── IT IS READ AFTER THE FLEET IS DOWN, AND THAT IS THE WHOLE CHANGE (Architect 2026-09-16) ──────────
+// *"Nothing should be using trace monitor while the bot is online, its post Mortem only."* This block
+// used to run in the middle of the verdict, with every bot still in the world — a lens pointed at a
+// record that was still being written, which is the one thing a lens is not for. It now runs after
+// `teardown`, against a finished record, which is what a post-mortem is.
+//
+// SO IT IS SKIPPED ENTIRELY ON `leave-up`, and says so rather than going quiet. That setting leaves the
+// crew in the world on purpose, and a run that left the fleet up has no post-mortem to take — grading a
+// record that is still growing would report a build as late because it was asked too early (Law 25).
+// The grade is still available afterwards by hand, which is what the line says.
+const CLOCK_SECTION = '[headframe_clock]';
+const CLOCK_SECTION_RE = /^\s*\[[a-z0-9_.]+\]\s*$/;
+async function sayHeadframeClock() {
+  if (CONFIG.teardown === 'leave-up') {
+    say('headframe clock: not graded — the fleet is still up, and a lens reads a finished record only.');
+    say(`  take it by hand once it is down:  node Auren_Bot/monitoring/trace_monitor.js ${TRACE} --milestones`);
+    return;
+  }
+  if (!fs.existsSync(TRACE)) { say('headframe clock: no run record was written, so there is nothing to grade'); return; }
+  // THE LAST WRITES LAND AFTER THE LAST PROCESS DIES, so the record is still warm for a second or two
+  // after a teardown that has genuinely finished. The lens's gate refuses a captured read of a hot
+  // record, so this waits for it to go quiet rather than asking the gate to trust a caller's word for
+  // it. A record that never settles means something is STILL WRITING — which is worth saying out loud,
+  // and is not a grade (Law 25).
+  const settled = await require(paths.bot('monitoring', 'post_mortem_gate.js')).awaitSettled(TRACE);
+  if (!settled) {
+    say('headframe clock: not graded — the run record is still being written to, so the fleet is not all the way down');
+    return;
+  }
+  const r = spawnSync(process.execPath, [paths.bot('monitoring', 'trace_monitor.js'), TRACE, '--milestones'],
     { encoding: 'utf8' });
-  return { code: r.status, out: (r.stdout || '') + (r.stderr || '') };
-}
-// How many lines the lens said it matched, read off its OWN header — and null when that sentence is not
-// there, so an unrecognised answer is reported as unproven rather than rounded down to zero.
-const LENS_COUNT = /·\s*([0-9]+)\s*line\(s\)/;
-function errorLines(out) {
-  const m = LENS_COUNT.exec(out || '');
-  return m ? parseInt(m[1], 10) : null;
-}
-function firstProblem(out) {
-  const line = (out || '').split('\n').find(l => /❌|⚠️/.test(l));
-  return line ? line.trim().slice(0, 220) : 'nothing the lens would name';
+  const lines = ((r.stdout || '') + (r.stderr || '')).split('\n');
+  // ADDRESSED BY SECTION NAME, NEVER BY A PREFIX OR A COUNT. This once matched the sentence the lens
+  // opened with, then a fixed three-line slice; the first broke when the adjective changed and the
+  // second silently truncated when the lens grew a fourth field. The lens owns how much it has to say —
+  // this owns only where the block starts and ends. A blank line inside it is not a terminator; only the
+  // next `[section]` is, so spacing the renderer chooses cannot cut the block short.
+  const at = lines.findIndex(l => l.trim() === CLOCK_SECTION);
+  if (at === -1) { say(`headframe clock: the milestones lens printed no ${CLOCK_SECTION} section`); return; }
+  for (let i = at + 1; i < lines.length && !CLOCK_SECTION_RE.test(lines[i]); i++) {
+    if (lines[i].trim()) say(lines[i].trim());
+  }
 }
 
 // ── THE VERDICT, AND WHY IT ENDS IN A SENTENCE ABOUT PUBLISHING RATHER THAN A PUSH ──────────────────
@@ -860,7 +1048,7 @@ function firstProblem(out) {
 // conversation, because the thing being tested is different every time and a green run certifies the
 // feature that was exercised, not the tree (Architect 2026-09-10: *"were never testing the same thing
 // and errors will always be different. so the workflow is verbal not coded"*).
-function finish(why) {
+async function finish(why) {
   const failed = checks.filter(c => !c.ok);
   console.log(`\n══ ${failed.length ? 'FAIL' : 'PASS'} — ${checks.length - failed.length}/${checks.length} check(s) · ${why} ══`);
   for (const f of failed) say(`FAILED  ${f.name} — ${f.detail}`);
@@ -875,10 +1063,22 @@ function finish(why) {
     }
   }
   teardown(why);
+  // THE ONE LENS READ IN THIS FILE, AND IT IS HERE BECAUSE HERE IS AFTER THE FLEET IS DOWN. Everything
+  // above this line asked the live fleet directly; the record is only opened once nobody is writing it.
+  await sayHeadframeClock();
   if (!failed.length) {
     console.log(`\n  This is the build a stranger would get, and it worked. If the feature you were`);
     console.log(`  testing is the one you wanted, it is postable — that is a call to make out loud,`);
     console.log(`  not something this script does.\n`);
   }
-  process.exit(failed.length ? 2 : 0);
+  // THE RUN STATES ITS OWN OUTCOME, LAST, IN FIELDS (Architect 2026-09-16). Everything above this is
+  // written for a person reading along; this block is written for whoever has to ASK how it went
+  // without reading any of it. See run_outcome.js for why that is not the same job.
+  process.exit(outcome.write({
+    outcome: failed.length ? 'FAIL' : 'PASS',
+    stage: 'verdict', reason: why, checks,
+    woke, wokeOn, startedAt: RUN_STARTED_AT,
+    ranMin: (Date.now() - Date.parse(RUN_STARTED_AT)) / 60000,
+    exitCode: failed.length ? 2 : 0,
+  }));
 }

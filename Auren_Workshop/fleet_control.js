@@ -1738,7 +1738,7 @@ async function down() {
   }
   if (film === 'unclean') {
     console.error(`\ndown: the film teardown did not report clean (read its output above). Continuing with ` +
-      `the fleet — but check for a stray OBS and an unwrapped take before the next filmed run.`);
+      `the fleet — but check for stray camera windows (and, on a recorded run, a recorder still running) before the next run.`);
   }
   for (const name of FLEET_PROCESSES) {
     const entry = rt[name];

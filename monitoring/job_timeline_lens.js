@@ -37,8 +37,11 @@
 
 'use strict';
 
-const { relativeTime, padRight, padLeft, percent } = require('./report_formatting');
+const { relativeTime, percent } = require('./report_formatting');
 const { buildEpisodes, jobToken, OVERSEER_UNITS } = require('./trace_read');
+// The one writer to stdout. `padRight`/`padLeft` are no longer imported here because this lens no longer
+// owns a single space in its own output — data_out computes every column width from the data.
+const out = require('./data_out');
 
 // How many rows the by-type table prints before folding the tail into one counted line. A run claims a
 // few dozen distinct tokens; the reader is looking for where the time went, and the bottom of that list
@@ -118,7 +121,10 @@ function reduceJobTimeline({ seg = [], bot: botFilter = null } = {}) {
     if (j.gapBeforeSec != null) b.gapSec += j.gapBeforeSec;
     if (j.endSec != null) { b.prevEnd = { sec: j.endSec, ms: j.endMs }; b.lastSec = j.endSec; }
     if (j.durationSec != null && (!b.longest || j.durationSec > b.longest.durationSec)) b.longest = j;
-    if (j.verdict && /KILLED/.test(j.verdict.text)) b.killed++;
+    // Read the verdict CODE, not its sentence. This matched `/KILLED/` against the verdict's prose, which
+    // meant a reader's counter depended on wording no rule protected — and the wording changed the moment
+    // the episode fold started emitting tokens (2026-09-16). A code is the thing to key on.
+    if (j.verdict && j.verdict.code === 'killed') b.killed++;
   }
 
   // Per job token: the answer to "where did the run go".
@@ -142,8 +148,8 @@ function reduceJobTimeline({ seg = [], bot: botFilter = null } = {}) {
     if (j.durationSec != null) t.totalSec += j.durationSec;
     if (j.durationSec != null && (!t.worst || j.durationSec > t.worst.durationSec)) t.worst = j;
     if (j.verdict?.ok === true) t.complete++;
-    else if (j.verdict && /KILLED/.test(j.verdict.text)) t.killed++;
-    else if (j.verdict && /still running/.test(j.verdict.text)) t.unfinished++;
+    else if (j.verdict && j.verdict.code === 'killed') t.killed++;
+    else if (j.verdict && j.verdict.code === 'open_at_trace_end') t.unfinished++;
   }
 
   const workedSec = jobs.reduce((s, j) => s + (j.durationSec || 0), 0);
@@ -240,94 +246,132 @@ function reduceWoodLedger({ seg = [], bot: botFilter = null } = {}) {
   };
 }
 
-const tally = o => {
-  const parts = Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${v}x ${k}`);
-  return parts.length ? parts.join(', ') : 'none';
-};
+// One movement of one item, as table rows. `tally` used to live here and folded a whole bucket into the
+// one string `12x logs, 3x planks`; a bucket is a set of measurements and printing it as a phrase made
+// the reader parse prose to get two numbers back out. A bucket with nothing in it emits a single row
+// with a count of 0 rather than the word it used to print, so an absence is still a measurement.
+function movementRows(movement, bucket, prefix = []) {
+  const entries = Object.entries(bucket).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) return [[...prefix, movement, null, 0]];
+  return entries.map(([item, n]) => [...prefix, movement, item, n]);
+}
 
-const VERDICT_GLYPH = v => (!v ? '·' : v.ok === true ? '✔' : v.ok === false ? '✗' : /KILLED/.test(v.text) ? '⛔' : '⋯');
-
+// ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ────────────────────────────────────────────────
+// Field names and values only; every string in a value cell is copied out of the record (a bot name, a
+// job key the board composed, a verdict the judge wrote). WHAT WAS DELETED RATHER THAN TRANSLATED:
+//   · the three-line banner saying this lens is context-only and judges nothing — a claim about the
+//     instrument, not a measurement from the run. The comment block at the top of this file still says it.
+//   · the `⚠ N row(s) timed from whole-second stamps … rounded, not exact` paragraph. The count survives
+//     as `whole_second_timed_rows`, and each row carries `exact` so the reader sees which ones.
+//   · `(no dispatcher claim lines in the latest run — nothing has been picked up yet)` → `jobs` = 0.
+//   · the verdict GLYPH column (·/✔/✗/⛔/⋯). It was this lens deciding what the judge's sentence amounted
+//     to. The judge's own `ok` flag and its own text are both printed instead.
+//   · `no verdict line` in the verdict cell → an absent value, which is what data_out prints for one.
+//   · the trouble clause `3 failed step(s), 1 warn` → three counted fields.
+//   · `(--all prints them)` on the folded tail of the by-type table.
+//   · the wood ledger's `(observed movements only — the trace never states a harvest's YIELD …)` note and
+//     the `(withdrawn from a storage chest)` / `(announced, and re-announced on replan)` asides. Every one
+//     of them explained what a number means; that explanation is in the comments above, for a reader of
+//     the code rather than a reader of the run.
 function runJobTimeline({ seg = [], traceName = '?', bot: botFilter = null, verbose = false } = {}) {
   const r = reduceJobTimeline({ seg, bot: botFilter });
 
-  console.log(`trace_monitor · jobs · ${traceName} · latest run · span [${relativeTime(r.spanSec)}]${botFilter ? ` · bot=${botFilter}` : ''}`);
-  console.log('(context only — never flags, never wakes. Every job a bot claimed, in dispatch order, from the');
-  console.log(' dispatcher\'s claim to the judge releasing the seat. No duration here is judged against any');
-  console.log(' threshold — set a criterion with --milestones --deadline if you want one scored.)\n');
+  out.kv('lens', 'jobs');
+  out.kv('record', traceName);
+  out.kv('span', relativeTime(r.spanSec));
+  if (botFilter) out.kv('bot_filter', botFilter);
+  out.kv('jobs', r.jobs.length);
 
-  if (!r.jobs.length) {
-    console.log('(no dispatcher claim lines in the latest run — nothing has been picked up yet)');
-    return r;
-  }
-  if (r.inexact) {
-    console.log(`⚠ ${r.inexact} row(s) timed from the trace's whole-second stamps rather than its millisecond `
-      + 'ones (a line arrived without a parseable ISO). Those durations are rounded, not exact.\n');
-  }
+  if (!r.jobs.length) return r;
+
+  out.kv('worked', duration(r.workedSec));
+  // A duration timed from the whole-second relative stamp rather than the millisecond ISO. Kept as a
+  // count here and as the `exact` column on every row below (Law 25 — a measurement and an estimate
+  // must not print alike).
+  // Kept under data_out's 28-column key width on purpose — a longer name is CLIPPED by the emitter and
+  // its value runs straight onto the end of it.
+  out.kv('whole_second_timed_rows', r.inexact);
 
   // ── The story, in order ──
-  console.log('━━ THE FLEET IN ORDER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  for (const j of r.jobs) {
-    // The gap BEFORE this job, printed as its own row so it can never be mistaken for work. This is the
-    // planning cycle (board assessment + the token + whatever the bot did while holding no job) — the
-    // cost that used to hide inside the previous one-shot's duration. Computed in the reducer so the
-    // rendered row and the per-bot total can never disagree about it (Law 16).
-    if (j.gapBeforeSec != null && j.gapBeforeSec >= 0.5) {
-      console.log(`  ${padRight('', 9)} ${padLeft(duration(j.gapBeforeSec), 7)}  ${padRight(j.bot, 10)} ·  (between jobs)`);
-    }
-    const tail = j.verdict ? j.verdict.text : 'no verdict line';
-    const trouble = [j.fails && `${j.fails} failed step(s)`, j.warns && `${j.warns} warn`, j.errs && `${j.errs} error`]
-      .filter(Boolean).join(', ');
-    console.log(
-      `  [${padRight(relativeTime(j.startSec), 7)}] ${padLeft(duration(j.durationSec), 7)}  ${padRight(j.bot, 10)} `
-      + `${padRight(`${j.rank ?? '?'} ${j.token}`, 38)} ${VERDICT_GLYPH(j.verdict)} ${padRight(tail, 22)}`
-      + `${j.steps ? ` ${j.steps} step(s)` : ''}${trouble ? `  ⚠ ${trouble}` : ''}`);
-  }
+  // The gap BEFORE each job is its own COLUMN now rather than its own interleaved row, so it can never be
+  // mistaken for work. This is the planning cycle (board assessment + the token + whatever the bot did
+  // while holding no job) — the cost that used to hide inside the previous one-shot's duration. Computed
+  // in the reducer so the rendered cell and the per-bot total can never disagree about it (Law 16).
+  out.section('job_timeline');
+  out.table(
+    ['claimed_at', 'released_at', 'duration', 'gap_before', 'exact', 'bot', 'rank', 'job_key',
+      'verdict_ok', 'verdict', 'steps', 'failed_steps', 'warns', 'errors'],
+    r.jobs.map(j => [
+      relativeTime(j.startSec), j.endSec == null ? null : relativeTime(j.endSec),
+      duration(j.durationSec), duration(j.gapBeforeSec), j.exact,
+      j.bot, j.rank, j.token,
+      j.verdict ? j.verdict.ok : null, j.verdict ? j.verdict.code : null,
+      j.steps, j.fails, j.warns, j.errs,
+    ]),
+  );
 
   // ── Where the time went ──
-  console.log('\n━━ WHERE THE TIME WENT — by job ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`  ${padRight('job', 34)} ${padLeft('claims', 6)} ${padLeft('total', 8)} ${padLeft('mean', 8)} ${padLeft('worst', 8)} ${padLeft('share', 6)}  outcomes`);
+  out.section('by_job');
   const rows = verbose ? r.byType : r.byType.slice(0, TYPE_ROWS);
-  for (const t of rows) {
-    const outcomes = [
-      t.complete && `${t.complete} complete`,
-      t.killed && `${t.killed} KILLED`,
-      t.unfinished && `${t.unfinished} unfinished at trace end`,
-    ].filter(Boolean).join(', ');
-    console.log(
-      `  ${padRight(t.token, 34)} ${padLeft(t.claims, 6)} ${padLeft(duration(t.totalSec), 8)} `
-      + `${padLeft(duration(t.totalSec / t.claims), 8)} ${padLeft(duration(t.worst?.durationSec), 8)} `
-      + `${padLeft(percent(t.totalSec, r.workedSec), 6)}  ${outcomes}`);
-    if (t.worst) console.log(`  ${padRight('', 34)} ${padLeft('', 6)} worst at [${relativeTime(t.worst.startSec)}] — ${t.worst.bot}, ${t.worst.verdict?.text || 'no verdict'}`);
-  }
-  if (rows.length < r.byType.length) {
-    const rest = r.byType.slice(rows.length);
-    console.log(`  … +${rest.length} more job type(s) totalling ${duration(rest.reduce((s, t) => s + t.totalSec, 0))}  (--all prints them)`);
-  }
+  out.table(
+    ['job_key', 'claims', 'total', 'mean', 'worst', 'share_of_worked', 'complete', 'killed',
+      'unfinished_at_trace_end', 'worst_at', 'worst_bot', 'worst_verdict'],
+    rows.map(t => [
+      t.token, t.claims, duration(t.totalSec), duration(t.totalSec / t.claims),
+      duration(t.worst?.durationSec), percent(t.totalSec, r.workedSec),
+      t.complete, t.killed, t.unfinished,
+      t.worst ? relativeTime(t.worst.startSec) : null,
+      t.worst ? t.worst.bot : null,
+      t.worst?.verdict ? t.worst.verdict.code : null,
+    ]),
+  );
+  const rest = r.byType.slice(rows.length);
+  out.kv('job_types_not_listed', rest.length);
+  out.kv('job_types_not_listed_total', duration(rest.reduce((s, t) => s + t.totalSec, 0)));
 
   // ── Per bot ──
-  console.log('\n━━ PER BOT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  for (const b of r.byBot) {
-    const covered = b.workingSec + b.gapSec;
-    console.log(`  ${padRight(b.bot, 10)} ${padLeft(b.jobs, 4)} job(s)   working ${duration(b.workingSec)} (${percent(b.workingSec, covered)})`
-      + `   between jobs ${duration(b.gapSec)} (${percent(b.gapSec, covered)})`
-      + `   first claim [${relativeTime(b.firstSec)}]${b.killed ? `   ⛔ ${b.killed} KILLED` : ''}`);
-    if (b.longest) console.log(`  ${padRight('', 10)} longest: ${b.longest.token} ${duration(b.longest.durationSec)} at [${relativeTime(b.longest.startSec)}] → ${b.longest.verdict?.text || 'no verdict'}`);
-  }
+  out.section('by_bot');
+  out.table(
+    ['bot', 'jobs', 'working', 'working_share', 'between_jobs', 'between_jobs_share', 'first_claim',
+      'killed', 'longest_job', 'longest_duration', 'longest_at', 'longest_verdict'],
+    r.byBot.map(b => {
+      const covered = b.workingSec + b.gapSec;
+      return [
+        b.bot, b.jobs, duration(b.workingSec), percent(b.workingSec, covered),
+        duration(b.gapSec), percent(b.gapSec, covered), relativeTime(b.firstSec), b.killed,
+        b.longest ? b.longest.token : null,
+        b.longest ? duration(b.longest.durationSec) : null,
+        b.longest ? relativeTime(b.longest.startSec) : null,
+        b.longest?.verdict ? b.longest.verdict.code : null,
+      ];
+    }),
+  );
+
   // ── The wood ledger ──
   const w = reduceWoodLedger({ seg, bot: botFilter });
-  console.log('\n━━ THE WOOD LEDGER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  (observed movements only — the trace never states a harvest\'s YIELD, so nothing here is a');
-  console.log('   tree count multiplied by an assumed logs-per-tree.)');
-  console.log(`  TREES FELLED       ${w.trees}${w.censusFirst != null ? `   · standing census ${w.censusFirst} → ${w.censusLast}` : ''}`);
-  console.log(`  INTO CHESTS        ${tally(w.into)}`);
-  console.log(`  OUT OF STORAGE     ${tally(w.outOfStorage)}        (a bot taking wood back out to use it)`);
-  console.log(`  OUT OF STAGING     ${tally(w.outOfStaging)}        (preconstruction pulling it to place)`);
-  console.log(`  CRAFT STEPS POSTED ${tally(w.craftSteps)}        (announced, and re-announced on replan)`);
-  for (const s of w.bots) {
-    console.log(`    ${padRight(s.bot, 10)} ${padLeft(s.trees, 3)} tree(s) · in ${tally(s.into)} · out ${tally({ ...s.outOfStorage })} storage / ${tally({ ...s.outOfStaging })} staging · peak ${s.peakLogs} logs in pocket`);
-  }
+  out.section('wood_ledger');
+  out.kv('trees_felled', w.trees);
+  out.kv('standing_census_first', w.censusFirst);
+  out.kv('standing_census_last', w.censusLast);
+  out.table(['movement', 'item', 'count'], [
+    ...movementRows('into_chests', w.into),
+    ...movementRows('out_of_storage', w.outOfStorage),
+    ...movementRows('out_of_staging', w.outOfStaging),
+    ...movementRows('craft_steps_posted', w.craftSteps),
+  ]);
 
-  console.log('');
+  out.section('wood_by_bot');
+  out.table(['bot', 'trees', 'peak_logs_in_pocket'], w.bots.map(s => [s.bot, s.trees, s.peakLogs]));
+
+  out.section('wood_movements_by_bot');
+  out.table(['bot', 'movement', 'item', 'count'], w.bots.flatMap(s => [
+    ...movementRows('into_chests', s.into, [s.bot]),
+    ...movementRows('out_of_storage', s.outOfStorage, [s.bot]),
+    ...movementRows('out_of_staging', s.outOfStaging, [s.bot]),
+    ...movementRows('craft_steps_posted', s.craftSteps, [s.bot]),
+  ]));
+
+  out.blank();
   return { ...r, wood: w };
 }
 

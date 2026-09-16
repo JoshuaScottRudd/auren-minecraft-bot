@@ -29,10 +29,10 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/whea
 //
 // Usage (developer mode):
 //   node Auren_Workshop/tools/wheat_site_probe.js [--at=X,Z] [--continue]
-//     --at=X,Z    stand on the surface of that column first (/spreadplayers). Without it the body scans from
+//     --at=X,Z    stand on the surface of that column first (/tp above it, then fall). Without it the body scans from
 //                 where the server puts a new player — world spawn, which is never where a crew scans from.
 //     --continue  leave the world as the last run left it (no rollback)
-// Exit: 0 at least one plot · 2 the scan ran and no river or ocean bank in view holds one · 1 it could not scan.
+// Exit: 0 at least one plot · 2 the scan ran and no sea-level water bank in view holds one · 1 it could not scan.
 
 const net = require('net');
 const { spawnSync } = require('child_process');
@@ -111,12 +111,14 @@ async function probe(at) {
   // a different place from the one it reports standing on. The bench reads the dev world's own console
   // credentials rather than the environment's (rcon_link's note on benches).
   const cmds = [`gamemode creative ${NAME}`];
-  if (at) cmds.push(`spreadplayers ${at.x + 0.5} ${at.z + 0.5} 0 1 false ${NAME}`);
+  // DROPPED IN FROM ABOVE, not /spreadplayers: with a spread distance of 0 the server answers "too many
+  // entities for space" and moves nobody. A /tp above the column lets the body fall to whatever surface is there.
+  if (at) cmds.push(`tp ${NAME} ${at.x + 0.5} 120 ${at.z + 0.5}`);
   for (const { cmd, body } of await rcon.once(cmds, { creds: rcon.readServerProperties() })) say(`> ${cmd} — ${body || '(ok)'}`);
   if (at) {
     const landed = await until(() => {
       const p = bot.entity.position;
-      return Math.max(Math.abs(p.x - (at.x + 0.5)), Math.abs(p.z - (at.z + 0.5))) <= 3;
+      return Math.max(Math.abs(p.x - (at.x + 0.5)), Math.abs(p.z - (at.z + 0.5))) <= 3 && bot.entity.onGround;
     }, PLACE_WAIT_MS);
     if (!landed) {
       say(`the body did not reach (${at.x},${at.z}) within ${PLACE_WAIT_MS / 1000}s — it is at ${where(bot)}. Nothing was scanned.`);

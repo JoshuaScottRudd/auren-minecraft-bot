@@ -49,7 +49,10 @@
 // is now recorded once, in monitoring/lens_paths.js, instead of in five lenses.
 require('./lens_paths').registerAliases();
 const crewLog = require('@api/crew_log');
-const { stat, oneDecimal, twoDecimals, padRight, ABSENT } = require('./report_formatting');
+const { stat, oneDecimal, twoDecimals } = require('./report_formatting');
+// The one writer to stdout. `padRight` and `ABSENT` are no longer imported here: this lens no longer owns
+// a column width, and an absent value is data_out's own em-dash rather than one this file pastes in.
+const out = require('./data_out');
 
 // `report_formatting.relativeTime` is not used here and the difference is the whole reason this lens has
 // its own two: that one renders WHOLE seconds because it exists to match the trace's own eye-index stamp
@@ -285,129 +288,182 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
   return { bots, clock: total && msLines === total ? 'ms' : (msLines ? 'mixed' : 'seconds') };
 }
 
-// ── THE SENTENCE ────────────────────────────────────────────────────────────────────────────────────
-// His example is the template: who engaged, from how far, how long until the first blow landed and at
-// what range, and then every strike. It reads as prose because a post-mortem is read once, start to
-// finish, by a person deciding what to fix — the table shape the other lenses use is for scanning a
-// repeated measurement, which this is not.
-function narrate(f) {
-  const who = f.mob;
-  const parts = [];
-  if (f.unannounced) {
-    parts.push(`${who} was STRUCK at ${stamp(f.firstStrikeAt)} with no aggro line for it`);
-  } else {
-    parts.push(`${who} engaged at ${stamp(f.openedAt)} [${f.openedRel}s in the trace] from ${oneDecimal(f.openedAtDistance)}b (${f.via || '?'})`);
-  }
-  if (f.firstFacedAt !== null && !f.unannounced) {
-    parts.push(`faced ${seconds(f.firstFacedAt - f.openedAt)} later${f.firstFaceWhy && f.firstFaceWhy !== 'closest' ? ` (${f.firstFaceWhy})` : ''}`);
-  }
-  if (f.firstStrikeAt !== null && !f.unannounced) {
-    parts.push(`first struck ${seconds(f.firstStrikeAt - f.openedAt)} later at ${twoDecimals(f.firstStrikeDistance)}b`);
-  } else if (!f.unannounced) {
-    // NEVER SILENT ABOUT A MOB THAT WAS NEVER HIT. It is the single most diagnostic outcome in the whole
-    // record — the fight the bot could not reach, or the mob another bot killed — and an omitted clause
-    // reads as "nothing to report" (Law 25).
-    parts.push('NEVER STRUCK');
-  }
-  if (f.strikes.length) {
-    const hp = f.strikes.map((s) => s.hp).filter((x) => x !== null);
-    parts.push(`${f.strikes.length} strike(s)${hp.length ? `, hp ${oneDecimal(hp[0])} → ${oneDecimal(hp[hp.length - 1])}` : ''}`);
-  }
-  if (f.closedAt !== null) parts.push(`off the board at ${stamp(f.closedAt)} — ${seconds(f.closedAt - (f.openedAt ?? f.closedAt))} of fight`);
-  else parts.push('still on the board when the run ended');
-  return parts.join(', ');
-}
+// The encirclement criterion, as a number rather than a word. It is DECLARED here and printed beside the
+// measurement as its own field, so the reader checks the comparison instead of being handed its result.
+const ENCIRCLE_THRESHOLD_DEG = 135;
+
+// A stamp only when there is something to stamp. `stamp(null)` renders `0m 0.0s`, which is a real-looking
+// instant that never happened — the exact falsehood Law 25 names.
+const at = (t) => (t == null ? null : stamp(t));
+const after = (t, from) => (t == null || from == null ? null : seconds(t - from));
 
 // ── runEngagement(...) — the human-facing half ──────────────────────────────────────────────────────
 // Renders and RETURNS the same object `reduceEngagements` produced, so a caller that wanted both gets
 // both from one pass. It does not exit; the CLI owns the exit (the trap every extracted lens here was
 // built to avoid).
+//
+// ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ────────────────────────────────────────────────
+// `narrate(f)` STOOD HERE AND IS DELETED — the whole point of it was to compose his example sentence
+// ("zombie ID# engaged AurenBot 12 blocks away… attacked 2 seconds later once auren came within 2.9
+// blocks"), and a sentence is the one thing this instrument may no longer form. Every measurement it
+// carried is a column of `fights` below, in the same order it used to read: mob, opened_at,
+// opened_distance, via, faced_after, first_strike_after, first_strike_distance, strikes, hp, closed_at.
+// WHAT WAS DELETED RATHER THAN TRANSLATED:
+//   · `NEVER STRUCK` → `struck` = false. · `still on the board when the run ended` →
+//     `on_board_at_run_end` = true. · `with no aggro line for it` → `unannounced` = true.
+//   · `— NO GUARD went up against it` → the `answered` column on every threat window, false.
+//   · `held past the end of the run` → an absent `held_ms`.
+//   · the CLOCK paragraph telling the reader to re-read the per-bot file for tenths. `clock` survives as
+//     a field; where to go next is the reader's move, not the instrument's.
+//   · `0 crew events parsed in this run.` → `crew_events` = 0.
+//   · `Bearings: none posted` / `0 instants with two or more mobs engaged at once` → `bearing_changes`
+//     and `encirclement_samples`, which are 0 in exactly those two cases.
+//   · `declared threshold 135°, OVER` → `widest_spread_deg`, `threshold_deg` and `over_threshold` as
+//     three fields, so the verdict and the number it was measured against are both on the page.
+//   · `(--all for every strike and every change of tactic)`.
 function runEngagement({ seg = [], traceName = '?', bot: botFilter = null, verbose = false } = {}) {
   const reduced = reduceEngagements({ seg, bot: botFilter });
-  console.log(`\n══ ENGAGEMENTS — ${traceName}${botFilter ? ` · ${botFilter}` : ''} ══`);
+
+  out.kv('lens', 'engagement');
+  out.kv('record', traceName);
+  if (botFilter) out.kv('bot_filter', botFilter);
+  out.kv('bots', reduced.bots.size);
+  // WHICH clock the durations were measured on, reported rather than assumed: `ms` from the ISO prefix,
+  // `seconds` from the coarse relative tag, `mixed` when the segment carries both.
+  out.kv('clock', reduced.clock);
 
   if (!reduced.bots.size) {
     // The two zeros a reader must be able to tell apart: a run with no fights, and a run whose seats are
-    // not reporting at all. Both print "nothing" unless the lens says which (Law 25).
-    console.log('  no crew events in this run — either nothing fought, or the three seats are not wired to');
-    console.log('  the trace. Cross-read with --tag=COMMANDER: an engagement always posts at least an aggro.');
+    // not reporting at all. `bots` = 0 with `crew_events` = 0 is the second; `bots` > 0 with 0 fights is
+    // the first (Law 25).
+    out.zero('crew_events');
     return reduced;
   }
 
-  if (reduced.clock !== 'ms') {
-    console.log(`  ⚠️ CLOCK: ${reduced.clock} — this trace carries no millisecond stamp on its crew lines, so every`);
-    console.log('     duration below is rounded to the second. Re-read the PER-BOT file for tenths:');
-    console.log('     node Auren_Bot/monitoring/trace_monitor.js Auren_Bot/fleet_logs/traces/watcher_<Bot>.jsonl --engagement');
-  }
-
   for (const b of reduced.bots.values()) {
-    console.log(`\n── ${b.name} — ${b.fights.length} engagement(s) from ${b.lines} crew event(s) ──`);
-
-    for (const f of b.fights) {
-      console.log(`  • ${narrate(f)}`);
-      for (const g of f.guardsAgainst) {
-        console.log(`      shield ${g.why} at ${stamp(g.from)} — raised ${g.waitedMs == null ? ABSENT : `${g.waitedMs}ms`} into the threat, held ${g.heldMs == null ? 'past the end of the run' : `${g.heldMs}ms`}${g.by && g.by !== 'timer' ? ` (lowered by ${g.by})` : ''}`);
-      }
-      // ── THE JOIN THAT NO SEAT CAN MAKE ────────────────────────────────────────────────────────────
-      // A threat window with no guard raised against it. The commander saw the draw and the gunner never
-      // answered it: either the timer never reached its raise point (the mob loosed early, or fled) or
-      // the shield was not in the pack. This is the whole reason the two threat edges are on/off.
-      for (const th of f.threats) {
-        if (th.answered) continue;
-        const span = th.to === null ? 'still open at the end of the run' : seconds(th.to - th.from);
-        console.log(`      ⚠️ ${th.kind} from ${stamp(th.from)} (${span}) — NO GUARD went up against it`);
-      }
-      if (verbose) {
-        for (const s of f.strikes) {
-          console.log(`      strike ${stamp(s.at)} at ${twoDecimals(s.d)}b with ${s.with || '?'}${s.hp === null ? '' : ` (target hp ${oneDecimal(s.hp)})`}`);
-        }
-        for (const bear of f.bearings) {
-          console.log(`      bearing ${padRight(bear.dir, 14)} ${stamp(bear.at)} at ${twoDecimals(bear.d)}b`);
-        }
-        for (const m of f.modes) {
-          console.log(`      feet → ${padRight(m.to, 14)} ${stamp(m.at)} at ${twoDecimals(m.d)}b${m.setpoint === null ? '' : ` toward ${twoDecimals(m.setpoint)}b`}`);
-        }
-      }
-    }
-
-    // ── THE FLEET-LEVEL NUMBERS, and only the ones a single fight cannot show ────────────────────────
+    // ── THE PER-BOT NUMBERS, and only the ones a single fight cannot show ────────────────────────────
     const engaged = b.fights.filter((f) => !f.unannounced);
     const reached = engaged.filter((f) => f.firstStrikeAt !== null);
-    const delays = reached.map((f) => f.firstStrikeAt - f.openedAt);
-    const d = stat(delays);
-    console.log(`\n    Reach: ${reached.length}/${engaged.length} engaged mob(s) were struck at all` +
-      `${d ? `; aggro → first strike ${seconds(d.min)}–${seconds(d.max)} (median ${seconds(d.med)})` : ''}.`);
+    const d = stat(reached.map((f) => f.firstStrikeAt - f.openedAt));
     const opens = stat(engaged.map((f) => f.openedAtDistance));
-    if (opens) console.log(`    Opened at ${oneDecimal(opens.min)}–${oneDecimal(opens.max)}b (median ${oneDecimal(opens.med)}b).`);
     const strikeD = stat(b.fights.flatMap((f) => f.strikes.map((s) => s.d)));
-    if (strikeD) console.log(`    Struck from ${twoDecimals(strikeD.min)}–${twoDecimals(strikeD.max)}b (median ${twoDecimals(strikeD.med)}b).`);
-
     const waited = stat(b.guards.map((g) => g.waitedMs));
-    console.log(`    Guard: ${b.guards.length} raise(s)` +
-      `${waited ? `, ${waited.min}–${waited.max}ms into the threat (median ${waited.med}ms)` : ''}` +
-      `${b.guards.length ? ` — a median near zero means the timer has become a toggle` : ''}.`);
-
-    // ENCIRCLEMENT IS REPORTED EVEN WHEN IT NEVER HAPPENED, because "the mobs were never on opposite
-    // sides" is the answer to his question just as much as "they were" — a silent line reads as "no data"
-    // and would leave the kiter-facing decision unmade (Law 25).
     const enc = b.encirclement || { worst: null, samples: 0 };
-    if (!b.bearings.length) {
-      console.log('    Bearings: none posted — the commander is not reporting compass direction in this run.');
-    } else if (!enc.samples) {
-      console.log(`    Encirclement: ${b.bearings.length} bearing change(s), but never two mobs engaged at once — nothing to circle.`);
-    } else {
-      console.log(`    Encirclement: widest angle between live mobs ${enc.worst.spread}° at ${stamp(enc.worst.at)} (${enc.worst.mobs.join(', ')}), over ${enc.samples} sample(s)` +
-        `${enc.worst.spread >= 135 ? ' — mobs on opposing sides; one facing cannot cover both' : ' — every mob stayed within one quadrant of the others'}.`);
+
+    out.section('bot_engagement');
+    out.kv('bot', b.name);
+    out.kv('crew_events', b.lines);
+    out.kv('engagements', b.fights.length);
+    out.kv('engaged_mobs', engaged.length);
+    out.kv('mobs_struck', reached.length);
+    // Every name here is kept under data_out's 28-column key width — a longer one is CLIPPED by the
+    // emitter and its value runs straight onto the end of it.
+    out.kv('aggro_to_strike_min', d && seconds(d.min));
+    out.kv('aggro_to_strike_max', d && seconds(d.max));
+    out.kv('aggro_to_strike_median', d && seconds(d.med));
+    out.kv('opened_distance_min', opens && oneDecimal(opens.min));
+    out.kv('opened_distance_max', opens && oneDecimal(opens.max));
+    out.kv('opened_distance_median', opens && oneDecimal(opens.med));
+    out.kv('strike_distance_min', strikeD && twoDecimals(strikeD.min));
+    out.kv('strike_distance_max', strikeD && twoDecimals(strikeD.max));
+    out.kv('strike_distance_median', strikeD && twoDecimals(strikeD.med));
+    out.kv('guard_raises', b.guards.length);
+    out.kv('guard_waited_ms_min', waited && waited.min);
+    out.kv('guard_waited_ms_max', waited && waited.max);
+    out.kv('guard_waited_ms_median', waited && waited.med);
+    // ENCIRCLEMENT IS REPORTED EVEN WHEN IT NEVER HAPPENED, because "the mobs were never on opposite
+    // sides" is the answer to his question just as much as "they were" — an omitted field reads as "no
+    // data" and would leave the kiter-facing decision unmade (Law 25).
+    out.kv('bearing_changes', b.bearings.length);
+    out.kv('encirclement_samples', enc.samples);
+    out.kv('widest_spread_deg', enc.worst ? enc.worst.spread : null);
+    out.kv('threshold_deg', ENCIRCLE_THRESHOLD_DEG);
+    out.kv('over_threshold', enc.worst ? enc.worst.spread >= ENCIRCLE_THRESHOLD_DEG : null);
+    out.kv('widest_spread_at', enc.worst ? at(enc.worst.at) : null);
+    out.kv('stalls', b.stalls.length);
+    out.kv('stalls_without_jump', b.stalls.filter((s) => !s.jumped).length);
+    out.kv('rearms', b.rearms.length);
+    out.kv('sprints', b.sprints.length);
+
+    // The reducer holds each live mob as `name#id dir`; split back into two columns here so no value cell
+    // carries a space. The reducer itself is untouched — this is rendering.
+    if (enc.worst) {
+      out.section('widest_spread_mobs');
+      out.table(['mob', 'dir'], enc.worst.mobs.map((s) => s.split(' ')));
+    }
+
+    out.section('fights');
+    out.table(
+      ['mob', 'unannounced', 'opened_at', 'opened_rel_sec', 'opened_distance', 'via', 'faced_after',
+        'face_why', 'struck', 'first_strike_at', 'first_strike_after', 'first_strike_distance',
+        'strikes', 'hp_first', 'hp_last', 'closed_at', 'fight_duration', 'on_board_at_run_end'],
+      b.fights.map((f) => {
+        const hp = f.strikes.map((s) => s.hp).filter((x) => x !== null);
+        return [
+          f.mob, f.unannounced === true, at(f.openedAt), f.openedRel, oneDecimal(f.openedAtDistance),
+          f.via, after(f.firstFacedAt, f.openedAt), f.firstFaceWhy,
+          // ABSOLUTE and RELATIVE both, because an unannounced fight has no aggro to measure from and the
+          // instant it was struck is the only time it has. `narrate` printed that instant and dropping it
+          // would delete a measurement (rule: nothing lost but the grammar).
+          f.firstStrikeAt !== null, at(f.firstStrikeAt), after(f.firstStrikeAt, f.openedAt),
+          twoDecimals(f.firstStrikeDistance), f.strikes.length,
+          hp.length ? oneDecimal(hp[0]) : null, hp.length ? oneDecimal(hp[hp.length - 1]) : null,
+          at(f.closedAt), f.closedAt === null ? null : seconds(f.closedAt - (f.openedAt ?? f.closedAt)),
+          f.closedAt === null,
+        ];
+      }),
+    );
+
+    // Every guard raise the gunner made, including one raised with no fight open against it — the
+    // superset of the per-fight list this used to print, and the `mob` column says which fight each
+    // belongs to.
+    out.section('guards');
+    out.table(['mob', 'at', 'why', 'waited_ms', 'held_ms', 'lowered_by'],
+      b.guards.map((g) => [g.mob, at(g.from), g.why, g.waitedMs, g.heldMs, g.by]));
+
+    // ── THE JOIN THAT NO SEAT CAN MAKE ──────────────────────────────────────────────────────────────
+    // A threat window and whether a guard was raised against it. The commander saw the draw and the
+    // gunner either answered it or did not: `answered` false is the arrow nobody blocked — the timer
+    // never reached its raise point (the mob loosed early, or fled) or the shield was not in the pack.
+    // This is the whole reason the two threat edges are on/off. ALL windows are listed now, not only the
+    // unanswered ones, so the reader has the denominator as well as the finding.
+    out.section('threats');
+    out.table(['mob', 'kind', 'from', 'to', 'span', 'answered', 'open_at_run_end'],
+      b.fights.flatMap((f) => f.threats.map((th) => [
+        f.mob, th.kind, at(th.from), at(th.to),
+        th.to === null ? null : seconds(th.to - th.from), th.answered === true, th.to === null,
+      ])));
+
+    if (b.rearms.length) {
+      out.section('rearms');
+      out.table(['at', 'from', 'to', 'why'], b.rearms.map((r) => [at(r.at), r.from, r.to, r.why]));
     }
 
     if (b.stalls.length) {
-      const stuck = b.stalls.filter((s) => !s.jumped);
-      console.log(`    Stalls: ${b.stalls.length}${stuck.length ? `, ${stuck.length} with NO jump tap — the body could not even try` : ''}.`);
+      out.section('stalls');
+      out.table(['at', 'mob', 'mode', 'distance', 'keys', 'jumped'],
+        b.stalls.map((s) => [at(s.at), s.mob, s.mode, twoDecimals(s.d), s.keys, s.jumped === true]));
     }
-    if (b.rearms.length) console.log(`    Re-armed ${b.rearms.length} time(s): ${b.rearms.map((r) => `${r.from}→${r.to}`).join(', ')}.`);
-    if (!verbose) console.log('    (--all for every strike and every change of tactic)');
+
+    if (verbose) {
+      out.section('strikes');
+      out.table(['mob', 'at', 'distance', 'weapon', 'target_hp'],
+        b.fights.flatMap((f) => f.strikes.map((s) => [f.mob, at(s.at), twoDecimals(s.d), s.with, oneDecimal(s.hp)])));
+
+      out.section('bearings');
+      out.table(['mob', 'dir', 'at', 'distance'],
+        b.bearings.map((bear) => [bear.mob, bear.dir, at(bear.at), twoDecimals(bear.d)]));
+
+      out.section('modes');
+      out.table(['mob', 'mode', 'at', 'distance', 'setpoint'],
+        b.modes.map((m) => [m.mob, m.to, at(m.at), twoDecimals(m.d), twoDecimals(m.setpoint)]));
+
+      out.section('sprints');
+      out.table(['at', 'state', 'why'], b.sprints.map((s) => [at(s.at), s.state, s.why]));
+    }
   }
 
+  out.blank();
   return reduced;
 }
 

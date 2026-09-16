@@ -60,6 +60,7 @@ const { isFluid } = require('@utils/gravity_utils');   // water/lava set — the
 // already paid for costs nothing here.
 const { combatCheckpoint } = require('@api/battle_stations');
 const blueprintSurvey = require('@perception/blueprint_survey');
+const blueprintRegistry = require('@kernel/blueprint_registry');
 const anchoredRepair = require('@api/anchored_repair');
 const { getFarmlandCells, getFieldPlan } = require('@perception/farmland_site');
 const { collectNearby } = require('@api/drop_collector.js');
@@ -324,7 +325,7 @@ async function buildAnchor(bot, stand, steps, anchorLabel) {
     // Never dig the block being stood on. The step-aside machinery already exists in anchored_repair
     // and building already opts in; without this, any step landing on the plot's own stand cell would
     // run in the bulk pass and mine the floor out from under the bot. This is the opt-in, not a second
-    // implementation (Law 16). Paired with the wheat_plot_pair anchor being an external voxel, which
+    // implementation (Law 16). Paired with the wheat_tine_row stand being an external voxel, which
     // removes the cause; this is the safety net if any future step ever targets the footing again.
     footingSidestep: true,
   };
@@ -385,7 +386,7 @@ async function tendPlot(bot, roomKey, blueprintName) {
       throw new Error(`[${TAG}] CODING VIOLATION: global.bot is not set before tendPlot ran.`);
     }
     // WHICH geometry — READ from this instance's chair, never named from config. The two are the same
-    // string today (every plot is a `wheat_plot_pair`), and that is exactly why the constant was the wrong
+    // string today (every row is a `wheat_tine_row`), and that is exactly why the constant was the wrong
     // way to get it: it states what the geometry OUGHT to be instead of what set_buildspot stamped, so it
     // goes stale silently the first time an instance is locked under anything else (Law 25). The room key
     // still defaults to instance 0 for a single-farm caller, which is a different question (which plot).
@@ -393,8 +394,8 @@ async function tendPlot(bot, roomKey, blueprintName) {
     blueprintName = blueprintName || blueprintSurvey.geometryOf(roomKey);
 
     // The field's anchors, one stand each (anchor floor Y + 1). A blueprint may declare MULTIPLE anchors
-    // when its field exceeds one stand's reach; wheat_plot_pair has ONE, its
-    // structural_fill stand. getWorldAnchors throws if the site isn't locked — a farm job before
+    // when its field exceeds one stand's reach; wheat_tine_row has ONE, the
+    // block it stands on (the bank, or the previous row's land block). getWorldAnchors throws if the site isn't locked — a farm job before
     // set_buildspot is a planning bug (Law 13). Geometry comes from the neutral survey engine, not
     // building_integrity: the farm is owned end-to-end by the farming subsystem.
     const worldAnchors = blueprintSurvey.getWorldAnchors(blueprintName, roomKey);
@@ -405,7 +406,8 @@ async function tendPlot(bot, roomKey, blueprintName) {
     // dispatches here, but guard anyway (Law 13, default-stopped) rather than drive the body into water.
     // resolvedFloor[] is what reachStand/goToStand drives the feet ONTO; stands[] (the feet cells) feeds
     // the reach math and repairAtAnchor. Same resolveStandableAnchor the integrity gate uses (Law 16).
-    const resolved = worldAnchors.map(a => anchoredRepair.resolveStandableAnchor(bot, a));
+    const fallback = blueprintRegistry.getBuilding(blueprintName, TAG).stand_fallback !== false;
+    const resolved = worldAnchors.map(a => anchoredRepair.resolveStandableAnchor(bot, a, { fallback }));
     if (resolved.every(r => r === null)) {
       watcher.warn(TAG, `all ${worldAnchors.length} anchor(s) stranded — no standable stand reaches the plot (dynamic water?); non-actionable this pass.`);
       return { worked: 0, refused: 0, reason: 'stranded', metrics: {} };
@@ -417,7 +419,7 @@ async function tendPlot(bot, roomKey, blueprintName) {
 
     // Survey the structure once, group its dig/place steps by anchor. The survey skips the blueprint's
     // declared crop/water cells (external voxels), so these steps are pure structure (for a
-    // wheat_plot_pair plot: a single structural_fill + dirt).
+    // wheat_tine_row: the land block, then its two plot blocks).
     // Unguarded: the survey is ours. `scan_failed` with zero worked and zero refused is indistinguishable
     // downstream from a farm that needed no structural work, so a broken surveyor read as a finished farm
     // (Law 13; Law 25 — a default is not a measurement).
@@ -519,7 +521,8 @@ async function tendPlot(bot, roomKey, blueprintName) {
       harvested: ctx.harvested, drops: ctx.drops, refused, till_deferred: ctx.tillDeferred,
       bonemealed: ctx.bonemealed || 0,
     };
-    const readable = `${TAG}: struct(place=${metrics.struct_place},dig=${metrics.struct_dig}) cleared=${ctx.cleared} tilled=${ctx.tilled} planted=${ctx.planted} harvested=${ctx.harvested} drops=${ctx.drops}${ctx.bonemealed ? ` bonemealed=${ctx.bonemealed}` : ''}`
+    // The row's key leads so the farm lens can credit the visit to the row it worked (one row per tendPlot).
+    const readable = `${TAG}: ${roomKey} struct(place=${metrics.struct_place},dig=${metrics.struct_dig}) cleared=${ctx.cleared} tilled=${ctx.tilled} planted=${ctx.planted} harvested=${ctx.harvested} drops=${ctx.drops}${ctx.bonemealed ? ` bonemealed=${ctx.bonemealed}` : ''}`
       + (ctx.missingHoe ? ' [no hoe]' : '') + (ctx.missingSeeds ? ' [no seeds]' : '')
       + (ctx.clearRefused ? ` [clear refused x${ctx.clearRefused}]` : '')
       + (ctx.tillRefused  ? ` [till refused x${ctx.tillRefused}]`   : '')

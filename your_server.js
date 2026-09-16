@@ -63,15 +63,19 @@ module.exports = {
   //                                                   environment override: AUREN_SERVER_PORT
   port: port('AUREN_SERVER_PORT', 25565),
 
-  // ── THE SERVER CONSOLE (RCON) — OPTIONAL, AND ONLY FOR THE EXTRAS ─────────────────────────────────
-  // The bots play the game as players and need none of this to walk, build, farm or fight. The console
-  // is what the workshop's tools use to set the time of day, place a test mob, or read the world back
-  // when checking the bots' own account of themselves. Leave the password empty and those tools simply
-  // say they cannot reach the console; nothing else changes.
-  //
-  // To switch it on, in your server.properties:  enable-rcon=true  and  rcon.password=<something>
-  // A blank password is NOT the same as no password — the server answers "No rcon password set in
-  // server.properties, rcon disabled!" and never opens the port at all.
+  // WHERE YOUR SERVER RUNS — the folder holding its server.properties, on this computer. This is the one
+  // value here that has no usual answer, so it is the one you fill in (or pass --server-folder).
+  // `start_auren.js` switches on what the bots need in that file — offline mode, the server console and
+  // a fresh random console password — and prints every change it made and why.
+  //   example (Windows):  serverFolder: 'C:\\Users\\you\\Minecraft\\server',
+  //                                                   environment override: AUREN_SERVER_DIR
+  serverFolder: process.env.AUREN_SERVER_DIR || '',
+
+  // ── THE SERVER CONSOLE (RCON) — SET UP FOR YOU, LEAVE THESE ALONE ─────────────────────────────────
+  // A crew is brought to where you stand through the console, so the bots do not start without it. You
+  // never pick its password: `start_auren.js` writes a new random one into server.properties each time it
+  // starts before your server, and hands it to the bots itself. These two exist for a launcher that has
+  // already set a console up and passes its password down (the workshop's `run.js` reads them).
   //                                                   environment override: AUREN_RCON_PORT
   rconPort: port('AUREN_RCON_PORT', 25575),
 

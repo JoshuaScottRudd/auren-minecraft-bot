@@ -29,9 +29,13 @@ const { guardExternalSync } = require('../js_kernel/utils/external_library_guard
 //                      comes. A re-request from the holder is a renewal heartbeat.
 //   'planning_release' — bot has finished its plan phase (magnet claimed AND
 //                      synced); the overseer promotes the next waiter (no payload)
-//   'log'            — one already-formatted watcher line (summary/warn/error), forwarded so the
-//                      overseer can print every bot's stream in one place tagged by bot
-//                      (payload: { line }). Display only — the overseer never acts on it (Law 3).
+//   'log'            — one already-formatted watcher line, forwarded so the overseer can print every
+//                      bot's stream in one place tagged by bot (payload: { line, level }). `level` is
+//                      the writer's own name for the channel it used — 'summary' | 'warn' | 'error' |
+//                      'context' — and the overseer TALLIES it per bot so a live supervisor can ask
+//                      whether this fleet has errored without reading anything (see handleLog and
+//                      'fleet_state'). Still no interpretation (Law 3): the overseer counts the field
+//                      the writer stated and never inspects the text.
 //
 // Operator → Overseer (fleet_control, headless surface):
 //   'operator_command' — a console verb arriving over the socket instead of the

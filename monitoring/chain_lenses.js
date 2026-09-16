@@ -17,6 +17,7 @@
 'use strict';
 
 const { relativeTime } = require('./trace_read');
+const out = require('./data_out');
 
 // ── --compost : did the composter chain actually run? ────────────────────────────────────────────
 //
@@ -74,10 +75,14 @@ function runCompost({ seg = [], traceName = '?', bot: botFilter = null, verbose 
     maxRel = Math.max(maxRel, l.relSec);
     if (!/compost/i.test(l.raw)) continue;
     let m;
-    const touch = (b, what) => {
+    // AN EVENT IS A TOKEN AND ITS FIELDS, NEVER A PHRASE (Architect 2026-09-16). This used to take one
+    // composed sentence (`fed 12, 3→4, +1 bone_meal`) and print it in a column, which is the lens
+    // narrating what it read. The same four numbers now travel as their own cells, and `reason` below is
+    // the DUMP's own word carried through untouched.
+    const touch = (b, kind, fields) => {
       if (b.firstAt === null) b.firstAt = l.relSec;
       b.lastAt = l.relSec;
-      if (what) b.timeline.push({ t: l.relSec, what });
+      if (kind) b.timeline.push({ t: l.relSec, kind, ...fields });
     };
     // A level reading is worth carrying from wherever it appears: the fill curve over the run is what
     // says whether feeding outran harvesting or the block sat idle, and no single line owns it.
@@ -93,81 +98,83 @@ function runCompost({ seg = [], traceName = '?', bot: botFilter = null, verbose 
       const b = B(l.bot); b.visits++; b.fed += +m[1]; b.harvested += m[2] ? +m[2] : 0;
       noteLevel(b, m[4]);
       if (CP_X_STOPPED_RE.test(l.raw)) b.declines.stoppedEarly++;
-      touch(b, `fed ${m[1]}, ${m[3]}→${m[4]}${m[2] ? `, +${m[2]} bone_meal` : ''}`);
+      touch(b, 'fed', { fed: +m[1], levelFrom: m[3], levelTo: m[4], boneMeal: m[2] ? +m[2] : 0 });
     } else if ((m = l.raw.match(CP_D_HELD_RE))) {
       // The dump reports the WHOLE held pocket every time, not a delta, so summing across cycles would
       // overcount the same held items repeatedly — a falsehood that looks like runaway accumulation
       // (Law 25). Last and peak, never a sum.
       const b = B(l.bot); b.held = +m[1]; b.heldPeak = Math.max(b.heldPeak, +m[1]); b.heldEvents++;
       b.heldReasons.set(m[2], (b.heldReasons.get(m[2]) || 0) + 1);
-      touch(b, `⚠️ held ${m[1]} — ${m[2]}`);
+      touch(b, 'held', { held: +m[1], reason: m[2] });
     } else if ((m = l.raw.match(CP_X_QUEUE_RE))) {
-      const b = B(l.bot); b.queued++; touch(b, `queued behind ${m[1]}`);
+      const b = B(l.bot); b.queued++; touch(b, 'queued', { behind: m[1] });
     } else if ((m = l.raw.match(CP_X_FREED_RE))) {
       const b = B(l.bot); b.queueWaitSec += +m[1]; touch(b, null);
     }
   }
 
-  console.log(`trace_monitor · compost · ${traceName} · latest run · span [${relativeTime(maxRel)}]${botFilter ? ` · bot=${botFilter}` : ''}`);
-  console.log('(context only — never flags, never wakes)\n');
+  // ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ──────────────────────────────────────────────
+  // Field names and values only. Every reason string below is carried VERBATIM out of the bot's own line
+  // (`composter_not_built_yet`, `no_composter_in_blueprint`, `composter_lock_lost_to_peer`) — the bot was
+  // present for that decision and may name it; this lens was not and may only copy it. What used to live
+  // here and no longer does: a VERDICT line folding fed/harvested/held into one of three named outcomes,
+  // and a footnote explaining what a low harvest at a low fed count means. Both were this instrument
+  // deciding what its own numbers amounted to. The numbers are all still below, one field each.
+  out.kv('lens', 'compost');
+  out.kv('record', traceName);
+  out.kv('span', relativeTime(maxRel));
+  if (botFilter) out.kv('bot_filter', botFilter);
 
   const totalHarvest = [...bots.values()].reduce((n, b) => n + b.harvested, 0);
   const totalFed = [...bots.values()].reduce((n, b) => n + b.fed, 0);
-
-  if (!bots.size) {
-    // The honest zero (Law 25). Not "the chain failed" — the chain was never reached, and the reader is
-    // told which precondition to check rather than left to infer a verdict from an empty table.
-    console.log('NO COMPOST ACTIVITY IN THIS RUN — nothing fed, nothing harvested, nothing held back.');
-    console.log('  Composting is a side-errand of inventory_swapper.dumpExcess, so an empty section means');
-    console.log('  NO SURPLUS COMPOSTABLE WAS EVER DUMPED — not that the composter was skipped. A bot');
-    console.log('  holding saplings it could not place would appear here as HELD.');
-    console.log('  The composter itself is voxel [-5,2,1] of headframe ANCHOR 1 (114 voxels), not anchor 0.');
-    console.log('  Check the two preconditions in order:');
-    console.log('    trace.ps1 --milestones          ← did headframe anchor 1 complete?');
-    console.log('    trace.ps1 --story               ← did any dumpExcess run carry a COMPOST_INPUTS item?');
-    console.log('  If both hold and this is still empty, the fault is in inventory_swapper.dumpExcess —');
-    console.log('  its compost.isCompostable filter, or a chest deficit still absorbing the item first.');
-    return;
-  }
-
   const totalHeld = [...bots.values()].reduce((n, b) => n + b.held, 0);
-  // Three verdicts, not two. NEVER REACHED is the one the old lens could not say: material existed, the
-  // dump tried, and the block turned it away every time — which reads identically to "nothing to compost"
-  // in any tally that only counts what got fed (Law 25).
-  console.log(`VERDICT: ${totalHarvest > 0
-    ? `CHAIN CLOSED — ${totalFed} item(s) in, ${totalHarvest} bone_meal out`
-    : totalFed > 0
-      ? `NOT CLOSED — ${totalFed} item(s) fed, 0 bone_meal harvested`
-      : `NEVER REACHED — 0 item(s) fed, ${totalHeld} compostable(s) still in pockets (see HELD below for why)`}`);
-  console.log('  (~30% of fed items raise a level; 8 levels = 1 bone meal, so a low harvest at low fed');
-  console.log('   count is expected variance, not a defect. Bone meal out is the only success measure.)\n');
 
-  for (const [id, b] of bots) {
-    console.log(`${id}  ·  active [${relativeTime(b.firstAt)}] → [${relativeTime(b.lastAt)}]`);
-    console.log(`  WORK        ${b.visits} visit(s), ${b.fed} item(s) fed, ⭑ ${b.harvested} bone_meal harvested`);
-    // HELD is the row that replaced the unclaimed-errand tally, and it is the one to read first on a
-    // disappointing run: material the dump wanted to compost and could not place. The reason is carried
-    // verbatim from feedFromPocket, because the reasons demand opposite responses and would be
-    // indistinguishable as a count: `composter_not_built_yet` is the build order working (the bin is a
-    // later anchor than the chests, so a fresh world has a window with chests and no bin — expected, and
-    // it ends by itself), `no_composter_in_blueprint` is a blueprint defect, and
-    // `composter_lock_lost_to_peer` is contention that self-corrects. Only the middle one is anyone's to
-    // act on, and a run where the first one persists past the base being finished is the real signal.
-    if (b.heldEvents) {
-      console.log(`  ⚠️ HELD      ${b.held} compostable(s) still held (peak ${b.heldPeak}) over ${b.heldEvents} dump(s) — ` +
-        `${[...b.heldReasons].map(([r, n]) => `${r} ×${n}`).join(' · ')}`);
-    }
-    if (b.queued) console.log(`  QUEUE       waited behind a peer ${b.queued}× · ${b.queueWaitSec}s total`);
-    if (b.level.last !== null) console.log(`  LEVEL       last ${b.level.last}/8 · seen ${b.level.min}–${b.level.max}`);
-    const dec = Object.entries(b.declines).filter(([, n]) => n > 0);
-    if (dec.length) console.log(`  DECLINED    ${dec.map(([k, n]) => `${k} ×${n}`).join(' · ')}`);
-    if (verbose && b.timeline.length) {
-      console.log('  timeline (--all):');
-      for (const e of b.timeline) console.log(`    [${relativeTime(e.t)}]  ${e.what}`);
-    }
-    console.log('');
+  out.section('compost_totals');
+  out.kv('bots_with_compost_events', bots.size);
+  out.kv('items_fed', totalFed);
+  out.kv('bone_meal_harvested', totalHarvest);
+  out.kv('compostables_held', totalHeld);
+
+  if (!bots.size) return;
+
+  out.section('compost_by_bot');
+  out.table(
+    ['bot', 'first_at', 'last_at', 'visits', 'fed', 'bone_meal', 'held', 'held_peak', 'held_dumps',
+      'queued', 'queue_wait_sec', 'level_last', 'level_min', 'level_max'],
+    [...bots].map(([id, b]) => [id, relativeTime(b.firstAt), relativeTime(b.lastAt), b.visits, b.fed,
+      b.harvested, b.held, b.heldPeak, b.heldEvents, b.queued, b.queueWaitSec,
+      b.level.last, b.level.min, b.level.max]),
+  );
+
+  // The held REASON is the field to read on a disappointing run, and it is the bot's own word for why the
+  // dump could not place the item. Counted per reason, never merged into one "held" number.
+  const heldRows = [];
+  for (const [id, b] of bots) for (const [reason, n] of b.heldReasons) heldRows.push([id, reason, n]);
+  if (heldRows.length) {
+    out.section('compost_held_reasons');
+    out.table(['bot', 'reason', 'count'], heldRows);
   }
-  if (!verbose) console.log('(--all prints the per-event timeline)');
+
+  const decRows = [];
+  for (const [id, b] of bots) {
+    for (const [k, n] of Object.entries(b.declines)) if (n > 0) decRows.push([id, k, n]);
+  }
+  if (decRows.length) {
+    out.section('compost_declines');
+    out.table(['bot', 'decline', 'count'], decRows);
+  }
+
+  if (verbose) {
+    const events = [];
+    for (const [id, b] of bots) {
+      for (const e of b.timeline) {
+        events.push([relativeTime(e.t), id, e.kind, e.fed ?? null, e.boneMeal ?? null,
+          e.levelFrom ?? null, e.levelTo ?? null, e.held ?? null, e.reason ?? null, e.behind ?? null]);
+      }
+    }
+    out.section('compost_events');
+    out.table(['at', 'bot', 'event', 'fed', 'bone_meal', 'level_from', 'level_to', 'held', 'reason', 'queued_behind'], events);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────

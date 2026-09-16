@@ -23,7 +23,7 @@
 
 const watcher = require('@kernel/watcher');
 const hq      = require('@kernel/corporate_headquarters');
-const { group_to_item: ROOT_GROUPS, getBotInventory, underground_items, stone_prospect_items, furnace_chain_items, farm_items, hunt_items, normalizeItemName, chestItemCounts } = require('@utils/fragment_utils');
+const { group_to_item: ROOT_GROUPS, getBotInventory, underground_items, stone_prospect_items, furnace_chain_items, farm_items, hunt_items, normalizeItemName, chestItemCounts, substitutes_for: SUBSTITUTES_FOR } = require('@utils/fragment_utils');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const inventoryLens = require('@kernel/inventory_lens');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
@@ -218,7 +218,10 @@ function _planOneCraftStep(topItem, topHave, topTarget, byItem, inventory, _visi
 
     for (const [rawIng, perCraft] of Object.entries(bp.ingredients)) {
         const ing = rawIng.trim().toLowerCase();
-        const ingHave = _getInventoryCount(ing, inventory);
+        // Coal is spendable as charcoal (`substitutes_for`), and craft_handler's recipesFor picks whichever
+        // is held — so a pocket of coal affords a torch craft and must be counted as affording one here.
+        let ingHave = _getInventoryCount(ing, inventory);
+        for (const alt of (SUBSTITUTES_FOR[ing] || [])) ingHave += _getInventoryCount(alt, inventory);
         const ingNeeded = perCraft * craftsNeeded;
         if (ingHave < ingNeeded) {
             // A chain-product ingredient (charcoal from the furnace, wheat from the farm) isn't
@@ -792,14 +795,17 @@ module.exports = {
             // harvest, else chest→pocket→chest just shuffles storage.
             if (!magnet.destination) {
                 const chestInv = _readChestInventory();
+                // The named root first, then its substitutes: a charcoal root is answered by coal in a
+                // chest exactly as chainGate counted it when it admitted the order (`substitutes_for`).
                 for (const root of missingRoots) {
                     const shortfall = root.need;
                     if (shortfall <= 0) continue;
-                    const inChest = _getInventoryCount(root.item, chestInv);
-                    if (inChest > 0) {
+                    for (const source of [root.item, ...(SUBSTITUTES_FOR[root.item] || [])]) {
+                        const inChest = _getInventoryCount(source, chestInv);
+                        if (inChest <= 0) continue;
                         const pull = Math.min(inChest, shortfall);
-                        watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → withdraw ${pull}x ${root.item} from chest (chest has ${inChest}, harvest covers any remainder) | ${snap}`);
-                        _withdrawFromChest(payload, root.item, pull);
+                        watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → withdraw ${pull}x ${source} from chest for ${root.item} (chest has ${inChest}, harvest covers any remainder) | ${snap}`);
+                        _withdrawFromChest(payload, source, pull);
                         return;
                     }
                 }
@@ -817,7 +823,7 @@ module.exports = {
                 //
                 // Skipping — not throwing like underground_items does — because a chain product going
                 // missing is an ordinary timing state (mid-smelt, mid-grow), not a job_board gating
-                // bug. The loop falls through to Step 6 STUCK → release, and the bot picks up other
+                // bug. The loop falls through to Step 6, which releases a returning claim, and the bot picks up other
                 // work while the chain runs. Without this distinction, a chain product's shortfall
                 // would reach harvest_executor's wild-punch path and halt the bot on repeated identical
                 // scans for a crop that only its own chain can make.
@@ -863,9 +869,9 @@ module.exports = {
         //
         // WHY THIS IS A BUG AND NEVER THE WORLD, which is Law 13's own test. The board is the ONLY party
         // permitted to refuse an order — job_gates' walk-back note states it, and it is why nothing
-        // downstream re-checks a claim (Law 16: one gate, and that is it). So a job arriving here has
-        // already been certified fillable by the only party that judges fillability, and reaching this
-        // line means the certificate was false: either the chain gate failed to hold an order whose
+        // downstream re-checks a claim (Law 16: one gate, and that is it). So a job arriving here FRESH
+        // has already been certified fillable by the only party that judges fillability, and reaching the
+        // throw means the certificate was false: either the chain gate failed to hold an order whose
         // material only another chain can produce, or the board's requirement walk did not reach the same
         // leaves this fulfiller reaches. Both are gate defects. Neither is a state a correct system
         // produces in a normal world, so soft-failing to the judge would hide a broken gate behind
@@ -876,6 +882,24 @@ module.exports = {
         // one that let this through.
         const rootNames = missingRoots.map(r => r.item).join(',');
         const awaiting = missingRoots.length > 0 && missingRoots.every(r => _isChainProduct(r.item, byItem));
+
+        // ── A CLAIM THAT SPENT THE LAST OF A CHAIN PRODUCT RELEASES THE REST TO THE BOARD ─────────────
+        // The certificate above is issued against the world the board SAW, and it holds for exactly one
+        // receive: the fresh dispatch. chainGate admits on ONE craft's cost (job_gates, "a partial supply is
+        // a job that can make progress"), and the craft planner above spends a scarce chain product as a
+        // partial batch on purpose. So a return from this claim's own executor, with every missing root a
+        // chain product, is the partial-batch design working: this bot withdrew and crafted the reachable
+        // stock, that stock is now zero, and the remainder is a new question about a new world. The board
+        // is the party that asks it — re-posted, the remainder meets chainGate against zero and is held
+        // until the furnace or farm delivers (Law 25: an honest partial carried forward; Law 12: fresh
+        // dispatch from current world state). Reached on a fresh dispatch, the same shape is still the
+        // gate hole the throw below names.
+        if (awaiting && payload.executor) {
+            watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | AWAITING CHAIN [${rootNames}] — this claim spent every reachable unit | RELEASE remainder to the board | ${snap}`);
+            _releaseJob(`partial ${targetItem} (have ${have}/${holdGoal}) — the remainder waits on [${rootNames}] from its chain`);
+            return;
+        }
+
         throw new Error(
             `[${TAG}] CODING VIOLATION: dispatched an order this fragment cannot fill, for ${targetItem} `
             + `(have ${have}/${holdGoal}, from=${from}, roots=[${rootNames}]). `

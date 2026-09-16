@@ -28,40 +28,39 @@ Two verbs, and they are the whole argument: **AI as the developer, not the pilot
 
 ## What you need
 
-- **Node.js 22 or newer** — `node --version` to check.
-- **Minecraft Java Edition 1.21.5**, and a server you can reach. Nearby 1.21 versions usually work; the
-  further you drift the more likely the bot reaches for a block that got renamed. **Bedrock will not work.**
-- **Offline mode, or a real account for the bot.** By default it logs in without authenticating, which a
-  server accepts only when `online-mode=false` in `server.properties`.
-- **The server console switched on** — two more lines in the same `server.properties`:
-
-  ```
-  enable-rcon=true
-  rcon.password=pick-anything
-  ```
-
-  **This is not optional and here is why.** A bot starts working from where *you* are standing, and
-  getting it there means one `tp` issued through the server's own console. A bot that cannot be placed
-  does not start at all — so without these two lines you would get a bot standing still and nothing to
-  read. `start_auren.js` checks the console before it opens and tells you if it cannot reach it.
+**Current Node.js, Java for your Minecraft server, and a Minecraft Java 1.21.5 server on this computer.
+Then, in this folder:**
 
 ```
 npm install
 ```
 
-**That download is about 450 MB**, nearly all of it `minecraft-data` — the block, item and recipe tables
-the bot reads constantly. There is no smaller version of it. Nothing installs outside this folder.
+That download is about 450 MB, nearly all of it the game's block, item and recipe tables. Nothing installs
+outside this folder. On a Node older than 22 it stops and names the version it needs.
 
 ---
 
 ## How to run it
 
-One command, and it mirrors how I run it myself. The only thing it asks you to name is the console
-password you just set.
+One command. The only thing it asks you to name is the folder your server runs in:
 
 ```
-node start_auren.js --rcon-password pick-anything
+node start_auren.js --server-folder "C:\path\to\your\server"
 ```
+
+(Put that folder in `serverFolder` in `your_server.js` and you never type it again.)
+
+**Auren sets your server up for itself and prints every change it makes, and why.** It needs three
+settings in your `server.properties` and writes them if they are missing:
+
+- `online-mode=false` — the bots have no Minecraft accounts.
+- `enable-rcon=true` — a crew is brought to where you stand through the server console.
+- `rcon.password` — **a new random one each time Auren starts before your server.** You never see or type
+  it, and it is only good until the server next restarts.
+
+A server reads those settings only when it starts. So start Auren first and then your server, or restart
+your server when Auren asks — it waits and carries on by itself. If people outside your home can reach your
+server, keep in mind that offline mode checks no accounts.
 
 That starts a **foreman** — a clerk that joins your world and waits. **No bots yet.** Walk to where you
 want them, and ask in chat:
@@ -88,15 +87,16 @@ filtered on it. There is no terminal flag for that, because there is no owner to
 and no coordinate to type because you are standing on it.
 
 **If your server is not on `localhost:25565`, there is one file to edit: `your_server.js`,** at the top
-level beside this README. It holds the address, the port, and the server console's port and password, and
-everything in this project reads it — the bots, the foreman, the camera rig, the tools. Nothing probes for
+level beside this README. It holds your server folder, the address and the port, and everything in this
+project reads it — the bots, the foreman, the camera rig, the tools. Nothing probes for
 a server or falls back to a second address: if nothing answers where that file says, the run stops and
 prints that file and the exact field to change. (`--host` and `--port` still work on the command above when
 you want to point one run somewhere else without editing anything.)
 
-**You start your Minecraft server and you stop it. The bots only join it.** Nothing here will start,
-stop or reconfigure a world it did not create. Every part of this project that touches a world asks it one
-question — *are you there* — and gets the answer by speaking to the server, never by being told.
+**You start your Minecraft server and you stop it. The bots only join it.** Nothing here will start or
+stop a world it did not create, and the three settings above are the only thing it writes to yours. Every
+part of this project that touches a world asks it one question — *are you there* — and gets the answer by
+speaking to the server, never by being told.
 
 **Ctrl-C stops everything, including the bots the foreman fetched.** That is the whole interface.
 
@@ -135,16 +135,17 @@ same either way, and `node developer_mode.js off` puts it back.
 
 **Common ones:**
 
-- **Connects then immediately kicked** — the server is in online mode and the bot has no account. Set
-  `online-mode=false`, or give the bot a paid account.
+- **Connects then immediately kicked** — the server is still running on the settings it started with.
+  Restart it; Auren already wrote `online-mode=false`.
 - **`Cannot find module 'mineflayer'`** — `npm install` wasn't run, or was run in the wrong folder.
+- **`npm error code EBADENGINE`** — your Node is older than 22. Install the current one and run
+  `npm install` again.
 - **"something is already using port 3001"** — an overseer is still running from last time. Close it.
-- **"Auren cannot reach your server's console"** — `enable-rcon=true` and `rcon.password=` are not both
-  set in `server.properties`, the server was not restarted after setting them, or the password you passed
-  to `--rcon-password` is not the one in the file. Nothing launched, so there is nothing to clean up.
+- **"Auren cannot reach your server's console"** — the server was started before `server.properties`
+  last changed. Restart the server and start Auren again. Nothing launched, so there is nothing to clean up.
 - **A bot says it did not start because it is not standing with you** — it was raised, it could not be
-  brought to you, and it refused to plan a base somewhere you did not choose. Usually the console
-  password: see the line above.
+  brought to you, and it refused to plan a base somewhere you did not choose. Usually the console: see the
+  line above.
 - **Joins and stands still** — usually ground it cannot work: no wood in reach, or spawn-protected. It
   re-plans and gets the same answer. The trace says which, and so will I if you send it.
 - **Version mismatch** — pass `--version 1.21.5` to match your server exactly.

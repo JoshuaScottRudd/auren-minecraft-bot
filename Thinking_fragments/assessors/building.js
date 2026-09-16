@@ -44,6 +44,9 @@ function assess() {
     // preconstruction withdraws and crafts against a shortfall, abandoning mid-stage and overbuilding
     // low-priority pieces while the structure itself stays materially short.
     let buildAnchorIndex = null;   // which anchor the structure job builds (per-anchor gating)
+    // Each structure's verdict for the setup gate (architect_config SETUP_ORDER), keyed by its field. Only the
+    // STRUCTURE_COMPLETE rung speaks for "built"; siting and pasting are rungs on the way there.
+    const built = {};
 
     // Condition gate: `condition`-tagged requirement invisible until it holds; unknown token → default
     // stopped (Law 13). No live tokens today (the one past user was scrapped); gate stays for the next one.
@@ -149,6 +152,7 @@ function assess() {
             }
         }
 
+        if (req.type === TYPE_STRUCTURE_COMPLETE) built[req.field] = satisfied;
         if (!satisfied && firstUnsatisfied === null) {
             firstUnsatisfied = req;
         }
@@ -173,6 +177,7 @@ function assess() {
             job_type: JOB_TYPE[firstUnsatisfied.job_type] ?? JOB_TYPE.building_structure,
             claimed_by: null,
             step: firstUnsatisfied.type,
+            structure: firstUnsatisfied.field,
             scope: 'shared',
             ...(withAnchor ? { anchor_index: buildAnchorIndex } : {}),
         });
@@ -210,6 +215,7 @@ function assess() {
                 // `supply_manager._dispatchDelivery`). Carry the key that was already in hand.
                 station_id: poolChest.id,
                 destination: 'headframe',
+                structure: firstUnsatisfied.field,
                 job_type: supplyJobType,
                 claimed_by: null,
                 hold_goal: gap, at_destination: 0,
@@ -222,6 +228,7 @@ function assess() {
             jobs.push(supplyJob({
                 id: `build_supply_${raw}`, what: raw, need: gap,
                 where: null,
+                structure: firstUnsatisfied.field,
                 job_type: JOB_TYPE.resource_baseline,
                 claimed_by: null,
                 hold_goal: countInInventory(raw, getBotInventory()) + gap,
@@ -245,7 +252,9 @@ function assess() {
     // and would be subtracted twice if the whole requirement were filed here.
     const buildClaim = { ...pullNeeded, ...surfaceNeeded };
 
-    return { jobs, pullNeeded, buildClaim };
+    // `claim_structure`: the claim and the pull above are the first unsatisfied structure's, so job_board can drop
+    // both while that structure waits its turn in SETUP_ORDER.
+    return { jobs, pullNeeded, buildClaim, built, claim_structure: firstUnsatisfied ? firstUnsatisfied.field : null };
 }
 
 module.exports = { name: 'building', assess };

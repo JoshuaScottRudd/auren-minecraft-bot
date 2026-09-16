@@ -811,33 +811,18 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
   const allowDig   = opts.allowDig   !== undefined ? !!opts.allowDig   : allowWorldAlteration;
   const allowPlace = opts.allowPlace !== undefined ? !!opts.allowPlace : allowWorldAlteration;
 
-  // ── THE SPAWN-PROTECTED SQUARE SUPPRESSES THE ALTERING EDGES, PER CELL ───────────────────────────
-  // The two flags above are search-wide; this is the same suppression applied cell by cell. Inside the
-  // square the server refuses breaks and placements, so a route that digs or bridges through it is a
-  // route the body cannot walk — and it must be removed at GENERATION time for exactly the reason the
-  // allowDig note above gives: A* returns the CHEAPEST route, so a dig through spawn wins against a
-  // legal walk-around, and rejecting the path afterwards would report "unreachable" for a place the
-  // body could plainly walk to.
+  // THE SPAWN SQUARE IS NOT A TERM IN THIS SEARCH ANY MORE (Architect 2026-09-15). It used to be hoisted
+  // here and consulted per cell to suppress the six altering edges. It is now handled one layer below
+  // the search: `spawn_protection.maskWorldReads` makes every cell inside the square read as BEDROCK, so
+  // the reader this search runs on reports it solid, undiggable and unplaceable, and no dig, bridge or
+  // pillar edge can be generated there in the first place. The cost model needs no keep-out clause,
+  // because the graph no longer contains the cells (the lava treatment: not priced, not present).
   //
-  // A PRICE WOULD NOT DO, AND THAT IS THE WHOLE POINT. Every other rule about protected ground in this
-  // file is a COST — a blueprint voxel is PROTECTED_VOXEL_DETOUR_BUDGET, a station the same tier —
-  // because those are things the fleet OWNS and may spend against when nothing cheaper exists. A cost
-  // is payable, so a search with no cheaper detour buys the block; here the purchase cannot complete,
-  // because the world will not sell. Refusing the edge is the only form that matches the fact.
-  //
-  // WALKING THROUGH SPAWN STAYS LEGAL, and no cell is deleted from the graph. Spawn protection governs
-  // CHANGING blocks, not standing on them, so this is deliberately unlike the depth floor's pop-loop
-  // deletion below: a bot may cross the square, stand in it, fight in it and collect drops in it. Only
-  // the six world-altering edges stop existing there.
-  //
-  // Hoisted once per search and compared inline — the same reason the depth floor is read once above:
-  // this is asked hundreds of thousands of times in one pass, and a module lookup per node would price
-  // a keep-out check into every one of them. Null when the rule is off or the world spawn is not known
-  // yet, and every comparison below short-circuits on that, so a search runs bit-identically to before.
-  const spawnBox = require('@perception/spawn_protection').spawnProtectionBox(bot);
-  const inSpawnBox = spawnBox
-    ? (x, z) => Math.max(Math.abs(x - spawnBox.centerX), Math.abs(z - spawnBox.centerZ)) <= spawnBox.radius
-    : null;
+  // WHAT CHANGED IN BEHAVIOUR, stated because it is a real trade the old note promised the other way: a
+  // route may no longer be planned THROUGH the square — a solid column is not walkable — so the fleet
+  // walks around a 33x33 block of ground it used to be able to cross. The base stands at least 50 blocks
+  // clear of it (`PERSON_CLEAR_OF_SPAWN`), so what this costs is an occasional detour, and what it buys
+  // is that no part of this fleet has to know the square exists.
 
   // WALL-CLOCK DEADLINE (Architect 2026-08-01: "it must plan that route in about 0.25 seconds and give
   // partial if it cant"). maxNodes alone cannot express this — node cost varies with how much of the
@@ -1018,11 +1003,6 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     const cx = current.pos.x, cy = current.pos.y, cz = current.pos.z;
     const currentG = gCost.get(current.key);
 
-    // Whether THIS column may be altered — the two edges that dig or place at the bot's own XZ
-    // (dig_down, pillar). Computed once per pop rather than at those two sites so the pair cannot drift
-    // apart in which column they think they are changing.
-    const mayAlterHere = !inSpawnBox || !inSpawnBox(cx, cz);
-
     // --- Edge generation: check all movement types at this node ---
 
     // From a water node, outgoing walk/climb edges are re-typed 'swim' so the executor uses
@@ -1050,12 +1030,6 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     for (const [dx, , dz] of CARDINAL) {
       const nx = cx + dx, nz = cz + dz;
       const dirName = DIRS[dirIdx++];
-      // Whether the NEIGHBOUR column may be altered — the four edges that dig or place there
-      // (dig_climb_up, dig_climb_down, dig_through, bridge). Read off the neighbour rather than the
-      // current cell because that is the column whose blocks the edge actually changes: a bot standing
-      // one block outside the square digging inward is still digging inside it.
-      const mayAlterThere = !inSpawnBox || !inSpawnBox(nx, nz);
-
       // --- Walk edge (same Y) ---
       const walkFloorPos = new Vec3(nx, cy, nz);
       const walkFloor = bot.blockAt(walkFloorPos);
@@ -1112,7 +1086,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       // (goal usually above) instead of boring a flat COST_HIGH tunnel across (Architect 2026-07-11).
       // COST_HIGH so a clear walk-around/climb always wins; reuses stairUpStep, which already digs
       // the obstructing foot/head blocks. Overhead cells are ceiling-checked (no flood, no gravity).
-      if (allowDig && mayAlterThere && !upClass && !fromWater && isBlockSolid(upFloor) && isFloorSafe(upFloor) && isFullHeightFloor(upFloor)) {
+      if (allowDig && !upClass && !fromWater && isBlockSolid(upFloor) && isFloorSafe(upFloor) && isFullHeightFloor(upFloor)) {
         const curHead = bot.blockAt(new Vec3(cx, cy + 3, cz));   // clearance above the current head, to rise
         const upFoot  = bot.blockAt(new Vec3(nx, cy + 2, nz));   // cell the feet enter after stepping up
         const upHead  = bot.blockAt(new Vec3(nx, cy + 3, nz));   // cell the head enters — overhead of the tread
@@ -1142,7 +1116,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       // Mirror of dig_climb_up: the landing one down-and-over is solid, but a diggable wall blocks
       // the step into it. Dig foot+head and stair down. Sideways-and-down dig, so no gravity guard
       // (nothing lands on the head as the bot moves away/below). Reuses stairDownStep. COST_HIGH.
-      if (allowDig && mayAlterThere && !downClass && !fromWater && isBlockSolid(downFloor) && isFloorSafe(downFloor)) {
+      if (allowDig && !downClass && !fromWater && isBlockSolid(downFloor) && isFloorSafe(downFloor)) {
         const dnFoot = bot.blockAt(new Vec3(nx, cy, nz));        // new feet cell
         const dnHead = bot.blockAt(new Vec3(nx, cy + 1, nz));    // new head cell
         const okDig = (b) => isBlockPassable(b) || (isBlockSolid(b) && b.diggable && !HAZARD_BLOCKS.has(b.name));
@@ -1218,7 +1192,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       // Neighbor has a solid floor (support after digging) + diggable foot/head: dig one column,
       // step in. A* chains these across thick walls. Blocked from water — digging while swimming
       // is far too slow and unreliable.
-      if (allowDig && mayAlterThere && !walkClass && !upClass && !fromWater) {
+      if (allowDig && !walkClass && !upClass && !fromWater) {
         const dtFloor = bot.blockAt(new Vec3(nx, cy, nz));
         const dtFoot  = bot.blockAt(new Vec3(nx, cy + 1, nz));
         const dtHead  = bot.blockAt(new Vec3(nx, cy + 2, nz));
@@ -1252,7 +1226,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       // Complement of dig_through: place a block over a non-solid gap (air, lava) to make a floor.
       // Lava-safe — the placed block covers the hazard. Water excluded (bot swims it, doesn't fill
       // it) and blocked from water nodes (placement while swimming is unreliable). A* chains gaps.
-      if (allowPlace && mayAlterThere && !walkClass && !fromWater) {
+      if (allowPlace && !walkClass && !fromWater) {
         const brFloor = bot.blockAt(new Vec3(nx, cy, nz));
         if (brFloor && !isBlockSolid(brFloor) && !isWaterBlock(brFloor)) {
           const hasBlocks = bot.inventory.items().some(i => i.count > 0 && isScaffoldBlock(i.name));
@@ -1309,7 +1283,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     // one edge. It is now flowPrice()'d like every other dig (Architect 2026-08-18): the ban meant a bot
     // in a pit ringed by water had no down move at all, and a bot that must go down to live should pay
     // rather than be refused. It now also sees lava, which the ban never did.
-    if (allowDig && mayAlterHere && !fromWater) {
+    if (allowDig && !fromWater) {
       const curFloorBlock = bot.blockAt(new Vec3(cx, cy, cz));
       const belowBlock = bot.blockAt(new Vec3(cx, cy - 1, cz));
       if (curFloorBlock && curFloorBlock.diggable
@@ -1350,7 +1324,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     // that reachable floor exists; deeper than reach → no edge. "Needs a face to place against"
     // (Architect): the face is a solid within reach below — one block down is almost never enough, so
     // the scan looks the full BLOCK_REACH down, matching the executor's fill. p2/p3 keep plain shaftOk.
-    if (allowPlace && mayAlterHere) {
+    if (allowPlace) {
       const pillarDest = new Vec3(cx, cy + 1, cz);
       const pk = keyOf(pillarDest);
       if (!visited.has(pk)) {

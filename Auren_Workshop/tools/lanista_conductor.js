@@ -388,7 +388,7 @@ function main() {
         note('film crew', false, r.why);
         return 1;
       }
-      note('film crew', true, `${overlayName} — cameras${overlay.architectEye() ? " + the Architect's eye" : ''}${r.obs ? ', recording' : ', not recording'}`);
+      note('film crew', true, `${overlayName} — cameras${overlay.architectEye() ? " + the Architect's eye" : ''}${r.records ? ', recording' : ', not recording'}`);
     }
 
     // ── 3. THE LADDER: battleground → summon in aggro range → wait → next wave ─────────────────────
@@ -427,7 +427,7 @@ function main() {
       banner('5. TEARDOWN — SKIPPED (--keep-up)');
       console.log(`  The fleet is STILL RUNNING and is yours to reap:  node ${path.relative(REPO_ROOT, FLEET)} down --port=${port}`);
       if (overlayRaised) {
-        console.log(`  The cameras are STILL UP${overlay.OVERLAYS[overlayName].obs ? ' and STILL RECORDING — every file is still open' : ''}.`);
+        console.log(`  The cameras are STILL UP${overlay.OVERLAYS[overlayName].records ? ' and STILL RECORDING — every file is still open' : ''}.`);
         console.log(`  Close them FIRST, before the fleet:  node Auren_Workshop/tools/record_overlay.js stop`);
       }
     } else {

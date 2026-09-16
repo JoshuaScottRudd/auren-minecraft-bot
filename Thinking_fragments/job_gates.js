@@ -61,7 +61,7 @@ const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const inventoryLens = require('@kernel/inventory_lens');
 const craftingRegistry = require('@kernel/crafting_blueprint_registry');
 const stationRegistry = require('@perception/station_registry');
-const { isNightTime, isDaylightOnlyJob, mayGatherOutdoors, STONE_PROSPECT } = require('@thinking/architect_config');
+const { isNightTime, isDaylightOnlyJob, mayGatherOutdoors, STONE_PROSPECT, SETUP_ORDER } = require('@thinking/architect_config');
 
 // The four recipe-reading gates bind SUPPLY jobs only. A mining, farming or canopy verb has no stock row,
 // no recipe and no `need` in the same sense, so asking them these questions produces answers about the
@@ -200,7 +200,7 @@ function describeRoots(short) {
 
 // ── THE GATES ─────────────────────────────────────────────────────────────────────────────────────
 // Each takes (job, ctx) and returns a REASON STRING to disqualify, or null to let the job through.
-// ctx = { inventory, allStations, pullNeeded }.
+// ctx = { inventory, allStations, pullNeeded, built }.
 //
 // A job declares what the gates should ask about in `job.gates` (see job_board's supplyJob). A job with
 // no `gates` block is subject only to the gates that read the job itself — night and obtainability —
@@ -218,6 +218,37 @@ function describeRoots(short) {
 function nightGate(job) {
     if (!isNightTime()) return null;
     return isDaylightOnlyJob(job) ? 'outdoor verb after dusk' : null;
+}
+
+// SETUP — a structure job waits for the structures this species must finish first (architect_config
+// SETUP_ORDER, which carries the whole rule). An EXPLICIT hold where the order used to be an inference: the farm
+// started second only because its seeds came from a chest shelf in a weaker position, which worked and had to be
+// reasoned through to see (Architect 2026-09-15: *"its ambigious so instead make it explicit"*).
+//
+// `ctx.built` is what each structure's own assessor measured THIS sweep, carried forward by job_board like the
+// pull list — never a chair, because a remembered "built" would outlive the damage that un-built it (Invariant B).
+function setupGate(job, ctx) {
+    if (job.structure === undefined) return null;
+    const waitingOn = setupWaitingOn(job.structure, ctx.built, job.id);
+    return waitingOn
+        ? { why: 'setup order: an earlier structure is not built', detail: `${job.structure} waits on ${waitingOn}` }
+        : null;
+}
+
+// setupWaitingOn(structure, built) → the first structure this one must wait for, or null when it may start.
+// THE ONE ANSWER to "may any part of this structure begin" — the gate asks it of a job, and job_board asks it
+// of the material a structure's assessor would CLAIM or PULL, so a waiting building neither posts work nor
+// reserves stock nor sends anyone mining for it (Architect 2026-09-15: *"the whole process should be gated.
+// its law 17 safety"*). Two askers, one function (Law 16).
+function setupWaitingOn(structure, built, who = structure) {
+    if (typeof structure !== 'string' || !structure) {
+        throw new Error(`[job_gates] CODING VIOLATION (Law 13): ${who} carries structure=${JSON.stringify(structure)} — `
+            + 'a structure stamp is the structure\'s name or absent.');
+    }
+    const order = SETUP_ORDER[require('@kernel/bot_mandate').currentMode()];
+    const at = order.indexOf(structure);
+    const before = at === -1 ? order : order.slice(0, at);
+    return before.find(name => built?.[name] !== true) || null;
 }
 
 // STATION — the work needs a PLACED station, and the registry is the authority rather than the pocket.
@@ -579,7 +610,10 @@ function obtainableGate(job) {
 // ── THE ORDER, AND WHY IT IS THE ORDER ────────────────────────────────────────────────────────────
 // First match wins, so this decides which REASON a held job is reported under, and one of the five
 // carries a side effect. Cheapest and most absolute first (a clock read, a registry lookup), then the
-// recipe walks, then the one that mutates. The two rules that are load-bearing rather than tidy:
+// recipe walks, then the one that mutates. The rules that are load-bearing rather than tidy:
+//   - `setup` runs FIRST: a structure that may not start yet is reported as waiting on the structure before
+//     it, never as dark or short of something — and it never reaches `underground`, so a held building
+//     files no mining pull of its own through the gates.
 //   - `underground` runs after `passive`, so a passive row never commissions a mining pull.
 //   - `chain` runs BEFORE `underground`, so a root another chain already produces is never converted
 //     into a mining pull. Reversed, a torch short of fuel would commission a descent — and the descent
@@ -593,6 +627,7 @@ function obtainableGate(job) {
 //   - `obtainable` runs last because it is the deepest walk and the least specific verdict; anything
 //     with a namable cause should be reported under that cause instead.
 const GATES = [
+    ['setup',       setupGate],
     ['night',       nightGate],
     ['station',     stationGate],
     ['craft_station', craftStationGate],
@@ -639,5 +674,6 @@ function applyGates(jobs, ctx) {
 
 module.exports = {
     applyGates,
+    setupWaitingOn,
     declarationFor,
 };

@@ -43,11 +43,128 @@
 'use strict';
 
 const { relativeTime, PASSIVE_LINE } = require('./trace_read');
+// Every byte this file puts on stdout goes through data_out: field names and values, no grammar. Nothing
+// here calls console.log any more — see data_out.js's header for the ask and the shape.
+const out = require('./data_out');
 
 const MS_LOCK_RE = /Locked (\S+) build site — build_center \(([^)]+)\)/;
 const MS_GATE_RE = /"([^"]+)" anchor (\d+) gated — order \(short\): (.+)$/;
 const MS_PLACED_RE = /"([^"]+)" — (\d+)\/(\d+) structure placed/;
 const MS_ANCHOR_DONE_RE = /'([^']+)' anchor (\d+) has no gating work left/;
+// ONE STRUCTURE, TWO NAMES — and that mismatch is why this lens has advertised an `ANCHOR N COMPLETE` row
+// since it was written and never once printed one (found 2026-09-16).
+//   the GATE line names the BLUEPRINT : assessors/building writes `"headframe" anchor 0 gated — order (short)`
+//   the DONE line names the JOB KEY   : building_manager writes `'headframe_execute' anchor 2 has no gating work left`
+// Keyed on the raw capture, those file under two different sites, so the anchors that gated and the anchors
+// that finished never met and every anchor read COMPLETE: NOT YET while the structure demonstrably stood.
+// The job key is the structure plus the stage that builds it; stripping that suffix is what makes the two
+// lines talk about the same thing. Normalised HERE, once, so the clock and the milestone rows cannot drift
+// apart on it (Law 16).
+const JOB_KEY_STAGE_RE = /_execute$/;
+const structureOfJobKey = (key) => String(key).replace(JOB_KEY_STAGE_RE, '');
+const MS_BUILT_RE = /🏁 STRUCTURE BUILT: '([^']+)'/;
+const MS_STANDING_RE = /🏠 STRUCTURE STANDING AT FIRST SWEEP: '([^']+)'/;
+const MS_START_RE = /🧪 Injected autonomous start signal/;
+
+// ── THE HEADFRAME CLOCK (Architect 2026-09-15) ───────────────────────────────────────────────────────────────
+// *"there should be an 11.5 minute timer when the bots start from nothing. and there should be a rating given to
+// the construction so when i return later, i remember why its important."* The bands and the reason are HIS,
+// authored in architect_config.HEADFRAME_CLOCK, so this lens may grade against them (Law 25 — a criterion the
+// asker supplied, read rather than invented here).
+//
+// START = THE START COMMAND (Architect 2026-09-15: *"it starts at a start command. once the bots begin then the
+// timer starts"*): the earliest `🧪 Injected autonomous start signal` any ROSTER bot wrote — start_injector's
+// line, reached the same way whether a body is born started or an operator types `start`. Wall-clock ISO, not
+// the [Nm Ss] tag, because that tag counts from each bot's own birth.
+// END = THE SHELL, NOT THE WHOLE STRUCTURE (Architect 2026-09-16: *"the last anchor doesent count as
+// finished. its the shelll thats the most important. so anchor 2 should lap the clock"*). What stops the
+// clock is the earliest `'headframe' anchor <graded_anchor> has no gating work left` — building_manager's
+// release line, the only line that states an anchor is DONE rather than implying it. The anchor index is
+// his, authored in architect_config.HEADFRAME_CLOCK.graded_anchor.
+//
+// THE WHOLE BUILD IS STILL MEASURED (*"i still want to know how long the entire thing takes"*): the earliest
+// `🏁 STRUCTURE BUILT: 'headframe'` from any bot is kept as `fullSec` and printed beside the grade. It is
+// reported and never graded — two numbers, and the renderer names which is which so the shell time can
+// never be read as the whole time (Law 25).
+// A headframe found standing at a bot's first sweep is a continued world and is reported untimed.
+// IT IS A GRADE AND NOTHING ELSE (*"its just a grade. it shouldnt pass or fail the run"*): no caller may turn it
+// into a check or a wake.
+// Returns { rating, elapsedSec, fullSec, spanSec, by, fullBy } — rating is GREEN | OK | LATE | ALERT |
+// PENDING | STANDING | NOT_STARTED, and elapsedSec is always the GRADED (shell) time.
+function headframeClock(seg) {
+  const cfg = require(require('./lens_paths').bot('Thinking_fragments/architect_config.js'));
+  const { HEADFRAME_CLOCK: clock, BOT_SENIORITY: roster } = cfg;
+  let startMs = null, lastMs = null, builtMs = null, builtBy = null, standing = false;
+  let shellMs = null, shellBy = null;
+  for (const l of seg) {
+    if (!l.iso || !l.bot || !(l.bot in roster)) continue;
+    const t = Date.parse(l.iso);
+    if (Number.isNaN(t)) continue;
+    if (lastMs === null || t > lastMs) lastMs = t;
+    let m;
+    if (MS_START_RE.test(l.raw) && (startMs === null || t < startMs)) startMs = t;
+    else if ((m = l.raw.match(MS_ANCHOR_DONE_RE)) && structureOfJobKey(m[1]) === clock.structure && +m[2] === clock.graded_anchor
+             && (shellMs === null || t < shellMs)) { shellMs = t; shellBy = l.bot; }
+    else if ((m = l.raw.match(MS_BUILT_RE)) && m[1] === clock.structure && (builtMs === null || t < builtMs)) { builtMs = t; builtBy = l.bot; }
+    else if ((m = l.raw.match(MS_STANDING_RE)) && m[1] === clock.structure) standing = true;
+  }
+  if (startMs === null) return { rating: 'NOT_STARTED', elapsedSec: null, fullSec: null, spanSec: null, by: null, fullBy: null, clock };
+  const spanSec = Math.max(0, Math.round((lastMs - startMs) / 1000));
+  const fullSec = builtMs === null ? null : Math.round((builtMs - startMs) / 1000);
+  // A CONTINUED WORLD IS UNTIMED WHETHER OR NOT AN ANCHOR LINE APPEARS. The standing test comes before the
+  // shell test because a headframe already up can still emit a release line during a repair, and timing
+  // that from the start command would report a repair as a build.
+  if (standing && builtMs === null) return { rating: 'STANDING', elapsedSec: null, fullSec: null, spanSec, by: null, fullBy: null, clock };
+  if (shellMs === null) {
+    return { rating: spanSec >= clock.alert_from_sec ? 'ALERT' : 'PENDING', elapsedSec: null, fullSec, spanSec, by: null, fullBy: builtBy, clock };
+  }
+  const elapsedSec = Math.round((shellMs - startMs) / 1000);
+  const rating = elapsedSec <= clock.green_within_sec ? 'GREEN'
+    : elapsedSec <= clock.ok_within_sec ? 'OK'
+    : elapsedSec < clock.alert_from_sec ? 'LATE' : 'ALERT';
+  return { rating, elapsedSec, fullSec, spanSec, by: shellBy, fullBy: builtBy, clock };
+}
+
+// ── THE CLOCK AS FIELDS (Architect 2026-09-16) ──────────────────────────────────────────────────────
+// This used to return prose lines (`HEADFRAME CLOCK: OK 🟡 shell closed at 11m 36s — at the edge of dusk`)
+// for runMilestones to print and for run.js to grep by that prefix. It now emits through data_out, so:
+//   · the GRADE survives as the `rating` value, and every threshold it was measured against is its own
+//     field beside it — a reader can re-derive the band without trusting the word.
+//   · the glyphs, the band sentence, the dusk/ALERT-LEVEL wording and `clock.why` are DELETED, not
+//     renamed. They said what the number MEANT, which is the reader's job; `why` is still authored in
+//     architect_config.HEADFRAME_CLOCK.why for anyone who wants the reason.
+//   · the prefixed `HEADFRAME CLOCK:` line is gone with the prose, so run.js's `startsWith` pick-up no
+//     longer matches. The grade is `rating` inside the `headframe_clock` section; run.js is another
+//     file's to re-point.
+// Shell time and whole-structure time keep SEPARATE field names (`shell_*` vs `whole_structure_*`) so
+// the graded number can never be read as the ungraded one — the job the old two-line split did.
+function emitHeadframeClock(hc) {
+  const { clock } = hc;
+  out.section('headframe_clock');
+  out.kv('structure', clock.structure);
+  out.kv('rating', hc.rating);
+  out.kv('graded_anchor', clock.graded_anchor);
+  out.kv('threshold_green_sec', clock.green_within_sec);
+  out.kv('threshold_ok_sec', clock.ok_within_sec);
+  out.kv('threshold_alert_sec', clock.alert_from_sec);
+  out.kv('shell_closed', hc.elapsedSec === null ? null : relativeTime(hc.elapsedSec));
+  out.kv('shell_closed_sec', hc.elapsedSec);
+  out.kv('shell_closed_by', hc.by);
+  out.kv('span', hc.spanSec === null ? null : relativeTime(hc.spanSec));
+  out.kv('span_sec', hc.spanSec);
+  if (hc.elapsedSec === null && hc.spanSec !== null) {
+    out.kv('green_remaining_sec', Math.max(0, clock.green_within_sec - hc.spanSec));
+  }
+  out.kv('standing_at_first_sweep', hc.rating === 'STANDING');
+  out.kv('start_command_seen', hc.rating !== 'NOT_STARTED');
+  out.kv('whole_structure_built', hc.fullSec !== null);
+  out.kv('whole_structure', hc.fullSec === null ? null : relativeTime(hc.fullSec));
+  out.kv('whole_structure_sec', hc.fullSec);
+  out.kv('whole_structure_by', hc.fullBy);
+  // Field names stay inside data_out's 28-column key gutter, or the padder clips them onto their own value.
+  out.kv('shell_to_whole_sec', hc.fullSec === null || hc.elapsedSec === null ? null : hc.fullSec - hc.elapsedSec);
+  out.kv('whole_structure_graded', false);
+}
 
 // `deadlineSec` is the ASKER'S CRITERION and it arrives as an argument for that reason (Law 25): the
 // Architect asks "was anchor 0 built within 10 minutes", so the number comes from him and the lens
@@ -61,6 +178,10 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
     if (!s) { s = { locked: null, center: null, by: null, gates: 0, firstGate: null, lastGate: null, first: null, last: null, total: null, anchors: new Map() }; sites.set(name, s); }
     return s;
   };
+  // The farm's row sites are measured by farm_lens as ONE structure, printed after the buildings, so their lock
+  // lines are left out of this site map rather than printed twice.
+  const farmLens = require('./farm_lens');
+  const { FARM_BLUEPRINT_NAME: farmRowPrefix, FARM_STRUCTURE: farmStructure } = require(require('./lens_paths').bot('Thinking_fragments/architect_config.js'));
   let maxRel = 0;
   for (const l of seg) {
     if (l.relSec == null) continue;
@@ -69,6 +190,7 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
     maxRel = Math.max(maxRel, l.relSec);
     let m;
     if ((m = l.raw.match(MS_LOCK_RE))) {
+      if (m[1].startsWith(farmRowPrefix)) continue;
       const s = site(m[1]);
       if (s.locked === null) { s.locked = l.relSec; s.center = m[2]; s.by = l.bot; }
     } else if ((m = l.raw.match(MS_GATE_RE))) {
@@ -86,6 +208,10 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
       // it: the integrity scan runs from the moment the site is locked, so treating its first appearance
       // as the start would report the build beginning before a single block was placed.
       if (s.first === null && +m[2] > 0) s.first = { t: l.relSec, c: +m[2], by: l.bot };
+    } else if ((m = l.raw.match(MS_BUILT_RE)) && m[1] !== farmStructure) {
+      // job_board's false→true edge — the one line that says the whole structure stands, not one anchor of it.
+      const s = site(m[1]);
+      if (!s.built) s.built = { t: l.relSec, by: l.bot };
     } else if ((m = l.raw.match(MS_ANCHOR_DONE_RE))) {
       // The job key ('headframe_execute'), not the blueprint name — matched by prefix so the row lands on
       // the structure a reader is asking about. An unmatched key is kept under its own name rather than
@@ -99,9 +225,22 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
     }
   }
 
-  console.log(`trace_monitor · milestones · ${traceName} · latest run · span [${relativeTime(maxRel)}]${botFilter ? ` · bot=${botFilter}` : ''}`);
-  console.log('(context only — never flags, never wakes; first-occurrence clock per establishment event)\n');
-  if (!sites.size) { console.log('(no build-site lines in the latest run yet)'); return; }
+  // The header's `(context only — never flags, never wakes …)` line is DELETED rather than given a field:
+  // it described what the lens is FOR, which is a claim about the output and not a measurement in it.
+  out.section('milestones');
+  out.kv('trace', traceName);
+  out.kv('span', relativeTime(maxRel));
+  out.kv('span_sec', maxRel);
+  out.kv('bot_filter', botFilter);
+  out.kv('build_sites', sites.size);
+  // The fleet's clock, not one bot's — so it ignores --bot and reads every roster bot in the run.
+  emitHeadframeClock(headframeClock(seg));
+  // THE FARM BLOCK IS PRINTED BY ITS OWN LENS. This used to take renderFarm's lines and console.log them
+  // here; with stdout owned by data_out there is no line-printer left in this file, and farm_lens is the
+  // file that owns how the farm answers. Its reducer runs twice on a --milestones call, which costs one
+  // pass over the segment and keeps the two lenses from drifting apart on rendering (Law 16).
+  const emitFarm = () => farmLens.runFarm({ seg, traceName, bot: botFilter, verbose });
+  if (!sites.size) { emitFarm(); return; }
 
   // A base layout locks all 32 wheat plots in the first second, and printing five lines for each buries
   // the one structure anybody is asking about under thirty-two identical "locked, nothing since" blocks.
@@ -111,57 +250,88 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
   const idle = [...sites].filter(([, s]) => !s.anchors.size && !s.last);
   const active = [...sites].filter(([, s]) => s.anchors.size || s.last);
   if (idle.length && !verbose) {
-    console.log(`${idle.length} site(s) locked with nothing since — no anchor gate, no integrity scan: ` +
-                `${idle.slice(0, 4).map(([n]) => n).join(', ')}${idle.length > 4 ? `, +${idle.length - 4} more` : ''}`);
-    console.log('  (--all prints them in full)\n');
+    // The `(--all prints them in full)` hint is deleted — it was instruction to the reader, not data. The
+    // truncation itself survives as a count, so nothing is silently dropped.
+    out.section('idle_sites');
+    out.kv('idle_sites', idle.length);
+    out.list('idle_site', idle.slice(0, 4).map(([n]) => n));
+    out.kv('idle_sites_not_listed', Math.max(0, idle.length - 4));
   }
   for (const [name, s] of (verbose ? [...sites] : active)) {
-    console.log(`${name}${s.total ? `  ·  ${s.total} structure cell(s)` : ''}`);
-    if (s.locked !== null) console.log(`  [${relativeTime(s.locked)}]  SITE LOCKED at (${s.center})  — ${s.by}`);
-    else console.log('  ──        SITE LOCKED: no lock line in this run (the site was already locked before it started)');
+    out.section('build_site');
+    out.kv('site', name);
+    out.kv('structure_cells', s.total);
+    out.kv('site_locked', s.locked === null ? null : relativeTime(s.locked));
+    out.kv('site_locked_sec', s.locked);
+    out.kv('site_locked_center', s.center);
+    out.kv('site_locked_by', s.by);
+    out.kv('anchors', s.anchors.size);
 
+    // ONE ROW PER ANCHOR, replacing the four prose lines each anchor used to print. Every number those
+    // lines carried has a column: the gate count, both gate times, both shortfall strings verbatim from
+    // the record, the completion time and bot, the lock→done span, and how long an unfinished anchor has
+    // been sitting gated. What is gone is the wording around them (`released to the next anchor`,
+    // `still gated … ago`), which asserted what the times meant.
+    const anchorRows = [];
+    const deadlineRows = [];
     for (const [idx, a] of [...s.anchors].sort((x, y) => x[0] - y[0])) {
-      if (a.firstGate !== null) {
-        console.log(`  [${relativeTime(a.firstGate)}]  anchor ${idx} GATED on materials — short: ${a.shortFirst}`);
-        if (a.gates > 1) console.log(`             …${a.gates} gate post(s), last at [${relativeTime(a.lastGate)}] still short: ${a.shortLast}`);
-      }
-      if (a.done !== null) {
-        console.log(`  [${relativeTime(a.done)}]  ⭑ ANCHOR ${idx} COMPLETE — released to the next anchor  (${a.doneBy})`);
-        if (s.locked !== null) console.log(`             ⇒ ${relativeTime(a.done - s.locked)} from site lock to anchor ${idx} done`);
-      } else if (a.firstGate !== null) {
-        console.log(`  ──        anchor ${idx} COMPLETE: NOT YET — still gated ${relativeTime(maxRel - a.lastGate)} ago at [${relativeTime(maxRel)}]`);
-      }
+      anchorRows.push([
+        idx, a.gates,
+        a.firstGate === null ? null : relativeTime(a.firstGate), a.shortFirst,
+        a.lastGate === null ? null : relativeTime(a.lastGate), a.shortLast,
+        a.done !== null,
+        a.done === null ? null : relativeTime(a.done), a.doneBy,
+        a.done !== null && s.locked !== null ? relativeTime(a.done - s.locked) : null,
+        a.done === null && a.lastGate !== null ? maxRel - a.lastGate : null,
+      ]);
       // The asker's criterion, measured from RUN START (relSec resets on each `start`) — not from site
       // lock, because "built within ten minutes" is a question about the run, and lock time is one of the
       // costs it is asking about. MISSED is asserted only when it can no longer change: an unfinished
       // anchor past the deadline is already over it, while an unfinished one inside it is PENDING and
       // must not be scored (Law 25 — never a verdict the evidence has not earned).
-      if (deadlineSec !== null) {
-        const verdict = a.done !== null
-          ? (a.done <= deadlineSec ? `✅ MET — done at [${relativeTime(a.done)}], ${relativeTime(deadlineSec - a.done)} to spare`
-                                   : `❌ MISSED — done at [${relativeTime(a.done)}], ${relativeTime(a.done - deadlineSec)} over`)
-          : (maxRel > deadlineSec ? `❌ MISSED — not complete, and the run is already at [${relativeTime(maxRel)}]`
-                                  : `⏳ PENDING — not complete, ${relativeTime(deadlineSec - maxRel)} of the budget left`);
-        console.log(`             ⇒ deadline ${relativeTime(deadlineSec)} for anchor ${idx}: ${verdict}`);
-      }
+      if (deadlineSec !== null) deadlineRows.push(deadlineRow(idx, a.done, maxRel, deadlineSec, a.gates + (a.done === null ? 0 : 1)));
+    }
+    if (anchorRows.length) {
+      out.table(['anchor', 'gates', 'first_gate', 'short_first', 'last_gate', 'short_last',
+        'complete', 'complete_at', 'complete_by', 'lock_to_complete', 'gated_for_sec'], anchorRows);
     }
     // An anchor that never posted a gate AND never completed leaves no row above, so a deadline asked
     // about it would silently print nothing — a missing verdict reading exactly like a passing one.
-    if (deadlineSec !== null && !s.anchors.has(0)) {
-      console.log(`             ⇒ deadline ${relativeTime(deadlineSec)} for anchor 0: ` +
-        `${maxRel > deadlineSec ? '❌ MISSED' : '⏳ PENDING'} — NO anchor-0 line at all in this run ` +
-        '(neither a materials gate nor a completion); the build never reached it');
+    // `anchor_lines` 0 is what says the verdict was reached on no evidence at all.
+    if (deadlineSec !== null && !s.anchors.has(0)) deadlineRows.unshift(deadlineRow(0, null, maxRel, deadlineSec, 0));
+    if (deadlineRows.length) {
+      out.section('anchor_deadlines');
+      out.kv('deadline', relativeTime(deadlineSec));
+      out.kv('deadline_sec', deadlineSec);
+      out.table(['anchor', 'verdict', 'complete', 'measured_at', 'margin_sec', 'anchor_lines'], deadlineRows);
     }
 
-    if (s.first) {
-      console.log(`  [${relativeTime(s.first.t)}]  ⭑ FIRST PLACEMENT — ${s.first.c}/${s.total} placed  (${s.first.by})`);
-      console.log(`             ⇒ ${relativeTime(s.first.t - (s.locked || 0))} from site lock to the first block in the ground`);
-    } else {
-      console.log(`  ──        FIRST PLACEMENT: NOT YET — ${s.last ? `${s.last.c}/${s.total} at [${relativeTime(s.last.t)}]` : 'no integrity scan seen'} after ${relativeTime(maxRel)}`);
-    }
-    if (s.last && s.first) console.log(`  [${relativeTime(s.last.t)}]  latest scan — ${s.last.c}/${s.total} placed`);
-    console.log('');
+    out.kv('first_placement', s.first ? relativeTime(s.first.t) : null);
+    out.kv('first_placement_sec', s.first ? s.first.t : null);
+    out.kv('first_placement_placed', s.first ? s.first.c : null);
+    out.kv('first_placement_by', s.first ? s.first.by : null);
+    out.kv('lock_to_first_placement', s.first ? relativeTime(s.first.t - (s.locked || 0)) : null);
+    out.kv('integrity_scan_seen', !!s.last);
+    out.kv('latest_scan', s.last ? relativeTime(s.last.t) : null);
+    out.kv('latest_scan_placed', s.last ? s.last.c : null);
+    out.kv('structure_built', !!s.built);
+    out.kv('built_at', s.built ? relativeTime(s.built.t) : null);
+    out.kv('built_by', s.built ? s.built.by : null);
+    out.kv('lock_to_built', s.built && s.locked !== null ? relativeTime(s.built.t - s.locked) : null);
   }
+  emitFarm();
+}
+
+// One deadline verdict as a ROW. `margin_sec` is the deadline minus the moment measured, so it is spare
+// time when positive and overrun when negative — one signed column in place of the two phrases (`to
+// spare` / `over`) the prose used to switch between. `measured_at` names what it was measured against:
+// the completion time when there is one, the run's span when there is not.
+function deadlineRow(anchor, doneSec, maxRel, deadlineSec, anchorLines) {
+  const measured = doneSec === null ? maxRel : doneSec;
+  const verdict = doneSec !== null
+    ? (doneSec <= deadlineSec ? 'MET' : 'MISSED')
+    : (maxRel > deadlineSec ? 'MISSED' : 'PENDING');
+  return [anchor, verdict, doneSec !== null, relativeTime(measured), deadlineSec - measured, anchorLines];
 }
 
 // ── THE TORCH CLOCK (--torch) ───────────────────────────────────────────────────────────────────
@@ -199,8 +369,14 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
 //
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --torch [--bot=B] [--deadline=10m]
 
-const TORCH_OK_RE     = /\bcrafted (\S+) x(\d+) → (\S+) have=(\d+)\/(\d+)/;
-const TORCH_BAD_RE    = /\bcraft (PARTIAL|FAILED) (\S+) x(\d+) → (\S+) have=(\d+)\/(\d+)/;
+// THE CRAFT OUTCOME IS READ OFF craft_handler's ONE `craft book` SUMMARY (craft_handler.js ~1324), the line
+// that carries every order's verdict AND the delta. This lens keyed on `crafted <item> xN → <item> have=a/b`
+// and `craft PARTIAL|FAILED …`, spellings no fragment writes any more, and on 2026-09-15 it printed
+// "NOT YET — no craft produced a torch" over a run whose book read `torch x12 ✓ … torch craft 11→15/12 (+4)`
+// twice. The book is: `craft book i/n order(s) — <order> | <order> | tables placed=… | crafts ok=… fail=… |
+// <notes joined by ' · '>`, each order `<item> xN ✓` · `<item> xN partial +M short S` · `<item> xN FAILED a/b`.
+const TORCH_BOOK_RE   = /craft book \d+\/\d+ order\(s\) — (.+?) \| tables placed=\d+ reused=\d+ \| crafts ok=\d+ fail=\d+ \| (.*)$/;
+const TORCH_ORDER_SEG = /^(\S+) x(\d+) (?:(✓)|partial \+(\d+) short (\d+)|FAILED (\d+)\/(\d+))$/;
 // The token before the job is CAPTURED rather than matched, and stays that way even though only one
 // spelling is live. The board has written it as a priority (`P23 supply/torch`) and as a band/rung pair
 // (`[bot/gather] supply/torch`), and a regex pinned to either reports "never ordered" on a run using the
@@ -217,7 +393,7 @@ const TORCH_GATE_RE   = /🚧 GATED (\S+) \(\d+\): (.+)$/;
 // prompted this lens did exactly that — four torches in the bot's inventory and the lens saying NOT YET,
 // which is a false negative that reads exactly like a true one (Law 25). The question is when a torch
 // first existed, not whether the order that made it was filled in whole.
-const TORCH_MADE_RE   = /\bcraft \d+→\d+\/\d+ \(\+(\d+)\)/;
+const TORCH_MADE_RE   = /\btorch craft (\d+)→(\d+)\/(\d+) \(\+(\d+)\)/;
 
 // A gate post carries several clauses separated by ' · ', and ONE clause may name several jobs
 // separated by ', ' — the night gate posts every job it stopped under a single reason. Both splits are
@@ -251,19 +427,17 @@ function runTorchClock({ seg = [], traceName = '?', bot: botFilter = null, deadl
     if (PASSIVE_LINE.test(l.raw)) continue;
     maxRel = Math.max(maxRel, l.relSec);
     let m;
-    if ((m = l.raw.match(TORCH_OK_RE))) {
-      // Either name may be the torch: the request is logged as asked for, the progress tag as the
-      // recipe resolved it, and a rename on either side must not make the craft invisible.
-      if (/torch/i.test(m[1]) || /torch/i.test(m[3])) {
-        const d = l.raw.match(TORCH_MADE_RE);
-        crafts.push({ t: l.relSec, bot: l.bot, outcome: 'CRAFTED', qty: +m[2], have: +m[4], target: +m[5], made: d ? +d[1] : +m[2] });
-      }
-    } else if ((m = l.raw.match(TORCH_BAD_RE))) {
-      if (/torch/i.test(m[2]) || /torch/i.test(m[4])) {
-        const d = l.raw.match(TORCH_MADE_RE);
-        // A FAILED batch carries no delta because nothing was made; 0 is the read, not a defaulted
-        // field (Law 13 — the absence here is the fact, and the line says so in words as well).
-        crafts.push({ t: l.relSec, bot: l.bot, outcome: m[1], qty: +m[3], have: +m[5], target: +m[6], made: d ? +d[1] : 0 });
+    if ((m = l.raw.match(TORCH_BOOK_RE))) {
+      const d = m[2].match(TORCH_MADE_RE);
+      for (const seg of m[1].split(' | ')) {
+        const o = seg.match(TORCH_ORDER_SEG);
+        if (!o || o[1] !== 'torch') continue;
+        // The delta note is the count that came into existence. A batch with no torch note made nothing (a
+        // FAILED order, or one already met on entry); 0 is the read, not a defaulted field (Law 13).
+        const outcome = o[3] ? 'CRAFTED' : o[4] ? 'PARTIAL' : 'FAILED';
+        const have = d ? +d[2] : o[6] != null ? +o[6] : null;
+        const target = d ? +d[3] : o[7] != null ? +o[7] : +o[2];
+        crafts.push({ t: l.relSec, bot: l.bot, outcome, qty: +o[2], have, target, made: d ? +d[4] : 0 });
       }
     } else if ((m = l.raw.match(TORCH_ORDER_RE))) {
       if (!order) order = { firstT: l.relSec, firstLane: m[1], firstNeed: +m[2] };
@@ -281,71 +455,91 @@ function runTorchClock({ seg = [], traceName = '?', bot: botFilter = null, deadl
     }
   }
 
-  console.log(`trace_monitor · torch clock · ${traceName} · latest run · span [${relativeTime(maxRel)}]${botFilter ? ` · bot=${botFilter}` : ''}`);
-  console.log('(first-occurrence clock for the torch chain — reports what happened; the numbers are printed, not judged)\n');
+  // The `(first-occurrence clock … the numbers are printed, not judged)` header line is deleted: it was a
+  // promise about the output, which the output's shape now makes rather than states.
+  out.section('torch_clock');
+  out.kv('trace', traceName);
+  out.kv('span', relativeTime(maxRel));
+  out.kv('span_sec', maxRel);
+  out.kv('bot_filter', botFilter);
 
   const productive = crafts.filter(c => c.made > 0);
   const first = productive[0];
-  console.log('FIRST TORCH CRAFT');
-  if (first) {
-    // The batch outcome rides ALONGSIDE the time rather than deciding whether there is one to print. A
-    // partial that made four torches answers "when was the first torch crafted" completely, and it also
-    // has to say it was short — both facts, neither suppressing the other.
-    const short = first.outcome === 'CRAFTED' ? '' : `  —  batch ${first.outcome}, asked ${first.qty}, ${first.target - first.have} still short`;
-    console.log(`  [${relativeTime(first.t)}]  ⭑ FIRST TORCH — ${first.made} made → have=${first.have}/${first.target}  (${first.bot})${short}`);
-    const total = productive.reduce((s, c) => s + c.made, 0);
-    const last = productive[productive.length - 1];
-    if (productive.length > 1) console.log(`             ⇒ ${productive.length} productive craft(s), ${total} torch(es); the last at [${relativeTime(last.t)}] → have=${last.have}/${last.target}`);
-  } else {
-    // NOT-YET is reported as not-happened rather than as a zero: a run that crafted no torch and a run
-    // that crafted zero torches are the same number and completely different facts (Law 25).
-    console.log(`  ──        NOT YET — no craft anywhere in this run produced a torch (span ${relativeTime(maxRel)})`);
-  }
-  // Every craft outcome that produced nothing, listed under the headline rather than in place of it.
-  for (const f of crafts.filter(c => c.made === 0)) {
-    console.log(`  [${relativeTime(f.t)}]  ⚠️ craft ${f.outcome} torch x${f.qty} — nothing made, have=${f.have}/${f.target}  (${f.bot})`);
+  out.section('first_torch');
+  // NOT-YET is reported as not-happened rather than as a zero: a run that crafted no torch and a run
+  // that crafted zero torches are the same number and completely different facts (Law 25). The boolean
+  // carries that, and every time field below it is absent rather than 0 when it is false.
+  out.kv('first_torch_crafted', !!first);
+  out.kv('first_torch_at', first ? relativeTime(first.t) : null);
+  out.kv('first_torch_sec', first ? first.t : null);
+  out.kv('first_torch_made', first ? first.made : null);
+  out.kv('first_torch_have', first ? first.have : null);
+  out.kv('first_torch_target', first ? first.target : null);
+  out.kv('first_torch_bot', first ? first.bot : null);
+  // The batch outcome rides ALONGSIDE the time rather than deciding whether there is one to print. A
+  // partial that made four torches answers "when was the first torch crafted" completely, and it also
+  // has to say it was short — both facts, neither suppressing the other.
+  out.kv('first_torch_outcome', first ? first.outcome : null);
+  out.kv('first_torch_asked', first ? first.qty : null);
+  out.kv('first_torch_short', first && first.have !== null ? first.target - first.have : null);
+  out.kv('productive_crafts', productive.length);
+  out.kv('torches_made', productive.reduce((s, c) => s + c.made, 0));
+  const last = productive[productive.length - 1];
+  out.kv('last_productive_at', last ? relativeTime(last.t) : null);
+  out.kv('last_productive_have', last ? last.have : null);
+  out.kv('last_productive_target', last ? last.target : null);
+
+  // Every craft outcome that produced nothing, as rows beside the headline rather than in place of it.
+  const barren = crafts.filter(c => c.made === 0);
+  out.kv('crafts_that_made_nothing', barren.length);
+  if (barren.length) {
+    out.table(['craft_at', 'outcome', 'asked', 'have', 'target', 'bot'],
+      barren.map(f => [relativeTime(f.t), f.outcome, f.qty, f.have, f.target, f.bot]));
   }
   if (deadlineSec !== null) {
-    const verdict = first
-      ? (first.t <= deadlineSec ? `✅ MET — crafted at [${relativeTime(first.t)}], ${relativeTime(deadlineSec - first.t)} to spare`
-                                : `❌ MISSED — crafted at [${relativeTime(first.t)}], ${relativeTime(first.t - deadlineSec)} over`)
-      // MISSED is asserted only once it can no longer change; inside the window it is PENDING and must
-      // not be scored, exactly as runMilestones treats an unfinished anchor.
-      : (maxRel > deadlineSec ? `❌ MISSED — no torch, and the run is already at [${relativeTime(maxRel)}]`
-                              : `⏳ PENDING — no torch yet, ${relativeTime(deadlineSec - maxRel)} of the budget left`);
-    console.log(`             ⇒ deadline ${relativeTime(deadlineSec)} for the first torch: ${verdict}`);
+    // MISSED is asserted only once it can no longer change; inside the window it is PENDING and must
+    // not be scored, exactly as runMilestones treats an unfinished anchor. Same row shape as the anchor
+    // deadlines, so one reading of `margin_sec` serves both.
+    const [, verdict, met, measuredAt, marginSec] = deadlineRow(0, first ? first.t : null, maxRel, deadlineSec, crafts.length);
+    out.section('torch_deadline');
+    out.kv('deadline', relativeTime(deadlineSec));
+    out.kv('deadline_sec', deadlineSec);
+    out.kv('verdict', verdict);
+    out.kv('crafted', met);
+    out.kv('measured_at', measuredAt);
+    out.kv('margin_sec', marginSec);
   }
-  console.log('');
 
-  console.log('THE ORDER ON THE BOARD');
-  if (order) {
-    console.log(`  [${relativeTime(order.firstT)}]  first posted — ${order.firstLane} supply/torch (need:${order.firstNeed})`);
-    if (order.lastT !== order.firstT || order.lastNeed !== order.firstNeed || order.lastLane !== order.firstLane) {
-      console.log(`  [${relativeTime(order.lastT)}]  last  posted — ${order.lastLane} supply/torch (need:${order.lastNeed})`);
-    }
-  } else {
-    console.log('  ──        the torch job never reached the board in this run — no posting in any band');
-    console.log('            (a job held by a gate is posted as GATED below, not as a board row)');
-  }
-  console.log('');
+  out.section('torch_order');
+  // The parenthetical about a gated job being posted below is deleted — it told the reader how to read
+  // the zero. The gate section beneath carries its own counts.
+  out.kv('order_posted', !!order);
+  out.kv('first_posted_at', order ? relativeTime(order.firstT) : null);
+  out.kv('first_posted_lane', order ? order.firstLane : null);
+  out.kv('first_posted_need', order ? order.firstNeed : null);
+  out.kv('last_posted_at', order ? relativeTime(order.lastT) : null);
+  out.kv('last_posted_lane', order ? order.lastLane : null);
+  out.kv('last_posted_need', order ? order.lastNeed : null);
 
-  console.log('GATES ON THE TORCH JOB — in order of first appearance');
-  if (!gateOrder.length) {
-    console.log('  ──        no gate post ever named a torch job in this run');
-  } else {
-    for (const key of gateOrder) {
-      const g = gates.get(key);
-      console.log(`  [${relativeTime(g.first)} → ${relativeTime(g.last)}]  x${g.n}  GATED ${g.reason} — ${g.why}  (${g.job})`);
-      console.log(`             short: ${g.shortFirst}${g.shortLast !== g.shortFirst ? `  →  ${g.shortLast} (last)` : ''}`);
-    }
+  out.section('torch_gates');
+  out.kv('gate_posts', gateOrder.reduce((s, k) => s + gates.get(k).n, 0));
+  out.kv('gate_rows', gateOrder.length);
+  if (gateOrder.length) {
+    // Rows in order of FIRST appearance, which is what makes the handoff legible.
+    out.table(['first_at', 'last_at', 'posts', 'reason', 'why', 'job', 'short_first', 'short_last'],
+      gateOrder.map(key => {
+        const g = gates.get(key);
+        return [relativeTime(g.first), relativeTime(g.last), g.n, g.reason, g.why, g.job, g.shortFirst, g.shortLast];
+      }));
     // THE HANDOFF IS THE POINT. One gate opening and a different one closing behind it is the single
     // fact a gate-count cannot show, and it is what separates "the fix did nothing" from "the fix
     // worked and something else stopped it" — the two readings a redesigned gate has to be told apart.
+    // The count of changes is the datum; the sentence that used to explain it is deleted.
     const reasons = [...new Set(gateOrder.map(k => gates.get(k).reason))];
-    if (reasons.length > 1) console.log(`  ⇒ the gate REASON changed ${reasons.length - 1} time(s): ${reasons.join(' → ')}`);
-    else console.log(`  ⇒ one gate reason for the whole run: ${reasons[0]}`);
+    out.kv('gate_reasons', reasons.length);
+    out.kv('gate_reason_changes', reasons.length - 1);
+    out.list('gate_reason_in_order', reasons);
   }
-  console.log('');
 }
 
-module.exports = { runMilestones, runTorchClock };
+module.exports = { runMilestones, runTorchClock, headframeClock };

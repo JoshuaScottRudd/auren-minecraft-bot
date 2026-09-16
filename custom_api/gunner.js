@@ -621,7 +621,8 @@ function serveTerrain(bot, near, shieldUp) {
       job.settled = true; job.ok = true; job.why = 'already_clear';
     } else {
       performDig(bot, at, block, TAG).then(
-        (r) => { job.settled = true; job.ok = !!(r && r.success); job.why = (r && r.reason) || (r && r.success ? 'dug' : 'dig_failed'); },
+        // performDig answers a bare boolean (true only when the cell re-senses passable), never { success }.
+        (r) => { job.settled = true; job.ok = r === true; job.why = r === true ? 'dug' : 'dig_failed'; },
         (e) => { job.settled = true; job.ok = false; job.why = `dig_threw:${e && e.message}`; });
     }
   } else {

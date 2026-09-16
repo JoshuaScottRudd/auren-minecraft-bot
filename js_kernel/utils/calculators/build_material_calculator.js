@@ -10,7 +10,7 @@ crafting_blueprints.json (boot snapshot, drift-warned, never a live read).
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
 
 const craftingRegistry = require('@kernel/crafting_blueprint_registry');
-const { hunt_items, farm_items, furnace_chain_items, group_to_item } = require('@utils/fragment_utils');
+const { hunt_items, farm_items, furnace_chain_items, group_to_item, substitutes_for } = require('@utils/fragment_utils');
 
 // Absence from the recipe book IS the definition of raw — there is no separate raw-material list to keep
 // in sync with it.
@@ -263,9 +263,18 @@ function debitFromBudget(budget, token, amount) {
 // node the leaf answer has already dissolved into logs. Two walks would answer it, and they would drift
 // (Law 16): the leaf walk and the node walk must agree about batch sizes and about what the pool already
 // covers, or the fleet keeps material nothing is waiting for and dumps material something is.
+// A SUBSTITUTE IS SPENT AFTER THE NAMED ITEM, AND BEFORE THE WALK DECIDES ANYTHING IS SHORT
+// (`substitutes_for`, fragment_utils). chainGate counts coal as charcoal when it admits a torch order; this
+// walk used to count charcoal alone, so the fulfiller reading it found "1 charcoal short" on a bot whose
+// home chest held five coal, and threw at supply_manager Step 6 on an order the gate had rightly admitted
+// (2026-09-15, TessaBot 4m50s). One table, spent here, is what makes the gate and the fulfiller agree.
 function spendAgainstBudget(item, quantity, budget, shortfall, depth, wanted) {
-  const spent = Math.min(countInInventory(item, budget), quantity);
+  let spent = Math.min(countInInventory(item, budget), quantity);
   if (spent > 0) debitFromBudget(budget, item, spent);
+  for (const alt of (substitutes_for[item] || [])) {
+    const take = Math.min(budget[alt] || 0, quantity - spent);
+    if (take > 0) { budget[alt] -= take; spent += take; }
+  }
   const still = quantity - spent;
   if (still <= 0) return;
 

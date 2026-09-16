@@ -28,9 +28,14 @@ require('../js_kernel/utils/developer_door').enter('monitoring/motion_classifier
 
 const path = require('path');
 const { readTrace, segmentRuns, buildEpisodes, jobToken } = require('./trace_read.js');
+const out = require('./data_out');
 
 const paths = require('./lens_paths');
-const KERNEL = paths.bot('js_kernel');
+// NO READER SPELLS A RECORD'S PATH — record_homes answers it, and this file was the one place still
+// guessing (found 2026-09-16). It read `js_kernel/watcher_<bot>.jsonl`, which is where traces lived
+// before they moved to `fleet_logs/traces/`; every run since has thrown ENOENT here. The rule exists
+// precisely so a move like that cannot leave a reader behind (Law 16).
+const TRACE_DIR = require(paths.bot('js_kernel/utils/record_homes')).TRACE_DIR;
 
 const args = process.argv.slice(2);
 const opt = (n, d) => { const h = args.find(a => a.startsWith(`--${n}=`)); return h ? h.split('=').slice(1).join('=') : d; };
@@ -189,7 +194,7 @@ function arcBreakdown(spans, segments) {
 // classification is identical, only the file it reads differs, which is why this is one argument rather
 // than a second entry point (Law 16).
 function computeSplit(bot, minSeg = MIN_SEG, traceFile = null) {
-  const seg = segmentRuns(readTrace(traceFile || path.join(KERNEL, `watcher_${bot}.jsonl`))).pop() || [];
+  const seg = segmentRuns(readTrace(traceFile || path.join(TRACE_DIR, `watcher_${bot}.jsonl`))).pop() || [];
   const spans = arcSpans(seg);
   const carve = spans.filter(a => CARVE_ARC.test(a.token));
   const inCarve = sec => carve.some(a => sec >= a.startSec && sec < a.endSec);
@@ -206,23 +211,32 @@ function main() {
   if (!split) { console.error(`motion_classifier: no MOVE/DO activity in ${BOT}'s latest run`); process.exit(1); }
   const { spans, segments, totMove, totDo } = split;
 
-  if (AS_JSON) { console.log(JSON.stringify({ bot: BOT, minSeg: MIN_SEG, segments }, null, 2)); return; }
+  if (AS_JSON) { out.json({ bot: BOT, minSeg: MIN_SEG, segments }); return; }
 
+  // OUTPUT IS DATA (Architect 2026-09-16). MOVE and DO are measured classes, not judgements — a second
+  // is whichever kind of line is in the majority within it. What left: the header sentence and the note
+  // naming footage_clipper as the consumer; who reads a table is not part of the table.
   const tot = totMove + totDo;
-  console.log(`motion_classifier · ${BOT} · latest run · min-segment ${MIN_SEG}s`);
-  console.log(`  MOVING ${mmss(totMove)} (${(100 * totMove / tot).toFixed(0)}%)  ·  DOING ${mmss(totDo)} (${(100 * totDo / tot).toFixed(0)}%)  ·  ${segments.length} segments\n`);
+  out.kv('lens', 'motion');
+  out.kv('bot', BOT);
+  out.kv('min_segment_sec', MIN_SEG);
+  out.kv('moving', mmss(totMove));
+  out.kv('moving_pct', Math.round(100 * totMove / tot));
+  out.kv('doing', mmss(totDo));
+  out.kv('doing_pct', Math.round(100 * totDo / tot));
+  out.kv('segments', segments.length);
 
-  console.log('  per-job split (moving vs doing within each arc):');
-  for (const r of arcBreakdown(spans, segments)) {
-    const mpct = Math.round(100 * r.move / (r.move + r.doo));
-    console.log(`    [${mmss(r.aStart)}] ${r.token.padEnd(26).slice(0, 26)} ${mmss(r.dur).padStart(6)}  MOVE ${String(mpct).padStart(3)}% / DO ${100 - mpct}%`);
-  }
+  out.section('split_by_arc');
+  out.table(['at', 'token', 'duration', 'move_pct', 'do_pct'],
+    arcBreakdown(spans, segments).map((r) => {
+      const mpct = Math.round(100 * r.move / (r.move + r.doo));
+      return [mmss(r.aStart), r.token, mmss(r.dur), mpct, 100 - mpct];
+    }));
 
-  console.log('\n  segment list (feeds footage_clipper — cut MOVE→moving/, DO→doing/):');
-  for (const s of segments) {
-    if (s.durSec < MIN_SEG) continue;
-    console.log(`    ${s.cls === 'MOVE' ? '🚶 MOVE' : '⛏️ DO  '} ${mmss(s.startSec)} → ${mmss(s.endSec)}  (${mmss(s.durSec)})`);
-  }
+  out.section('segments');
+  out.table(['class', 'start', 'end', 'duration'],
+    segments.filter(s => s.durSec >= MIN_SEG)
+      .map(s => [s.cls, mmss(s.startSec), mmss(s.endSec), mmss(s.durSec)]));
 }
 
 if (require.main === module) main();

@@ -50,7 +50,7 @@ function whatIsBehindIt() {
   console.log('    Auren_Workshop/fleet_control.js    the world and the fleet, verb by verb');
   console.log('    monitoring/trace_monitor.js        what a run actually did, through its lenses');
   console.log('    Auren_Workshop/tools/              the benches: combat, siting, pathfinding, seeds, latency');
-  console.log('    Auren_Workshop/camera/             the camera crew and the OBS bridge');
+  console.log('    Auren_Workshop/camera/             the camera crew (watch a run through it; nothing records)');
   console.log('');
   console.log('  It changes NOTHING about how the bots play. No bot process reads this setting, and');
   console.log('  `node start_auren.js` behaves identically either way.');

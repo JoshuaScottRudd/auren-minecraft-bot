@@ -131,7 +131,7 @@ function scan(bot) {
       found.push({ x: cell.x, y: cell.y, z: cell.z, d2: dx * dx + dz * dz });
     }
   }
-  found.sort((a, b) => a.d2 - b.d2);                    // nearest the center first — light inward-out
+  found.sort((a, b) => a.d2 - b.d2);                // nearest the center first — light inward-out
   const darkCount = found.length;
   const truncated = darkCount > MAX_REPORT;
   const darkCells = found.slice(0, MAX_REPORT).map(({ x, y, z }) => ({ x, y, z }));

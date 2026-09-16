@@ -55,7 +55,8 @@
 //      to run from an arbitrary origin, so the origin is the headframe centre. NOT lanista's arena_sites:
 //      that is a tool reached over RCON, and a fragment reaching into it would cross the tool/production
 //      boundary to get a scan production already owns.
-//   3. Nothing sited → no teleport. Vanilla already puts the bot at world spawn.
+//   3. Nothing sited → the body stays where vanilla put it, UNLESS that is inside the spawn-protected
+//      square, in which case leaving the square is the recovery (`noHome` below, and the note on it).
 //
 // THE +1 IS APPLIED ONCE, HERE, AND IT IS THE SAME +1 FOR BOTH TIERS. Every tier returns the FLOOR block
 // and the feet go one above it: the headframe's anchor 0 sits at relative [-4,1,0] with the voxel above it
@@ -96,6 +97,30 @@ const SPAWN_SPOT_MAX_DISTANCE = 48;
 const recovery = require('@kernel/body_recovery');
 const { isDead, reviveBody, teleportTo, anchorZeroPoint, ARRIVAL_TOLERANCE } = recovery;
 
+// ── THE THIRD TIER IS NOT "STAY PUT" ANY MORE (Architect 2026-09-15) ────────────────────────────────
+// *"it should be the highest bot task. check if in spawn area. very first task is to move 50 blocks outside
+// of it."*
+//
+// A VANILLA RESPAWN WITH NO BED LANDS AT WORLD SPAWN, which is the centre of the one square where this
+// fleet can neither break nor place — so the tier that teleports nowhere was, in the exact case it fires
+// (no headframe locked, i.e. the whole early game and the most death-prone window there is), the tier that
+// parks the body inside the keep-out and leaves it there. The desk refuses to LAUNCH a crew within 50 blocks
+// of world spawn (foreman.js, PERSON_CLEAR_OF_SPAWN) and nothing held the same line on the way back from a
+// death. This closes that asymmetry: the same number, the same metric, measured by the same module.
+//
+// THE SITE IS FOUND, NEVER ASSUMED. `find_buildingspot.locate` is the fleet's one site scan and it already
+// refuses a footprint touching the square, so "somewhere a body fits, clear of spawn" is asked of the
+// production scanner from an origin set outside the square rather than computed here (Law 16). When it finds
+// nothing the body genuinely stays put — and the verdict SAYS it is standing in the square (Law 25), instead
+// of reading like an ordinary fallthrough.
+const { isSpawnProtectedAt, worldSpawnPoint, chebyshevFromWorldSpawn } = require('@perception/spawn_protection');
+const { PERSON_CLEAR_OF_SPAWN } = require('@thinking/architect_config');
+
+// How far past the clearance the search ORIGIN is set. The scan grows outward from its origin, so an origin
+// sitting exactly on the line returns candidates on both sides of it and half of them fail the clearance
+// test below for the sake of a block or two.
+const CLEAR_SEARCH_MARGIN = 8;
+
 // anchorZeroBuilt(bot, blueprintName, field) → does anchor 0 owe any work?
 // Safety is inherited, not re-derived: an anchor with nothing left to place and
 // nothing left to dig is a floor that is actually there. An absent or unreadable anchor 0 returns false —
@@ -110,6 +135,45 @@ function anchorZeroBuilt(bot, blueprintName, field) {
   const a0 = Array.isArray(scan.anchor_status) ? scan.anchor_status.find((a) => a.anchor_index === 0) : null;
   if (!a0) return false;
   return a0.place_count === 0 && a0.dig_count === 0;
+}
+
+// noHome(bot, why) → the third tier, which is "leave the square" when the body is standing in it and
+// "stay put" when it is not. EVERY world-spawn return in the ladder below goes through here, because every
+// one of them means the same thing — this crew has nowhere to come back to — and the body's position is the
+// only thing that decides whether that is a problem. Async because finding the site is a scan.
+async function noHome(bot, why) {
+  const here = bot?.entity?.position;
+  if (!isSpawnProtectedAt(bot, here)) return { kind: 'world_spawn', at: null, why };
+
+  const spawnAt = worldSpawnPoint(bot);
+  if (!spawnAt) {
+    return { kind: 'world_spawn', at: null, why: `${why} — and the body is at a world spawn this fleet cannot locate, so no clearance can be measured` };
+  }
+  const findSpot = require('@action/find_buildingspot.js');
+  const { building, dims } = findSpot.loadBlueprintDims('spawn_spot');
+  const reach = PERSON_CLEAR_OF_SPAWN + CLEAR_SEARCH_MARGIN;
+  const result = await findSpot.locate(bot, {
+    blueprintName: 'spawn_spot',
+    building,
+    dims,
+    origin: { x: spawnAt.x + reach, y: Math.floor(here.y), z: spawnAt.z },
+    requireShaft: false,
+    requireDirtGround: false,
+    existingFootprints: findSpot.getExistingFootprints(),
+  });
+  const c = result && result.found && result.candidate && result.candidate.build_center;
+  if (!c || !Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) {
+    return { kind: 'world_spawn', at: null, why: `${why}, AND THE BODY IS STANDING IN THE SPAWN-PROTECTED SQUARE — no clear site was found to move it to (${result?.reason || 'no candidate'}), so every dig and placement it attempts from here will be refused` };
+  }
+  const out = chebyshevFromWorldSpawn(bot, c);
+  if (out < PERSON_CLEAR_OF_SPAWN) {
+    return { kind: 'world_spawn', at: null, why: `${why}, AND THE BODY IS STANDING IN THE SPAWN-PROTECTED SQUARE — the nearest site found is only ${out}b out, inside the ${PERSON_CLEAR_OF_SPAWN}b clearance` };
+  }
+  return {
+    kind: 'clear_of_spawn',
+    at: { x: c.x, y: c.y + 1, z: c.z },
+    why: `${why}; the respawn put the body inside the spawn-protected square, so leaving it comes before any work — this site is ${out}b out, past the ${PERSON_CLEAR_OF_SPAWN}b clearance the desk requires of a person`,
+  };
 }
 
 // recoveryPoint(bot) → { kind, at, why }.
@@ -170,16 +234,12 @@ async function recoveryPoint(bot) {
         why: `no house is sited yet, so home is ${owner} — standing where they stand, which is ground a person is already occupying`,
       };
     }
-    return {
-      kind: 'world_spawn',
-      at: null,
-      why: `no contractor house is sited yet and ${owner} could not be located (${read.ok ? 'not in the world' : read.reason}) — nothing to come back to`,
-    };
+    return noHome(bot, `no contractor house is sited yet and ${owner} could not be located (${read.ok ? 'not in the world' : read.reason}) — nothing to come back to`);
   }
 
   const buildCenter = readBuildCenter('headframe');
   if (!buildCenter || typeof buildCenter.x !== 'number') {
-    return { kind: 'world_spawn', at: null, why: 'no headframe centre is locked — nothing is sited yet, so vanilla world spawn is the plan' };
+    return noHome(bot, 'no headframe centre is locked — nothing is sited yet');
   }
 
   // ── TIER 1 ──
@@ -214,7 +274,7 @@ async function recoveryPoint(bot) {
     if (result && result.found && result.candidate) {
       const d = result.distFromOrigin;
       if (typeof d === 'number' && d > SPAWN_SPOT_MAX_DISTANCE) {
-        return { kind: 'world_spawn', at: null, why: `nearest spawn_spot is ${Math.round(d)}b from the headframe, past the ${SPAWN_SPOT_MAX_DISTANCE}b recovery radius — that is a second base, not a way home` };
+        return noHome(bot, `nearest spawn_spot is ${Math.round(d)}b from the headframe, past the ${SPAWN_SPOT_MAX_DISTANCE}b recovery radius — that is a second base, not a way home`);
       }
       // A candidate's position is `build_center`, NOT bare x/y/z on the candidate itself — see
       // find_buildingspot.makeCandidate, which is the one place that shape is authored.
@@ -229,7 +289,7 @@ async function recoveryPoint(bot) {
         // Not a throw: the scan is an environmental read and a candidate that cannot be expressed as a
         // cell is a world fact, not a coding fault. It drops to the tier below with the reason intact.
         watcher.warn(TAG, `spawn_spot scan returned a candidate with no usable build_center (${JSON.stringify(result.candidate)}) — falling to world spawn rather than teleporting to a cell that does not exist.`);
-        return { kind: 'world_spawn', at: null, why: 'the spawn_spot candidate carried no usable position — staying where vanilla put the body' };
+        return noHome(bot, 'the spawn_spot candidate carried no usable position');
       }
       return {
         kind: 'spawn_spot',
@@ -237,7 +297,7 @@ async function recoveryPoint(bot) {
         why: `headframe anchor 0 is not built, so the nearest spawn_spot${typeof d === 'number' ? ` (${Math.round(d)}b out)` : ''} is the recovery point`,
       };
     }
-    return { kind: 'world_spawn', at: null, why: `no spawn_spot site found near the headframe (${result?.reason || 'unknown'}) — staying where vanilla put the body` };
+    return noHome(bot, `no spawn_spot site found near the headframe (${result?.reason || 'unknown'})`);
   }
 }
 

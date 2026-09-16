@@ -73,10 +73,14 @@ const OVERSEER_PORT = Number(process.env.OVERSEER_PORT) || 3001;
 // second answer (Law 16).
 const WORLD = require('./your_server');
 const FLAGS = [
+  { flag: 'server-folder', env: 'AUREN_SERVER_DIR', help: "the folder your Minecraft server runs in (the one holding server.properties)" },
   { flag: 'host', def: WORLD.host, help: 'server address the foreman connects to' },
   { flag: 'port', def: String(WORLD.port), help: 'server port' },
-  { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', help: "your server's rcon.password — how the crew gets brought to you" },
-  { flag: 'rcon-port', env: 'AUREN_RCON_PORT', help: "your server's rcon.port  (default: 25575)" },
+  // The console password and port as FLAGS are the machine hand-off — `Auren_Workshop/run.js` passes a
+  // password its host already minted. A person never types one: with `--server-folder` known, this script
+  // sets the console up and mints the password itself (see `prepareOwnServer` below).
+  { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', help: "a console password already set up by a launcher above this one" },
+  { flag: 'rcon-port', env: 'AUREN_RCON_PORT', help: "that console's port  (default: 25575)" },
   // 'sweep' (default) empties fleet_logs/ because this door is the start of a run. 'keep' is for a
   // caller that IS the start and already swept — see the sweep site below for what the second sweep did.
   { flag: 'records', def: 'sweep', help: "'sweep' empties fleet_logs/ first (default) · 'keep' if your launcher already did" },
@@ -86,26 +90,21 @@ function usage() {
   console.log(`
   Start Auren: the desk you hire bots from, and the referee that keeps them apart.
 
-    node start_auren.js --rcon-password <your server's rcon password>
+    node start_auren.js --server-folder <the folder your Minecraft server runs in>
 
+    --server-folder <dir>   where your server runs — REQUIRED, see below
     --host <address>        server address the foreman connects to  (default: ${WORLD.host})
     --port <n>              server port  (default: ${WORLD.port})
-    --rcon-password <pw>    your server's rcon.password — REQUIRED, see below
-    --rcon-port <n>         your server's rcon.port  (default: ${WORLD.rconPort})
     --help                  this text
 
-  Those defaults are read from your_server.js, beside this file. Edit that once instead of typing
-  --host and --port every time.
+  Put serverFolder in your_server.js, beside this file, and you never type it again.
 
-  Your server needs a console, and these two lines in server.properties turn it on:
-
-      enable-rcon=true
-      rcon.password=<pick anything>
-
-  Then pass that same password with --rcon-password. This is how a bot gets
-  brought to where you are standing, which is the only place it will start
-  working from. Without it nothing can be placed, so nothing starts — and this
-  script says so at once rather than leaving you with a bot standing still.
+  Auren sets your server up for itself, and prints every change it makes and why:
+      online-mode=false       the bots have no Minecraft accounts
+      enable-rcon=true        the crew is brought to you through the server console
+      rcon.password=<random>  a new one each time Auren starts before your server
+  A server only reads those when it starts, so start your server after Auren (or
+  restart it when Auren asks) and Auren carries on by itself.
 
   What happens:
     A foreman joins your world. No bots start yet. Walk to where you want them
@@ -128,6 +127,79 @@ function usage() {
 function die(message) {
   console.error('\n  ' + message + '\n');
   process.exit(1);
+}
+
+// ── prepareOwnServer — THE CONSOLE IS SET UP BY THE BOT, AND IT SAYS SO LOUDLY (2026-09-14) ──────────────
+// *"if the bot cannot run without it then its a useless step to stop for human verification. it should
+// instead report loudly what it did and why."* The settings and the one-time password are written by
+// `server_settings` (the one writer); this function owns the part only a launcher can: finding the folder,
+// sensing whether the server is up, printing what changed, and waiting for the server to read it.
+//
+// A SERVER READS server.properties ONLY WHEN IT STARTS. That single fact decides the three cases:
+//   down at start          → settings written, password minted; wait for the person to start it.
+//   up, nothing to change  → the file's password is the running server's; carry on at once.
+//   up, something changed  → the running server still has the old settings; wait for it to go down and
+//                            come back, which is a restart only the person who started it can do.
+// Waiting is bounded (Law 8: nothing here outlives a person who walked away) and names what it waited for.
+const WAIT_LIMIT_MS = 10 * 60 * 1000;
+const POLL_MS = 2000;
+
+async function waitUntil(sensed, waitingFor) {
+  const started = Date.now();
+  let lastSaid = started;
+  while (!(await sensed())) {
+    if (Date.now() - started > WAIT_LIMIT_MS) {
+      die(`Waited ${WAIT_LIMIT_MS / 60000} minutes for ${waitingFor}, and it did not happen. Nothing was launched.\n`
+        + `  The settings Auren wrote are still in server.properties — start Auren again when your server is ready.`);
+    }
+    if (Date.now() - lastSaid >= 30000) {
+      console.log(`  still waiting for ${waitingFor}  (Ctrl-C to stop)`);
+      lastSaid = Date.now();
+    }
+    await new Promise(r => setTimeout(r, POLL_MS));
+  }
+}
+
+async function prepareOwnServer() {
+  const found = require('./js_kernel/utils/workstation').findServerDir();
+  if (!found.dir) {
+    die(`Auren needs to know where your Minecraft server runs, so it can switch on the server console it\n`
+      + `  brings your crew through. Nothing was launched.\n\n`
+      + `  Tell it once, either way:\n`
+      + `      node start_auren.js --server-folder "C:\\path\\to\\your\\server"\n`
+      + `      or put that folder in serverFolder in your_server.js, beside this file\n\n`
+      + `  It is the folder holding server.properties. Looked in: ${found.tried.join(', ')}`);
+  }
+  const settings = require('./js_kernel/utils/server_settings');
+  const gamePort = settings.serverPort(found.dir);
+  const upAtStart = await settings.serverAnswers(gamePort);
+  const prep = settings.prepare(found.dir, { serverUp: upAtStart });
+
+  process.env.AUREN_RCON_PASSWORD = prep.password;
+  process.env.AUREN_RCON_PORT = String(prep.rconPort);
+
+  if (prep.changes.length) {
+    console.log(`\n  ══ AUREN CHANGED YOUR SERVER SETTINGS ══════════════════════════════════════════`);
+    console.log(`  in ${prep.file}\n`);
+    for (const c of prep.changes) console.log(`    ${c.key}\n        why: ${c.why}`);
+    if (prep.changes.some(c => c.key.startsWith('online-mode'))) {
+      console.log(`\n    NOTE: in offline mode a server checks no accounts. If people outside your home can`
+        + `\n    reach it, anyone can join under any name — keep it private or turn on the whitelist.`);
+    }
+    console.log(`  ════════════════════════════════════════════════════════════════════════════════`);
+  } else {
+    console.log(`\n  server settings: ${prep.file} already has what Auren needs — nothing changed.`);
+  }
+
+  if (!upAtStart) {
+    console.log(`\n  Your server is not running. Start it now — Auren is waiting and carries on by itself.`);
+    await waitUntil(() => settings.serverAnswers(prep.rconPort), `your server's console on port ${prep.rconPort}`);
+  } else if (prep.changes.length) {
+    console.log(`\n  Your server is running on the settings it read when it started, so the changes above`
+      + `\n  are not live yet. Restart it — stop it, then start it — and Auren carries on by itself.`);
+    await waitUntil(async () => !(await settings.serverAnswers(gamePort)), `your server to stop`);
+    await waitUntil(() => settings.serverAnswers(prep.rconPort), `your server's console on port ${prep.rconPort}`);
+  }
 }
 
 const argv = process.argv.slice(2);
@@ -154,6 +226,10 @@ const port = given.port || String(WORLD.port);
 // leaves the variable untouched, so a machine that already exports it is unchanged.
 if (given['rcon-password'] !== undefined) process.env.AUREN_RCON_PASSWORD = given['rcon-password'];
 if (given['rcon-port'] !== undefined) process.env.AUREN_RCON_PORT = given['rcon-port'];
+// The server folder takes the same route to the one resolver that answers "which server folder"
+// (`workstation.findServerDir` reads AUREN_SERVER_DIR): the flag wins, then `your_server.js`.
+if (given['server-folder'] !== undefined) process.env.AUREN_SERVER_DIR = given['server-folder'];
+else if (!process.env.AUREN_SERVER_DIR && WORLD.serverFolder) process.env.AUREN_SERVER_DIR = WORLD.serverFolder;
 
 // ── A CONSOLE PASSWORD WRITTEN IN `your_server.js` HAS TO REACH THE PROBE (2026-09-11) ──────────────
 // Without this the file is a page you can fill in that does nothing: `rcon_link.credentials()` reads the
@@ -182,18 +258,23 @@ if (!process.env.AUREN_RCON_PASSWORD && WORLD.rconPassword) {
   // ASKED ONCE, HERE, because this is the one moment the answer is cheap and the person is still at the
   // keyboard expecting to configure something. The reason comes back raw from `rcon_link.probe` and the
   // sentence a person acts on is composed here, where the flag names actually live (Law 25).
+  //
+  // A LAUNCHER ABOVE THIS ONE MAY ALREADY HAVE SET THE CONSOLE UP and handed its password down
+  // (`host_and_run` → `run.js` → here). Then this door touches no file: the fleet is TOLD, and it asks.
+  // Otherwise the console is this door's to set up, from the server folder it was given.
+  const told = !!process.env.AUREN_RCON_PASSWORD;
+  if (!told) await prepareOwnServer();
   const reach = await require('./js_kernel/utils/rcon_link').probe();
   if (!reach.ok) {
     die(`Auren cannot reach your server's console, so it could not bring a crew to you — and a bot that\n`
       + `  cannot be placed does not start. Nothing was launched.\n\n`
       + `  What the console said: ${reach.reason}\n\n`
-      + `  Two lines in your server's server.properties turn it on:\n\n`
-      + `      enable-rcon=true\n`
-      + `      rcon.password=<pick anything>\n\n`
-      + `  Restart the server, then start Auren with that same password:\n\n`
-      + `      node start_auren.js --rcon-password <that password>\n\n`
-      + `  If your rcon.port is not ${WORLD.rconPort}, pass --rcon-port too.\n\n`
-      + `  To stop typing it every time, put the password and port in your_server.js beside this file.`);
+      + (told
+        ? `  The console password came from the launcher that started this script, and the server refused it.\n`
+          + `  That launcher's server is not the one answering on port ${process.env.AUREN_RCON_PORT || WORLD.rconPort}.`
+        : `  Auren set your server up and it is running, but its console refused the password in\n`
+          + `  server.properties. The server was started before that file last changed — restart it and\n`
+          + `  run Auren again.`));
   }
 
   // ── NO RECORD SURVIVES A RUN (Architect 2026-08-31, STANDING) ───────────────────────────────────

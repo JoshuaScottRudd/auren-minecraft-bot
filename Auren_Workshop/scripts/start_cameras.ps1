@@ -7,7 +7,8 @@
 # because the server runs offline-mode - no extra accounts, no extra purchases, ever.
 #
 # What this script does, in order, every time:
-#   1. Finds Prism Launcher (portable, in tools\PrismLauncher). Downloads it if missing.
+#   1. Finds Prism Launcher (the workstation resolver: Auren_Workshop\camera\clients\PrismLauncher, then an
+#      installed Prism). Downloads the portable build into that bot folder if there is none.
 #   2. Reads the server's Minecraft version from its log (currently 1.21.5) and creates one
 #      launcher instance per camera, pinned to that version. Re-run safe: existing instances
 #      are kept, version drift is corrected automatically after a server upgrade.
@@ -39,8 +40,8 @@
 # NOTE the switch is -HostSeat and not -Host: $Host is a PowerShell automatic variable (the host UI
 # object), so a parameter of that name would shadow it inside this script.
 #
-# After the windows open: click into each one, press F1 (hides the hotbar - clean footage). The
-# titler names each window Cam_<Bot>, so in ONE OBS instance add a Window Capture per camera
+# After the windows open: click into each one, press F1 (hides the hotbar - clean view). Nothing here
+# records. To record with your own OBS: the titler names each window Cam_<Bot>, so in ONE OBS instance add a Window Capture per camera
 # (method "Windows 10 (1903+)", priority "Match title") and it locks to the right window even
 # after a restart -- no per-bot OBS, no re-picking. Window Capture (not Display Capture) is right
 # here: it grabs a specific window regardless of position/overlap (pauseOnLostFocus:false keeps
@@ -117,18 +118,15 @@ Assert-DeveloperMode 'Auren_Workshop/scripts/start_cameras.ps1'
 # carries its instance name and the director's processes carry camera_rig.js. Process order and window
 # titles are not identity here (the titler's header has the long form of why).
 
-# THREE HOPS TO THE REPO ROOT, not two (2026-09-10): the workshop moved inside the bot, so
-# scripts -> Auren_Workshop -> Auren_Bot -> repo root. `tools\PrismLauncher` (the 1.1 GB camera crew)
-# is the Architect's own equipment at the repo root; looked for under `Auren_Bot/` this script would
-# decide Prism was not installed and offer to download it again. The server folder is NOT computed here:
-# it is the workstation resolver's answer, asked once node is resolved below.
+# NOTHING HERE LOOKS ABOVE THE BOT (2026-09-14). Prism and the server folder are both the workstation
+# resolver's answers, asked once node is resolved below: a download keeps Prism inside the bot at
+# Auren_Workshop\camera\clients\PrismLauncher, and the Architect's machines name their own folder in their
+# workstation file. Until that day this script computed three hops up and put 1.1 GB in `tools\` beside
+# the bot — somebody else's disk on a stranger's machine.
 $scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $workshopDir  = Split-Path -Parent $scriptDir
 $botRoot      = Split-Path -Parent $workshopDir
-$repoRoot     = Split-Path -Parent $botRoot
-$toolsDir     = Join-Path $repoRoot 'tools'
-$prismDir     = Join-Path $toolsDir 'PrismLauncher'
-$prismExe     = Join-Path $prismDir 'prismlauncher.exe'
+$clientsDir   = Join-Path $workshopDir 'camera\clients'
 $fleetControl = Join-Path $workshopDir 'fleet_control.js'
 
 # ---- -Down: reap what this script raises, and nothing else -----------------------------------
@@ -299,34 +297,34 @@ function Set-InstanceCfgLine([string]$File, [string]$Key, [string]$Value) {
     [IO.File]::WriteAllText($File, ($out -join "`n") + "`n", $utf8NoBom)
 }
 
-# ---- Step 1: Prism Launcher (portable, lives inside the repo's tools folder) --------------
-if (-not (Test-Path $prismExe)) {
-    # Also accept a normally-installed Prism before downloading anything.
-    $installed = Join-Path $env:LOCALAPPDATA 'Programs\PrismLauncher\prismlauncher.exe'
-    if (Test-Path $installed) {
-        $prismExe = $installed
-        $prismDir = Split-Path -Parent $installed
-        Write-Host "Using installed Prism Launcher: $prismExe"
-    } else {
-        Write-Host 'Prism Launcher not found - downloading the portable build (one time)...'
-        try {
-            $rel = Invoke-RestMethod 'https://api.github.com/repos/PrismLauncher/PrismLauncher/releases/latest' `
-                       -Headers @{ 'User-Agent' = 'Auren-camera-rig' }
-            $asset = $rel.assets | Where-Object { $_.name -match 'Windows-MSVC-portable' -and $_.name -notmatch 'arm64' -and $_.name -match '\.zip$' } | Select-Object -First 1
-            if (-not $asset) { throw 'no Windows portable zip in the latest release' }
-            $zip = Join-Path $env:TEMP $asset.name
-            Write-Host "  $($asset.name) ($([math]::Round($asset.size / 1MB, 1)) MB)"
-            Invoke-WebRequest $asset.browser_download_url -OutFile $zip -Headers @{ 'User-Agent' = 'Auren-camera-rig' }
-            New-Item -ItemType Directory -Force $prismDir | Out-Null
-            Expand-Archive $zip -DestinationPath $prismDir -Force
-            Remove-Item $zip
-            Write-Host "  Installed to $prismDir"
-        } catch {
-            Write-Host "Automatic download failed ($($_.Exception.Message))."
-            Write-Host 'Manual fallback: https://prismlauncher.org/download/ - pick "Portable (zip)",'
-            Write-Host "extract into $prismDir so prismlauncher.exe sits directly inside, then re-run."
-            exit 1
-        }
+# ---- Step 1: Prism Launcher (the resolver's answer; downloaded into the bot if there is none) ------
+$workstation = Join-Path $botRoot 'js_kernel\utils\workstation.js'
+$prismExe = & $node $workstation prism 2>$null
+if ($LASTEXITCODE -eq 0 -and $prismExe) {
+    $prismExe = "$prismExe".Trim()
+    $prismDir = Split-Path -Parent $prismExe
+    Write-Host "Using Prism Launcher: $prismExe"
+} else {
+    $prismDir = "$(& $node $workstation prism-home)".Trim()
+    $prismExe = Join-Path $prismDir 'prismlauncher.exe'
+    Write-Host "Prism Launcher not found - downloading the portable build (one time, ~1 GB with game files) into $prismDir ..."
+    try {
+        $rel = Invoke-RestMethod 'https://api.github.com/repos/PrismLauncher/PrismLauncher/releases/latest' `
+                   -Headers @{ 'User-Agent' = 'Auren-camera-rig' }
+        $asset = $rel.assets | Where-Object { $_.name -match 'Windows-MSVC-portable' -and $_.name -notmatch 'arm64' -and $_.name -match '\.zip$' } | Select-Object -First 1
+        if (-not $asset) { throw 'no Windows portable zip in the latest release' }
+        $zip = Join-Path $env:TEMP $asset.name
+        Write-Host "  $($asset.name) ($([math]::Round($asset.size / 1MB, 1)) MB)"
+        Invoke-WebRequest $asset.browser_download_url -OutFile $zip -Headers @{ 'User-Agent' = 'Auren-camera-rig' }
+        New-Item -ItemType Directory -Force $prismDir | Out-Null
+        Expand-Archive $zip -DestinationPath $prismDir -Force
+        Remove-Item $zip
+        Write-Host "  Installed to $prismDir"
+    } catch {
+        Write-Host "Automatic download failed ($($_.Exception.Message))."
+        Write-Host 'Manual fallback: https://prismlauncher.org/download/ - pick "Portable (zip)",'
+        Write-Host "extract into $prismDir so prismlauncher.exe sits directly inside, then re-run."
+        exit 1
     }
 }
 
@@ -665,7 +663,7 @@ if (-not $serverUp) {
 # diagnosed in watcher_camera_rig.json like everything else, not dumped raw into this window.
 # NOTE: Prism is single-instance — launch #2 forwards to process #1 and exits, so most of
 # Cam_TessaBot's launch output lands in Cam_AurenBot's log file. Attribution is approximate.
-$launchLogDir = Join-Path $toolsDir 'camera_launch_logs'
+$launchLogDir = Join-Path $clientsDir 'camera_launch_logs'
 New-Item -ItemType Directory -Force $launchLogDir | Out-Null
 
 # Which clients are ALREADY standing, sensed from the running processes rather than remembered. Only
@@ -690,7 +688,7 @@ for ($i = 0; $i -lt $toLaunch.Count; $i++) {
     $cam    = $toLaunch[$i]
     $player = Get-PlayerName $cam
     $what   = if ($cam -eq $HostCam) { "HOST SEAT '$cam' as player '$player' (yours to play)" } else { "camera window '$cam'" }
-    Write-Host "Launching $what (launcher log: tools\camera_launch_logs\$cam.*.log)..."
+    Write-Host "Launching $what (launcher log: $launchLogDir\$cam.*.log)..."
     $outLog = Join-Path $launchLogDir "$cam.out.log"
     $errLog = Join-Path $launchLogDir "$cam.err.log"
     Remove-Item $outLog, $errLog -Force -ErrorAction SilentlyContinue
@@ -769,7 +767,5 @@ Write-Host ''
 $eyeNote = if ($ArchitectOn) { " (incl. $ArchitectCam - yours to fly)" } else { ' (no Architect eye - add -Architect for a seat you fly)' }
 $hostNote = if ($HostOn) { " (incl. $HostCam - yours to PLAY, joined as $HostPlayer)" } else { '' }
 Write-Host "Camera crew up: $($CamList.Count) window(s)$eyeNote$hostNote + 1 director + titler."
-Write-Host 'In each camera window: press F1 once for clean footage.'
-Write-Host 'OBS (one instance for all cameras): add a Window Capture per camera, method "Windows 10'
-Write-Host '(1903+)", pick the window titled Cam_<Bot>, priority "Match title". With the Source Record'
-Write-Host 'plugin, give each source a Source Record filter to write its own per-bot file.'
+Write-Host 'In each camera window: press F1 once for a clean view.'
+Write-Host 'Each window is titled Cam_<Bot> and keeps that title, so any screen recorder can capture one by name.'

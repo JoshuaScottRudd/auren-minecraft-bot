@@ -147,6 +147,18 @@ bot.once('spawn', () => {
 
   global.bot = bot;
 
+  // AND THE SQUARE IS MADE INVISIBLE, BEFORE ANY PERCEPTION RUNS (Architect 2026-09-15). Arming latches
+  // WHERE it is; masking is what keeps its cells out of every scan, route and plan without a single
+  // fragment asking.
+  //
+  // HERE AND NOT BESIDE THE ARM, for a reason that cost a run: `maskWorldReads` wraps `bot.blockAt`, and
+  // mineflayer has not attached that yet at the moment `createBot` returns — the wrap threw
+  // `maskWorldReads called with no body to mask` at module load and the process died before it joined.
+  // Spawn is the first moment the body is whole, and it is still early enough to leave no window: every
+  // read in this construct happens under a handler registered below this line, so no candidate can be
+  // chosen off unmasked ground and outlive the wrap.
+  require('@perception/spawn_protection').maskWorldReads(bot);
+
   // STATE THE SQUARE ONCE PER RUN, whatever it says. A gate that only speaks when it refuses something
   // is indistinguishable from a gate that is dead, and this one refuses work — so a run needs the line
   // that says which ground was off-limits in order to read a "nothing to mine" as a keep-out rather

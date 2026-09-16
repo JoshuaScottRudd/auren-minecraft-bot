@@ -44,7 +44,10 @@ paths.registerAliases();
 const crewLog = require('@api/crew_log');
 
 const { readForemanView } = require('./trace_read');
-const { padRight, padLeft, ABSENT } = require('./report_formatting');
+const { ABSENT } = require('./report_formatting');
+// THE ONE WRITER TO STDOUT (Architect 2026-09-16). `padRight`/`padLeft` left this file with the prose
+// they were padding: data_out owns every space and every column width now.
+const out = require('./data_out');
 // The DECODER FROM THE ENCODER'S OWN FILE. Requiring the desk's module from the monitoring side is the
 // dependency running the legal direction — a reader may read the thing it reads; the desk must never
 // require a lens (monitoring/README's one-way rule).
@@ -136,7 +139,10 @@ function reduceForeman(lines, opts = {}) {
         // the desk's own wiring rather than something to hide, so it is kept where a reader will see it.
         const open = [...turn.crossings].reverse().find(c => c.answer === null);
         if (open) open.answer = { ok: e.fields.ok === 'yes', reason: e.fields.reason || null };
-        else turn.crossings.push({ door: ABSENT, action: 'answer with no crossing', detail: '', answer: { ok: e.fields.ok === 'yes', reason: e.fields.reason || null } });
+        // The action token is snake_case because it is PRINTED in the `crossings` table: a three-word
+        // phrase in a value cell is the lens narrating again (2026-09-16). The fold is otherwise
+        // untouched — same branch, same placement, same fields.
+        else turn.crossings.push({ door: ABSENT, action: 'answer_with_no_crossing', detail: '', answer: { ok: e.fields.ok === 'yes', reason: e.fields.reason || null } });
         break;
       }
       case 'said':
@@ -157,80 +163,113 @@ function reduceForeman(lines, opts = {}) {
 const clock = (ms) => new Date(ms).toISOString().slice(11, 19);
 const mins = (a, b) => (!a || !b ? ABSENT : `${((b - a) / 60000).toFixed(1)}m`);
 
-function renderTurn(t, full) {
-  const out = [];
-  out.push(`    ${clock(t.at)}  « ${t.said}`);
-  if (t.readAs) out.push(`              read as: ${t.readAs}`);
-  if (t.refusal) out.push(`              ⛔ REFUSED [${t.refusal.code}]`);
-  for (const c of t.crossings) {
-    const a = c.answer
-      ? (c.answer.ok ? `→ fleet: ok${c.answer.reason ? ` (${c.answer.reason})` : ''}`
-                     : `→ fleet: NO${c.answer.reason ? ` (${c.answer.reason})` : ''}`)
-      : '→ fleet: NO ANSWER RECORDED';
-    out.push(`              ✂ crossed [${c.door}] ${c.action}${c.detail ? ` ${c.detail}` : ''} ${a}`);
-  }
-  // The desk's own words are the half a reader needs least often and most urgently — held behind --all
-  // so the default stays a spine of decisions, exactly as the fleet lenses hold their detail back.
-  if (full) for (const r of t.replies) out.push(`              » ${r}`);
-  else if (t.replies.length) out.push(`              » ${t.replies.length} line(s) back${t.replies[0] ? `: ${t.replies[0].slice(0, 88)}` : ''}`);
-  return out;
+// ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ─────────────────────────────────────────────
+// The person's words and the desk's words are VALUES — copied verbatim out of the record into a cell,
+// never summarised. The glyph grammar that used to carry them is gone: `«`, `»`, `✂ crossed`,
+// `⛔ REFUSED`, `→ fleet: NO ANSWER RECORDED` and `crossed the veil` were this lens narrating a
+// conversation it was not part of. What is DELETED rather than given a field name: the `══ FOREMAN DESK`
+// banner rules, the `No record — the desk trace holds zero readable lines` sentence, the
+// `never spoke to the desk` / `nobody spoke to it` sentences, the `(same refusal code, same speaker,
+// more than once)` gloss under repeated refusals, the `belonged to no turn or carried an undeclared
+// verb` sentence, and the `--all` pointer. Every COUNT they carried survives as a field below. The
+// non-verbose preview of the desk's first reply line is gone with them — `replies` counts the lines and
+// `--all` prints them, so no figure was lost, only a sentence fragment.
+
+// One row per turn: the spine of decisions. `said` is the person's own text, copied.
+function turnRow(t) {
+  return [clock(t.at), t.readAs, t.refusal ? t.refusal.code : ABSENT,
+    t.crossings.length, t.replies.length, t.said];
 }
 
 function runForeman(opts = {}) {
   const full = !!opts.verbose;
   const lines = readForemanTrace(opts.dir);
-  // The banner NAMES ITS SOURCE, and asks for it rather than spelling it. The spelled version was false
+  // The header NAMES ITS SOURCE, and asks for it rather than spelling it. The spelled version was false
   // within one edit of being written — it pointed readers at a directory the writer had left, which is
   // the exact failure the records-home module exists to end: one fact, one place, every caller asking
   // (Law 16).
   const source = path.relative(recordHomes.BOT_DIR, recordHomes.traceFile('foreman')).replace(/\\/g, '/');
-  console.log(`\n══ FOREMAN DESK — ${source}${opts.bot ? ` · ${opts.bot}` : ''} ══`);
+  out.kv('lens', 'foreman');
+  out.kv('record', source);
+  if (opts.bot) out.kv('person_filter', opts.bot);
 
   if (!lines.length) {
-    // ABSENCE IS NAMED, NOT REPORTED AS A QUIET RUN. The desk writes its first line at startup, so an
-    // empty file is a desk that never came up — a different fact from a desk nobody spoke to, and the
-    // one a reader would otherwise misread as "no visitors" (Law 25).
-    console.log('  No record. The desk writes from its first line, so this is a foreman that never started —');
-    console.log('  not a quiet one. Check the foreman window, or that a run start has not just cleared it.\n');
+    // ABSENCE IS NAMED AS A COUNT, NOT AS A QUIET RUN. The desk writes its first line at startup, so
+    // `lines 0` is a desk that never came up, and it is a different field from `speakers 0` below —
+    // which is a desk that came up and nobody spoke to (Law 25).
+    out.zero('lines');
     return { people: [], orphans: [], eventCount: 0 };
   }
+  out.kv('lines', lines.length);
 
-  const out = reduceForeman(lines, { person: opts.bot });
-  if (out.people.length === 0) {
-    console.log(opts.bot
-      ? `  ${opts.bot} never spoke to the desk in this run.\n`
-      : '  The desk ran and nobody spoke to it.\n');
-    return out;
-  }
+  const folded = reduceForeman(lines, { person: opts.bot });
+  out.kv('speakers', folded.people.length);
+  out.kv('events', folded.eventCount);
+  if (folded.people.length === 0) return folded;
 
-  for (const p of out.people.sort((a, b) => a.firstAt - b.firstAt)) {
+  for (const p of folded.people.sort((a, b) => a.firstAt - b.firstAt)) {
     const refused = [...p.refusals.values()].reduce((n, x) => n + x, 0);
-    console.log(`\n  ${padRight(p.who, 18)} ${padLeft(p.turns.length, 3)} turn(s) · ${mins(p.firstAt, p.lastAt)} at the desk · `
-      + `${refused} refused · ${p.crossings} crossed the veil`);
-    console.log('  ' + '─'.repeat(96));
-    for (const t of p.turns) for (const l of renderTurn(t, full)) console.log(l);
+    out.section('speaker');
+    out.kv('who', p.who);
+    out.kv('turns', p.turns.length);
+    out.kv('at_desk', mins(p.firstAt, p.lastAt));
+    out.kv('first_at', clock(p.firstAt));
+    out.kv('last_at', clock(p.lastAt));
+    out.kv('refused', refused);
+    out.kv('crossings', p.crossings);
 
-    // THE FINDING THIS LENS EXISTS FOR, stated rather than left for the reader to count. One person
-    // meeting one refusal repeatedly is the desk failing to GUIDE — the doctrine's second half — and it
-    // is invisible in a fleet-wide tally, which is exactly why it is computed per person.
+    out.table(['at', 'read_as', 'refusal_code', 'crossings', 'replies', 'said'], p.turns.map(turnRow));
+
+    // The refusal CODE and the desk's refusal text are both the record's own words.
+    const refusalRows = p.turns.filter(t => t.refusal)
+      .map(t => [clock(t.at), t.refusal.code, t.refusal.said]);
+    if (refusalRows.length) {
+      out.section('refusals');
+      out.table(['at', 'code', 'said'], refusalRows);
+    }
+
+    // A crossing with no verdict recorded is `fleet_ok` ABSENT — an unanswered door call, kept visible
+    // as a missing value rather than described.
+    const crossRows = [];
+    for (const t of p.turns) {
+      for (const c of t.crossings) {
+        crossRows.push([clock(t.at), c.door, c.action, c.detail,
+          c.answer ? c.answer.ok : null, c.answer ? c.answer.reason : null]);
+      }
+    }
+    if (crossRows.length) {
+      out.section('crossings');
+      out.table(['at', 'door', 'action', 'detail', 'fleet_ok', 'fleet_reason'], crossRows);
+    }
+
+    // THE FINDING THIS LENS EXISTS FOR, counted per person: one person meeting one refusal repeatedly is
+    // invisible in a fleet-wide tally, which is exactly why it is folded per speaker.
     const repeated = [...p.refusals].filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]);
     if (repeated.length) {
-      console.log(`\n    ⚠ repeated refusals: ${repeated.map(([c, n]) => `${c} ×${n}`).join(', ')}`);
-      console.log('      A person meeting one refusal more than once was not guided out of it the first time —');
-      console.log('      the correction is a guard AND a guide, and this is the half that failed.');
+      out.section('repeated_refusals');
+      out.table(['code', 'count'], repeated.map(([c, n]) => [c, n]));
+    }
+
+    // The desk's own words are the half a reader needs least often and most urgently — held behind --all
+    // so the default stays a spine of decisions, exactly as the fleet lenses hold their detail back.
+    if (full) {
+      const transcript = [];
+      for (const t of p.turns) {
+        transcript.push([clock(t.at), p.who, t.said]);
+        for (const r of t.replies) transcript.push([clock(t.at), 'foreman', r]);
+      }
+      out.section('transcript');
+      out.table(['at', 'who', 'text'], transcript);
     }
   }
 
-  console.log(`\n  ${out.people.length} speaker(s), ${out.eventCount} recorded event(s).`);
-  if (out.orphans.length) {
-    // Never silently absorbed: an orphan means either the desk emitted before anyone spoke, or it emitted
-    // a verb its own vocabulary file does not declare. Both are worth a reader's eye.
-    console.log(`  ⚠ ${out.orphans.length} event(s) belonged to no turn or carried an undeclared verb: `
-      + `${[...new Set(out.orphans.map(o => o.verb))].join(', ')}`);
-  }
-  if (!full) console.log('  (--all for the full transcript of every line either party said.)');
-  console.log('');
-  return out;
+  // Never silently absorbed: an orphan means either the desk emitted before anyone spoke, or it emitted
+  // a verb its own vocabulary file does not declare. Both are worth a reader's eye, so the count and the
+  // verbs themselves are fields.
+  out.section('orphan_events');
+  out.kv('orphans', folded.orphans.length);
+  if (folded.orphans.length) out.list('verb', [...new Set(folded.orphans.map(o => o.verb))]);
+  return folded;
 }
 
 module.exports = { runForeman, reduceForeman, deskEvents, readForemanTrace };

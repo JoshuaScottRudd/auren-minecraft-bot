@@ -338,7 +338,7 @@ therefore never tries to start anything.
 | `watch` | `true` · `false` | a wake-on-error watch that ENDS the run when something fires · soak blind |
 | `wake` | `error` · `halt` · `death` | which signatures wake it. Nothing else can — his rule, as a value |
 | `stream` | fragment tags | live commentary while watching. `[]` for silence |
-| `record` | `off` · `cameras` · `film` | nothing · cameras only · cameras plus OBS writing files |
+| `record` | `off` · `cameras` · `film` | nothing · cameras only · cameras plus a recorder writing files (a machine with a recorder; a download refuses `film`) |
 | `teardown` | `down` · `leave-up` | reap the fleet · leave it standing for you to poke at. **The world is left running either way** |
 
 ### 3c. The `hosting` block, read by `host_and_run.js` ONLY
@@ -521,7 +521,7 @@ Filming attaches to a rung rather than becoming rungs of its own. Say the word a
 
 | | |
 |---|---|
-| `record` | cameras for every bot, and OBS recording every one to its own file |
+| `record` | cameras for every bot, and a recorder writing every one to its own file (needs a recorder on this machine) |
 | `watch` | the same cameras, **nothing written** |
 | *(no word)* | today's run, unchanged byte for byte |
 
@@ -535,7 +535,7 @@ node Auren_Workshop/tools/record_overlay.js    status      # what is filming, an
 
 **The Architect's eye (`Cam_Architect`)** is one more spectator client, built and launched like a bot
 camera, that the director **arms and then never commands**. It is absent from the rig's shot list, so
-nothing can teleport it. It gets its own OBS capture and its own `footage/Cam_Architect_*` file. Its name
+nothing can teleport it. On a recorded run it gets its own capture and its own file. Its name
 and on/off state are declared in `camera/camera_configure.js` (`architect.camName`, `architect.enable`).
 It defaults off — it is the only seat producing nothing unless a human is in it for the whole run.
 `lanista_conductor` still takes `--architect`, having no authored run to read. Full section:

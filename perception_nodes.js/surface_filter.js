@@ -322,52 +322,11 @@ function scan(bot, filter) {
   // to the returned array — see the budget note at the top of this file for the livelock that ordering
   // caused. Passing it also keeps the palette-based section skip, because `matching` stays an id list.
   const callerExclude = filter && typeof filter.exclude === 'function' ? filter.exclude : null;
-
-  // ── THE SPAWN-PROTECTED SQUARE IS EXCLUDED FROM EVERY TYPE SEARCH, CALLER OR NO CALLER ───────────
-  // This is the fleet's ONE surface-candidate search: trees, crops, seeds, salvage and the navigator's
-  // candidate list all come out of here. Composing the keep-out into the search itself is what turns
-  // "the server refuses this tree" into "this tree was never a candidate" — the difference between a
-  // bot that walks to spawn, swings, is refused, replans and walks back, and a bot that picks the next
-  // tree out instead. That loop is the whole reason the gate belongs at selection and not only at the
-  // swing (Law 27: the failing case cannot form inside the thing that would have to form it).
-  //
-  // IT MUST COMPOSE WITH THE CALLER'S FILTER, NEVER REPLACE IT. harvest_executor passes its own base
-  // keep-out; a scan that dropped it in favour of this one would send bots to farm their own build.
-  //
-  // TYPE MODE ONLY — the coordinates branch above returns before this. There the caller named exact
-  // cells and is asking what is AT them, so silently omitting some would answer a question it did not
-  // ask (Law 25: the asker owns the criterion), and the integrity scanners that read that way would
-  // start reporting protected cells as absent rather than as protected. Acting on such a cell is still
-  // refused, at the dig authority, which is where an act is refused rather than a reading edited.
-  // The box is hoisted ONCE and compared inline, and the predicate is only installed when there is
-  // actually something to exclude. Both matter here and nowhere else: useExtraInfo makes findBlocks
-  // materialise a full block object per candidate instead of matching ids out of the palette, so
-  // handing it an always-present predicate would put that cost on every scan in the fleet — including
-  // the runs where spawn protection is switched off and nothing is being excluded at all. Null when the
-  // rule is off or the world spawn is not known yet, which restores the original fast path exactly.
-  const { spawnProtectionBox } = require('@perception/spawn_protection');
-  const spawnBox = spawnProtectionBox(bot);
-  let spawnHeld = 0;
-  const exclude = (callerExclude || spawnBox)
-    ? (position) => {
-        if (callerExclude && callerExclude(position)) return true;
-        if (spawnBox && position
-            && Math.max(Math.abs(Math.floor(position.x) - spawnBox.centerX),
-                        Math.abs(Math.floor(position.z) - spawnBox.centerZ)) <= spawnBox.radius) {
-          spawnHeld++;
-          return true;
-        }
-        return false;
-      }
-    : null;
+  const exclude = callerExclude;
 
   // The full pipeline for ONE ring. Kept as a closure rather than inlined three times so the tiers
   // cannot drift apart in what they mean by "a usable candidate" (Law 16).
   const sweep = (radius) => {
-    // Reset per ring, not accumulated across them: each ring re-scans the ground the last one covered,
-    // so a running total would count the same protected tree once per tier and report a number that
-    // never existed in the world (Law 25 — the count has to be true, not merely large).
-    spawnHeld = 0;
     let scanned = [];
     if (ids.length) {
       const positions = bot.findBlocks({
@@ -434,10 +393,7 @@ function scan(bot, filter) {
     _negativeMemo.delete(bot);   // anything found retires the memo immediately
   }
 
-  // The spawn keep-out is named in the scan line whenever it held anything. Without it a bot standing
-  // beside a forest inside the protected square reports "0 found" and reads as an empty world, which is
-  // the one wrong conclusion this whole gate would otherwise cause a reader to draw (Law 6).
-  const how = `rings ${tierTrace.join(' ')}${spawnHeld > 0 ? `, ${spawnHeld} held by spawn protection` : ''}`;
+  const how = `rings ${tierTrace.join(' ')}`;
   return finalize(filter, result.blocks, result.resolved, center, surface, how);
 }
 

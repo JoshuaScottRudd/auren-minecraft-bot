@@ -46,6 +46,17 @@ fleet_control_runtime.json
 console_windows.json
 console_windows.json.*.tmp
 
+# ── The camera crew's game launcher ─────────────────────────────────────────────────────────────────
+# `start_cameras.ps1` downloads Prism Launcher here when a machine has none, and the camera clients' game
+# files, instances and launch logs grow beside it — about 1 GB of somebody else's program plus one
+# machine's login. Kept inside the bot because it is the only folder a download owns (2026-09-14).
+Auren_Workshop/camera/clients/
+
+# ── Voxel snapshots ─────────────────────────────────────────────────────────────────────────────────
+# Every block of one loaded area, captured live by `Auren_Workshop/tools/voxel_snapshot.js` so scanners can be
+# tested with no server. Megabytes each, and a fact about one world at one moment; the tool keeps the newest 10.
+Auren_Workshop/voxel_snapshots/
+
 # ── A bot's memory of one world ─────────────────────────────────────────────────────────────────
 # Buildspots, chest positions and inventories, keyed to the exact world that produced them. On any
 # other world these are coordinates pointing at nothing. The design data beside them

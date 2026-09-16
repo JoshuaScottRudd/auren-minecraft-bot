@@ -227,27 +227,6 @@ function evaluateCandidate(bot, centerX, centerZ, extent, buildingH, refY, exist
   const endX   = bEndX + BUFFER_BLOCKS;
   const endZ   = bEndZ + BUFFER_BLOCKS;
 
-  // ── THE SPAWN-PROTECTED SQUARE, FIRST OF ALL THE GATES ──────────────────────────────────────────
-  // Ahead of every other rejection because it is the only one that costs no world reads: pure
-  // arithmetic against a hoisted box, where flatness, ground type and overhead each walk the footprint
-  // calling blockAt. A candidate the server would never let us build on should not be paid for.
-  //
-  // THE BUILDING FOOTPRINT, NOT THE BUFFERED EXTENT. Spawn protection governs placing and breaking, and
-  // the buffer is only walked — a build whose navigation margin clips the square is perfectly legal, so
-  // rejecting on the buffer would refuse legitimate sites for ground nobody touches. The footprint is
-  // exactly the set of columns this blueprint puts blocks into, which is exactly what the rule binds.
-  //
-  // ANY cell, not the centre: the square has a hard edge, so a footprint straddling it would have some
-  // rows place and others silently refuse, leaving a half-built structure the integrity scan then tries
-  // to repair forever against ground that cannot accept a block.
-  {
-    const { firstSpawnProtectedCell } = require('@perception/spawn_protection');
-    const cells = [];
-    for (let x = bStartX; x <= bEndX; x++) for (let z = bStartZ; z <= bEndZ; z++) cells.push({ x, z });
-    const hit = firstSpawnProtectedCell(bot, cells);
-    if (hit) return { valid: false, reason: 'spawn_protected', blockName: `(${hit.x},${hit.z})` };
-  }
-
   // Overlap check against existing buildings (full extent)
   if (existingBoxes && existingBoxes.length > 0) {
     const overlap = overlapsExisting(startX, endX, startZ, endZ, existingBoxes);
@@ -380,7 +359,6 @@ const REJECTION_LABELS = {
   overhead_blocked:   'overhead blocked',
   overlaps_existing:  'overlaps existing building',
   not_dirt_ground:    'ground not dirt-groupable',
-  spawn_protected:    'inside the spawn-protected square',
 };
 const STAIRCASE_REJECTION_LABELS = {
   too_shallow:     'staircase too shallow',
@@ -496,7 +474,7 @@ async function locate(bot, opts) {
     // that already exist (`!== undefined`), so a reason missing from this object is counted zero forever
     // and its gate reads as dead in every scan report — a silent filter, which is the one thing a gate
     // in this fleet may not be (Law 6).
-    const rejections = { chunk_unloaded: 0, too_uneven: 0, overhead_blocked: 0, overlaps_existing: 0, not_dirt_ground: 0, spawn_protected: 0 };
+    const rejections = { chunk_unloaded: 0, too_uneven: 0, overhead_blocked: 0, overlaps_existing: 0, not_dirt_ground: 0 };
     // Tree-farm mode: histogram of the block names at rejected floor cells, so a failed scan's summary
     // says WHAT the ground was (e.g. "stone×600") instead of a bare count.
     const notDirtBlockCounts = {};

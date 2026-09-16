@@ -133,18 +133,6 @@ function _wallFault(bot, reader, x, y, z) {
 // summary line — a scan that rejects 64 columns for 64 different causes reads very differently from
 // one that rejects them all for the same cause, and that difference is the diagnosis).
 function _evaluate(bot, reader, x, z, refY, protectedKeys) {
-    // THE SPAWN-PROTECTED SQUARE, BEFORE THE FIRST WORLD READ. A prospecting column is nothing but a
-    // plan to dig a shaft straight down, and the square is full-height — so a protected column is not a
-    // worse candidate, it is not a candidate: every cell of the run is unbreakable, top to bottom.
-    // Cheapest possible gate (two subtractions, no blockAt) placed ahead of the column walk, which
-    // costs a read per level plus four per wall.
-    // ONE XZ TEST COVERS THE WHOLE SHAFT — that is the shape of the rule, not a shortcut: spawn
-    // protection has no vertical term, so if the surface cell is inside the square, so is every cell
-    // beneath it, and if it is outside, so is all of it. Contrast the blueprint check further down,
-    // which must walk the column because blueprint voxels are placed at particular heights.
-    if (require('@perception/spawn_protection').isSpawnProtected(bot, x, z)) {
-        return { fit: null, why: 'spawn_protected' };
-    }
     const ground = groundYAt(reader, x, z, refY, STONE_PROSPECT.scan_up, STONE_PROSPECT.scan_down);
     if (!ground) return { fit: null, why: 'no_ground' };
     if (isCanopy(ground.name)) return { fit: null, why: 'canopy' };

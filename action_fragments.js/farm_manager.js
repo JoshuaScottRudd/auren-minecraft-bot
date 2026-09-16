@@ -34,6 +34,7 @@ const farmExecutor = require('@action/farm_executor');
 const { combatCheckpoint } = require('@api/battle_stations');
 const { routeToJudge } = require('@utils/signal_utils');
 const blueprintSurvey = require('@perception/blueprint_survey');   // geometryOf: which blueprint this instance is
+const { FARM_ROOM_KEYS } = require('@thinking/architect_config');
 
 const TAG = 'farm_manager';
 
@@ -42,16 +43,13 @@ function _release(reason) {
   routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
 }
 
-// The nearest unserviced plot to the bot's current position — greedy in-cluster ordering so the visit walks
-// the short hops between plots instead of criss-crossing. Distance is planar (x/z); the plots share
-// roughly one Y band on the riverbank.
-function _nearest(plots, pos) {
-  let best = null, bestD = Infinity;
-  for (const p of plots) {
-    const d = Math.hypot(p.center.x - pos.x, p.center.z - pos.z);
-    if (d < bestD) { bestD = d; best = p; }
-  }
-  return best;
+// LOWEST ANCHOR FIRST (Architect 2026-09-15). A tine row stands on the land block of the row behind it, so a
+// row can only be worked once every row between it and the bank is whole — and walking out along the tine
+// passes them in that order anyway. FARM_ROOM_KEYS is locked in anchor order (tine by tine, bank outward), so
+// the lowest key still unserviced is the next plot. Anchors 5, 8 and 12 broken: stand on 4 to fix 5, walk to
+// 7 to fix 8, walk to 11 to fix 12.
+function _lowestAnchor(plots) {
+  return plots.reduce((best, p) => (!best || FARM_ROOM_KEYS.indexOf(p.roomKey) < FARM_ROOM_KEYS.indexOf(best.roomKey) ? p : best), null);
 }
 
 module.exports = {
@@ -86,16 +84,35 @@ module.exports = {
     // reason a plant plot needs its seeds there (farm_executor applies from the hand, not from a chest).
     // One unit per treatable plot — bonemealReachable spends at most one per crop it advances and stops
     // the moment the pocket is empty, so over-pulling a scarce item buys nothing.
-    const plantablePlots = cluster.actionable_plots.filter(p => p.phase === 'build' || p.phase === 'plant');
-    const bonemealPlots  = cluster.actionable_plots.filter(p => p.phase === 'bonemeal');
-    if (plantablePlots.length > 0 || bonemealPlots.length > 0) {
-      const prepared = await landPrep.prepare(bot, {
-        seeds: plantablePlots.length, boneMeal: bonemealPlots.length,
-      });
-      if (!prepared) return;   // land_prep abandoned to the judge — one signal already lives
-    }
+    // THE DECISION IS MADE ONCE, BUT NOT AT A MOMENT THAT CANNOT SEE THE WORK (Architect 2026-09-15, the
+    // missing-hoe regression). This block used to read the ENTRY scan only: a visit claimed while the cluster
+    // read `idle:15 harvest:1` found no plantable plot, skipped prep, and then tended sixteen rows with an
+    // empty pocket — because the loop below re-senses every iteration and HARVESTING IS WHAT CREATES the
+    // untilled, unsown cells (farming_integrity orders `plant` ahead of `harvest` for that very reason). The
+    // 2026-09-15 run: `tilled 0, planted 0`, `[no hoe]` on two rows, three cells left untilled, while a
+    // wooden_hoe sat in the headframe chest for the whole run. The rule was correct when one job serviced one
+    // plot (the decision and the work were about the same plot); the cluster loop made the decision's scope
+    // narrower than the work's, and nothing re-opened it.
+    //
+    // ONE RESUPPLY PER VISIT IS PRESERVED — that is the whole reason this seat exists, and it is now a latch
+    // rather than a position in the file: the first plot that needs a tool or a seed pays for the trip, and
+    // every later one is already covered. A harvest-only visit still never preps (harvest consumes nothing
+    // and an unobtainable hoe would abandon a trip that needed no hoe). The latch is set BEFORE the await, so
+    // a prep that abandons is not attempted twice inside one visit.
+    let prepped = false;
+    const prepIfNeeded = async (scan) => {
+      if (prepped) return true;
+      const plantablePlots = scan.actionable_plots.filter(p => p.phase === 'build' || p.phase === 'plant');
+      const bonemealPlots  = scan.actionable_plots.filter(p => p.phase === 'bonemeal');
+      if (plantablePlots.length === 0 && bonemealPlots.length === 0) return true;
+      prepped = true;
+      // Seeds are counted, not plots: a tine row sows two, and the rows further out that this visit opens as it
+      // builds need theirs in the pocket before it walks out (scanCluster.seeds_for_visit).
+      return landPrep.prepare(bot, { seeds: scan.seeds_for_visit, boneMeal: bonemealPlots.length });
+    };
+    if (!await prepIfNeeded(cluster)) return;   // land_prep abandoned to the judge — one signal already lives
 
-    // ── THE CLUSTER TEND LOOP ── Re-sense the cluster each iteration (Invariant B), pick the NEAREST
+    // ── THE CLUSTER TEND LOOP ── Re-sense the cluster each iteration (Invariant B), pick the LOWEST-ANCHOR
     // unserviced actionable plot, service it once, mark it serviced. Each plot gets exactly ONE tendPlot per
     // visit: the `serviced` set is the loop's termination guarantee — a plot that partially progressed (built
     // its dirt but ran out of seeds before planting) stays 'actionable' in the re-scan, so without the set it
@@ -114,7 +131,12 @@ module.exports = {
       const remaining = scan.actionable_plots.filter(p => !serviced.has(p.roomKey));
       if (remaining.length === 0) break;
 
-      const plot = _nearest(remaining, bot.entity.position);
+      const plot = _lowestAnchor(remaining);
+
+      // The work the re-sense just found may be work the entry scan could not see — so the prep question is
+      // asked again HERE, against this scan, and answered at most once per visit by the latch above.
+      if (!await prepIfNeeded(scan)) return;   // land_prep abandoned to the judge — one signal already lives
+
       serviced.add(plot.roomKey);
       visited++;
 

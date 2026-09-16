@@ -39,6 +39,7 @@ const { collectNearby } = require('@api/drop_collector.js');
 const { performDig } = require('@utils/movement/dig_authority');
 const exploration = require('@api/exploration_api');
 const { guardExternal } = require('@utils/external_library_guard');
+const { claimFirst, releaseTarget } = require('@utils/target_claims');
 
 const TAG = 'seed_picker';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -81,23 +82,30 @@ function eyeDist2(bot, p) {
   return dx * dx + dy * dy + dz * dz;
 }
 
-// Nearest grass block whose center is within break reach of the eyes, or null.
-function nearestGrassInReach(bot) {
+// Every grass block whose center is within break reach of the eyes, nearest first, less the tufts a peer holds
+// and the tufts this pick already swung at and failed to clear.
+function grassInReach(bot, peerHeld, failedHere) {
   const feet = bot.entity.position.floored();
-  let best = null, bestD = REACH * REACH;
+  const found = [];
   for (let dx = -MELEE_SCAN_RADIUS; dx <= MELEE_SCAN_RADIUS; dx++) {
     for (let dy = -MELEE_SCAN_RADIUS; dy <= MELEE_SCAN_RADIUS; dy++) {
       for (let dz = -MELEE_SCAN_RADIUS; dz <= MELEE_SCAN_RADIUS; dz++) {
         const p = new Vec3(feet.x + dx, feet.y + dy, feet.z + dz);
         const b = bot.blockAt(p);
-        if (!b || !GRASS_SET.has(b.name)) continue;
+        if (!b || !GRASS_SET.has(b.name) || peerHeld.has(grassKeyOf(p)) || failedHere.has(grassKeyOf(p))) continue;
         const d2 = eyeDist2(bot, p);
-        if (d2 <= bestD) { bestD = d2; best = p; }
+        if (d2 <= REACH * REACH) found.push({ p, d2 });
       }
     }
   }
-  return best;
+  return found.sort((a, b) => a.d2 - b.d2).map(f => f.p);
 }
+
+// ── ONE TUFT, ONE PUNCHER (Architect 2026-09-15) ─────────────────────────────────────────────────────────────
+// Seeds are a shared order — every idle bot may be out for them — so two bodies in one patch would swing at the
+// same tuft. Each tuft is claimed before it is punched and released right after, through target_claims, the walk
+// trees and stone columns use (Law 16). A tuft a peer holds is remembered for this pick and never re-asked.
+const grassKeyOf = (p) => `grass:${p.x},${p.y},${p.z}`;
 
 // Only shears changes the grass drop (block instead of seeds); unequip it if held. Any other
 // held item breaks grass identically, so leave it — no needless swap.
@@ -126,11 +134,20 @@ async function pick(bot, opts = {}) {
 
   watcher.summary(TAG, `Picking seeds: have ${startCount}, want +${quantity}, and will stop at ${maxPunches} punches whichever comes first.`);
 
+  const peerHeld = new Set();     // tuft keys a peer held when this pick asked — never re-asked this pick
+  // Tuft keys this pick swung at without clearing — never re-picked this pick. A failed punch spends no budget
+  // (only a confirmed clear is a punch), so without this set nothing about the loop moved when a tuft refused
+  // and the same tuft came back as nearest forever. Each failure shrinks the in-reach set by one, so the pass
+  // always reaches the approach branch below, where MAX_STALLS ends it.
+  const failedHere = new Set();
+
   while (countSeeds(bot) < targetTotal && punches < maxPunches) {
     await combatCheckpoint(bot, 'seed_pick');
 
-    const tuft = nearestGrassInReach(bot);
-    if (tuft) {
+    const walk = await claimFirst(grassInReach(bot, peerHeld, failedHere), { keyOf: grassKeyOf });
+    for (const key of walk.peerHeldKeys) peerHeld.add(key);
+    if (walk.pick) {
+      const tuft = walk.pick;
       const block = bot.blockAt(tuft);
       if (block && GRASS_SET.has(block.name)) {
         await ensureBareHands(bot);
@@ -144,11 +161,13 @@ async function pick(bot, opts = {}) {
             punches++;
             stalls = 0;
           } else {
-            watcher.warn(TAG, `punch did not clear grass at (${tuft.x},${tuft.y},${tuft.z})`);
+            failedHere.add(walk.key);
+            watcher.warn(TAG, `punch did not clear grass at (${tuft.x},${tuft.y},${tuft.z}) — not asked again this pick`);
           }
         }
         await sleep(60);
       }
+      releaseTarget(walk.key);    // the tuft is punched or gone either way — its claim ends with this swing
       continue;
     }
 
@@ -216,7 +235,7 @@ async function pick(bot, opts = {}) {
 
     // Arrived but nothing landed in reach — a couple of these in a row means the grass is
     // fenced off / on terrain we can't stand beside. Concede instead of scan↔approach forever.
-    if (!nearestGrassInReach(bot) && ++stalls >= MAX_STALLS) {
+    if (grassInReach(bot, peerHeld, failedHere).length === 0 && ++stalls >= MAX_STALLS) {
       watcher.warn(TAG, `grass unreachable after ${stalls} approaches — conceding.`);
       concedeReason = 'unreachable';
       break;

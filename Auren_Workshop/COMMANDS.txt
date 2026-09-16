@@ -59,7 +59,7 @@
     watch      true | false             end the run the moment something errors
     wake       error, halt, death       what is allowed to wake the watch
     stream     fragment tags            live commentary, [] for silence
-    record     off | cameras | film     cameras and OBS
+    record     off | cameras | film     cameras to watch; film needs a recorder
     teardown   down | leave-up          reap the fleet / leave it for you to poke at
 
   hosting:                              only host_and_run.js reads this
@@ -98,8 +98,6 @@
   FILMING
 ================================================================================
 
-  .\Auren_Workshop\scripts\camera_obs.ps1 status
-  .\Auren_Workshop\scripts\camera_obs.ps1 miccheck      # 8 seconds, measures, deletes
   node Auren_Workshop/tools/record_overlay.js status
 
   Your own flying camera:   architect.enable: true

@@ -39,7 +39,7 @@
 const Vec3 = require('vec3');
 const watcher = require('@kernel/watcher');
 const stationRegistry = require('@perception/station_registry');
-const { group_to_item } = require('@utils/fragment_utils');
+const { group_to_item, substitutes_for } = require('@utils/fragment_utils');
 const { waitUntilChestFree } = require('@utils/chest_lock_utils');
 const { routeToJudge } = require('@utils/signal_utils');
 const { guardExternalSync, withCleanup } = require('@utils/external_library_guard');
@@ -770,7 +770,14 @@ function computeExcess(invCounts, whitelist, wanted = null) {
                 if (take > 0) { spokenFor[member] = (spokenFor[member] || 0) + take; remaining -= take; }
             }
         } else {
-            spokenFor[token] = (spokenFor[token] || 0) + count;
+            // The named item first, then its substitutes (`substitutes_for`): coal a torch order withdrew
+            // in place of charcoal is spoken for by that order, or the dumper banks it straight back.
+            let remaining = count;
+            for (const source of [token, ...(substitutes_for[token] || [])]) {
+                if (remaining <= 0) break;
+                const take = source === token ? remaining : Math.min(invCounts[source] || 0, remaining);
+                if (take > 0) { spokenFor[source] = (spokenFor[source] || 0) + take; remaining -= Math.min(invCounts[source] || 0, take); }
+            }
         }
     }
     const keepBack = (item, over) => Math.max(0, over - (spokenFor[item] || 0));

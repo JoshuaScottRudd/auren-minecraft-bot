@@ -28,6 +28,7 @@
 // that exited would kill any caller that imports it).
 
 const { afterMarker } = require('./trace_read');
+const out = require('./data_out');
 
 const MARK = { error: '❌', warn: '⚠️ ', summary: '📊', infra: '·' };
 
@@ -80,34 +81,29 @@ function reduceNarration({ seg, allLines, bot, verbose = false }) {
 
 function runNarration({ seg, allLines, bot, traceName, verbose = false, full = false }) {
   const r = reduceNarration({ seg, allLines, bot, verbose });
-  const window = full ? 'whole trace' : 'latest run';
+
+  // OUTPUT IS DATA (Architect 2026-09-16). The `text` column is the unit's OWN sentence, carried
+  // verbatim — a unit may interpret itself and this lens is the envelope, never the author. What left:
+  // the flag hints, and the sentence explaining why lines sit outside the window. `lines_outside_window`
+  // is the measurement that sentence was wrapped around, and it survives as a field.
+  out.kv('lens', 'narration');
+  out.kv('record', traceName);
+  out.kv('window', full ? 'whole_trace' : 'latest_run');
 
   if (!r.unit) {
-    console.log(`trace_monitor · narration · ${traceName} · ${window}`);
-    console.log('(pick a unit with --bot=<name>; these posted)\n');
-    for (const u of r.units) {
-      console.log(`  ${u.unit.padEnd(16)} ${String(u.total).padStart(5)} line(s)  ` +
-        `📊 ${u.summary} · ⚠️ ${u.warn} · ❌ ${u.error}`);
-    }
-    console.log('\n  --all includes the trace\'s own infra lines; --full reads past the last `start` broadcast.');
+    out.section('units_that_posted');
+    out.table(['unit', 'lines', 'summary', 'warn', 'error'],
+      r.units.map(u => [u.unit, u.total, u.summary, u.warn, u.error]));
     return r;
   }
 
-  console.log(`trace_monitor · narration · ${traceName} · ${r.unit} · ${window} · ${r.inWindow} line(s)`);
-  console.log('(context only — this view never flags and never wakes a watcher)\n');
+  out.kv('unit', r.unit);
+  out.kv('lines_in_window', r.inWindow);
+  out.kv('lines_outside_window', r.outsideWindow);
 
-  if (!r.lines.length) {
-    console.log(`  ${r.unit} posted nothing in the ${window}.`);
-  } else {
-    for (const l of r.lines) console.log(`  [${stamp(l.relSec)}] ${MARK[l.level]} ${l.text}`);
-  }
-
-  // The whole reason this lens states its window: a unit that came up before the run started has its
-  // bring-up in an earlier segment, and a reader who does not know that reads an empty view as silence.
-  if (r.outsideWindow > 0) {
-    console.log(`\n  ${r.outsideWindow} more line(s) from ${r.unit} sit outside the ${window} — ` +
-      `everything it said before the last \`start\` broadcast. Add --full to include them.`);
-  }
+  out.section('unit_lines');
+  out.table(['at', 'level', 'text'],
+    r.lines.map(l => [stamp(l.relSec), MARK[l.level], l.text]));
   return r;
 }
 

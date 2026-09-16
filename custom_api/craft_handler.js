@@ -439,13 +439,6 @@ function scanPlaceRing(bot, r) {
         const floor = bot.blockAt(new Vec3(fx, fy, fz));
         if (!floor || floor.boundingBox !== 'block') continue;
         if (!classifyFloor(bot, floor)) continue;   // safe surface + clearance above
-        // Spawn protection refuses the placement silently, so a spot inside the square would be
-        // accepted here, walked to, clicked, and reported placed while nothing appeared — and the
-        // caller would then hunt a station that does not exist. Dropped at the SCAN, which is the ring
-        // expansion's own vocabulary for "not a spot": the search simply steps outward to the next
-        // ring, and a bot standing at spawn ends up placing its table just outside the square instead
-        // of failing sixteen attempts in a row.
-        if (require('@perception/spawn_protection').isSpawnProtected(bot, fx, fz)) continue;
         spots.push({ x: fx, y: fy, z: fz, dist: Math.hypot(dx, dy, dz) });
       }
     }

@@ -7,7 +7,7 @@
 //          resupply between plots:
 //            1. HOE   — equipped if owned; else pulled from a headframe chest (a prior cycle's
 //                       dumpExcess left it there); else crafted. Never carried between jobs.
-//            2. SEEDS — up to `seeds` (the plantable-plot count), asked for by name; the selector answers
+//            2. SEEDS — up to `seeds` (the seeds the visit can sow), asked for by name; the selector answers
 //                       WHERE. Best-effort — gated on the accessible pool so an empty pool never abandons.
 //            3. BONE MEAL — up to `boneMeal` (the growing-plot count), pulled from a chest so the
 //                       executor's pocket-reading applier has something to apply.

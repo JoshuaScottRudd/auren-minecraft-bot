@@ -248,30 +248,24 @@
 // `maxRateDegPerTick` stops a teleporting bot whipping the camera. `aimRise` aims at head/upper body.
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-//  THE SCOUT (`scout.*`) and OBS (`obs.*`)
+//  THE SCOUT (`scout.*`)
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // The scout is the read-only headless observer that owns every raycast (the rig is pure RCON and has no
 // world). Parked high, spectator, out of frame; `settleMs` skips raycasts after a re-park because a raycast
 // into an unloaded chunk reads as empty air — a FALSE CLEAR. If it fails to connect the rig degrades to
 // blind framing rather than stopping.
-// OBS values are DECISIONS, which is why they are tracked here while OBS's own generated profile/scene
-// files under tools/OBS are machine exhaust — gitignored, regenerated per box, never hand-synced.
-// `container: hybrid_mp4` survives an unclean stop (plain mp4 corrupts). `encoder: auto` MEASURES what
-// actually initialised on this machine rather than inferring from the GPU model. `capture.method 2` (WGC)
-// keeps an OCCLUDED window rendering, which is what lets cameras be stacked on one monitor rather than
-// tiled across three; `priority 1` matches by TITLE, which the window titler makes unique and stable.
-// `recordMode 3` follows the main recording, so one StartRecord drives every per-camera file — NOT 1,
-// which is "Always" and starts writing the instant the filter is created. `verifySeconds` is a CEILING on
-// polling for real bytes on disk: issuing a command is not evidence it worked, and Source Record buffers,
-// so files sit at 0 bytes for ~5-9s before the muxer flushes.
+//
+// THIS FILE HOLDS NO RECORDING SETTINGS (2026-09-14). The camera crew ships for WATCHING; each window is
+// titled Cam_<name> so any screen recorder can bind it. Recording settings belong to whatever records, and
+// the Architect's recorder keeps its own beside itself.
 //
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE ARCHITECT'S EYE (`architect.*`) — a camera the rig arms and then never touches
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // One more spectator client, built and launched exactly like a bot camera, that no director ever
 // commands: a human flies it. `camName` is the ONE declaration of its name, and three separate
-// consumers read it (the launcher builds the instance and titles the window, the rig arms it, OBS
-// binds a capture and a Source Record filter to it) — a second copy anywhere is the value-used-to-
+// consumers read it (the launcher builds the instance and titles the window, the rig arms it, a
+// recorder binds a capture to it) — a second copy anywhere is the value-used-to-
 // check drifting from the value-used-to-act (Law 16). `enable` is the ONE declaration of whether it
 // exists at all, read by the same consumers, for the same reason.
 //
@@ -284,7 +278,7 @@
 // the seat asks for it and no run has to remember to undo it (Law 26 — an input authored while the
 // machine is stopped). Editing `enable` to `true` here is the standing form of the same switch.
 //
-// IT IS ONE VALUE BECAUSE HALF-ARMING IT IS SILENT. The launcher building the instance and OBS
+// IT IS ONE VALUE BECAUSE HALF-ARMING IT IS SILENT. The launcher building the instance and a recorder
 // binding its capture are separate acts by separate owners; if only one reads the switch, the failure
 // is a window nobody records or a recording filter pointed at a client that never launched — neither
 // throws, and both are discovered after the run. One declaration, every consumer, is what makes the
@@ -301,12 +295,12 @@
 // the film crew observes, it does not act in the shared world).
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-//  THE HOST SEAT (`host.*`) — the client a human PLAYS, recorded with his voice on it
+//  THE HOST SEAT (`host.*`) — the client a human PLAYS
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // A let's play has a presenter, and the presenter is a PLAYER — not a lens. This seat is therefore
 // the one client in the whole stack that is neither directed nor armed: no spectator, no night
-// vision, no shot list, no gimbal. It joins as an ordinary player under a real player name, it is
-// captured like any other window, and its file is the only one in a take that carries a microphone.
+// vision, no shot list, no gimbal. It joins as an ordinary player under a real player name and is a
+// window like any other.
 //
 // WHY IT IS NOT THE ARCHITECT'S EYE WITH A FLAG. The eye is a SPECTATOR — the rig sends it
 // `gamemode spectator` at bring-up precisely so it can never fall, die, block a mob or change the
@@ -324,29 +318,6 @@
 // `/time set day` or `/tp` from inside his own window. `proxy_human` reads the same name off the same
 // ops list for the same reason.
 //
-// THE MICROPHONE TRAVELS ON A MIXER TRACK, AND THE FORM WAS MEASURED RATHER THAN READ.
-// A Source Record filter writes its parent source's own audio unless it is told otherwise, and the
-// obs-source-record build in `tools/OBS` gates that on TWO keys, not one: `audio_track: N` ALONE IS
-// INERT — measured 2026-09-06, a filter carrying it wrote digital silence (-91.0 dB) while a 440 Hz
-// tone assigned to that same mixer track reached the main recording at -21.1 dB in the same pass. It
-// is `different_audio: true` that arms the track, and with both set the file carried the track exactly
-// (-21.1 dB). So the host's window audio and the microphone are both assigned to `micTrack`, the
-// host's filter reads that track, and every bot camera stays pinned to track 1 alone so no other
-// window can bleed into the presenter's file. Naming a single source instead (`audio_source`) also
-// works and is the wrong tool here: it carries one source, and this file needs two mixed.
-//
-// `micDevice` NAMES A DEVICE RATHER THAN TAKING WINDOWS' DEFAULT, and that is not fussiness. This
-// machine reports eleven audio endpoints of which most are virtual (Steam Streaming Microphone,
-// Virtual Desktop Audio, an Oculus headset) — devices that answer as a microphone and emit digital
-// silence. A take recorded against the wrong one plays back perfectly and has no voice, which is
-// discovered after the episode. `'default'` keeps OBS's own choice; any other value is the device's
-// name as Windows reports it. `camera_obs.ps1 miccheck` is the assay, and it exists because no
-// command return can prove a microphone is audible (Law 25).
-//
-// DESKTOP AUDIO STAYS MUTED WHETHER THIS SEAT IS UP OR NOT. "Just the client window and the
-// microphone" is a constraint on what may reach a take, so the machine's own output — a browser, a
-// notification, whatever else is open during a two-hour episode — is never in the set.
-//
 // OFF BY DEFAULT for the same reason the eye is: it produces nothing unless a human is in it.
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -354,7 +325,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // The scout client can answer two unrelated questions, and each has its own switch, toggleable
 // independently so the whole camera system can stay off until recording is wanted:
-//   framing — place and cut cameras. The film crew: cameras, gimbals, cuts, OBS.
+//   framing — place and cut cameras. The film crew: cameras, gimbals, cuts.
 //   witness — write the server's own account of every fight the fleet has. See camera/combat_witness.js.
 // They share ONE scout client and ONE rcon link and are otherwise independent: either alone, both, or
 // neither. BOTH DEFAULT OFF (Law 13 — default stopped, prove it should run). With both off the rig
@@ -380,7 +351,7 @@ module.exports = {
   // The seat a human PLAYS from — see THE HOST SEAT above for why it is not the eye with a flag.
   host: {
     // The instance and window name. Prefixed `Cam_` deliberately even though it is not a camera:
-    // every teardown, every titler match and every OBS window bind in this system identifies a
+    // every teardown, every titler match and every recorder's window bind identifies a
     // launched client by that prefix, and a seat outside the prefix is a window nothing reaps.
     // NAMED FOR WHAT THE SEAT IS, not for its role in a take: this is the client the Architect
     // himself drives and issues commands from, which is a different thing from `Cam_Architect` one
@@ -388,7 +359,7 @@ module.exports = {
     // names sit next to each other on purpose, and the property that separates them is the one in
     // their declarations: the eye is armed to spectator, this seat is never armed at all.
     // NOT A WINDOW NAME WHEREVER THE SERVER IS BEING ASKED. `playerName` below is what the world
-    // knows this seat as; this string is what Windows, the titler and OBS know it as. Handing the
+    // knows this seat as; this string is what Windows, the titler and a recorder know it as. Handing the
     // window name to anything that talks to the server asks about an entity that cannot exist, and
     // nothing throws (see camera_rig's PRESENT-ONLY block).
     camName:    'Cam_Architect_Control',
@@ -397,13 +368,6 @@ module.exports = {
     // stamped to somebody who is not him.
     playerName: 'KaptainKrispyjr',
     enable:     false,
-    // 'default' = whatever Windows hands OBS. Name a device to pin it — see the header on why the
-    // default is a real hazard on a box carrying virtual microphones.
-    micDevice:  'default',
-    // Mixer track carrying [host window audio + microphone]. Track 1 is OBS's own recording track
-    // and every other source sits on it; this is a second track so the presenter's file is the only
-    // place the microphone ever lands. Range 2-6.
-    micTrack:   2,
   },
 
   mode: {
@@ -673,56 +637,5 @@ module.exports = {
     // responsiveness here is free — raising this makes a frame solve finish sooner and the witness deafer,
     // in that proportion.
     scanSliceMs:  8,
-  },
-
-  obs: {
-    profileName:   'AurenCameras',
-    sceneName:     'AurenCameras',
-    filterName:    'AurenSourceRecord',
-    outputDir:     'footage',
-    container:     'hybrid_mp4',
-    // BITRATE is sized for UPLOAD, not for archival: a mastering-grade bitrate produces files far too large
-    // to upload quickly, and a long video must not cost hours to upload. YouTube re-encodes everything on
-    // ingest and recommends 12000 for 1080p60 SDR, so anything above that is bits thrown away twice.
-    // 10000 sits under that: Minecraft is flat-shaded with no film grain, the cheapest content a
-    // modern encoder ever sees, and NVENC on this box is well inside transparency at this rate.
-    // Raise it only if a judged frame shows real blocking artefacts — not on suspicion.
-    bitrateKbps:   10000,
-    // THE MAIN OBS RECORDING IS A TRIGGER, NOT FOOTAGE — and it is sized and filed as one.
-    // The per-camera Source Record filters run in "Recording" mode, meaning they write only while
-    // OBS's own recording is active. That is what makes ONE `start` enough for N cameras, so the
-    // main output cannot simply be switched off; but its FILE is pure by-product. Left at the
-    // deliverable bitrate it duplicates whichever camera sits topmost in the scene at full size —
-    // measured on the first three-camera take: 1.8 GB of exact duplicate per run, the largest single
-    // file of the four.
-    // Two settings that are provably isolated from the deliverables, because each Source Record
-    // filter carries its OWN path and bitrate, set explicitly and separately:
-    //   dir  — keeps the by-product out of the folder the clipper and the editor read, so `footage/`
-    //          holds only files that are footage.
-    //   bitrateKbps — the trigger is never watched by anyone. Nothing reads it, so quality in it is
-    //          waste by definition. Resolution is deliberately NOT lowered here: bitrate provably
-    //          governs only this output, whereas the canvas is what every capture is sampled at.
-    trigger:       { dir: 'footage/_trigger', bitrateKbps: 400 },
-    canvas:        { width: 1920, height: 1080, fps: 60 },
-    encoder:       'auto',
-    // WGC window capture can also take the WINDOW*S* OWN AUDIO, and does not by default — which is why
-    // every take filmed before 2026-08-20 carries an AAC track measuring -91 dB mean AND max from end
-    // to end: a real stream, containing digital silence. Nothing downstream could tell, because a silent
-    // track is indistinguishable from a quiet one until something tries to duck under it.
-    //   audio        — capture_audio, the WGC flag that makes the source produce sound at all.
-    //   audioPerCam  — reroute_audio, which keeps that sound ON THE SOURCE instead of merging it into
-    //                  desktop audio. It is what makes N cameras N soundtracks: each bots file then
-    //                  carries the world as heard AT THAT BOT, matching the picture it is cut against.
-    //                  Merged desktop audio would give every camera the same mix of all N clients,
-    //                  which is not a soundtrack, it is a crowd.
-    // MUSIC IS NOT SILENCED HERE. It is silenced in the CLIENT (start_cameras.ps1 sets
-    // soundCategory_music and soundCategory_record to 0.0 on every camera, every launch), because a
-    // camera that cannot emit licensed music cannot leak it into a take no matter what OBS is doing.
-    // Turning it off at this layer instead would put the copyright guarantee behind a setting that is
-    // one forgotten re-configure away from being wrong.
-    capture:       { method: 2, priority: 1, audio: true, audioPerCam: true },
-    sourceRecord:  { recordMode: 3 },
-    websocketPort: 4455,
-    verifySeconds: 15,
   },
 };

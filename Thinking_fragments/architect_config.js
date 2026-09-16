@@ -191,9 +191,10 @@ const BOT_SENIORITY = {
 //   building_headframe — the only work here with a clock the WORLD sets: the shell must stand before
 //     nightfall and no later effort buys back a night outside. Selected per-requirement via
 //     BUILDING_REQUIREMENTS.job_type/.supply_job_type, so ordinary buildings keep building_structure.
-//   supply_seeds — safe at blueprint height ONLY because seeds feed no build. A good a build CONSUMES
-//     (logs, charcoal, iron_ingot) must never carry a blueprint-level default, or a bot hoards it to its
-//     dump threshold before building.
+//   farm_supply_dirt / farm_supply_seeds — the FARM'S OWN ORDERS, not shelves: each asks for exactly what the
+//     unfinished field is short of and stops when it is covered. Dirt goes to the pocket that lays the row;
+//     seeds go to the chest the tend visit pulls from. Stages are MEASURED. What keeps both off the headframe's
+//     clock is SETUP_ORDER (job_gates.setupGate: no farm job posts until the headframe is built), never a line here.
 //   crafting_station_tooled — DELETED with the pocket-furnace row it ranked (see the STOCK_THRESHOLDS
 //     note on `furnace`). It existed to lift "craft a furnace to carry" into the `bot` band so the fuel
 //     chain did not wait behind a build; there is no such craft any more, because a furnace is half of a
@@ -278,7 +279,8 @@ const JOB_TYPES = [
     ['blueprint', [
         { key: 'building_headframe',        stage: 'build' },
         'building_headframe_supply',
-        'supply_seeds',
+        'farm_supply_seeds',
+        'farm_supply_dirt',
         { key: 'farm_tend',                 stage: 'build' },
         { key: 'building_structure',        stage: 'build' },
         { key: 'light_base',                stage: 'build' },
@@ -447,7 +449,8 @@ function isNightTime() {
 const DAYLIGHT_ONLY_JOBS = new Set([
     'resource_baseline',        // surface gathering — logs and the like (a build's own gather)
     'resource_standing_stock',  // the same work for a standing shelf level, in a weaker band
-    'supply_seeds',
+    'farm_supply_seeds',        // punching grass on open ground
+    'farm_supply_dirt',         // digging soil on open ground
     'farm_tend',
     'clear_canopy',
     'ground_salvage',           // outdoor walk to a drop
@@ -611,7 +614,7 @@ const REQUESTABLE_STRUCTURES = ['headframe'];
 //                     under: a craftable/gather row defaults to crafting_flat / resource_baseline, a
 //                     `holder:'storage'` row defaults to resource_chest_restock. GUARDRAIL: only give a
 //                     storage row a BLUEPRINT-category job type if NO build consumes its good
-//                     (wheat_seeds ok; logs/charcoal/iron_ingot never) — else the bot fills storage to
+//                     (logs/charcoal/iron_ingot never) — else the bot fills storage to
 //                     target before building instead of building with what it holds.
 //   (`role:` is REJECTED at load — the integrity loop throws on it. See the `holder` entry above.)
 //
@@ -768,12 +771,11 @@ const REQUESTABLE_STRUCTURES = ['headframe'];
 //     and how much raw iron it sends the shaft down for; equal makes the ask literal. Equal deficit_below and dump_threshold
 //     normally thrashes and does not here because in-flight smelt batches are ADDED to `have` before the
 //     deficit test — that in-flight term is the hysteresis, and without it these two would have to be split.
-//   wheat_seeds — SEEK TWO, HOLD THIRTY-TWO, COMPOST THE REST. A high seek floor is a hazard, not merely
-//     slower: grass drops seeds at a low rate, so seeking more than a couple is a long wandering search
-//     with no fixed endpoint that can carry a bot far from base into the dark. Two is enough because the
-//     FARM pays, not the grass — mature wheat drops seeds guaranteed, so two is a seed crystal and the
-//     field compounds from the first harvest. `dump_threshold` is the compost handoff: the surplus lands in a
-//     chest where the composter's standing request pulls it back out. No new pathway.
+//   wheat_seeds — NO ROW, AND THAT IS THE DESIGN (Architect 2026-09-15: *"remove seed job from the request
+//     system and instead build it into the farm building. so it requests the exact number of seeds it
+//     needs"*). The keep-two shelf asked for a seed crystal whether or not a field wanted any, and made
+//     the farm's start an inference about bands. The farm orders its own seeds now (assessors/farming →
+//     farm_supply_seeds), sized to the rows and cells it has not sown, and behind SETUP_ORDER.
 //   saplings — dump_threshold 0 sheds them from the pocket, NOT because they are worthless: the composter's
 //     standing request drains them out of whatever chest they land in. Where an item rests stops
 //     mattering once something asks for it.
@@ -800,7 +802,10 @@ const STOCK_THRESHOLDS = [
     { item: 'torch',          holder: 'bot', deficit_below: 12, dump_threshold: 32, mode: 'active' },
     { item: 'planks',         holder: 'bot', deficit_below: 12, dump_threshold: 20, job_type: 'resource_pillaring_stock', mode: 'active' },
     { item: 'stick',          holder: 'bot', dump_threshold: 8 },
-    { item: 'dirt',           holder: 'bot', dump_threshold: 20 },
+    // 48 = a whole 32-plot trident (16 rows × plot, land, plot) carried at once. Still NO deficit_below: the
+    // headframe must stand by dusk, so soil is never a standing errand. The farm orders what a funded row is
+    // short of (assessors/farming → farm_supply_dirt) and nothing else fetches it.
+    { item: 'dirt',           holder: 'bot', dump_threshold: 48 },
     { item: 'cobblestone',    holder: 'bot', deficit_below: 9, dump_threshold: 20, mode: 'active' },
     { item: 'raw_iron',       holder: 'bot', dump_threshold: 0 },
     { item: 'wheat',          holder: 'bot', dump_threshold: 0 },
@@ -823,7 +828,6 @@ const STOCK_THRESHOLDS = [
     // work it cannot yet name; it is wrong for material that only ever exists to be consumed by an order
     // that already exists.
     { item: 'iron_ingot',  holder: 'storage', deficit_below: 20,  dump_threshold: 20, mode: 'active', after_fulfilled: 'logs' },
-    { item: 'wheat_seeds', holder: 'storage', deficit_below: 2, dump_threshold: 32, job_type: 'supply_seeds', mode: 'active' },
     { item: 'bone_meal',   holder: 'storage', deficit_below: 8,  dump_threshold: 32, job_type: 'crafting_flat', mode: 'passive' },
     { item: 'sword',       holder: 'storage', kind: 'tool', deficit_below: 1, dump_threshold: 1, min_tier: 'stone', job_type: 'crafting_weapon', mode: 'passive' },
 ];
@@ -927,15 +931,9 @@ const HUMAN_SURFACE_SLACK = 4;
 // mid-80s; what it excludes is the ground where no sea-level water is within a loaded chunk of the person.
 const HUMAN_MAX_ABOVE_SEA = 20;
 
-// The water a wheat field is sited against: river and ocean biomes (Architect 2026-09-11 — *"it must
-// either be a river or ocean biome tile… water biome only, bank only, cluster only"*). Sea-level water in
-// any other biome is a lake or a pond, and wheat_plot_scanner neither floods it nor counts its banks.
-// Written out name by name, so a biome is on this list by being written here.
-const FARM_WATER_BIOMES = new Set([
-    'river', 'frozen_river',
-    'ocean', 'deep_ocean', 'cold_ocean', 'deep_cold_ocean', 'lukewarm_ocean', 'deep_lukewarm_ocean',
-    'warm_ocean', 'frozen_ocean', 'deep_frozen_ocean',
-]);
+// (FARM_WATER_BIOMES removed 2026-09-14. A wheat field is sited against ANY sea-level water — *"i should
+//  include any body of water"* — because the river/ocean biome list could not see a bank: the water at a
+//  river's edge belongs to the land biome beside it. wheat_plot_scanner's scanWheatPlots header holds the count.)
 
 // Smelting. Fuel preference order (first one held is used; logs excluded — a log burns like a
 // plank but is worth four, so it is 4x the waste). Yield = smelts per fuel unit; cook = ms per
@@ -1001,8 +999,10 @@ const RETRIEVAL_MS_PER_COST_UNIT = 400;
 // ── COMPOST → BONE MEAL ────────────────────────────────────────────────────────────────────────────
 // Waste (leaf litter, saplings) into bone meal. `leaf_litter` is the compostable block — leaf BLOCKS need
 // shears the fleet does not craft and are deliberately not in this chain. THE RATE IS HONEST AND SLOW:
-// each compostable has a 30% chance of one level, seven levels make one bone meal, and one bone meal is
-// one growth stage of one plant. It accelerates the farm; it does not transform it.
+// each compostable has a 30% chance of one level, seven levels make one bone meal (~23 litter), and one bone
+// meal advances a wheat 2-5 of its 7 stages, so a full grow is about two bone meal, ~47 litter. Measured
+// 2026-09-14 on sub_agent_01: a forest carries ~650 litter items per 1,000 columns, a birch forest ~5 — one
+// forest patch in view is on the order of 100 wheat, once. It accelerates the farm; it does not transform it.
 //
 // COMPOSTING IS NOT A JOB AND MUST NOT BECOME ONE AGAIN. The composter was modelled as a standing order —
 // dump files a sapling in a chest, a standing request pulls it back out — and the flaw is that pulling it
@@ -1016,7 +1016,7 @@ const RETRIEVAL_MS_PER_COST_UNIT = 400;
 // COMPOST_INPUTS is an opt-in list: anything not named is never fed to a composter. `wheat_seeds` is
 // ABSENT despite being compostable — seeds are the farm's scarcest input (the till budget is a pure
 // function of it), one seed is a planting, and converting it to a 30% chance of one-seventh of a bone
-// meal is a loss in every world. Its row is storage-held, so no bot dump threshold would defend it either.
+// meal is a loss in every world. It has no stock row at all (the farm orders it), so no dump threshold defends it.
 // The intent "compost anything above the seed reserve" is correct and blocked on ONE link: the dump
 // offers a wanting storage row the item before the bin, but the chest-selection test asks whether the chest
 // has a free SLOT rather than whether it already holds its `dump_threshold`, so storage accepts seeds past its
@@ -1143,13 +1143,46 @@ const HARVEST_KEEPOUT_RADIUS = 8;
 // blueprint name so a single-farm caller's default resolves; the rest suffix '#N'. Every farm reader
 // threads the instance key, and the reader loop is the ONLY place the count is known (Invariant D), so
 // growing the field is one edit here.
-// The wheat_plot_scanner is the SOLE siter — it alone enforces the hydration Y-rule AND the cross-plot
-// spacing. No water bucket, no fence, no iron. (Deferred: farming_integrity must capture each plot's
-// dynamic water source to repair or rescan a damaged field.)
-const FARM_BLUEPRINT_NAME = 'wheat_plot_pair';
+// THE TRIDENT (Architect 2026-09-15). The field is tines built out from the bank into sea-level water, sited by
+// wheat_trident_scanner — the SOLE siter; it enforces hydration, spacing and a walking route to the tine's land
+// anchor. ONE INSTANCE IS ONE TINE ROW, a four-block anchor: the block the bot stands on, and in front of it
+// plot · land · plot. The land block is the NEXT row's stand, so the anchors overlap and each row is built,
+// tended and repaired from the row before it; row 0 stands on the bank. Instances are keyed in anchor order
+// (tine by tine, row 0 outward), so key order IS "lowest anchor first".
+// No water bucket, no fence, no iron. Plots per row are the blueprint's `growing` voxels.
+const FARM_BLUEPRINT_NAME = 'wheat_tine_row';
 const FARM_PLOT_COUNT = 32;
-const FARM_ROOM_KEYS = Array.from({ length: FARM_PLOT_COUNT }, (_, i) =>
+const FARM_PLOTS_PER_ROW = 2;
+if (FARM_PLOT_COUNT % FARM_PLOTS_PER_ROW !== 0) {
+    throw new Error(`CODING VIOLATION (Law 13): FARM_PLOT_COUNT ${FARM_PLOT_COUNT} is not whole tine rows of ${FARM_PLOTS_PER_ROW} plots.`);
+}
+const FARM_ROOM_KEYS = Array.from({ length: FARM_PLOT_COUNT / FARM_PLOTS_PER_ROW }, (_, i) =>
     i === 0 ? FARM_BLUEPRINT_NAME : `${FARM_BLUEPRINT_NAME}#${i}`);
+// The whole field's name as ONE structure — what SETUP_ORDER lists and what every farm job is stamped with.
+// A row's key names a row; nothing else names the field, and the setup gate needs a name for it.
+const FARM_STRUCTURE = 'wheat_farm';
+
+// ── THE SMALLEST DIRT TRIP WORTH MAKING (Architect 2026-09-16) ────────────────────────────────────────
+// *"setup the minimum amount of dirt to gather be 15 if it needs it. first use pocket, then use chest,
+// finally gather 15 dirt."*
+//
+// THE ORDER OF CONSUMPTION IS UNCHANGED AND IS NOT WHAT THIS SETS. Pocket dirt is already netted out
+// before the order exists (`farming_integrity`'s dirtGap = dirtPlanned − pocketDirt), and a chest that
+// holds dirt is already drawn before anything is dug (`supply_manager` withdraws for a pocket order
+// first). This sets the SIZE of the order once those two have been asked.
+//
+// WHY A FLOOR AT ALL. The gap is computed from the rows the seeds can currently plant, and on a fresh
+// world the seeds arrive a few at a time — so the farm asked for `3 dirt` and got a whole gather round
+// trip for three blocks, then asked again. The 2026-09-16 fresh-world run: `blueprint/gather supply/dirt`
+// claimed 3 times for 2m 53s while the field laid 13 rows, and the cluster line read
+// `3 dirt ordered (3 for the rows the seeds can plant, 0 held)` over and over. A floor turns N small trips
+// into one, and dirt is the cheapest block in the game to over-carry — it is pocket-held, it is never
+// wasted (every unlaid row will want it), and carrying a stack costs one slot.
+// It is a FLOOR, never a cap: a gap larger than this is ordered in full.
+const FARM_DIRT_MIN_GATHER = 15;
+if (!Number.isInteger(FARM_DIRT_MIN_GATHER) || FARM_DIRT_MIN_GATHER < 1) {
+    throw new Error(`CODING VIOLATION (Law 13): FARM_DIRT_MIN_GATHER must be a positive whole number of blocks, got ${FARM_DIRT_MIN_GATHER}.`);
+}
 
 // A hostile is "aggroed" iff within AGGRO_RANGE blocks AND has clear line-of-sight to the bot (the
 // concrete A3 test — no mob-target introspection). DISENGAGE_RANGE must be > AGGRO_RANGE: backing out
@@ -1283,6 +1316,78 @@ const BOT_MODES = Object.freeze({ HOMESTEADER: 'homesteader', CONTRACTOR: 'contr
 // reader would make a mis-wired launcher look like a working homesteader (Law 13).
 const TERMINAL_SPAWN_MODE = BOT_MODES.HOMESTEADER;
 
+// ── SETUP ORDER: THE STRUCTURES A BODY MUST FINISH, IN ORDER, BEFORE ANY OTHER STRUCTURE (Architect 2026-09-15) ──
+// *"all buildings should be gated on the primary alpha structure... no other structure can be built until the
+// alpha structure is built"* — and for a homesteader *"the farm cannot be built until the headframe is done and
+// no other building can be completed until the farm is done."* Shelter comes before food (Law 17): a bot that
+// does not move spends no hunger, and standing still inside walls is safe.
+//
+// ONE RULE, READ BY ONE GATE (job_gates.setupGate). A job stamped `structure: <name>`:
+//   - named in this list → held until every name BEFORE it is built;
+//   - not named here    → held until EVERY name here is built.
+// A job with no `structure` stamp is not construction (gathering, mining, crafting) and is never held here.
+// "Built" is WHOLE: the headframe counts only once every anchor that blocks completion is done, mine-dependent
+// anchor included (Architect 2026-09-15). The assessor that owns a structure reports it built each sweep;
+// unreported is NOT built (Law 13 — default stopped).
+//
+// A CONTRACTOR'S LIST IS ITS HOUSE ALONE. It is the minimum that makes a contractor useful to a person; a farm
+// is the person's to request, never imposed.
+const SETUP_ORDER = Object.freeze({
+    [BOT_MODES.HOMESTEADER]: Object.freeze(['headframe', FARM_STRUCTURE]),
+    [BOT_MODES.CONTRACTOR]:  Object.freeze(['contractor_house']),
+});
+// ── THE HEADFRAME CLOCK: DAWN TO DUSK (Architect 2026-09-15) ────────────────────────────────────────────────────
+// *"the headframe must be built within 11.5 minutes. its a dawn to dusk timer. so there should be an 11.5 minute
+// timer when the bots start from nothing. and there should be a rating given to the construction so when i return
+// later, i remember why its important."* WHY IT MATTERS: the headframe is the alpha structure — every other
+// blueprint waits on it (SETUP_ORDER), and it is the crew's shelter for the first night. A crew still building at
+// dusk spends that night exposed (Law 17: shelter before food; a bot standing still inside walls is safe).
+//
+// The clock runs from the START COMMAND (the first crew bot's start_injector line — *"once the bots begin then the
+// timer starts"*) to the first sweep that finds the WHOLE headframe built. Read by the milestones lens
+// (`trace_monitor --milestones`) and printed at the end of run.js. IT IS A GRADE, NEVER A PASS/FAIL AND NEVER A
+// REASON TO END A RUN (*"its just a grade. it shouldnt pass or fail the run"*). The numbers are HIS criterion, so a
+// lens may grade against them (Law 25). Bands, by elapsed time:
+//   GREEN  ≤ green_within_sec      built inside dawn-to-dusk
+//   OK     ≤ ok_within_sec         the edge of dusk
+//   LATE   <  alert_from_sec       past dusk, not yet alert (unnamed by him — confirm)
+//   ALERT  ≥ alert_from_sec        an alert-level issue, built or not
+const HEADFRAME_CLOCK = Object.freeze({
+    structure: 'headframe',
+    green_within_sec: 690,   // 11m 30s
+    ok_within_sec: 720,      // 12m
+    alert_from_sec: 780,     // 13m
+    why: 'dawn to dusk — the alpha structure every other building waits on, and the crew\'s shelter for the first night (Law 17)',
+    // ── WHAT STOPS THE CLOCK (Architect 2026-09-16) ───────────────────────────────────────────────────
+    // *"the last anchor doesent count as finished. its the shelll thats the most important. so anchor 2
+    // should lap the clock. i still want to know how long the entire thing takes but i want it to be graded
+    // off anchor 2 completion because thats where the safety is."*
+    //
+    // THE CLOCK MEASURES SHELTER, NOT COMPLETION, and those stopped being the same thing once the headframe
+    // grew a fourth anchor. The `why` above is the standard the grade answers to — *the crew's shelter for
+    // the first night* — and a crew is sheltered when the shell closes. Grading on the whole structure made
+    // the number answer a question nobody asked: the 2026-09-16 fresh-world run graded ALERT while the last
+    // anchor waited on ONE charcoal, which is a supply story and not a safety one.
+    //
+    // The full build is still measured and still printed; it is simply not what earns the colour. Two
+    // numbers, one graded, said plainly (Law 25) — the lens prints both so a reader can never mistake the
+    // shell time for the whole time.
+    graded_anchor: 2,
+});
+if (!(HEADFRAME_CLOCK.green_within_sec < HEADFRAME_CLOCK.ok_within_sec && HEADFRAME_CLOCK.ok_within_sec < HEADFRAME_CLOCK.alert_from_sec)) {
+    throw new Error('CODING VIOLATION (Law 13): HEADFRAME_CLOCK bands must rise — green < ok < alert.');
+}
+if (!Number.isInteger(HEADFRAME_CLOCK.graded_anchor) || HEADFRAME_CLOCK.graded_anchor < 0) {
+    throw new Error(`CODING VIOLATION (Law 13): HEADFRAME_CLOCK.graded_anchor must be a whole anchor index, got ${HEADFRAME_CLOCK.graded_anchor}.`);
+}
+
+for (const mode of Object.values(BOT_MODES)) {
+    const order = SETUP_ORDER[mode];
+    if (!Array.isArray(order) || order.length === 0 || new Set(order).size !== order.length) {
+        throw new Error(`CODING VIOLATION (Law 13): SETUP_ORDER for species '${mode}' must be a non-empty list of distinct structure names.`);
+    }
+}
+
 // ── THE SIGN ORDER DESK WAS DELETED 2026-08-30, UNBUILT (Architect) ──────────────────────────────
 // It was a full design and never had one consumer: SIGN_CLAIM_EDGE / SIGN_CLAIM_VERTICAL_OFFSET /
 // SIGN_CLAIM_HALF_EXTENT (an 11³ chests-only cube claimed by a sign), SIGN_LINE_MAX_CHARS (a 12-char
@@ -1349,6 +1454,8 @@ module.exports = {
     FOREMAN_NAME,
     BOT_MODES,
     TERMINAL_SPAWN_MODE,
+    SETUP_ORDER,
+    HEADFRAME_CLOCK,
     ORDER_ALIASES,
     JOB_TYPE,
     JOB_CATEGORY_OF,
@@ -1382,6 +1489,8 @@ module.exports = {
     FARM_BLUEPRINT_NAME,
     FARM_PLOT_COUNT,
     FARM_ROOM_KEYS,
+    FARM_STRUCTURE,
+    FARM_DIRT_MIN_GATHER,
     AGGRO_RANGE,
     MOB_AGGRO_RANGE,
     MAX_AGGRO_RANGE,
@@ -1405,7 +1514,6 @@ module.exports = {
     SEA_LEVEL,
     HUMAN_SURFACE_SLACK,
     HUMAN_MAX_ABOVE_SEA,
-    FARM_WATER_BIOMES,
     FUEL_PREFERENCES,
     FUEL_SMELT_YIELD,
     SMELT_COOK_MS,

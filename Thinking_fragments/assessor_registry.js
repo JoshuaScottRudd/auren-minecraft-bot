@@ -69,9 +69,15 @@ const GATE = respawn;
 // different structure. Its position among the others decides nothing about what is claimed — the band
 // and the rung do that — so what it must not do is drift AWAY from `building`, where a later reader
 // would stop recognising the two as one kind of work.
+// THE STRUCTURE ASSESSORS RUN IN SETUP_ORDER, AHEAD OF `supply` (Architect 2026-09-15). job_board carries each
+// structure's "built" verdict forward through this loop and drops the claim of any structure still waiting its
+// turn; a structure evaluated before the ones it waits on would see them unreported, read "not built", and
+// withhold a claim it is entitled to. So: building (headframe) → farming (the farm) → contractorHouse, and all
+// three before supply, the first reader of the claim. farming reads no claim, so moving it up changes none of
+// its own answers.
 const EVALUATE_ORDER = [
-    hunger, mining, building, contractorHouse, supply, furnace,
-    baseLayout, woodPreference, farming, lighting, canopy, groundSalvage,
+    hunger, mining, building, farming, contractorHouse, supply, furnace,
+    baseLayout, woodPreference, lighting, canopy, groundSalvage,
 ];
 
 // ASSEMBLE — urgent → stable (Law 18). The order jobs are CONCATENATED in, which survives into the

@@ -28,6 +28,9 @@
 'use strict';
 
 const { relativeTime } = require('./trace_read');
+// THE ONE WRITER TO STDOUT (Architect 2026-09-16). Every figure below leaves as a field name and a
+// value; this lens no longer owns a space, a separator or a column width.
+const out = require('./data_out');
 
 // The one completion line every container-to-container move writes (inventory_swapper._executeTransfer).
 // The chest snapshot is the tail of it, which is why standing contents and the manifest come from the
@@ -145,151 +148,146 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
         }
     }
 
-    console.log(`trace_monitor · inventory · ${traceName} · latest run · span [${relativeTime(maxRel)}]`
-        + `${botFilter ? ` · bot=${botFilter}` : ''}`);
-    console.log('(context only — never flags, never wakes)\n');
+    // ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ───────────────────────────────────────────
+    // Every string below is either a field name this lens declared or a value it COPIED out of the
+    // record. What stood here and is DELETED rather than given a field name: the `(context only — never
+    // flags, never wakes)` banner; the three-line note about which completion-line shape is matched; the
+    // STANDING INVENTORY preamble about the record not being the live world; the BY CONSTRUCTION note
+    // that ground pickups write no matchable line; the two-clock warning under contention; the name-join
+    // footnote under double handling; the PEAK-not-closing footnote and the `a chest is 27 slots` aside
+    // under fragmentation; the `(per-move, not per-item)` aside; the `none — every item that entered a
+    // chest stayed in it` sentence; and every `--all` pointer. Each was this instrument saying what its
+    // own numbers MEANT or what the reader should do next. Every NUMBER they surrounded is still printed
+    // below, one field each — the metric-type labels became FIELD NAMES (`redundant_slots_peak`).
+    out.kv('lens', 'inventory');
+    out.kv('record', traceName);
+    out.kv('span', relativeTime(maxRel));
+    if (botFilter) out.kv('bot_filter', botFilter);
 
     if (!chests.size && !pockets.size) {
-        // The honest zero (Law 25): distinguish "nothing moved" from "nothing was recorded".
-        console.log('NO CONTAINER ACTIVITY AND NO POCKET READING IN THIS RUN.');
-        console.log('  Every container-to-container move goes through inventory_swapper._executeTransfer,');
-        console.log('  and every job_board sweep prints the pocket — so an empty section means the fleet');
-        console.log('  never opened a chest AND the board never swept, not that transfers went unlogged.');
-        console.log('  Check the run actually started:  trace.ps1 --story');
-        console.log('  ONE OTHER CAUSE, and check it before believing the zero: the completion line changed');
-        console.log('  shape on 2026-08-14 when one window began carrying several kinds. A trace recorded');
-        console.log('  BEFORE that date cannot be read by this lens and will land here looking idle.');
+        // The honest zero (Law 25), as three counted fields instead of a paragraph about absence.
+        out.zero('chests');
+        out.zero('pockets');
+        out.zero('transfers');
         return;
     }
 
     // ── STANDING INVENTORY ─────────────────────────────────────────────────────────────────────────
-    console.log('STANDING INVENTORY — last known contents, with the age of each reading');
-    console.log('  (from the record, not the live world: a container shows what it held when it was last');
-    console.log('   opened or swept. An old timestamp means untouched, never empty.)\n');
+    // Contents render as `name:count` pairs joined by a comma — the record's own pocket shape. The SPLIT
+    // is preserved (three `oak_log` entries stay three rather than summing to one) because stack
+    // fragmentation is one of the four costs measured below, and `at` carries the age of the reading.
+    const cells = (stacks) => (stacks.length ? stacks.map(s => `${s.name}:${s.count}`).join(',') : 0);
 
     const fleetTotal = {};
     // A chest can enter this map from a QUEUE line alone — the record proves the chest exists and that
     // someone waited on it, and says nothing whatever about its contents. Rendering that as `empty` is a
     // false verdict of exactly the kind this lens is meant to kill (Law 25), so a chest with no snapshot
-    // is named as unread rather than shown with a zero.
+    // goes to its own block with a peer count rather than into the contents table with a zero.
     const unread = [...chests].filter(([, c]) => c.at === null);
+    const chestRows = [];
     for (const [id, c] of [...chests].filter(([, c]) => c.at !== null).sort((a, b) => a[0].localeCompare(b[0]))) {
         const t = _totals(c.stacks);
         for (const [n, v] of Object.entries(t)) fleetTotal[n] = (fleetTotal[n] || 0) + v;
-        const body = c.stacks.length
-            ? c.stacks.map(s => `${s.name} x${s.count}`).join(', ')
-            : 'empty';
-        // The stack count is printed beside the item total because the gap between them IS the
-        // fragmentation: "41 in 3 stacks" is one chest slot's worth of goods eating three.
-        const split = Object.entries(t).filter(([n]) => c.stacks.filter(s => s.name === n).length > 1);
-        const frag = split.length
-            ? `  ⚠ fragmented: ${split.map(([n, v]) => `${n} ${v} in ${c.stacks.filter(s => s.name === n).length} stacks`).join(', ')}`
-            : '';
-        console.log(`  chest ${_prettyId(id).padEnd(16)} [${relativeTime(c.at)}]  ${c.stacks.length} stack(s)  ${body}${frag}`);
+        // The gap between the stack count and the item total IS the fragmentation, so the redundant slot
+        // count of the LAST snapshot is carried as its own field beside the peak figure in cost 3.
+        const redundantNow = Object.keys(t).reduce((n, name) => n + (c.stacks.filter(s => s.name === name).length - 1), 0);
+        chestRows.push([_prettyId(id), relativeTime(c.at), c.stacks.length, redundantNow, cells(c.stacks)]);
     }
-    for (const [id, c] of unread) {
-        console.log(`  chest ${_prettyId(id).padEnd(16)} [no contents reading in this run — seen only as a `
-            + `chest ${c.queues} peer(s) queued at]`);
+    out.section('chest_contents_last_known');
+    out.table(['chest', 'at', 'stacks', 'redundant_slots_now', 'contents'], chestRows);
+
+    if (unread.length) {
+        out.section('chest_no_contents_reading');
+        out.table(['chest', 'peers_queued'], unread.map(([id, c]) => [_prettyId(id), c.queues]));
     }
-    console.log('');
+
+    const pocketRows = [];
     for (const [id, p] of pockets) {
         const t = _totals(p.stacks);
         for (const [n, v] of Object.entries(t)) fleetTotal[n] = (fleetTotal[n] || 0) + v;
-        console.log(`  pocket ${String(id).padEnd(15)} [${relativeTime(p.at)}]  `
-            + (p.stacks.length ? p.stacks.map(s => `${s.name} x${s.count}`).join(', ') : 'empty'));
+        pocketRows.push([id, relativeTime(p.at), p.stacks.length, cells(p.stacks)]);
     }
+    out.section('pocket_contents_last_known');
+    out.table(['bot', 'at', 'stacks', 'contents'], pocketRows);
 
     // What the fleet HOLDS, regardless of which container holds it — the same figure job_board judges a
-    // storage threshold against, so this line and the board's verdict are readable against each other.
-    console.log('\n  FLEET-WIDE TOTAL (every chest + every pocket — the figure a storage threshold measures):');
+    // storage threshold against, so this block and the board's verdict are readable against each other.
     const sorted = Object.entries(fleetTotal).sort((a, b) => b[1] - a[1]);
-    console.log('    ' + (sorted.length ? sorted.map(([n, v]) => `${n}:${v}`).join('  ') : '(nothing held)'));
+    out.section('fleet_total_held');
+    if (!sorted.length) out.zero('items');
+    else out.table(['item', 'count'], sorted);
 
     // ── TRANSFER MANIFEST ──────────────────────────────────────────────────────────────────────────
-    console.log(`\nTRANSFER MANIFEST — ${manifest.length} container move(s)`);
-    console.log('  (ground pickups are absent BY CONSTRUCTION: a harvest never opens a container, so it');
-    console.log('   writes no line this lens could match.)\n');
-
-    if (!manifest.length) {
-        console.log('  none.\n');
-    } else if (verbose) {
-        for (const e of manifest) {
-            const arrow = e.dir === 'deposit' ? '→' : '←';
-            console.log(`  [${relativeTime(e.t)}] ${String(e.bot).padEnd(10)} ${e.dir.padEnd(8)} `
-                + `${String(e.count).padStart(3)} item(s) in ${e.kinds} kind(s) ${arrow} chest ${_prettyId(e.chestId).padEnd(16)}`
-                + ` wait ${e.waitSec.toFixed(1)}s · ${e.msPerItem}ms/item  [${e.moved}]`);
-        }
-        console.log('');
-    } else {
-        console.log('  (--all prints every move; per-chest and per-item rolls follow)\n');
+    out.section('transfer_manifest');
+    out.kv('moves', manifest.length);
+    if (manifest.length && verbose) {
+        // `moved` and the direction verb are the record's own words, copied into value cells.
+        out.table(
+            ['at', 'bot', 'direction', 'items', 'kinds', 'chest', 'open_sec', 'wait_sec', 'ms_per_item', 'moved'],
+            manifest.map(e => [relativeTime(e.t), e.bot, e.dir, e.count, e.kinds, _prettyId(e.chestId),
+                e.openSec, e.waitSec.toFixed(1), e.msPerItem, e.moved]),
+        );
     }
 
     // ── THE FOUR COSTS ─────────────────────────────────────────────────────────────────────────────
-    // Each row is a cost the current chest design pays and a candidate redesign would change. They are
-    // reported as measurements with their evidence, never as a verdict on the design (Law 23 — the
-    // reader judges; the lens states what was sensed).
-    console.log('THE FOUR COSTS — what the current chest layout actually spends\n');
-
+    // Each block is a cost the current chest layout pays and a candidate redesign would change. The two
+    // contention clocks stay in SEPARATE fields and are never added: the queue wait is already inside
+    // the wait figure, so a sum would double-count the worst chest.
     const totalWait = manifest.reduce((n, e) => n + e.waitSec, 0);
     const totalQueue = [...chests.values()].reduce((n, c) => n + c.queueSec, 0);
     const totalQueues = [...chests.values()].reduce((n, c) => n + c.queues, 0);
-    // Two clocks, never added together in the headline and never added in a row either — `waiting to get
-    // in` covers walk + lock acquire on EVERY move, while the queue clock counts only the moves that
-    // found a peer holding the chest, and the queue wait is already inside the wait figure. Summing them
-    // double-counts the worst chest, which is exactly the chest a reader is deciding about.
-    console.log(`  1. CONTENTION   ${totalWait.toFixed(1)}s spent getting in to a chest across ${manifest.length} move(s)`
-        + `${totalQueues ? `, of which ${totalQueue}s was ${totalQueues} lock queue(s) behind a peer` : ', no lock queue formed'}`);
+
+    out.section('cost_contention');
+    out.kv('wait_sec_total', totalWait.toFixed(1));
+    out.kv('moves', manifest.length);
+    out.kv('queue_sec_total', totalQueue);
+    out.kv('queues', totalQueues);
+    const waitRows = [];
     for (const [id, c] of [...chests].sort((a, b) => b[1].waitSec - a[1].waitSec)) {
         if (c.waitSec < 1) continue;
-        console.log(`       chest ${_prettyId(id).padEnd(16)} ${c.waitSec.toFixed(1)}s over `
-            + `${c.deposits + c.retrieves} move(s)${c.queues ? ` · of that, ${c.queueSec}s in ${c.queues} peer queue(s)` : ''}`);
+        waitRows.push([_prettyId(id), c.waitSec.toFixed(1), c.deposits + c.retrieves, c.queueSec, c.queues]);
     }
+    out.table(['chest', 'wait_sec', 'moves', 'queue_sec', 'queues'], waitRows);
 
     // Double handling: the same item both deposited into and withdrawn out of the SAME chest. The
     // overlap is the round trip the material did not need to make — the cost a system-wide count would
     // delete outright, since the material was already inside the storage system when it was withdrawn.
-    console.log('');
     let doubleTotal = 0;
     const doubleRows = [];
     for (const [id, c] of chests) {
         for (const [item, inCount] of Object.entries(c.flowIn)) {
             const outCount = c.flowOut[item] || 0;
             const overlap = Math.min(inCount, outCount);
-            if (overlap > 0) { doubleTotal += overlap; doubleRows.push(`${item} ${overlap} (in ${inCount}, out ${outCount}) at ${_prettyId(id)}`); }
+            if (overlap > 0) { doubleTotal += overlap; doubleRows.push([_prettyId(id), item, inCount, outCount, overlap]); }
         }
     }
-    console.log(`  2. DOUBLE HANDLING  ${doubleTotal} item(s) went INTO a chest and later back OUT of the same chest`);
-    for (const r of doubleRows.sort()) console.log(`       ${r}`);
-    console.log('       (measured from consecutive chest snapshots, so a deposit named `oak_log` and a');
-    console.log('        withdrawal named `logs` are the same material — a name join reports zero here)');
-    if (!doubleRows.length) console.log('       none — every item that entered a chest stayed in it.');
+    out.section('cost_double_handling');
+    out.kv('items_double_handled', doubleTotal);
+    out.table(['chest', 'item', 'items_in', 'items_out', 'overlap'], doubleRows.sort());
 
-    console.log('');
     let fragChests = 0, fragWaste = 0;
     const fragRows = [];
     for (const [id, c] of chests) {
         if (c.fragPeak > 0) {
             fragChests++; fragWaste += c.fragPeak;
-            fragRows.push(`chest ${_prettyId(id)} peaked at ${c.fragPeak} redundant slot(s) [${relativeTime(c.fragPeakAt)}]: ${c.fragPeakText}`);
+            fragRows.push([_prettyId(id), c.fragPeak, relativeTime(c.fragPeakAt), c.fragPeakText]);
         }
     }
-    console.log(`  3. FRAGMENTATION  ${fragWaste} redundant stack slot(s) at peak across ${fragChests} chest(s)`
-        + ' — one item type occupying several slots where one would hold it');
-    for (const r of fragRows) console.log(`       ${r}`);
-    console.log('       (PEAK, not the closing snapshot: a chest drained by the end reads zero all run');
-    console.log('        while having spent the slots. A chest is 27 slots; this is what a consolidation');
-    console.log('        pass would return.)');
+    out.section('cost_fragmentation');
+    out.kv('redundant_slots_peak', fragWaste);
+    out.kv('chests_fragmented', fragChests);
+    out.table(['chest', 'redundant_slots_peak', 'at', 'stacks_at_peak'], fragRows);
 
-    console.log('');
     const small = manifest.filter(e => e.count <= SMALL_TRANSFER);
     const bulk = manifest.filter(e => e.count > SMALL_TRANSFER);
     const avg = (rows) => rows.length ? Math.round(rows.reduce((n, e) => n + e.msPerItem, 0) / rows.length) : 0;
-    console.log(`  4. SMALL-TRANSFER TAX  ${small.length} of ${manifest.length} move(s) carried ≤${SMALL_TRANSFER} item(s)`
-        + ` at ${avg(small)}ms/item, vs ${avg(bulk)}ms/item for the ${bulk.length} larger move(s)`);
-    console.log('       (the window open/close is a fixed cost, so a 1-item trip pays it in full; the ratio');
-    console.log('        is what batching would recover, and it is per-move, not per-item)');
-
-    if (!verbose) console.log('\n(--all prints the full move-by-move manifest)');
+    out.section('cost_small_transfer_tax');
+    out.kv('small_transfer_max_items', SMALL_TRANSFER);
+    out.kv('moves_small', small.length);
+    out.kv('moves_bulk', bulk.length);
+    out.kv('moves_total', manifest.length);
+    out.kv('ms_per_item_small', avg(small));
+    out.kv('ms_per_item_bulk', avg(bulk));
 }
 
 module.exports = { runInventory };

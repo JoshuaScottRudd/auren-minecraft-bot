@@ -48,12 +48,20 @@ function serverPropertiesFile() { return path.join(workstation.needServerDir(), 
 // readServerProperties → { port, password, level }. Throws when RCON is disabled: a link that "succeeded" with
 // a default port against a server that never opened one would fail later, somewhere less legible
 // (Law 13 — prove safe to continue). Never hardcodes either value (Law 6 — one source of truth).
-function readServerProperties(file = serverPropertiesFile()) {
+// parseServerProperties(text) → { key: value } — the ONE parser of the format (Law 16). Exported without the
+// RCON gate below because `server_settings` has to read a file that is exactly the one this gate refuses: a
+// server whose console is not switched on yet.
+function parseServerProperties(text) {
   const props = {};
-  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+  for (const line of text.split(/\r?\n/)) {
     const m = line.match(/^([^#=]+)=(.*)$/);
     if (m) props[m[1].trim()] = m[2].trim();
   }
+  return props;
+}
+
+function readServerProperties(file = serverPropertiesFile()) {
+  const props = parseServerProperties(fs.readFileSync(file, 'utf8'));
   // NAMED SO A STRANGER CAN FIX IT (Architect 2026-09-12: a code 13 should mean *"i coded something wrong
   // or a setting is wrong"* — this is the second kind, so it stays a throw, and what it owed was the
   // remedy). It said only "rcon disabled in server.properties", which is a true statement of the fault and
@@ -276,4 +284,4 @@ async function probe(opts = {}) {
 // probes in this directory keep calling `readServerProperties()` directly and that is CORRECT rather than
 // an oversight: a bench needs a dev world it drives itself, so being pointed at a foreign server by a
 // stray environment variable would be a bench measuring something nobody asked about.
-module.exports = { readServerProperties, credentials, open, once, probe, entityPos };
+module.exports = { parseServerProperties, readServerProperties, credentials, open, once, probe, entityPos };

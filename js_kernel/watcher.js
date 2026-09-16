@@ -355,7 +355,15 @@ class Watcher {
   // _forward: mirror one printed line to the overseer so both bots' streams can be watched in one
   // place (tagged by bot on the overseer side). Best-effort and re-entry-guarded — the forward path
   // must never log (it would recurse) and must never throw into a caller (Law 5: logging is passive).
-  _forward(entry) {
+  //
+  // ── THE LEVEL TRAVELS AS A FIELD, NOT AS A GLYPH IN THE TEXT (Architect 2026-09-16) ──────────────
+  // The three call sites below each know which level they are, and until this date that knowledge was
+  // dropped at the wire and left recoverable only by looking for ❌/⚠️/📊 inside the formatted string.
+  // A live supervisor that needs to know whether this fleet has errored must not have to read the
+  // sentence to find out — reading the text to recover a fact the writer already had is the lens-shaped
+  // hop the Architect struck out ("it should skip that and talk directly"). `level` is that fact,
+  // stated once, by the only module entitled to state it.
+  _forward(entry, level) {
     if (this._forwarding) return;
     this._forwarding = true;
     try {
@@ -365,7 +373,7 @@ class Watcher {
       // the fleet, because the module it reaches has alias requires of its own. Outside a bot the
       // forward still self-faults, and that is the correct outcome — there is no overseer to forward to.
       const link = require('./overseer_link');
-      if (link && typeof link.forwardLog === 'function') link.forwardLog(entry);
+      if (link && typeof link.forwardLog === 'function') link.forwardLog(entry, level);
     } catch (e) { _selfFault('_forward', e); }
     finally { this._forwarding = false; }
   }
@@ -380,7 +388,7 @@ class Watcher {
     this._traceRecord(stage, entry);
     // Sub-loop chatter (QUIET_FORWARD_STAGES) is recorded to the per-bot file above but not mirrored
     // to the overseer signal-trace stream — warn()/error() still forward, so failures never hide.
-    if (!QUIET_FORWARD_STAGES.has(stage)) this._forward(entry);
+    if (!QUIET_FORWARD_STAGES.has(stage)) this._forward(entry, 'summary');
     this._bufferClear(stage);
   }
 
@@ -391,7 +399,7 @@ class Watcher {
     this.currentLoop.push(entry);
     this._record(entry, { printed: true });
     this._traceRecord(stage, entry);
-    this._forward(entry);
+    this._forward(entry, 'error');
   }
 
   warn(stage, message) {
@@ -400,7 +408,7 @@ class Watcher {
     this.currentLoop.push(entry);
     this._record(entry, { printed: true });
     this._traceRecord(stage, entry);
-    this._forward(entry);
+    this._forward(entry, 'warn');
   }
 
   track(component, fn) {
@@ -458,7 +466,12 @@ class Watcher {
       this.currentLoop.push(entry);
       this._lastStoryAt = Date.now();
       this.summaryLog.push(`[${formatTimestamp(this._lastStoryAt)}] ${entry}`);
-      this._forward(entry);   // error context belongs on the overseer, not just the bot's story file
+      // `context`, NOT `error`, and the distinction is load-bearing now that the overseer counts these.
+      // One error() dumps its whole deferred buffer first, so a stage holding twelve buffered lines
+      // would post one error and twelve more lines behind it — tallied as `error` that reads as
+      // thirteen failures where there was one. These lines are the CONTEXT for the error that follows,
+      // never failures of their own (Law 25 — a count that overstates is not a conservative count).
+      this._forward(entry, 'context');   // error context belongs on the overseer, not just the bot's story file
     }
     this._buffers[stage] = [];
     this._writeWatcherFile();

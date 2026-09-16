@@ -386,6 +386,10 @@ function latchHolds(bot, order, dy) {
 // Required lazily and only on the compute path — navigator requires battle_stations which requires this
 // file, so a top-level require closes the cycle; and building the Set walks three perception nodes, which
 // is not a thing to do 20 times a second for a want that fires a handful of times an hour.
+//
+// The spawn square is NOT asked about here any more (Architect 2026-09-15): its cells read as bedrock to
+// every reader, so a want for one cannot form — the terrain read that would produce it sees an undiggable
+// block. One mechanism, a layer below this seat (Law 16).
 function isProtected(bot, cell) {
   const { loadProtectedBlocks } = require('@locomotion/navigator');
   const set = loadProtectedBlocks(bot);
@@ -401,7 +405,10 @@ function terrainWant(bot, self, order, dy, heading) {
   wantLatch = null;
   const feet = self.floored();
   if (order.mode === 'vertical_gap') {
-    if (dy > 0) return (wantLatch = { kind: 'place', at: { x: feet.x, y: feet.y, z: feet.z }, why: 'target_above', refused: false });
+    if (dy > 0) {
+      wantLatch = { kind: 'place', at: { x: feet.x, y: feet.y, z: feet.z }, why: 'target_above', refused: false };
+      return wantLatch.refused ? null : wantLatch;
+    }
     const floor = { x: feet.x, y: feet.y - 1, z: feet.z };
     wantLatch = { kind: 'dig', at: floor, why: 'target_below', refused: isProtected(bot, floor) };
     return wantLatch.refused ? null : wantLatch;

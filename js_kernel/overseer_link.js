@@ -308,9 +308,12 @@ function recordStartupPosition(bot) {
 // isConnected() proves readyState === OPEN, which is the only thing ws.send refuses on, so a throw
 // escaping here is a defect and not a dropped packet (Law 26 — the interface must not report through
 // the channel it is reporting about).
-function forwardLog(line) {
+// `level` is the watcher's own word for which of its three channels wrote this line ('summary' |
+// 'warn' | 'error' | 'context'). It rides beside the text rather than inside it so the overseer can
+// count faults without reading a sentence — see watcher._forward's note.
+function forwardLog(line, level) {
   if (!isConnected() || typeof line !== 'string') return;
-  _ws.send(JSON.stringify(createEnvelope('log', _botId, { line })));
+  _ws.send(JSON.stringify(createEnvelope('log', _botId, { line, level: level || null })));
 }
 
 // Tells the overseer this bot is done with a key. Fire-and-forget.
