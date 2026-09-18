@@ -51,7 +51,8 @@ const LAVA = new Set(['lava']);
 // similar one. building_site_overlays re-exports it, so every existing consumer is unchanged and
 // there is still exactly one definition (Law 16).
 //
-// Live-tuned: the 1.21.5 "Spring to Life" flora (leaf_litter/wildflowers/bush/dry-grass) is in here
+// Live-tuned: the "Spring to Life" flora (leaf_litter/wildflowers/bush/dry-grass), added in 1.21.5 and
+// still present on 26.1, is in here
 // because a birch_forest floor is carpeted with it and would otherwise be wrongly read as non-clearable
 // terrain.
 const CLEARABLE = new Set([
@@ -67,7 +68,7 @@ const CLEARABLE = new Set([
   // decorative ground plants — a farm site sits in a forest, so the canopy AND the forest-floor flora it
   // grows over must not reject the site (preconstruction clears them). These are non-solid clearable
   // plants, NOT terrain — grass_block/dirt at height stay non-clearable (real slope). wildflowers/bush/
-  // leaf_litter/dry-grass are the 1.21.5 "Spring to Life" flora the birch_forest floor is carpeted with.
+  // leaf_litter/dry-grass are the "Spring to Life" flora the birch_forest floor is carpeted with.
   'leaf_litter', 'wildflowers', 'pink_petals', 'bush', 'firefly_bush', 'cactus_flower',
   'short_dry_grass', 'tall_dry_grass',
   'dandelion', 'poppy', 'blue_orchid', 'allium', 'azure_bluet',
@@ -75,6 +76,8 @@ const CLEARABLE = new Set([
   'oxeye_daisy', 'cornflower', 'lily_of_the_valley',
   'sunflower', 'lilac', 'rose_bush', 'peony',
   'dead_bush', 'vine', 'hanging_roots', 'spore_blossom',
+  // cocoa hangs on jungle trunks with a full-block box, so without it a pod reads as ground at trunk height
+  'cocoa',
   'azalea', 'flowering_azalea',
   'bamboo', 'sugar_cane',
   'snow', 'moss_carpet',

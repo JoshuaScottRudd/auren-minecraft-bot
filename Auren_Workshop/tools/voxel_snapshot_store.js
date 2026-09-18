@@ -1,6 +1,6 @@
 'use strict';
 // library: voxel_snapshot_store — where captured loaded areas live on disk, and how a scanner reads one back with no
-// server. The capture itself is voxel_snapshot.js (a live body); the benches that test scanners load from here.
+// server. The capture itself is voxel_snapshot.js (a live body); the building-site survey (zone_flatness.js) loads from here.
 //
 // ── WHAT A SNAPSHOT IS ──────────────────────────────────────────────────────────────────────────────
 // Every chunk column a connected body held once its view had fully arrived, serialised by prismarine-chunk's own
@@ -11,9 +11,9 @@
 // The header carries the seed, the world, the version, the view distance, world spawn, where the body stood and the
 // person spot it was placed on, so a result can be traced back to the exact ground it came from.
 //
-// ── TWO RULES THE STORE ENFORCES, BECAUSE A/B RESULTS ARE ONLY WORTH SOMETHING UNDER THEM ─────────────
+// ── TWO RULES THE STORE ENFORCES, BECAUSE A SURVEY ACROSS SNAPSHOTS IS ONLY WORTH SOMETHING UNDER THEM ──
 //   • NO TWO SNAPSHOTS OF ONE SEED SHARE A CHUNK. A voxel counted in two snapshots is one piece of ground weighed
-//     twice, and an A/B total built on it overstates whichever arm happens to like that ground. A capture that
+//     twice, and a total built across snapshots (a biome's share, a site ranking) overstates it. A capture that
 //     overlaps is refused, naming the snapshot it overlaps and how far to move (Law 13 correction).
 //   • AT MOST KEEP snapshots. Saving the eleventh deletes the oldest first, and says which.
 //

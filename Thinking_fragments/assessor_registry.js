@@ -43,11 +43,15 @@ const furnace       = require('@thinking/assessors/furnace');
 // bots just walk off to another loaded chunk to make a base. it should just refuse and crash and tell
 // the human that it cant find a place to build the base."* A crew is brought to where a person stands,
 // and that placement is the instruction — a base sited in another chunk overrules it.
-// `assessors/base_layout` now throws a Law 13 violation naming the biome instead of returning silence.
 // BIOME HUNTING FOR MATERIAL SURVIVES and is untouched: `supply_manager` routes to
 // `exploration_executor` directly for that, so it never needed a board job (*"it should only biome hunt
 // if searching for surface items like logs"*).
-const baseLayout    = require('@thinking/assessors/base_layout');
+//
+// `base_layout` IS GONE TOO — DELETED 2026-09-18. It posted `lock_base_layout`, the job by which a body
+// surveyed and locked its own base. Ruled out: *"double check forman does the site locking and its no longer
+// a job any bots do. its done before bot spawn. so the bots come in and get straight to work."* The foreman
+// sites the base before any body exists and hands it over at birth; `start_injector` records it and refuses
+// to start a body that has none (`lock_all_buildspots.recordHandedSite`).
 const woodPreference= require('@thinking/assessors/wood_preference');
 const hunger        = require('@thinking/assessors/hunger');
 const farming       = require('@thinking/assessors/farming');
@@ -77,13 +81,13 @@ const GATE = respawn;
 // its own answers.
 const EVALUATE_ORDER = [
     hunger, mining, building, farming, contractorHouse, supply, furnace,
-    baseLayout, woodPreference, lighting, canopy, groundSalvage,
+    woodPreference, lighting, canopy, groundSalvage,
 ];
 
 // ASSEMBLE — urgent → stable (Law 18). The order jobs are CONCATENATED in, which survives into the
 // printed board because the display sort is stable. It breaks no ties: equals are picked at random.
 const ASSEMBLE_ORDER = [
-    hunger, groundSalvage, baseLayout, woodPreference, supply,
+    hunger, groundSalvage, woodPreference, supply,
     furnace, building, contractorHouse, mining, farming, lighting, canopy,
 ];
 

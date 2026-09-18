@@ -29,39 +29,39 @@ const { relativeTime } = require('./report_formatting');
 
 // The merged fleet stream. Exported as a DEFAULT for callers to fall back to, never read here — the
 // caller owns which trace it is reading (Law 25: the asker's criterion, not the reader's).
-const DEFAULT_TRACE_FILE = require(require('./lens_paths').bot('js_kernel/utils/record_homes')).traceFile('overseer');
+const DEFAULT_TRACE_FILE = require(require('./lens_paths').bot('js_kernel/utils/record_homes')).traceFile('fleet');
 
 // ── Line parsing ─────────────────────────────────────────────────────────────
 // Two line shapes share one trace family:
 //   per-bot file : [ISO] [Nm Ns] [TAG] 📊 text          (bot = filename)
-//   overseer own : [ISO] [OVERSEER] text
+//   foreman own : [ISO] [FOREMAN] text
 // Level markers: ❌ prefixes error lines (⛔ only appears inside message text),
 // ⚠️ warn, 📊 summary; an unmarked line is infrastructure chatter.
 //
 // FORWARDED_RE reads a THIRD shape that is no longer written: `[Nm Ns] [BotId] [TAG]`, the copy the
-// overseer used to persist of every bot line. That duplication was deleted (see readFleetView) and the
+// foreman used to persist of every bot line. That duplication was deleted (see readFleetView) and the
 // pattern is kept only so a trace recorded before the deletion still parses — delete it once no such
 // file is of interest, and delete nothing else with it.
 const FORWARDED_RE = /^\[(\d+)m (\d+)s\] \[(\w+)\]/;
 const PERBOT_RE = /^\[[\d\-T:.Z]+\] \[(\d+)m (\d+)s\]/;
-// The overseer PROCESS writes under two tags and they are deliberately different units. `[OVERSEER]` is
-// the transport — who connected, what was relayed, what the operator typed. `[OVERSEER_BRAIN]` is the
+// The foreman PROCESS writes under two tags and they are deliberately different units. `[FOREMAN]` is
+// the transport — who connected, what was relayed, what the operator typed. `[FOREMAN_BRAIN]` is the
 // ARBITER — which bot holds the planning token, who is queued behind it, which claims were granted.
 // Attributing both to one name would fold the fleet's mutex decisions into its connection log, and the
 // arbiter's ledger is exactly what a stalled fleet has to be read through.
 //
-// FOUND BY ITS ABSENCE (2026-09-10). `overseer_brain` was given a sink into the run record that same
+// FOUND BY ITS ABSENCE (2026-09-10). `foreman_brain` was given a sink into the run record that same
 // hour, and its lines then landed in the trace and were invisible: this pattern matched the exact tag
-// `[OVERSEER]`, so every brain line parsed to `bot: null` and `unitsIn()` skips a line with no unit. The
-// census answered "OVERSEER_BRAIN posted nothing" about a record that held its lines — a lens reporting
+// `[FOREMAN]`, so every brain line parsed to `bot: null` and `unitsIn()` skips a line with no unit. The
+// census answered "FOREMAN_BRAIN posted nothing" about a record that held its lines — a lens reporting
 // silence where there is content, which is the one failure mode this whole folder exists to prevent
 // (Law 25). The writer and its reader are one change; shipping either alone is shipping a blind spot.
-const OVERSEER_RE = /^\[([\d\-T:.Z]+)\] \[(OVERSEER(?:_BRAIN)?)\]/;
+const FOREMAN_RE = /^\[([\d\-T:.Z]+)\] \[(FOREMAN(?:_BRAIN)?)\]/;
 
-// Every unit written by the overseer process rather than by a bot. Callers that walk lines looking for
-// BOT behaviour skip these by membership rather than by naming `'OVERSEER'`, so a third overseer-side
+// Every unit written by the foreman process rather than by a bot. Callers that walk lines looking for
+// BOT behaviour skip these by membership rather than by naming `'FOREMAN'`, so a third foreman-side
 // tag added later is excluded by joining this set instead of by editing every call site.
-const OVERSEER_UNITS = new Set(['OVERSEER', 'OVERSEER_BRAIN']);
+const FOREMAN_UNITS = new Set(['FOREMAN', 'FOREMAN_BRAIN']);
 
 function botFromFilename(file) {
   const m = path.basename(file).match(/^watcher_(.+)\.jsonl$/);
@@ -83,7 +83,7 @@ function parseLine(raw, idx, fileBot) {
     line.relSec = +m[1] * 60 + +m[2];
     line.bot = fileBot;
     line.iso = raw.slice(1, raw.indexOf(']'));
-  } else if ((m = raw.match(OVERSEER_RE))) {
+  } else if ((m = raw.match(FOREMAN_RE))) {
     line.bot = m[2];
     line.iso = m[1];
   }
@@ -133,19 +133,19 @@ function parseStoryFile(file) {
 
 // readTrace(file) — one story file, parsed into lines.
 //
-// THE MERGED FLEET VIEW IS BUILT HERE, NOT WRITTEN. The overseer used to persist a copy of every bot's
+// THE MERGED FLEET VIEW IS BUILT HERE, NOT WRITTEN. The foreman used to persist a copy of every bot's
 // line alongside its own, so every fleet event existed in two places and the merged file was a second
 // source of truth for it
-// (Law 16 / Invariant D). The overseer now persists only its OWN lines, and asking for the overseer
+// (Law 16 / Invariant D). The foreman now persists only its OWN lines, and asking for the foreman
 // trace merges it with every per-bot file by ISO stamp — the same view, derived where it is read.
-// Callers are unchanged: they pass the overseer path, as they always did.
+// Callers are unchanged: they pass the foreman path, as they always did.
 function readTrace(file) {
   if (path.basename(file) === path.basename(DEFAULT_TRACE_FILE)) return readFleetView(file);
   const fileBot = botFromFilename(file);
   return parseStoryFile(file).map((raw, i) => parseLine(raw, i, fileBot));
 }
 
-// Every persisted line carries its own ISO stamp (watcher._record writes it, and the overseer's own
+// Every persisted line carries its own ISO stamp (watcher._record writes it, and the foreman's own
 // lines lead with one), so the merge key needs nothing the files do not already hold. Lines without a
 // readable stamp keep their position relative to their own file by sorting on the file's last seen
 // stamp — dropping them would lose infrastructure chatter that a reader sometimes needs.
@@ -234,15 +234,15 @@ function mergeStreams(files) {
   return all.map((r, i) => parseLine(r.raw, i, r.bot));
 }
 
-function readFleetView(overseerFile) {
-  const dir = path.dirname(overseerFile);
-  return mergeStreams([overseerFile, ...streamFiles(dir, { view: STREAM_VIEW.FLEET })
-    .filter(f => f !== overseerFile)]);
+function readFleetView(foremanFile) {
+  const dir = path.dirname(foremanFile);
+  return mergeStreams([foremanFile, ...streamFiles(dir, { view: STREAM_VIEW.FLEET })
+    .filter(f => f !== foremanFile)]);
 }
 
 // readCameraView(dir) — the parallel stream: every camera process in one ISO-ordered view, and NOTHING
 // from the bots. Takes a directory rather than a file because there is no anchor process here — the rig,
-// the OBS operator and anything else that films are peers, and naming one of them the way the overseer
+// the OBS operator and anything else that films are peers, and naming one of them the way the foreman
 // anchors the fleet would make the view depend on which of them happened to run.
 function readCameraView(dir) {
   return mergeStreams(streamFiles(dir || path.dirname(DEFAULT_TRACE_FILE), { view: STREAM_VIEW.CAMERA }));
@@ -256,7 +256,7 @@ function readForemanView(dir) {
 }
 
 
-// The overseer outlives runs, so one combined story can span several — and each
+// The foreman outlives runs, so one combined story can span several — and each
 // 'start' resets the bots' relative clocks to [0m 0s]. Comparing stamps (or
 // integrity baselines, or repeat counts) across that boundary manufactures
 // anomalies out of history, so every signature's state dies at the boundary.
@@ -264,7 +264,7 @@ function readForemanView(dir) {
 // string literal, which reads identically to authored prose to any scanner — and the pass that now forbids
 // prose in a lens flagged it. Every other needle in this folder is already a `*_RE` constant; making this
 // one match that is what lets the guard be a whitelist instead of a list of special cases.
-const RUN_BOUNDARY_RE = /\[OVERSEER\] Broadcast 'start'/;
+const RUN_BOUNDARY_RE = /\[FOREMAN\] Broadcast 'start'/;
 
 function segmentRuns(lines) {
   const segments = [[]];
@@ -395,14 +395,14 @@ function buildEpisodes(seg) {
   for (const l of seg) {
     if (l.iso) curIso = l.iso;
     if (l.relSec != null) curRelSec = l.relSec;
-    // A kill can be logged by the judge under either the bot or (rarely) OVERSEER;
+    // A kill can be logged by the judge under either the bot or (rarely) FOREMAN;
     // attribute it to whichever bot has an open episode if the line names no bot.
     if (STORY_KILL.test(l.raw) && l.level === 'error') {
       const bot = l.bot && open.has(l.bot) ? l.bot : [...open.keys()][0];
       if (bot) { open.get(bot).events.push({ kind: 'err', text: afterMarker(l.raw) }); close(bot, { ok: false, code: 'killed', text: afterMarker(l.raw) }); }
       continue;
     }
-    if (!l.bot || OVERSEER_UNITS.has(l.bot)) continue;
+    if (!l.bot || FOREMAN_UNITS.has(l.bot)) continue;
     const bot = l.bot;
     let m;
     if ((m = l.raw.match(STORY_BOARD_HDR))) { board.set(bot, { count: +m[1], list: '' }); continue; }
@@ -530,8 +530,8 @@ const EPISODE_FIELDS = ['at', 'bot', 'job_key', 'phase', 'kind', 'n', 'text'];
 // as afterMarker and jobToken. It carries no threshold and no wake policy — the callers that decide what
 // silence MEANS keep that decision.
 //
-// A bot whose signal was killed still echoes overseer HQ merges forever, which is exactly the corpse the
-// silence signature exists to find. The same is true of 'Executing overseer command': an operator verb
+// A bot whose signal was killed still echoes foreman HQ merges forever, which is exactly the corpse the
+// silence signature exists to find. The same is true of 'Executing foreman command': an operator verb
 // relayed to a bot is answered by its link thread, which lives on after the bot's signal is dead — a
 // halted bot can therefore keep reporting recent "last activity" off the `exit` relay alone.
 //
@@ -539,11 +539,11 @@ const EPISODE_FIELDS = ['at', 'bot', 'job_key', 'phase', 'kind', 'n', 'text'];
 // kept it on one side of the cut and --milestones needed it on the other. Two copies of "what counts as
 // a life sign" is exactly the drift Law 16 forbids, and it would show up as two lenses disagreeing about
 // when a run ended.
-const PASSIVE_LINE = /Merged \d+ relayed station|Executing overseer command/;
+const PASSIVE_LINE = /Merged \d+ relayed station|Executing foreman command/;
 
 module.exports = {
   DEFAULT_TRACE_FILE,
-  FORWARDED_RE, PERBOT_RE, OVERSEER_RE, OVERSEER_UNITS, PASSIVE_LINE,
+  FORWARDED_RE, PERBOT_RE, FOREMAN_RE, FOREMAN_UNITS, PASSIVE_LINE,
   botFromFilename, parseLine, readTrace, readCameraView, readForemanView,
   CAMERA_STREAM_RE, FOREMAN_STREAM_RE, STREAM_VIEW,
   segmentRuns,

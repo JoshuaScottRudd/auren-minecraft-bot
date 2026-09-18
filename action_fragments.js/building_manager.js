@@ -104,7 +104,7 @@ module.exports = {
 
         // De-confliction note: WHICH bot runs this job is settled upstream by the
         // magnet under the planning token (task identity — see the taxonomy in
-        // overseer_brain.js), and an established buildspot is fleet-shared via the
+        // foreman_brain.js), and an established buildspot is fleet-shared via the
         // building_conference broadcast, so a peer adopts the home instead of
         // finding a duplicate. No arbiter claim belongs here — a buildspot is a
         // task outcome, not a physical object being contested.

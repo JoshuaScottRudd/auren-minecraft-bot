@@ -63,11 +63,13 @@ const rconLink = require(paths.bot('js_kernel/utils/rcon_link'));
 const stoneColumnScanner = require('@perception/stone_column_scanner');
 const { isNotSafeSurface } = require('@utils/movement/terrain_predicates');
 const { isGravityBlock, followGravityColumn } = require('@utils/gravity_utils');
-const { STONE_PROSPECT } = require('@thinking/architect_config');
+const { STONE_PROSPECT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 
 const HOST = process.env.PROBE_HOST || 'localhost';
 const PORT = Number(process.env.PROBE_PORT || 25565);
-const VERSION = process.env.PROBE_VERSION || '1.21.5';
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const VERSION = process.env.PROBE_VERSION || SERVER_MINECRAFT_VERSION;
 const NAME = process.env.PROBE_NAME || 'testbot';
 const SAMPLES = Number(process.env.PROBE_SAMPLES || 8);
 const SPREAD = Number(process.env.PROBE_SPREAD || 220);

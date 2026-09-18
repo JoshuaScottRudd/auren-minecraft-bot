@@ -507,13 +507,13 @@ module.exports = {
     },
 
     // ─────────────────────────────────────────────────────────────────────────────────────────────
-    // BARE — server and overseer only. Nothing else, and no restore.
+    // BARE — server and foreman only. Nothing else, and no restore.
     //
     // For the times the world itself is the subject: seeding a build by console, checking a snapshot,
     // running a probe that wants a server and no participants.
     // ─────────────────────────────────────────────────────────────────────────────────────────────
     bare: {
-      description: 'Server + overseer only — no foreman, no bots, world left exactly as it is.',
+      description: 'Server + foreman only (its body parked in spectator) — no bots, world left exactly as it is.',
       rung: 'standard',
       film: 'none',
       mode: 'homesteader',

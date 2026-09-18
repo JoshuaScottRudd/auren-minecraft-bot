@@ -48,7 +48,7 @@ An earlier pass (declared source scans) was deleted 2026-08-10 and another 2026-
 closed up each time, so a number here names a position and never an identity.
 
 Excluded on purpose: files with live side effects on require —
-  - overseer/overseer_server.js  (binds a WebSocket port on load)
+  - foreman/foreman_hub.js  (binds a WebSocket port on load)
   - master_core.js               (connects to a live Minecraft server)
 Loading those would bind ports / open sockets, which a smoke test must not do. Parsing has no side
 effects, so a parser-based pass COULD sweep them; pass 3's census is deliberately scoped to the fragment
@@ -287,11 +287,10 @@ const LAYERS = [
   'perception_nodes.js',
   'custom_api',
   'js_kernel',
-  'overseer',
-  // The foreman is a fleet process like the overseer and was missing from this list, so every file under
-  // it loaded for the first time in front of a human standing in the world. That is the silent-shrinkage
-  // fault this header describes, seen from the other side: the count was honest about the layers named
-  // and quiet about a layer that exists (Law 25).
+  // The foreman was once missing from this list, so every file under it loaded for the first time in
+  // front of a human standing in the world. That is the silent-shrinkage fault this header describes,
+  // seen from the other side: the count was honest about the layers named and quiet about a layer that
+  // exists (Law 25). Since 2026-09-18 the hub (once `overseer/`) lives in this folder too.
   'foreman',
   // `monitoring/` IS DELIBERATELY NOT A LAYER, and this is the one entry stating an omission because the
   // omission is the decision. The lens stack moved into the bot on 2026-09-10 so a stranger can diagnose
@@ -306,7 +305,7 @@ const LAYERS = [
 
 // Files with live side effects on require (bind ports / open sockets / connect).
 const EXCLUDE = new Set([
-  path.join('overseer', 'overseer_server.js'),
+  path.join('foreman', 'foreman_hub.js'),
   // Creates its mineflayer client at module scope, so requiring it JOINS THE SERVER — a load check that
   // takes a player slot is not a load check.
   path.join('foreman', 'foreman.js'),
@@ -996,7 +995,7 @@ console.log(`Shipped tree is self-contained — ${shipped.length} file(s), no re
 //
 // ── THE RULE, AND WHY IT IS NOT A WHITELIST (Law 29) ────────────────────────────────────────────────
 // A mention of private ground is a leak when it is an INSTRUCTION and fine when it is an EXPLANATION.
-// `overseer/owner_memory.js` names `Privacy/` eight times to explain why that folder is legitimately
+// `foreman/owner_memory.js` names `Privacy/` eight times to explain why that folder is legitimately
 // absent on a published copy — that is the separation being documented, which is the opposite of the
 // separation failing, and a pass that flagged it would be teaching people to delete their own reasons.
 //
@@ -1361,7 +1360,7 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
 //
 // THE CONSTRUCT IS LIVE BY DEFINITION. Everything under `Auren_Bot/` that is not `monitoring/` and not
 // `Auren_Workshop/` exists only to be a running bot: the kernel, the thinking and action fragments, the
-// perception nodes, the overseer, the foreman, master_core. There is no hour of the day at which one of
+// perception nodes, the foreman, master_core. There is no hour of the day at which one of
 // those files is doing a post-mortem. So a require or a spawn of a lens from any of them is wrong in
 // every possible execution, which makes it exactly the kind of thing a file scan can settle (Law 13).
 //
@@ -1432,6 +1431,137 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
     process.exit(1);
   }
   console.log('Lens reach OK — nothing in the construct reads a run record; the fleet answers for itself.');
+}
+
+// ── PASS: THE AUTHORED VERSION AGAINST WHAT THE INSTALLED LIBRARIES CAN ACTUALLY REACH ──────────────
+//
+// WHY THIS EXISTS (Architect 2026-09-17, on finishing the 1.21.5 → 26.1 move). The fleet's Minecraft
+// version is not chosen by looking at minecraft.net. It is chosen by the CLIENT LIBRARY: the highest
+// version present in BOTH `minecraft-protocol.supportedVersions` and `mineflayer.testedVersions` is the
+// highest version a bot here can join, whatever Mojang has published. At the time this pass was written
+// Mojang's newest release was 26.3 and that ceiling was 26.1 — a two-release gap that has nothing to do
+// with the fleet and everything to do with what PrismarineJS has shipped support for.
+//
+// Before this pass, the whole of that reasoning lived in a comment block in `architect_config.js`. A
+// comment is fine for explaining a decision and useless for NOTICING one, and the noticing is the part
+// that has an owner problem: **the ceiling moves when somebody runs `npm update`, not when anybody
+// decides anything.** So the upgrade-is-now-possible moment arrives silently, attached to an unrelated
+// action, and the only thing standing between it and being missed for months is a person remembering to
+// go and re-derive two fields by hand. That is precisely the class of fact this file exists to hold.
+//
+// IT ANSWERS OFFLINE, AND THAT IS DELIBERATE. The question is not "what is the newest Minecraft" — that
+// needs the network, goes stale, and is not actionable anyway. The question is "given what is installed
+// on THIS machine right now, can the fleet go higher than it is going?", which is answerable from two
+// manifests and is exactly the question whose answer changes after a dependency bump.
+//
+// WHY BOTH LIBRARIES AND NOT JUST ONE (Law 29 — the ceiling is ONE number, so it needs one rule that
+// produces one number). `minecraft-protocol` can parse a version that `mineflayer` has never tested
+// against; taking the protocol library alone would report a ceiling the bot cannot actually stand on.
+// The intersection is the honest answer, and the two are printed separately when they disagree so the
+// reader can see WHICH library is the binding constraint — that is the one to watch for a release.
+//
+// THE COMPARISON IS BY PROTOCOL NUMBER, NEVER BY STRING. Minecraft's version names changed shape in this
+// very migration: `1.21.11` sorts below `1.21.5` under every string comparison and below `1.21.9` under a
+// naive numeric split, and `26.1` sorts below all of them. Protocol numbers are monotonic by definition —
+// they are what the handshake actually negotiates — so they are the only ordering that cannot be wrong.
+//
+// THE THREE OUTCOMES, AND WHY ONLY ONE OF THEM FAILS THE RUN (Law 13 applied honestly, rather than
+// uniformly). A config ABOVE the ceiling is a defect: the fleet cannot connect, every run is dead before
+// it starts, and the failure it would otherwise produce is a handshake error four layers away from the
+// line that caused it. That one exits non-zero. A config BELOW the ceiling is not a defect at all — it is
+// an OPPORTUNITY, and an opportunity that failed the build would make `npm update` break a green tree and
+// teach everyone to stop running this. It reports and passes, the same asymmetry the layer-separation
+// pass draws for the same reason.
+{
+  const NM = path.join(BOT_DIR, 'node_modules');
+  const manifestVersions = (pkg, field) => {
+    try {
+      const mod = require(path.join(NM, pkg));
+      const list = mod && mod[field];
+      return Array.isArray(list) && list.length ? list : null;
+    } catch (e) { return null; }
+  };
+  // A version string is worth nothing here until it resolves to the number the handshake negotiates.
+  const protocolOf = (v) => {
+    try {
+      const d = require(path.join(NM, 'minecraft-data'))(v);
+      const n = d && d.version && d.version.version;
+      return typeof n === 'number' ? n : null;
+    } catch (e) { return null; }
+  };
+
+  const mcpList = manifestVersions('minecraft-protocol', 'supportedVersions');
+  const mfList = manifestVersions('mineflayer', 'testedVersions');
+
+  if (!mcpList || !mfList) {
+    // Absence is reported and never guessed past: a missing manifest means this machine cannot answer
+    // the question, which is a different statement from "the version is fine" (Law 26).
+    console.log('Version ceiling UNREAD — minecraft-protocol/mineflayer manifests not resolvable from ' +
+                'this tree, so no ceiling was computed. Nothing is claimed about the configured version.');
+  } else {
+    const authored = require('@thinking/architect_config').SERVER_MINECRAFT_VERSION;
+    const authoredProto = protocolOf(authored);
+
+    const highest = (list) => list
+      .map(v => ({ v, p: protocolOf(v) }))
+      .filter(x => x.p !== null)
+      .sort((a, b) => a.p - b.p)
+      .pop() || null;
+
+    // The intersection is the ceiling: a version both libraries carry.
+    const mfSet = new Set(mfList);
+    const reachable = mcpList.filter(v => mfSet.has(v));
+    const ceiling = highest(reachable);
+    const mcpTop = highest(mcpList);
+    const mfTop = highest(mfList);
+
+    // THE TEST IS MEMBERSHIP, NOT ORDERING — and that distinction was found by testing this pass rather
+    // than by designing it (2026-09-17). The first cut asked only "is the authored protocol number above
+    // the ceiling?", which silently passed the WORST input it can be given: `26.2`, a real Minecraft
+    // release that `minecraft-data` has never heard of. It resolved to no protocol number at all, fell
+    // into the can't-answer branch, and the run went green — a configured version the stack cannot even
+    // name, reported as nothing to see. A version absent from the lists is not an unknown to be reported
+    // around; it is the strongest possible evidence the fleet cannot join, so it is a refusal. Ordering
+    // now only decides WHICH sentence a failure prints, never whether it fails (Law 26: the honest
+    // failure and the well-formed silence are one keystroke apart, and only a test tells them apart).
+    if (!ceiling) {
+      console.log('Version ceiling UNREAD — the library lists did not resolve to protocol numbers on ' +
+                  'this machine. Nothing is claimed about the configured version.');
+    } else if (!reachable.includes(authored)) {
+      const above = authoredProto !== null && authoredProto > ceiling.p;
+      console.error(`\nVERSION UNREACHABLE — the fleet is configured for Minecraft ${authored}` +
+                    `${authoredProto === null ? '' : ` (protocol ${authoredProto})`}, which is not a ` +
+                    'version BOTH installed libraries carry.');
+      console.error(above
+        ? `  It is ABOVE the ceiling: they top out at ${ceiling.v} (protocol ${ceiling.p}).`
+        : `  The libraries do not list it at all — the highest they both reach is ${ceiling.v} ` +
+          `(protocol ${ceiling.p}).`);
+      console.error('  Every run dies at the handshake, and it dies far from the line that caused it.');
+      console.error(`      minecraft-protocol supports up to  ${mcpTop ? mcpTop.v : '?'}`);
+      console.error(`      mineflayer has tested up to        ${mfTop ? mfTop.v : '?'}`);
+      console.error('  The one authored answer is SERVER_MINECRAFT_VERSION in');
+      console.error('  Auren_Bot/Thinking_fragments/architect_config.js — lower it to the ceiling, or');
+      console.error('  raise the libraries (Auren_Bot/Auren_Workshop/scripts/npm.ps1 update) first.');
+      process.exit(1);
+    } else if (authoredProto === ceiling.p) {
+      console.log(`Version ceiling OK — configured for ${authored} (protocol ${authoredProto}), which IS ` +
+                  'the highest the installed libraries reach. Nothing to upgrade to.');
+    } else {
+      // The whole reason the pass was written: this line is the notification that an upgrade became
+      // possible, printed at the moment somebody next touches the code rather than whenever they think
+      // to go and look.
+      const binding = (mfTop && mcpTop && mfTop.p < mcpTop.p) ? 'mineflayer' : 'minecraft-protocol';
+      console.log(`Version ceiling — AN UPGRADE IS AVAILABLE: configured for ${authored} ` +
+                  `(protocol ${authoredProto}), libraries now reach ${ceiling.v} (protocol ${ceiling.p}).`);
+      console.log(`      minecraft-protocol supports up to  ${mcpTop ? mcpTop.v : '?'}`);
+      console.log(`      mineflayer has tested up to        ${mfTop ? mfTop.v : '?'}`);
+      console.log(`      binding constraint                 ${binding}`);
+      console.log('  This is not a failure — it is an opportunity, so the run stays green. Raising');
+      console.log('  SERVER_MINECRAFT_VERSION in Auren_Bot/Thinking_fragments/architect_config.js is the');
+      console.log('  whole config change; what costs time is the packet-shape sweep, and the population to');
+      console.log('  re-check is every _client.on / _client.prependListener site in the construct.');
+    }
+  }
 }
 
 const shape = scanCatchShape();

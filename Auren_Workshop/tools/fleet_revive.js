@@ -297,7 +297,15 @@ function serverListening(port, timeoutMs = 2000) {
 // death_manager's ACT 1 discipline, and the reason it is a discipline is that the two failures — the
 // packet was refused, and the packet worked but the body arrived late — are indistinguishable to anything
 // that only checks the send.
-async function revive(botId, { at, host = 'localhost', port = 25565, version = '1.21.5' } = {}) {
+// The three connection defaults are READ from the one page that owns them, never restated (Law 16,
+// 2026-09-17). `version` was the literal `'1.21.5'` and would have been the wrong protocol the day the
+// fleet moved to 26.1 — a corpse would have failed to stand up, on the one path that only runs when
+// something is already wrong. Named parameters stay, because a probe pointed elsewhere still needs them.
+async function revive(botId, { at, host, port, version } = {}) {
+    const cfg = require(paths.bot('Thinking_fragments/architect_config.js'));
+    host = host ?? cfg.SERVER_ENDPOINT.host;
+    port = port ?? cfg.SERVER_ENDPOINT.port;
+    version = version ?? cfg.SERVER_MINECRAFT_VERSION;
     const mineflayer = require('mineflayer');
     const out = { botId, connected: false, respawned: false, teleported: false, at: at || null, error: null };
     let bot = null;

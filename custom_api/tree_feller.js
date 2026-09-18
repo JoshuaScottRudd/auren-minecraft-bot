@@ -374,7 +374,7 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
     // its own scaffold and re-erecting it next dispatch — an endless same-coord fell.
     // That guard is per-climb and LOCAL, so it cannot cover a peer: a placed log column resting on
     // solid ground reads as a ground-supported trunk base to any other bot's scan. The peer half is
-    // closed one level up, by the arbiter's 5x5 tree column (overseer_brain.js), not here — a
+    // closed one level up, by the arbiter's 5x5 tree column (foreman_brain.js), not here — a
     // scaffold-block swap would only move that hole, since any pillar sits beside a trunk regardless.
     await microCenter(bot);
     const res = await pillarStep(bot, { debug: true });
@@ -495,7 +495,7 @@ async function standAtTreeBase(bot, dispatcher, base) {
   return (res && res.arrived) ? { arrived: true } : { arrived: false, reason: 'nav_failed' };
 }
 
-// Object lock (arbiter flavor a — physical exclusivity, see overseer_brain.js taxonomy):
+// Object lock (arbiter flavor a — physical exclusivity, see foreman_brain.js taxonomy):
 // a felled tree is one object, claimed by its base block. Chosen at EXECUTION time from
 // live perception, so the planning token can't cover it — this claim is what stops two
 // bots working the same trunk. Taken through target_claims, the one claim-reach-release walk

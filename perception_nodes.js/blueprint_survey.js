@@ -26,7 +26,7 @@ const hq       = require('@kernel/corporate_headquarters');
 const blueprintRegistry = require('@kernel/blueprint_registry');
 // The building room's keys carry an owner; this strips it back to the structure name. Imported rather
 // than split by hand here — one addressing rule, one place (Law 16).
-const { roomKeyName } = require('@overseer/message_schema');
+const { roomKeyName } = require('@foreman/message_schema');
 
 // A PLAIN REQUIRE, BECAUSE THE GUARD DEFEATED THE ONE TEST THAT COVERS THIS. Wrapped, a failed import
 // left both bindings undefined and the module carried on with silent holes in its block-name handling —
@@ -111,7 +111,7 @@ function scanBuilding(bot, pasted) {
   const externalTypes = pasted.external_types || new Set();
   for (const b of (pasted.voxels || [])) {
     const k = `${b.x},${b.y},${b.z}`;
-    if (!expected.has(k)) expected.set(k, { type: b.type, anchor_index: b.anchor_index ?? -1 });
+    if (!expected.has(k)) expected.set(k, { type: b.type, anchor_index: b.anchor_index ?? -1, state: b.state || null });
   }
 
   let correct = 0, missing = 0, mismatched = 0, extraneous = 0, unloaded = 0;
@@ -131,6 +131,10 @@ function scanBuilding(bot, pasted) {
     const [x, y, z] = k.split(',').map(Number);
     const { verdict, expType, actName } = classifyVoxel(bot, x, y, z, expRec.type, externalTypes);
     const isGroupToken = !!(group_to_item && group_to_item[expType]);
+    // The wanted state rides on the PLACE step only: it is an instruction to the placer. Whether the cell
+    // is correct is still decided by block type alone, so a block standing with the wrong facing is not dug
+    // up and re-laid from the same stand, which would only repeat the same result (Law 27).
+    const withState = expRec.state ? { state: expRec.state } : {};
 
     switch (verdict) {
       case 'correct':  correct++;  break;
@@ -140,7 +144,7 @@ function scanBuilding(bot, pasted) {
         break;
       case 'missing':
         missing++;
-        placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'missing', actual: actName, ...(isGroupToken ? { expected_group: expType } : {}) });
+        placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'missing', actual: actName, ...(isGroupToken ? { expected_group: expType } : {}), ...withState });
         break;
       case 'extraneous':
         extraneous++;
@@ -149,12 +153,12 @@ function scanBuilding(bot, pasted) {
       case 'group_mismatch':
         mismatched++;
         digSteps.push({ action: 'dig', place: { x, y, z }, type: actName, anchor_index: ai, reason: 'group_mismatch' });
-        placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'group_mismatch', actual: actName, expected_group: expType });
+        placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'group_mismatch', actual: actName, expected_group: expType, ...withState });
         break;
       case 'mismatch':
         mismatched++;
         digSteps.push({ action: 'dig', place: { x, y, z }, type: actName, anchor_index: ai, reason: 'mismatch' });
-        placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'mismatch', actual: actName });
+        placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'mismatch', actual: actName, ...withState });
         break;
     }
   }
@@ -205,12 +209,33 @@ function rotateOffsetY(dx, dz, quarterTurns) {
 
 function transposeVoxel(buildCenter, blueprintCenter, v, quarterTurns = 0) {
   const r = rotateOffsetY(v[0] - blueprintCenter.x, v[2] - blueprintCenter.z, quarterTurns);
-  return {
+  const out = {
     x: buildCenter.x + r.dx,
     y: buildCenter.y + (v[1] - blueprintCenter.y),
     z: buildCenter.z + r.dz,
     type: v[3],
   };
+  if (v[4]) out.state = rotateState(v[4], quarterTurns);
+  return out;
+}
+
+// rotateState — a voxel's optional fifth element (the block state the cell must show) turned with the
+// building. A facing is a direction, so it goes through the SAME rotateOffsetY as the voxel's own offset
+// — one rotation rule, never a hand-written compass table beside it (the hand table is what put an axis
+// backwards in June, scratchpad §3.2). An axis swaps x and z on an odd turn. Every other key is carried
+// as written.
+const COMPASS_VECTORS = { north: [0, -1], south: [0, 1], east: [1, 0], west: [-1, 0] };
+function rotateState(state, quarterTurns) {
+  const out = { ...state };
+  if (COMPASS_VECTORS[state.facing]) {
+    const [vx, vz] = COMPASS_VECTORS[state.facing];
+    const r = rotateOffsetY(vx, vz, quarterTurns);
+    out.facing = Object.keys(COMPASS_VECTORS).find(k => COMPASS_VECTORS[k][0] === r.dx && COMPASS_VECTORS[k][1] === r.dz);
+  }
+  if ((state.axis === 'x' || state.axis === 'z') && (((quarterTurns % 4) + 4) % 4) % 2 === 1) {
+    out.axis = state.axis === 'x' ? 'z' : 'x';
+  }
+  return out;
 }
 
 // footprintExtent — the XZ ground area a blueprint actually occupies, expressed as OFFSETS from its

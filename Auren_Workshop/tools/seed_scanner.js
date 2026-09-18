@@ -34,7 +34,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/seed
 // copy of it, and the difference is the whole measurement.
 //
 // ── WHY THE SERVER AND NOT THE FLEET ────────────────────────────────────────────────────────────────
-// `fleet_control up` would bring the overseer and a working bot online, which is minutes of bring-up and
+// `fleet_control up` would bring the foreman and a working bot online, which is minutes of bring-up and
 // a memory wipe to think about, per seed. The question here is only "what is the ground", and one
 // spectator-weight mineflayer client answers it. So each attempt costs a JVM start and a client join —
 // and a rejected seed costs no fleet at all. Nothing this file starts has autonomy, and nothing it starts

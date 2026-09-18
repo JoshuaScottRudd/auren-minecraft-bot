@@ -105,6 +105,27 @@ verbatim, because what they *should* be is the asker's question (Law 25).
 
 ---
 
+## Eating
+
+| flag | question |
+|---|---|
+| `--hunger` | **What the run cost in FOOD, and what feeding that pace forever takes.** Prices the run in Minecraft EXHAUSTION — blocks broken, jumps pressed, metres swum, damage taken, health regenerated — then converts the rate into loaves of bread and wheat plots. Every constant it multiplies by is printed as its own field, so the arithmetic is checkable rather than assertable. |
+
+**Read this one knowing hunger is not a clock.** Minecraft charges for ACTS, never for elapsed time, and
+**walking is priced at zero** — so the moving/doing split at the top of this lens's output (borrowed from
+`motion_classifier`, which owns that definition) answers *where the run went* and says nothing about what
+it cost. Measured on the 2026-09-16 green run: the fleet walked ~3,600 cells per bot for **0.00**
+exhaustion while ~300 jump presses carried **91%** of the bill. A jump costs ten times a block break.
+
+**The jump census is the number to check first if the answer ever looks wrong**, because it is almost all
+of the total and it is assembled from three sources rather than one — the navigator publishes
+`prejump(s)` per trip, but `scaffold_movement.pillarStep` holds jump for one crest per block it places,
+so every pillar step and every shaft seal-climb is a press nothing else counts. Missing them undercounted
+the first cut of this lens by a fifth. `jumps_by_source` is that split, and `jumps_uninstrumented` names
+the presses no line publishes at all.
+
+---
+
 ## Fighting
 
 | flag | question |
@@ -166,7 +187,7 @@ node .\Auren_Bot\monitoring\trace_monitor.js --narration --bot=camera_rig --full
 process can see one, so headroom here is evidence the card was not the limit — not proof no window
 stuttered (Law 25).
 
-`--full` matters on `--narration`: the trace segments on the overseer's `start` broadcast, and anything
+`--full` matters on `--narration`: the trace segments on the foreman's `start` broadcast, and anything
 that comes up before the fleet thinks has its whole bring-up in an earlier segment. The render states how
 many lines fall outside rather than quietly showing a subset.
 
@@ -219,7 +240,7 @@ error. The fleet STAYS UP on a flag, so the "after" is still there to inspect li
 
 ## A different file
 
-The default trace is `js_kernel\watcher_overseer.jsonl` (every bot, merged). To read one unit's own file,
+The default trace is `js_kernel\watcher_fleet.jsonl` (every bot, merged). To read one unit's own file,
 pass the path:
 
 ```

@@ -50,16 +50,16 @@ const TAG = 'console_window';
 
 // ── NO `external_library_guard` REQUIRE HERE, AND THAT IS DELIBERATE (2026-09-10) ───────────────────
 // It was tried and reverted the same turn, on evidence. The guard requires `../watcher`, the watcher
-// lazily requires `overseer_link`, and `overseer_link` requires `@kernel/watcher` BY ALIAS — so pulling
+// lazily requires `foreman_link`, and `foreman_link` requires `@kernel/watcher` BY ALIAS — so pulling
 // the guard in made a `fleet_control down` print:
 //
 //     [watcher:SELF-FAULT] _forward: Cannot find module '@kernel/watcher'
-//     Require stack: overseer_link → watcher → external_library_guard → console_window → fleet_control
+//     Require stack: foreman_link → watcher → external_library_guard → console_window → fleet_control
 //
 // `fleet_control.js` is a CLI that does not register module-alias, and the guard's own header names this
 // exact hazard: *"RELATIVE, NOT `@kernel/watcher`, AND IT MUST STAY RELATIVE. This module is required
 // from processes that do NOT register module-alias"* — a fix it applied to itself and explicitly did not
-// apply to `overseer_link`, because it is not that file's owner.
+// apply to `foreman_link`, because it is not that file's owner.
 //
 // THE GUARD IS NOT NEEDED, WHICH IS WHY THIS IS NOT A DODGE OF LAW 16. The one catch exists for external
 // calls that THROW, and neither call here does once it is written correctly:

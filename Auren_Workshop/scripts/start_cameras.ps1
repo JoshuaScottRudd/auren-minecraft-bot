@@ -9,9 +9,10 @@
 # What this script does, in order, every time:
 #   1. Finds Prism Launcher (the workstation resolver: Auren_Workshop\camera\clients\PrismLauncher, then an
 #      installed Prism). Downloads the portable build into that bot folder if there is none.
-#   2. Reads the server's Minecraft version from its log (currently 1.21.5) and creates one
-#      launcher instance per camera, pinned to that version. Re-run safe: existing instances
-#      are kept, version drift is corrected automatically after a server upgrade.
+#   2. Reads the server's Minecraft version from its log - the SERVER is the authority on this, never
+#      this script and never a number written down here - and creates one launcher instance per camera,
+#      pinned to that version. Re-run safe: existing instances are kept, and version drift is corrected
+#      automatically, so the run after a server upgrade rebuilds every camera onto the new version.
 #   2b. Copies your MAIN game's RESOURCE packs (from %APPDATA%\.minecraft) into every camera and
 #      enables them, so the footage matches your live game. Textures only - the instances are
 #      plain vanilla with no mod loader and no shaders (see the pack write for why).
@@ -343,8 +344,15 @@ if ($McVersion -eq '') {
         if ($verLine) { $McVersion = $verLine.Matches[0].Groups[1].Value }
     }
     if ($McVersion -eq '') {
+        # THE EXAMPLE IS READ, NOT RESTATED (Law 16, 2026-09-17). This line used to print a literal
+        # `1.21.5`, which is a second answer to a question architect_config already answers - and the day
+        # the fleet moved to 26.1 it became a hint that hands the reader the WRONG version to type at the
+        # exact moment they have no other source for it. The detection above is still the real answer;
+        # this only fires when the server log could not be read.
+        $cfgVer = & $node -e "process.stdout.write(require('$($botRoot -replace '\\','/')/Thinking_fragments/architect_config.js').SERVER_MINECRAFT_VERSION)" 2>$null
+        if ([string]::IsNullOrWhiteSpace($cfgVer)) { $cfgVer = '<the version your server runs>' }
         Write-Host 'Could not detect the server version from its log - pass it explicitly:'
-        Write-Host '  .\start_cameras.ps1 -McVersion 1.21.5'
+        Write-Host "  .\start_cameras.ps1 -McVersion $cfgVer"
         exit 1
     }
 }

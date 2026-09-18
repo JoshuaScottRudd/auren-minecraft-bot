@@ -146,7 +146,21 @@ function armSpawnProtection(bot) {
   if (_zones.has(bot)) return;                    // idempotent — a second arm would double-count nothing but is noise
   _zones.set(bot, { known: false, sx: 0, sz: 0 });
   bot._client.on('spawn_position', (packet) => {
-    const loc = packet && packet.location;
+    // ── THE PACKET HAS HAD TWO SHAPES FOR THIS ONE FACT, AND BOTH ARE READ (2026-09-17) ────────────
+    // Through 1.21.x the coordinate sat directly on the packet as `location`. 26.1 wraps it in a
+    // `globalPos` compound that also carries the dimension it belongs to — observed on the wire as
+    // `{"globalPos":{"dimensionName":"minecraft:overworld","location":{"x":0,"z":0,"y":64}},"yaw":0,
+    // "pitch":0}` — so the old read returns `undefined` and this handler warned that the packet carried
+    // no usable location on EVERY login. That warning is accurate and the consequence is silent: an
+    // unknown centre masks nothing (see the block above), so the fleet works an unmasked world and the
+    // server refuses every break near spawn without saying why. It is how this was found — the first
+    // 26.1 run could not place the person, because `--stand=biome` needs the centre to measure from.
+    // The list below is the list of shapes the packet has had, newest first; one coordinate comes out.
+    //
+    // THE DIMENSION IS READ AND NOT USED, deliberately. World spawn is an overworld fact and the fleet
+    // does not leave the overworld, so branching on `dimensionName` would be a rule for a case that
+    // cannot arise — and inventing one is how a false constitution gets written (Law 27).
+    const loc = (packet && packet.globalPos && packet.globalPos.location) || (packet && packet.location);
     if (!loc || typeof loc.x !== 'number' || typeof loc.z !== 'number') {
       // The packet is the ONLY source for the centre, so a malformed one cannot be repaired or
       // defaulted — say what arrived and leave the latch as it was (Law 13).
@@ -285,7 +299,7 @@ const _maskProtos = new Map();
 // Built once per version off the real registry rather than hand-written, so the masked block is a real
 // block carrying every field a consumer might read — the same discipline voxel_reader's table uses.
 function _maskProto(bot) {
-  const version = bot?.version || '1.21.5';
+  const version = bot?.version || require('@thinking/architect_config').SERVER_MINECRAFT_VERSION;
   let p = _maskProtos.get(version);
   if (p !== undefined) return p;
   const Block = require('prismarine-block')(version);

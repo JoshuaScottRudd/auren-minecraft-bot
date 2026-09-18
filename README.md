@@ -28,7 +28,7 @@ Two verbs, and they are the whole argument: **AI as the developer, not the pilot
 
 ## What you need
 
-**Current Node.js, Java for your Minecraft server, and a Minecraft Java 1.21.5 server on this computer.
+**Current Node.js, Java 25 or newer for your Minecraft server, and a Minecraft Java Edition 26.1 server on this computer.
 Then, in this folder:**
 
 ```
@@ -48,19 +48,27 @@ One command. The only thing it asks you to name is the folder your server runs i
 node start_auren.js --server-folder "C:\path\to\your\server"
 ```
 
-(Put that folder in `serverFolder` in `your_server.js` and you never type it again.)
+(Put that folder in `serverFolder` in `foreman_config.js` and you never type it again.)
 
-**Auren sets your server up for itself and prints every change it makes, and why.** It needs three
-settings in your `server.properties` and writes them if they are missing:
+**The foreman starts your server for you, and stops it when you press Ctrl-C** — after the bots have gone
+home and the world has saved. The server gets its own window, so you can watch it. If anything goes wrong
+(no Java, the licence not accepted in `eula.txt`, the port already taken, the world locked by another
+server), the foreman reads why from the server's own output and says it in plain words, with the file and
+the field to change.
+
+**It sets your server up for itself and prints every change it makes, and why.** It writes what the bots
+need into your `server.properties` before the server starts:
 
 - `online-mode=false` — the bots have no Minecraft accounts.
 - `enable-rcon=true` — a crew is brought to where you stand through the server console.
-- `rcon.password` — **a new random one each time Auren starts before your server.** You never see or type
-  it, and it is only good until the server next restarts.
+- `rcon.password` — **a new random one every start.** You never see or type it.
+- the fleet's own settings (spawn protection, difficulty, chunk saving) — each printed with its reason.
 
-A server reads those settings only when it starts. So start Auren first and then your server, or restart
-your server when Auren asks — it waits and carries on by itself. If people outside your home can reach your
-server, keep in mind that offline mode checks no accounts.
+If people outside your home can reach your server, keep in mind that offline mode checks no accounts.
+
+**Joining a server somebody else runs** is the other setting: `where: 'remote'` in `foreman_config.js`,
+with that server's address and the console password its owner gives you. The foreman then only joins it —
+it never starts or stops a world it did not start.
 
 That starts a **foreman** — a clerk that joins your world and waits. **No bots yet.** Walk to where you
 want them, and ask in chat:
@@ -86,17 +94,11 @@ somebody in the world asked for it — the owner is stamped into the bot at birt
 filtered on it. There is no terminal flag for that, because there is no owner to name from a terminal,
 and no coordinate to type because you are standing on it.
 
-**If your server is not on `localhost:25565`, there is one file to edit: `your_server.js`,** at the top
-level beside this README. It holds your server folder, the address and the port, and everything in this
-project reads it — the bots, the foreman, the camera rig, the tools. Nothing probes for
-a server or falls back to a second address: if nothing answers where that file says, the run stops and
-prints that file and the exact field to change. (`--host` and `--port` still work on the command above when
-you want to point one run somewhere else without editing anything.)
-
-**You start your Minecraft server and you stop it. The bots only join it.** Nothing here will start or
-stop a world it did not create, and the three settings above are the only thing it writes to yours. Every
-part of this project that touches a world asks it one question — *are you there* — and gets the answer by
-speaking to the server, never by being told.
+**Everything the foreman needs is in one file: `foreman_config.js`,** at the top level beside this
+README — local or remote, your server folder, the address, the port. Everything in this project reads it.
+Nothing probes for a server or falls back to a second address: if the world cannot be started or reached,
+the foreman stops and prints that file and the exact field to change. (The same values work as flags on
+the command above — `--where`, `--host`, `--port` — to point one run somewhere else.)
 
 **Ctrl-C stops everything, including the bots the foreman fetched.** That is the whole interface.
 
@@ -140,7 +142,7 @@ same either way, and `node developer_mode.js off` puts it back.
 - **`Cannot find module 'mineflayer'`** — `npm install` wasn't run, or was run in the wrong folder.
 - **`npm error code EBADENGINE`** — your Node is older than 22. Install the current one and run
   `npm install` again.
-- **"something is already using port 3001"** — an overseer is still running from last time. Close it.
+- **"something is already using port 3001"** — a foreman is still running from last time. Close it.
 - **"Auren cannot reach your server's console"** — the server was started before `server.properties`
   last changed. Restart the server and start Auren again. Nothing launched, so there is nothing to clean up.
 - **A bot says it did not start because it is not standing with you** — it was raised, it could not be
@@ -148,7 +150,8 @@ same either way, and `node developer_mode.js off` puts it back.
   line above.
 - **Joins and stands still** — usually ground it cannot work: no wood in reach, or spawn-protected. It
   re-plans and gets the same answer. The trace says which, and so will I if you send it.
-- **Version mismatch** — pass `--version 1.21.5` to match your server exactly.
+- **Version mismatch** — pass `--version <your server's version>` to match your server exactly. The bot
+  defaults to 26.1, which is the newest protocol its client library speaks.
 
 ---
 
@@ -157,16 +160,16 @@ same either way, and `node developer_mode.js off` puts it back.
 | | |
 |---|---|
 | `start_auren.js` | the one way in — the desk and the referee |
-| `your_server.js` | where your server is. The only file you might need to edit |
+| `foreman_config.js` | where your server is. The only file you might need to edit |
 | `developer_mode.js` | the door to the workbench, if you ever want it. Off until you say otherwise |
-| `start_bot.js` · `start_overseer.js` | one bot, or the referee, on their own — what the above is built from |
+| `start_bot.js` | one bot on its own — what the above is built from. The referee has no script of its own: it runs inside the foreman |
 | `master_core.js` | what a bot runs once it has been told who it is |
 | `Thinking_fragments/` | the deciding — planners, judges, and the config you'd edit to retune it |
 | `action_fragments.js/` | the doing — one file per verb |
 | `perception_nodes.js/` | the sensing |
 | `js_kernel/` | shared machinery: state store, trace writer, calculators |
 | `custom_api/` | the layer between the bot's vocabulary and Minecraft's |
-| `overseer/` · `foreman/` | job arbitration, and the desk you hire from |
+| `foreman/` | the one process outside the bots: job arbitration, the fleet's memory, and the desk you hire from |
 | `monitoring/` | the readers of what a run wrote. Behind the door; nothing the bot runs depends on it |
 | `Auren_Workshop/` | my own equipment, all of it, behind the door — see the section below |
 | `Auren_Structural_Laws.md` | the rules all of it obeys |

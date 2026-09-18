@@ -55,7 +55,7 @@ const mineflayer = moduleHomes.requireFromHomes('mineflayer');
 const rcon = require('@utils/rcon_link');
 const { openWindows, closeWindows, describeWindows } = require('@utils/console_window');
 const { loadedAreaSettled, settleLine, scanWheatPlots, describeScan } = require('@utils/wheat_plot_scanner');
-const { FARM_PLOT_COUNT } = require('@thinking/architect_config');
+const { FARM_PLOT_COUNT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const { hosting: HOSTING } = require('../run_config');
 
 const FLEET = paths.workshop('fleet_control.js');
@@ -98,7 +98,7 @@ async function until(test, ms, every = 250) {
 }
 
 async function probe(at) {
-  const bot = mineflayer.createBot({ host: HOST, port: PORT, username: NAME, version: '1.21.5', auth: 'offline' });
+  const bot = mineflayer.createBot({ host: HOST, port: PORT, username: NAME, version: SERVER_MINECRAFT_VERSION, auth: 'offline' });
   bot.on('error', e => say(`socket error: ${e.message}`));
   const joined = await new Promise(resolve => {
     bot.once('spawn', () => resolve(true));

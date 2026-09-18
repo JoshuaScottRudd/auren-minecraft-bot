@@ -39,7 +39,7 @@ const { loadedAreaSettled, inServerView } = require('@utils/wheat_plot_scanner')
 const { makeVoxelReader } = require('@utils/voxel_reader');
 const { ringScan, formatRejections } = require('@utils/site_geometry');
 const { getBiomeName } = require('@perception/biome_scanner');
-const { SPAWN_PROTECTION_RADIUS } = require('@thinking/architect_config');
+const { SPAWN_PROTECTION_RADIUS, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const { personSpotTest, landingFloor } = require('./person_spot');
 const store = require('./voxel_snapshot_store');
 const { hosting: HOSTING } = require('../run_config');
@@ -148,7 +148,7 @@ async function capture() {
   try {
     if (!has('continue') && !fleet(['snapshot-restore', `--world=${HOSTING.worldName}`, `--snapshot=${HOSTING.snapshot}`])) return 1;
     if (!fleet(['server-start'])) { say('the server did not come up; nothing captured.'); return 1; }
-    const bot = mineflayer.createBot({ host: 'localhost', port: PORT, username: NAME, version: '1.21.5', auth: 'offline' });
+    const bot = mineflayer.createBot({ host: 'localhost', port: PORT, username: NAME, version: SERVER_MINECRAFT_VERSION, auth: 'offline' });
     bot.on('error', e => say(`socket error: ${e.message}`));
     if (!await new Promise(r => { bot.once('spawn', () => r(true)); bot.once('end', () => r(false)); })) return 1;
     const [{ body: seedLine }] = await rcon.once(['gamemode creative ' + NAME, 'seed'], { creds: rcon.readServerProperties() }).then(o => o.slice(1));

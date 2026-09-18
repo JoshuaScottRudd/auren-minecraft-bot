@@ -41,7 +41,7 @@ const path = require('path');
 
 const BOT_DIR = path.resolve(__dirname, '..', '..');
 
-// The records room. Every run trace, whatever unit wrote it — bots, the overseer, the cameras, the desk.
+// The records room. Every run trace, whatever unit wrote it — bots, the foreman, the cameras, the desk.
 const TRACE_DIR = path.join(BOT_DIR, 'fleet_logs', 'traces');
 
 // CREATED ON DEMAND, AND BY THE WRITER RATHER THAN BY A SETUP STEP. A fresh clone has no `fleet_logs/`

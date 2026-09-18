@@ -39,6 +39,9 @@
 //   node trace_monitor.js --route-cost [--bot=AurenBot] [traceFile]    (what routes PRICED — the evidence
 //                                                                      a cost tier is set from)
 //   node trace_monitor.js --jumps [--bot=AurenBot] [traceFile]         (jump presses split by approach bearing)
+//   node trace_monitor.js --hunger [--bot=AurenBot] [traceFile]        (what the run cost in exhaustion,
+//                                                                      act by act, and the bread and
+//                                                                      wheat plots that pace needs)
 //   node trace_monitor.js --jobs [--bot=AurenBot] [--all] [traceFile]  (every job claimed, in order:
 //                                                                      start stamp, duration, verdict,
 //                                                                      the gaps between jobs, then where
@@ -106,9 +109,9 @@
 //   node trace_monitor.js --around=<1m1s|ISO> [--lines=25 | --window=60 | --before=..|--after=..] [--tag=T] [--bot=B]
 //   node trace_monitor.js --from=<4m> --to=<7m> [--bot=B] [--tag=T] [--grep=<regex>] [--level=error] [--run=latest|N|all]
 //
-// Default traceFile: fleet_logs/traces/watcher_overseer.jsonl (merged fleet stream).
+// Default traceFile: fleet_logs/traces/watcher_fleet.jsonl (merged fleet stream).
 // Per-bot files (watcher_<Id>.json) work too — bot id comes from the filename.
-// Watch mode needs no flush verb: the overseer persists the combined story
+// Watch mode needs no flush verb: the foreman persists the combined story
 // debounced at 250ms, so re-reading the file is always near-live.
 // Exit codes: 0 clean · 2 flags found · 1 could not read trace.
 
@@ -153,6 +156,11 @@ const path = require('path');
 //   locomotion_lenses.js   --pathfinding, --route-cost, --jumps. All read the navigator's own lines;
 //                          --route-cost reads the per-SEARCH path line (the only one carrying cost),
 //                          the other two read the per-trip census.
+//   hunger_lens.js         --hunger. Prices a run in Minecraft EXHAUSTION rather than in time — the
+//                          blocks broken, the jumps pressed, the metres swum, the damage taken — then
+//                          converts that rate into loaves of bread and wheat plots. It reuses
+//                          motion_classifier, job_timeline_lens and engagement_lens for the three
+//                          measurements they already own, and counts only the acts nothing else does.
 //
 // WHAT IS LEFT IS ONE VERB: find what went wrong in a run. The signatures, the per-bot digest, the
 // wake policy, the watch, and the three read-only views over the SAME trace the signatures read
@@ -164,7 +172,7 @@ const path = require('path');
 // file is the CLI — it owns the flags, reads the trace once, and hands the segment down.
 const {
   DEFAULT_TRACE_FILE, botFromFilename, parseLine, readTrace, readCameraView, segmentRuns,
-  afterMarker, relativeTime, buildEpisodes, episodeRows, EPISODE_FIELDS, PASSIVE_LINE, OVERSEER_UNITS,
+  afterMarker, relativeTime, buildEpisodes, episodeRows, EPISODE_FIELDS, PASSIVE_LINE, FOREMAN_UNITS,
 } = require('./trace_read');
 const { makeArgs, parseDuration } = require('./command_line_arguments');
 // ── THE ANSWER CHANNEL IS DATA, NOT PROSE (Architect 2026-09-16) ────────────────────────────────────
@@ -322,6 +330,12 @@ const PROGRESS = has('progress');
 const PATHFINDING = has('pathfinding');
 const ROUTECOST = has('route-cost');
 const JUMPS = has('jumps');
+// --hunger — what the run cost in FOOD. A flag of its own rather than a row on --jobs because the two
+// speak different units and only one of them can answer the question: --jobs measures the run in
+// seconds, and Minecraft charges for acts, never for elapsed time. A bot that walks for an hour spends
+// nothing (walking is priced at 0) while thirty jumps spend more than three hundred blocks mined, so a
+// clock cannot be converted into a food bill at any exchange rate.
+const HUNGER = has('hunger');
 const MILESTONES = has('milestones');
 // --torch — when the first torch was crafted, and what held it when it was not. A flag of its own
 // rather than a row on --milestones because that lens keys everything by build site and a torch is
@@ -417,7 +431,7 @@ const STREAM_TAGS = (opt('stream', '') || '')
   .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 // --follow : --stream with no tag list — echo EVERY new line as it lands. Added 2026-09-03 for the
 // Architect's one-window fleet console: he asked for the fleet's twelve separate consoles collapsed into
-// a single scrolling view, and what he wants to watch scroll is the merged overseer story. That is
+// a single scrolling view, and what he wants to watch scroll is the merged foreman story. That is
 // exactly --stream with the filter removed, so it is the same code path rather than a second one
 // (Law 16) — `--follow` sets the predicate to "always true" and nothing else about watch mode changes.
 // --bot= still narrows it, so `--follow --bot=AurenBot` is one bot's console without a window of its own.
@@ -596,7 +610,7 @@ function sigSilence(lines) {
   for (const l of lines) {
     const dm = l.raw.match(/Bot '(\w+)' disconnected/);
     if (dm) disconnected.add(dm[1]);
-    if (l.relSec === null || !l.bot || OVERSEER_UNITS.has(l.bot)) continue;
+    if (l.relSec === null || !l.bot || FOREMAN_UNITS.has(l.bot)) continue;
     maxRel = Math.max(maxRel, l.relSec);
     if (PASSIVE_LINE.test(l.raw)) continue;
     const prev = lastByBot.get(l.bot);
@@ -752,7 +766,7 @@ function detect(lines) {
 // (monitoring/dashboard.js) consumes the same Map — neither re-implements the count.
 // ── Authoritative per-bot liveness (the anti-ambiguity read) ─────────────────────────────────────
 // WHY THIS EXISTS. Every other "is this bot alive" number in this tool is derived from ONE trace file —
-// by default the MERGED watcher_overseer.json. The merge can lag a single bot while that bot is running
+// by default the MERGED watcher_fleet.json. The merge can lag a single bot while that bot is running
 // perfectly, and when it does, `last activity [Nm Ss]` for that bot silently freezes and the bot reads as
 // dead. That is not hypothetical: on 2026-07-20 the watch heartbeat reported TessaBot's last activity at
 // [28m 3s] and its counters frozen for ~3 minutes, and the AI developer escalated it as a wedged bot. Her
@@ -773,15 +787,15 @@ function detect(lines) {
 //
 // Reported ALONGSIDE the merged view rather than replacing it, and any disagreement between the two is
 // printed as MERGE-LAG. The disagreement is itself the diagnosis — it means the bot is fine and the
-// OVERSEER STREAM is behind, which is a different fault with a different fix, and the old output
+// FOREMAN STREAM is behind, which is a different fault with a different fix, and the old output
 // collapsed those two into one indistinguishable symptom (Law 6: a number that cannot be checked against
 // its source is a hidden variable).
 // ── THE HEARTBEATS COME FROM THE TRACE THAT WAS HANDED IN, NOT FROM THIS REPOSITORY (2026-09-10) ────
 // This was `record_homes.TRACE_DIR` unconditionally, which is the REPOSITORY's trace folder. Correct
 // whenever the file being read is also the repository's, and silently wrong the moment it is not — the
-// lens then watches one fleet's overseer stream while measuring a different fleet's liveness.
+// lens then watches one fleet's foreman stream while measuring a different fleet's liveness.
 //
-// MEASURED: `run.js` points this at a stranger download's `watcher_overseer.jsonl`. Ten seconds into a
+// MEASURED: `run.js` points this at a stranger download's `watcher_fleet.jsonl`. Ten seconds into a
 // two-minute window the freeze arm fired `FLEET FROZEN — no bot has logged for 5708s`, while the digest
 // over the very same file reported `last activity [0m 7s]`. Two irreconcilable answers about one fleet,
 // because the heartbeats were this repository's leftovers from earlier in the day and the stream was the
@@ -826,7 +840,7 @@ function readBotHeartbeats() {
   try { files = fs.readdirSync(KERNEL_DIR); } catch (_) { return beats; }
   for (const f of files) {
     const m = /^watcher_(.+)\.jsonl$/.exec(f);
-    if (!m || m[1] === 'overseer') continue;
+    if (!m || m[1] === 'fleet') continue;
     const bot = m[1];
     try {
       // Walk BACKWARD to the newest line carrying a readable stamp. A torn final line (the process died
@@ -871,7 +885,7 @@ function computeBotStats(lines) {
   const segs = segmentRuns(lines);
   const bots = new Map();
   for (const l of (segs[segs.length - 1] || [])) {
-    if (!l.bot || OVERSEER_UNITS.has(l.bot)) continue;
+    if (!l.bot || FOREMAN_UNITS.has(l.bot)) continue;
     if (!bots.has(l.bot)) bots.set(l.bot, { s: 0, w: 0, e: 0, lastRel: 0, lastIso: null, latestBuild: null, latestBuildT: 0, latestMine: null, latestMineT: 0, haltedAt: null, haltedOn: null });
     const b = bots.get(l.bot);
     if (l.level === 'summary') b.s++;
@@ -1030,7 +1044,7 @@ function warningsDigest(lines) {
   const groups = new Map();   // `${bot}\u0000${text}` → { bot, text, n, firstRel }
   const order = [];
   for (const l of latest) {
-    if (l.level !== 'warn' || !l.bot || OVERSEER_UNITS.has(l.bot)) continue;
+    if (l.level !== 'warn' || !l.bot || FOREMAN_UNITS.has(l.bot)) continue;
     const text = afterMarker(l.raw);
     const key = `${l.bot}\u0000${text}`;
     if (!groups.has(key)) { groups.set(key, { bot: l.bot, text, n: 0, firstRel: l.relSec }); order.push(key); }
@@ -1269,7 +1283,7 @@ function runProgress() {
   let maxRel = 0;
   for (const l of seg) {
     if (l.relSec == null) continue;
-    // A halted/inert bot keeps echoing overseer HQ merges long after its own work stopped; those
+    // A halted/inert bot keeps echoing foreman HQ merges long after its own work stopped; those
     // passive relays must not inflate the run span (same corpse-filter sigSilence/computeBotStats use).
     if (PASSIVE_LINE.test(l.raw)) continue;
     maxRel = Math.max(maxRel, l.relSec);
@@ -1510,7 +1524,7 @@ function runQuery() {
 // ── Watch mode ───────────────────────────────────────────────────────────────
 // Re-reads the trace on a cadence and reports only flags anchored in NEW lines
 // (signatures still run over the full story — an episode needs its history).
-// A shrinking story means the overseer restarted → treat as a fresh run.
+// A shrinking story means the foreman restarted → treat as a fresh run.
 // Heartbeats once a minute prove liveness without adding noise.
 function runWatch() {
   const t0 = Date.now();
@@ -1626,10 +1640,10 @@ function runWatch() {
     // lying, "alive" signal. Here we measure the newest bot line's ABSOLUTE time against the wall
     // clock. Fires once per episode (re-armed when a newer line lands); exempt before any bot logs.
     // Sourced from the PER-BOT files, not the merged trace. The merged stream writes bot lines as
-    // `[Nm Ss] [Bot] ...` with NO absolute stamp (only the overseer's own lines carry an ISO), so
+    // `[Nm Ss] [Bot] ...` with NO absolute stamp (only the foreman's own lines carry an ISO), so
     // `l.iso` was null for every bot line here, botLines came out empty, and this whole detector was
     // unreachable against the default trace file. It never fired once. Proven 2026-07-20: the fleet
-    // died at 13:13:33Z — server, overseer and both bots, no error logged — and the watch ran another
+    // died at 13:13:33Z — server, foreman and both bots, no error logged — and the watch ran another
     // 4 minutes printing `quiet` and exited 0 with "No anomalies." A watch that reports clean over a
     // dead fleet is worse than no watch (Law 25: a success signal that can lie makes every honest one
     // worthless). readBotHeartbeats reads lastStoryAt, which is a real ISO, from each bot's own file.
@@ -1637,7 +1651,7 @@ function runWatch() {
     let newestBotMs = null;
     for (const h of hb.values()) newestBotMs = Math.max(newestBotMs ?? 0, h.at.getTime());
     if (newestBotMs === null) {
-      const botLines = lines.filter(l => l.bot && !OVERSEER_UNITS.has(l.bot) && l.iso);
+      const botLines = lines.filter(l => l.bot && !FOREMAN_UNITS.has(l.bot) && l.iso);
       newestBotMs = botLines.length ? botLines.reduce((mx, l) => Math.max(mx, Date.parse(l.iso)), 0) : null;
     }
     if (newestBotMs && Date.now() - newestBotMs > SILENCE_GAP_SEC * 1000) {
@@ -1755,7 +1769,7 @@ function latestSegment() {
 const wantsCameraView = () => !args.some(a => !a.startsWith('--'))
   && !!BOT_FILTER && String(BOT_FILTER).toLowerCase().startsWith('camera_');
 
-// What a rendered header must call the record it read. A lens that prints `watcher_overseer.jsonl` over
+// What a rendered header must call the record it read. A lens that prints `watcher_fleet.jsonl` over
 // lines that came out of the camera view has given the reader a return address that does not lead back
 // to the material (Law 24 — the report is a translation, and a wrong source name breaks it).
 const traceLabel = () => (wantsCameraView() ? 'watcher_camera_*.jsonl' : path.basename(TRACE_FILE));
@@ -1785,6 +1799,7 @@ if (require.main === module) {
   else if (PATHFINDING) runLens(locomotionLenses.runPathfinding);
   else if (ROUTECOST) runLens(locomotionLenses.runRouteCost, { over: parseInt(opt('over', '60'), 10) || 60 });
   else if (JUMPS) runLens(locomotionLenses.runJumps);
+  else if (HUNGER) runLens(require('./hunger_lens').runHunger);
   else if (MILESTONES) runLens(buildLenses.runMilestones, { deadlineSec: MS_DEADLINE_SEC, verbose });
   else if (TORCH) runLens(buildLenses.runTorchClock, { deadlineSec: MS_DEADLINE_SEC });
 else if (FARM) runLens(require('./farm_lens').runFarm, { verbose });

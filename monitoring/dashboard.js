@@ -45,7 +45,7 @@ const opt = (n, d) => {
 const INTERVAL = Math.max(1, parseInt(opt('interval', '2'), 10) || 2);
 const ONCE = args.includes('--once');
 const TRACE_FILE = args.find(a => !a.startsWith('--'))
-  || require(paths.bot('js_kernel/utils/record_homes')).traceFile('overseer');
+  || require(paths.bot('js_kernel/utils/record_homes')).traceFile('fleet');
 // Written into the records room, not the kernel: the kernel holds what a bot needs to RUN, and
 // nothing in the fleet reads this — it is an observer's output for a human's editor (Architect
 // 2026-08-31).

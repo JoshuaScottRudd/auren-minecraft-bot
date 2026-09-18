@@ -465,7 +465,7 @@ module.exports = {
       // Round 40 paid 38 minutes for that clear: the three unplaceable ceiling voxels at 26|24|91 had
       // their reason computed and destroyed on all five passes, so the judge's kill printed a loop with
       // no cause attached and the diagnosis had to be rebuilt offline from scratch. Dump BEFORE the
-      // summary — buffer.dump persists (writes the watcher file, forwards to the overseer) and does NOT
+      // summary — buffer.dump persists (writes the watcher file, forwards to the foreman) and does NOT
       // fake an error(): a voxel waiting on a neighbour is environmental (Law 13), not a crash, so
       // error() here would wake the fleet on ordinary work. This is the whole point of the buffer's
       // two exits — the happy path clears, a stalled pass keeps its evidence.

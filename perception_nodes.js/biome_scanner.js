@@ -6,7 +6,7 @@
 //          wants (Architect 2026-07-18: "biome_scanner should just give all the biomes, the caller decides").
 // invariants:
 //  - Uses bot.world.getBiome(pos) directly against the mineflayer chunk cache — no block queries, no chunk load.
-//  - Samples every biome CELL (4-block step — MC 1.21.5 stores biomes at 4×4×4) across the server's view
+//  - Samples every biome CELL (4-block step — Minecraft stores biomes at 4×4×4) across the server's view
 //    distance (view-distance 10 → 160-block radius → 81×81 grid ≈ 6561 points), then flood-fills same-biome
 //    neighbours into patches. The whole thing is a cache read, ~tens of ms — no throttle (see STEP note).
 //  - Y is pinned to the bot's floored altitude — a 2D horizontal (SURFACE) survey, never a vertical/underground
@@ -27,7 +27,7 @@ const watcher = require('@kernel/watcher');
 let _lastScan = null;
 
 // Server view-distance is 10 chunks (server.properties: view-distance=10) → 160-block radius.
-// STEP is the biome SAMPLE spacing. MC 1.21.5 stores biomes at 4×4×4 NATIVE resolution (a biome cell is
+// STEP is the biome SAMPLE spacing. Minecraft stores biomes at 4×4×4 NATIVE resolution (a biome cell is
 // 4 blocks), so STEP=4 samples EVERY distinct biome cell in the loaded area — the finest MEANINGFUL density
 // (STEP<4 just re-reads the same cell). The old STEP=16 sampled once per CHUNK, undersampling 4× per axis
 // (16× fewer points): it could miss a sub-chunk biome patch or misplace the nearest sampled point by up to a
@@ -36,7 +36,7 @@ let _lastScan = null;
 // synchronously in ~24ms (measured) — well inside one tick, no voxel_scan_throttle. If a future density/host
 // ever pushes it past a tick, add the throttle (its units are tiny + uniform — the ideal case).
 const RADIUS = 160;
-const STEP = 4;   // native biome-cell resolution (1.21.5: biomes are 4×4×4). ~6561 points across the loaded area.
+const STEP = 4;   // native biome-cell resolution (biomes are 4×4×4). ~6561 points across the loaded area.
 const NEIGHBORS = [[STEP, 0], [-STEP, 0], [0, STEP], [0, -STEP]];   // 4-connectivity at the sample spacing
 
 // getBiomeName — resolves bot.world.getBiome's numeric id to a stripped biome name (no 'minecraft:' prefix),
@@ -50,7 +50,7 @@ function getBiomeName(bot, x, y, z) {
   //
   // THE COLUMN IS CHECKED FIRST, and that half was missing (found 2026-09-05 by seed_scanner). Removing
   // the useless catch did not close the hole the catch was hiding: `getBiome` answering 0 for a column
-  // it has never seen is indistinguishable from a real answer, and **biome id 0 in 1.21.5 is
+  // it has never seen is indistinguishable from a real answer, and **biome id 0 on 26.1 is
   // `badlands`** — so every scan reported four phantom badlands patches, one at each corner of the
   // sample square where the ±160 sweep reaches past the server's 21×21 chunk window. MEASURED: 185
   // cells, byte-identical in four different worlds including a frozen_ocean/ice_spikes one where

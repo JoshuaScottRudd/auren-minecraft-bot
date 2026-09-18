@@ -47,7 +47,7 @@ const inventorySwapper = require('@api/inventory_swapper');
 const { OPTIONAL_BUILD_MATERIALS } = require('@thinking/architect_config');
 const hq = require('@kernel/corporate_headquarters');
 const portableJudge = require('@kernel/portable_judge');
-const overseerLink = require('@kernel/overseer_link');
+const foremanLink = require('@kernel/foreman_link');
 // The stationary dig-all/place-all routine is shared with mining_executor (Law 16 / D3 —
 // one repair primitive under two separate executors). build_executor supplies the
 // build-domain mechanics (group resolution, station registration, pillarStep footing) as
@@ -388,7 +388,12 @@ module.exports = {
       // the one place route (Law 16). The sneak rule this file ORIGINATED — sneak when the anchor is
       // interactable, so a click on a chest places against it instead of opening it — is the authority's
       // 'auto' default, so nothing is passed for it here.
-      const place = await performPlace(bot, pos, ev.anchor, ev.face, desiredName, 'build_executor');
+      // A voxel that names its block state is placed by the facing route, which picks its own clicked face,
+      // cursor and reported rotation from where the body stands (place_authority, opts.state).
+      const place = await performPlace(bot, pos, ev.anchor, ev.face, desiredName, 'build_executor', step.state ? { state: step.state } : {});
+      if (place.state && place.ok && !place.state.ok) {
+        watcher.warn('build_executor', `wrong state at (${pos.x},${pos.y},${pos.z}) ${desiredName}: wanted ${JSON.stringify(place.state.wanted)} got ${JSON.stringify(place.state.got)} [${place.aim}]`);
+      }
       if (!place.ok) {
         const bp = bot.entity.position;
         watcher.warn('build_executor', `place refused at (${pos.x},${pos.y},${pos.z}) — ${place.reason} | bot at (${bp.x.toFixed(1)},${bp.y.toFixed(1)},${bp.z.toFixed(1)}) dist=${dist3({x:pos.x+0.5,y:pos.y+0.5,z:pos.z+0.5},{x:bp.x,y:bp.y,z:bp.z}).toFixed(1)} anchor=${ev.anchor.name}@(${ev.anchor.position.x},${ev.anchor.position.y},${ev.anchor.position.z})`);
@@ -576,7 +581,7 @@ module.exports = {
       }
 
       // Object lock (arbiter flavor a — physical exclusivity, taxonomy in
-      // overseer_brain.js): the anchor is the claimed object — no other bot may
+      // foreman_brain.js): the anchor is the claimed object — no other bot may
       // build it while held (lock the object, not the bot). Chosen at execution
       // time, so the planning token can't cover it. A peer-held anchor is treated
       // like a stuck one: skip it and select another. In per-anchor-gated mode
@@ -590,9 +595,9 @@ module.exports = {
         // Unguarded: the claim is ours and answers in `granted`. The catch that stood here turned a
         // defect into `granted: false`, which reads as "a peer holds this anchor" — so the bot walked
         // away from an anchor nobody held, marked it stuck, and did that for every anchor in turn.
-        const claim = await overseerLink.requestClaim(claimKey);
+        const claim = await foremanLink.requestClaim(claimKey);
         if (claim.granted) {
-          if (heldAnchorClaimKey) overseerLink.releaseClaim(heldAnchorClaimKey);
+          if (heldAnchorClaimKey) foremanLink.releaseClaim(heldAnchorClaimKey);
           heldAnchorClaimKey = claimKey;
           break;
         }
@@ -760,7 +765,7 @@ module.exports = {
     // Executor is leaving the anchor either way — release the object lock so
     // peers can enter/build it (a re-dispatch re-claims).
     if (heldAnchorClaimKey) {
-      overseerLink.releaseClaim(heldAnchorClaimKey);
+      foremanLink.releaseClaim(heldAnchorClaimKey);
       heldAnchorClaimKey = null;
     }
 

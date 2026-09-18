@@ -17,7 +17,7 @@
 // this directory's README). Reading a watcher file by hand to recover a unit's own words is exactly the
 // act this door removes.
 //
-// THE WINDOW IS REPORTED, NEVER SILENTLY APPLIED. The trace is segmented on the overseer's `start`
+// THE WINDOW IS REPORTED, NEVER SILENTLY APPLIED. The trace is segmented on the foreman's `start`
 // broadcast, which is the right window for a bot (a bot has nothing to say before it is told to think)
 // and the WRONG one for anything that comes up beforehand — a camera director publishes its whole
 // bring-up before `start` is ever sent, so the latest segment would show none of it and would look

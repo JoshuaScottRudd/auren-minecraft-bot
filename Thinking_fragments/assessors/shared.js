@@ -148,7 +148,7 @@ function supplyJob(fields) {
 
 // currentBiome — bot's biome name (lowercased, namespace stripped) or null. Read straight off the bot
 // (perception, Law 1 exempt) — more reliable than bot_state.json (CWD-dependent). One definition (Law 16):
-// assessors/exploration and assessors/base_layout both read it, so they can't disagree on "buildable yet".
+// every assessor that asks "buildable yet" reads this one, so no two of them can disagree on it.
 function currentBiome() {
     const bot = global.bot;
     if (!bot || !bot.entity || typeof bot.world?.getBiome !== 'function') return null;

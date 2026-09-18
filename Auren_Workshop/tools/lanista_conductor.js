@@ -309,7 +309,7 @@ function main() {
     // of Law 25's trust contract — a re-verifying step is the redundant pathway Law 16 forbids.
     banner('1. ROLLBACK + BRING UP (sentry)');
     // Flips BEFORE the spawn, not after it returns: a bring-up that fails part-way has still left a
-    // server and an overseer standing, and those are ours to reap.
+    // server and an foreman standing, and those are ours to reap.
     raised = true;
     const upArgs = [FLEET, 'test', 'arena', '--count=1', `--world=${world}`, `--snapshot=${snap}`, `--port=${port}`];
     // NODE_PATH TRAVELS WITH THIS SPAWN TOO. It used to be set only on the ladder spawn below, on the

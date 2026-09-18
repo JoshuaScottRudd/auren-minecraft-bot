@@ -45,11 +45,11 @@ const path = require('path');
 // Kept as a table rather than a parser full of if-statements so that `--help` is generated FROM the same
 // table the parser reads. A flag that is documented but not honoured (or honoured but not documented) is
 // not possible here, which is the failure this shape is chosen to prevent.
-// The address defaults come from `your_server.js` — the one page a downloader edits — rather than from
+// The address defaults come from `foreman_config.js` — the one page a downloader edits — rather than from
 // literals here, so an edit there reaches a bot started directly by this door too (2026-09-11, Law 16).
 // A flag still wins, and the environment still wins over the file; this only settles what happens when
 // nobody has said anything.
-const WORLD = require('./your_server');
+const WORLD = require('./foreman_config');
 const FLAGS = [
   { flag: 'host',     env: 'AUREN_SERVER_HOST',        def: WORLD.host, help: 'server address the bot connects to' },
   { flag: 'port',     env: 'AUREN_SERVER_PORT',        def: String(WORLD.port), help: 'server port' },
@@ -57,8 +57,8 @@ const FLAGS = [
   { flag: 'mode',     env: 'BOT_MODE',                 def: 'homesteader', help: 'homesteader | contractor' },
   { flag: 'owner',    env: 'BOT_OWNER',                def: null,        help: 'your Minecraft name — REQUIRED for contractor, forbidden for homesteader' },
   { flag: 'near',     env: 'BOT_START_NEAR',           def: null,        help: 'a player in the world — the bot is teleported to them and confirmed there before it starts working (a contractor uses its owner when this is absent)' },
-  { flag: 'version',  env: 'AUREN_MINECRAFT_VERSION',  def: null,        help: "the server's Minecraft version (default: 1.21.5, set in architect_config)" },
-  { flag: 'overseer', env: 'OVERSEER_URL',             def: null,        help: 'ws://host:port of a running overseer — omit it and the bot runs alone' },
+  { flag: 'version',  env: 'AUREN_MINECRAFT_VERSION',  def: null,        help: "the server's Minecraft version (default: 26.1, set in architect_config)" },
+  { flag: 'foreman', env: 'FOREMAN_URL',             def: null,        help: 'ws://host:port of a running foreman — omit it and the bot runs alone' },
   // ── `--work` IS DELETED, AND THE MECHANISM BEHIND IT IS NOT (Architect 2026-09-10) ──────────────────
   // *"law 16 the system. only one way to do it so remove --work 1."*
   //
@@ -113,9 +113,10 @@ function usage() {
                   your orders, and belongs to the name you pass as --owner.
 
   Running more than one bot:
-    Start the overseer once (node start_overseer.js), then give every bot
-    --overseer ws://localhost:3001 so they can divide work instead of
-    colliding. One bot on its own does not need it.
+    Start the fleet once (node start_auren.js — the foreman runs inside
+    the foreman), then give every bot --foreman ws://localhost:3001 so
+    they can divide work instead of colliding. One bot on its own does not
+    need it.
 `);
 }
 
@@ -148,7 +149,7 @@ const given = parse(process.argv.slice(2));
 if (given === null) { usage(); process.exit(0); }
 
 // ── Stamping ───────────────────────────────────────────────────────────────────────────────────────────
-// Flag wins, then existing environment, then the default. `owner`, `version` and `overseer` have no
+// Flag wins, then existing environment, then the default. `owner`, `version` and `foreman` have no
 // default on purpose — an absent one must stay absent, because `bot_mandate` reads the DIFFERENCE between
 // "homesteader with no owner" and "homesteader with an empty owner" and refuses the second.
 for (const f of FLAGS) {
@@ -188,7 +189,7 @@ require('./js_kernel/utils/node_module_homes').bootstrapModulePath();
 console.log(`\n  Auren — starting '${process.env.BOT_ID}' as a ${mode}`
   + `${process.env.BOT_OWNER ? ` for ${process.env.BOT_OWNER}` : ''}`
   + `\n  connecting to ${process.env.AUREN_SERVER_HOST}:${process.env.AUREN_SERVER_PORT}`
-  + `${process.env.OVERSEER_URL ? `\n  overseer: ${process.env.OVERSEER_URL}` : '\n  no overseer — this bot plans alone'}`
+  + `${process.env.FOREMAN_URL ? `\n  foreman: ${process.env.FOREMAN_URL}` : '\n  no foreman — this bot plans alone'}`
   + `\n  everything it does is written to ${path.join(__dirname, 'fleet_logs', 'traces')}\n`);
 
 // The mandate is complete. Requiring master_core IS starting the bot.

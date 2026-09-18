@@ -17,7 +17,7 @@ terrain predicates, pillarStep, config objects → @utils/movement/*.
 const Vec3 = require('vec3');
 // Top-level require, not a per-call in-function require — a logger threaded through every
 // signature it's needed in is the self-referential swallow one layer out. No cycle: watcher
-// pulls only fs/path + lazy overseer_link.
+// pulls only fs/path + lazy foreman_link.
 const watcher = require('@kernel/watcher');
 
 // ── Core small utilities (pure, stateless) ───────────────────────────────────────────────────────
@@ -520,13 +520,24 @@ function tierIndex(name){
 // than author a belief about it), and it stays right across a version bump that no hand-written list would
 // survive. A name-regex could only ever encode one session's guess about 1,104 blocks.
 //
-// VERIFIED AGAINST THE FULL BLOCK SET (1.21.5, all 1,104), because "if verified" was the instruction:
-//   728  carry an explicit `mineable/<tool>`            → taken directly
-//    92  `incorrect_for_wooden_tool` + harvestTools     → pickaxe in ALL 92 cases, checked one by one by
-//        (the tier-gated ores: iron, gold, lapis, …)      resolving each harvestTools item id to its class
+// VERIFIED AGAINST THE FULL BLOCK SET, because "if verified" was the instruction. Re-run against 26.1 on
+// 2026-09-17 when the fleet left 1.21.5 — the CENSUS MOVED AND THE CONCLUSION DID NOT, which is exactly
+// the property reading the game's own material was chosen for (all 1,168 blocks, was 1,104 on 1.21.5):
+//   713  carry an explicit `mineable/<tool>`            → taken directly
+//   112  `incorrect_for_wooden_tool` + harvestTools     → pickaxe in ALL 112 cases (was 92 on 1.21.5),
+//        (the tier-gated ores: iron, gold, lapis, …)      checked one by one by resolving each
+//                                                         harvestTools item id to its class
 //   312  `default` — saplings, glass, beds, plants      → no tool; the hand is CORRECT, not a miss
 //    16  `wool` · 11 `leaves` · 1 `coweb`               → shears (below)
-//     5  command/structure blocks, empty harvestTools   → unobtainable; hand
+//     3  bamboo, bamboo_sapling (`sword_instantly_mines`) and crafter (bare
+//        `incorrect_for_wooden_tool`, no harvestTools)  → hand
+//
+// COBWEB IS WHY THE OVERRIDES ARE CHECKED FIRST, and 26.1 is where that stopped being incidental. Its
+// harvestTools on 26.1 are the SWORDS and shears, not pickaxes — so a block reaching the
+// `if (block.harvestTools) return 'pickaxe'` line below would be told to swing a pickaxe at it. It never
+// reaches that line, because `coweb` is in MATERIAL_TOOL_OVERRIDES and the override loop runs before both
+// the marker loop and the fallback. Re-checked after the bump: 112 blocks reach the fallback and all 112
+// are pickaxe. Move the override check below the fallback and cobweb breaks silently.
 //
 // TWO DELIBERATE OVERRIDES, both about which tool the FLEET should reach for rather than which the game
 // prefers, so they are decisions and are named as such:
@@ -552,7 +563,8 @@ function heuristicPreferredClass(block){
     if(m) return m[1];
   }
   // A tier-gated block states its TIER where the tool would go, so the tool is missing rather than absent.
-  // All 92 such blocks in 1.21.5 are pickaxe, verified by resolving their harvestTools rather than assumed.
+  // All 112 such blocks are pickaxe on 26.1 (92 on 1.21.5), verified by resolving their harvestTools
+  // rather than assumed — and cobweb never arrives here, because the override loop above takes it first.
   if(block.harvestTools) return 'pickaxe';
   return null;
 }

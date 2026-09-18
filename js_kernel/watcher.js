@@ -35,7 +35,7 @@ const HIDDEN_SUBSTRINGS = [];
 const ENABLE_WATCHER_LOGS = false;
 
 // QUIET_FORWARD_STAGES: stages whose routine summary() chatter is KEPT in the bot's own story file
-// (watcher_<BotId>.json — every line, fully recoverable) but NOT mirrored to the merged overseer
+// (watcher_<BotId>.json — every line, fully recoverable) but NOT mirrored to the merged foreman
 // stream that is the live signal-trace summary (and trace_monitor's default source). A sub-loop
 // (Law 15) like the navigator runs its own Sense-Plan-Act internally — A* plans, per-step progress,
 // unstick, pillar/bridge build-delivery — which are implementation detail, not signal-level events;
@@ -51,10 +51,10 @@ const fs = require('fs');
 const path = require('path');
 const _watcherBotId = process.env.BOT_ID || '';
 // A bot process (BOT_ID set) does NOT echo its own story to its local terminal: every line is
-// forwarded to the overseer, which is the single window the whole fleet is watched in. Nothing is
-// lost — the per-bot story file AND the overseer forward still receive every line (Law 6); only the
+// forwarded to the foreman, which is the single window the whole fleet is watched in. Nothing is
+// lost — the per-bot story file AND the foreman forward still receive every line (Law 6); only the
 // redundant local echo is dropped, so a bot window shows just its startup banner and then stays quiet
-// (instantly distinguishable from the overseer's live stream). Overseer/standalone (no BOT_ID) print
+// (instantly distinguishable from the foreman's live stream). Foreman/standalone (no BOT_ID) print
 // normally. This gates the three level prints + the buffer dump; it does NOT gate _forward or writes.
 const SILENT_TERMINAL = !!_watcherBotId;
 // .jsonl, not .json — the extension IS the durability contract (see _writeWatcherFile). One story line
@@ -87,7 +87,7 @@ const TRACE_FILE = recordHomes.deepTraceFile(_watcherBotId);
 // so "no silent swallow" is satisfiable INSIDE the logger without the recursion.
 //
 // Rules: console only, never a watcher level (that is the recursion). Never gated by SILENT_TERMINAL
-// — a bot process suppresses its own routine echo because the overseer forward carries it, but a
+// — a bot process suppresses its own routine echo because the foreman forward carries it, but a
 // self-fault means the forward and the file are the very things that may be broken, so this is the
 // one line that must print locally regardless. stderr survives a wrecked stdout and the launcher
 // captures it.
@@ -352,8 +352,8 @@ class Watcher {
     if (t.unref) t.unref();
   }
 
-  // _forward: mirror one printed line to the overseer so both bots' streams can be watched in one
-  // place (tagged by bot on the overseer side). Best-effort and re-entry-guarded — the forward path
+  // _forward: mirror one printed line to the foreman so both bots' streams can be watched in one
+  // place (tagged by bot on the foreman side). Best-effort and re-entry-guarded — the forward path
   // must never log (it would recurse) and must never throw into a caller (Law 5: logging is passive).
   //
   // ── THE LEVEL TRAVELS AS A FIELD, NOT AS A GLYPH IN THE TEXT (Architect 2026-09-16) ──────────────
@@ -371,8 +371,8 @@ class Watcher {
       // same-directory sibling is found in every caller shape, including the processes that register no
       // alias table. That makes THIS line unconditional; it does not make the forward path work outside
       // the fleet, because the module it reaches has alias requires of its own. Outside a bot the
-      // forward still self-faults, and that is the correct outcome — there is no overseer to forward to.
-      const link = require('./overseer_link');
+      // forward still self-faults, and that is the correct outcome — there is no foreman to forward to.
+      const link = require('./foreman_link');
       if (link && typeof link.forwardLog === 'function') link.forwardLog(entry, level);
     } catch (e) { _selfFault('_forward', e); }
     finally { this._forwarding = false; }
@@ -387,7 +387,7 @@ class Watcher {
     this._record(entry, { printed: true });
     this._traceRecord(stage, entry);
     // Sub-loop chatter (QUIET_FORWARD_STAGES) is recorded to the per-bot file above but not mirrored
-    // to the overseer signal-trace stream — warn()/error() still forward, so failures never hide.
+    // to the foreman signal-trace stream — warn()/error() still forward, so failures never hide.
     if (!QUIET_FORWARD_STAGES.has(stage)) this._forward(entry, 'summary');
     this._bufferClear(stage);
   }
@@ -466,12 +466,12 @@ class Watcher {
       this.currentLoop.push(entry);
       this._lastStoryAt = Date.now();
       this.summaryLog.push(`[${formatTimestamp(this._lastStoryAt)}] ${entry}`);
-      // `context`, NOT `error`, and the distinction is load-bearing now that the overseer counts these.
+      // `context`, NOT `error`, and the distinction is load-bearing now that the foreman counts these.
       // One error() dumps its whole deferred buffer first, so a stage holding twelve buffered lines
       // would post one error and twelve more lines behind it — tallied as `error` that reads as
       // thirteen failures where there was one. These lines are the CONTEXT for the error that follows,
       // never failures of their own (Law 25 — a count that overstates is not a conservative count).
-      this._forward(entry, 'context');   // error context belongs on the overseer, not just the bot's story file
+      this._forward(entry, 'context');   // error context belongs on the foreman, not just the bot's story file
     }
     this._buffers[stage] = [];
     this._writeWatcherFile();

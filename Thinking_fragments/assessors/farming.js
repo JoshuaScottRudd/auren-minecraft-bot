@@ -21,7 +21,7 @@ const {
 //
 // ONE job, not one per plot: the plots sit in a tight cluster well out from base, and a job per instance
 // made the fleet re-travel the full distance for each plot. LOCATE is absent (Law 16 — one pathway) —
-// base_layout locks every center at startup, so unlocated plots simply don't count here. scope:'local' —
+// the foreman sites every center before any body spawns (recorded at start), so unlocated plots simply don't count here. scope:'local' —
 // each bot feeds itself; no peer can claim it.
 //
 

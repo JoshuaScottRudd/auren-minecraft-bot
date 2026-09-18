@@ -4,12 +4,12 @@
 // corporate_headquarters is the ONLY dynamic state a bot carries, so flushing it
 // IS the flush. reset() empties the in-memory cache and writes the empty baseline
 // to disk in one step, so this session's next read and the next cold start (which
-// re-parses the file) both see a blank HQ. The overseer clears its own mirrored
+// re-parses the file) both see a blank HQ. The foreman clears its own mirrored
 // fleet state (merged stations + structures) separately when it broadcasts the
-// verb — see overseer_server — so nothing stale is re-injected.
+// verb — see foreman_hub — so nothing stale is re-injected.
 //
 // ── ITS RADIUS IS THE WHOLE FLEET, WHICH IS WHY IT IS NOT THE IN-WORLD VERB (Law 28) ──────────────────
-// This clears one bot's HQ whole, and the overseer clears the shared mirror alongside it — so across the
+// This clears one bot's HQ whole, and the foreman clears the shared mirror alongside it — so across the
 // fleet it reaches every owner's stations, every owner's structures and every human's standing requests.
 // Law 28 grants reach at exactly the scope of the answering: that radius is correct from the terminal,
 // where the whole fleet is one person's responsibility, and wrong from a person in the world who answers
@@ -19,7 +19,7 @@
 //
 // usage:
 //  - programmatic: const { flush } = require('@kernel/flush_system.js'); await flush();
-//  - console/overseer: the 'flush' verb via operator_commands (Law 16: one pathway)
+//  - console/foreman: the 'flush' verb via operator_commands (Law 16: one pathway)
 
 'use strict';
 

@@ -70,7 +70,7 @@ const rcon = require(paths.bot('js_kernel/utils/rcon_link'));
 const {
   hasEntityLineOfSight, lastSightlineBlock, hasLineOfSight, eyePos,
 } = require('@utils/movement/terrain_predicates');
-const { aggroCastRange, AGGRO_RANGE } = require('@thinking/architect_config');
+const { aggroCastRange, AGGRO_RANGE, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 
 // ── arguments ───────────────────────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -79,7 +79,9 @@ const flag = k => argv.includes(`--${k}`);
 
 const HOST = arg('host', 'localhost');
 const PORT = Number(arg('port', 25565));
-const VERSION = arg('version', '1.21.5');
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const VERSION = arg('version', SERVER_MINECRAFT_VERSION);
 const USERNAME = arg('username', 'RaycastCrucible');
 const RADIUS = Number(arg('radius', 8));          // the cube of block targets, ± this many on each axis
 const STEP = Number(arg('step', 0.05));           // coarse sweep resolution, in blocks

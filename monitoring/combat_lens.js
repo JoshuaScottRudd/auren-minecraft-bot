@@ -58,7 +58,7 @@ const DETONATED_VERDICT = 'detonated';
 // The per-bot story file, not the merged fleet view: every question here is about ONE body, and the
 // merge would fold three bots' waves into one stream for a caller that named a bot.
 //
-// LAST RUN ONLY. The story file outlives runs (the overseer's `start` broadcast is what segments them),
+// LAST RUN ONLY. The story file outlives runs (the foreman's `start` broadcast is what segments them),
 // so a bench asking "has a wave finished since I summoned" must not be able to match one from an hour
 // ago. `segmentRuns` is the fleet's own segmentation and is reused rather than re-derived.
 function readBotTrace(botId) {
@@ -199,7 +199,7 @@ function completedBattlesSince(sinceEpochMs, { bot = null } = {}) {
   return battles.sort((a, b) => a.at - b.at);
 }
 
-// Every bot with a story file, for the no-filter case. The camera and overseer streams are excluded BY
+// Every bot with a story file, for the no-filter case. The camera and foreman streams are excluded BY
 // NAME: they are not bodies, they have no waves, and reducing them would cost a file read per call for a
 // guaranteed empty result.
 function traceBots() {
@@ -208,7 +208,7 @@ function traceBots() {
   return files
     .filter(f => /^watcher_.+\.jsonl$/.test(f))
     .map(f => f.replace(/^watcher_/, '').replace(/\.jsonl$/, ''))
-    .filter(id => id !== 'overseer' && !id.startsWith('camera_'));
+    .filter(id => id !== 'fleet' && !id.startsWith('camera_'));
 }
 
 // ── fightSpansFromTrace — a fight's WALL-CLOCK EXTENT ───────────────────────────────────────────────

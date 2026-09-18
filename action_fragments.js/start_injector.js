@@ -20,6 +20,11 @@ const CONFIG = {
   alsoFlushOnStart: false // set to false to skip calling flush_system before starting
 };
 
+// How long a starting body waits to hear the foreman's memory (its base lives there). The hub broadcasts on
+// every registration, so this is normally met in well under a second; the ceiling only decides how long a
+// body stands still before saying plainly that the foreman never answered.
+const FIRST_BROADCAST_WAIT_MS = 30000;
+
 // watcher files live in js_kernel; hard-reset on start so history doesn't leak across restarts
 const _siBotId = process.env.BOT_ID || '';
 const _siKernelDir = path.dirname(require.resolve('@kernel/watcher.js'));
@@ -69,10 +74,10 @@ module.exports = {
     // WHY IT IS BEFORE THE ROUTE AND AFTER THE FLUSH. The flush above is what makes the run's record
     // start clean, so a refusal written after it lands in the trace a reader will actually open; a
     // refusal recorded before the flush would be erased by the next attempt. And it is before the route
-    // because routing IS the start — the first thing the planning loop does is survey for a base, and
-    // surveying from the wrong place is the whole fault this gate exists to close. Measured 2026-09-10:
-    // the survey ran 0.2s before the desk's teleport landed, three runs in a row, so the base layout was
-    // decided at the world spawn while the person who asked stood 130 blocks away.
+    // because routing IS the start. Measured 2026-09-10: the body's own base survey ran 0.2s before the
+    // desk's teleport landed, three runs in a row, so the base layout was decided at the world spawn while
+    // the person who asked stood 130 blocks away. (The body no longer surveys at all since 2026-09-18 —
+    // see the site record below — but it still must not begin work anywhere but where it was placed.)
     //
     // A BODY NOBODY PLACED STARTS WHERE IT STANDS. `startNearPlayer()` returns null only when no person
     // was named, which is the hand-launched single bot `beginsWorkAtBirth` describes — and inventing a
@@ -119,9 +124,35 @@ module.exports = {
         + `${spawnGuard.describeSpawnProtection(global.bot)} `
         + `Inside it the server refuses every break and placement by a non-op and REPORTS NOTHING, so `
         + `every dig this crew attempts near its base will be refused and the jobs that need stone, `
-        + `seeds or a cleared site will return nothing. The base is about to be surveyed from HERE. `
+        + `seeds or a cleared site will return nothing. The crew is about to start work from HERE. `
         + `To move it: set 'standing' to 'biome' in run_config.js, which places the person in the `
         + `nearest good biome clear of this square and brings the crew to them.`);
+    }
+
+    // ── A BODY WITH NO BASE DOES NOT START, AND IT NEVER SETS ONE (Architect 2026-09-18) ──────────────────
+    // *"Bots can't set their own points now"*. The foreman writes every site into its memory before it spawns
+    // a body, and the hub broadcasts that memory the moment the body registers. So the one thing to wait for
+    // is that first broadcast: before it, an empty building room means "not heard yet", not "no base".
+    //
+    // HERE FOR THE PLACEMENT GATE'S OWN REASON: every start passes this one function, so no route can begin
+    // planning without the base in hand. AFTER PLACEMENT, BEFORE THE ROUTE, so the first sweep sees the base.
+    //
+    // A body with no foreman at all (no FOREMAN_URL: one bot run alone) has nobody to hear from and reads its
+    // own memory as it stands. Either way a body with no base is refused: there is no job by which a bot could
+    // find or set one, which is the ruling itself.
+    const link = require('@kernel/foreman_link');
+    if (process.env.FOREMAN_URL && !(await link.awaitFirstBroadcast(FIRST_BROADCAST_WAIT_MS))) {
+      watcher.error('start_injector',
+        `⛔ NOT STARTED — the foreman's memory never reached this body (${FIRST_BROADCAST_WAIT_MS / 1000}s, no broadcast). `
+        + 'Its base lives there, and a body does not set its own. Is the foreman up and did this body register?');
+      return { started: false, why: "the foreman's memory never reached it, and a body does not set its own base" };
+    }
+    const lockLayout = require('@action/lock_all_buildspots');
+    if (!lockLayout.baseLayoutComplete()) {
+      watcher.error('start_injector',
+        '⛔ NOT STARTED — this body has no base. Only the foreman sets a site, before any body is spawned, and the '
+        + "foreman's memory holds none for this crew. Raise the crew through the foreman.");
+      return { started: false, why: 'it has no base: only the foreman sets a site, and none is held for this crew' };
     }
 
     watcher.summary('start_injector', '🧪 Injected autonomous start signal to recursive_judge');

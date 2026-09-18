@@ -55,7 +55,10 @@ const rconLink = require(paths.bot('js_kernel/utils/rcon_link'));
 
 const HOST = process.env.PROBE_HOST || 'localhost';
 const PORT = Number(process.env.PROBE_PORT || 25565);
-const VERSION = process.env.PROBE_VERSION || '1.21.5';
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const VERSION = process.env.PROBE_VERSION
+  || require(paths.bot('Thinking_fragments/architect_config.js')).SERVER_MINECRAFT_VERSION;
 const NAME = process.env.PROBE_NAME || 'SignProbe';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -145,7 +148,7 @@ async function main() {
     console.log(`   ${shapes[i].id}: accepted=${/Changed the block/i.test(reply)} botReads=${JSON.stringify(read.lines)} clean=${clean}`);
   }
   const cleanShapes = shapeResults.filter(s => s.clean);
-  record('Q1', 'Which /setblock SNBT shape puts the text the human MEANT onto a 1.21.5 sign?',
+  record('Q1', `Which /setblock SNBT shape puts the text the human MEANT onto a ${VERSION} sign?`,
     shapeResults.map(s => `${s.id}: parser=${/Changed the block/i.test(s.reply) ? 'ACCEPTED' : 'REJECTED'}, bot reads ${JSON.stringify(s.read.lines)}`).join('  ||  '),
     cleanShapes.length
       ? `ONLY ${cleanShapes.map(s => s.id).join(', ')} is faithful. The others are accepted by the parser and store their own punctuation AS SIGN TEXT — a silent falsehood, not an error.`

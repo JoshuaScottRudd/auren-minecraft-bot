@@ -29,8 +29,8 @@
 // anyway, by the candidate list this only re-orders. So the remembered value can never make the bot walk
 // to a tree that is not there.
 //
-// WHY IT RIDES THE BOARDROOM CHAIR. One bot decides for the fleet, so the answer has to cross the overseer.
-// Conference-room flags do not — they are local to each bot's HQ file. The overseer broadcasts exactly
+// WHY IT RIDES THE BOARDROOM CHAIR. One bot decides for the fleet, so the answer has to cross the foreman.
+// Conference-room flags do not — they are local to each bot's HQ file. The foreman broadcasts exactly
 // three things, and the chair is the right one: it already carries per-bot facts (magnet, claims, body
 // cell, position), every writer read-modify-writes it rather than replacing it, and it has exactly one
 // writer, so a merge conflict cannot arise (Invariant D). See architect_config.WOOD_PREFERENCE_CHAIR_FIELD
@@ -124,7 +124,7 @@ async function run(bot) {
   // Push it to the peers NOW rather than waiting for the next heartbeat. This job exists to run before the
   // gathering starts, so a preference that reaches the other bot a sweep late has already missed the logs
   // it was meant to steer.
-  guardExternalSync(TAG, 'overseer sendUpdate', () => require('@kernel/overseer_link').sendUpdate());
+  guardExternalSync(TAG, 'foreman sendUpdate', () => require('@kernel/foreman_link').sendUpdate());
 
   const censusStr = ranked.map(([n, c]) => `${n}:${c}`).join(' ');
   watcher.summary(TAG, `Wood preference set to ${species} (${trunks} trunks; census ${censusStr}). Construction now prefers it; every species stays fellable, and this job will not post again.`);

@@ -117,7 +117,18 @@ const opt = (k, fallback) => {
 
 const HOST = opt('host', 'localhost');
 const PORT = Number(opt('port', '25565'));
-const VERSION = opt('version', '1.21.5');
+// THE VERSION IS READ, NOT RESTATED (Law 16, 2026-09-17). This was the literal `'1.21.5'`, which is a
+// second answer to a question `architect_config` already answers — and on the day the fleet moved to 26.1
+// it was the answer that would have been wrong: the crew would have joined on the new protocol while the
+// person who has to type `foreman get` joined on the old one and was refused by the server. The flag
+// stays, because a probe pointed at somebody else's world still needs to say so.
+//
+// THE OTHER WORKSTATION MADE THIS EXACT FIX THE SAME DAY, independently, as a one-line inline require
+// (trunk commit 19f26ad6). The two are the same repair and neither is wrong; this form is kept because the
+// reasoning above is what stops the literal coming back, and a hoisted destructure is the shape every
+// other workshop tool already uses for this constant. Nothing of theirs is undone by keeping it.
+const { SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
+const VERSION = opt('version', SERVER_MINECRAFT_VERSION);
 const QUIET = has('quiet');
 
 // The protocol's own cap. A line over it is refused a layer down, so it is refused HERE, out loud, with

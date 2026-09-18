@@ -10,7 +10,7 @@
 //
 // "Office" pattern: each fragment owns one top-level key (its office).
 // "Conference room" pattern: shared space with named chairs per fragment.
-// "Boardroom" pattern: bot_boardroom.<botId> — cross-bot state synced via overseer.
+// "Boardroom" pattern: bot_boardroom.<botId> — cross-bot state synced via foreman.
 
 const fs = require('fs');
 const path = require('path');
@@ -36,7 +36,7 @@ const FLUSH_INTERVAL_MS = 2000;
 // So a contractor body keeps this cache in MEMORY — every fragment still reads and writes through it,
 // unchanged — and never touches the disk at either end: it does not load a file at startup and it never
 // flushes one. Its places arrive in the first `hq_broadcast` after it registers, out of the OWNER's file,
-// which the overseer holds (`overseer/owner_memory.js`). The player owns that file; the bot is borrowed.
+// which the foreman holds (`foreman/owner_memory.js`). The player owns that file; the bot is borrowed.
 //
 // WHY THE FILE HAD TO GO RATHER THAN BE CLEARED AT LAUNCH, which is what the previous round did. A file
 // that is deleted on the way IN is still written throughout the tenancy and still sits on disk between
@@ -165,7 +165,7 @@ function _flushToDisk() {
   if (!_dirty || !_cache) return;
   // NOTHING A CONTRACTOR KNOWS REACHES THIS DISK. `_dirty` is cleared rather than left standing: there is
   // no retry to arm, because nothing failed — this body simply has no file. Its places are already safe;
-  // they went up to the overseer in an `hq_delta` and were written into its OWNER's file.
+  // they went up to the foreman in an `hq_delta` and were written into its OWNER's file.
   if (_isEphemeral()) { _dirty = false; return; }
   _dirty = false;
   _cache.updated_at = new Date().toISOString();
@@ -288,24 +288,26 @@ function readBuildingChair(name, chair, fallback = null) {
 // back to life without anybody deciding it should. One chair states the fact, so one chair reverses it
 // (Law 16), and it is done here rather than in the fragment so it holds for every writer that ever
 // establishes a buildspot.
+//
+// ── AND A BOT NO LONGER WRITES `set_buildspot` AT ALL (Architect 2026-09-18) ──────────────────────────
+// *"Bots can't set their own points now"*. The foreman's hub is the one writer of a location
+// (`foreman_hub.lockSite`), and a re-site after a wipe is decided there — the later event wins in
+// `pickBuildingEntry` when the broadcast lands here. So the tombstone-clearing branch that lived in this
+// function has no caller left, and a bot asking to write the chair is a coding fault, refused by name.
+// The chairs ABOUT a base (`blueprint_paster`, `building_integrity`, …) are still the bot's to write.
 function writeBuildingChair(name, chair, data) {
   const { buildingRoomKey } = require('@kernel/bot_mandate');
   const key = buildingRoomKey(name);
   if (chair === 'set_buildspot') {
-    const hq = _getCache();
-    const entry = hq?.building_confrence_room?.[key];
-    if (entry && entry.removed_at) {
-      delete entry.removed_at;
-      require('@kernel/watcher').summary('corporate_headquarters',
-        `${key} was struck by a wipe and is being re-established — clearing the tombstone.`);
-    }
+    throw new Error(`[corporate_headquarters] CODING VIOLATION (Law 13): a bot asked to write the location of '${key}'. `
+      + 'Only the foreman sets points (foreman_hub.lockSite); a body reads its base from the broadcast.');
   }
   return writeConferenceRoomChair('building_confrence_room', key, chair, data);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 4 — Bot boardroom API
-// Each bot owns one named chair. The overseer broadcasts other bots' chairs.
+// Each bot owns one named chair. The foreman broadcasts other bots' chairs.
 // Local planners read all chairs; only this bot writes its own.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -327,14 +329,14 @@ function getFullBoardroom(fallback = {}) {
 }
 
 // releaseAbsentBotMagnets(connectedBotIds, selfId) — void every magnet held by a bot that is NOT
-// currently connected to the overseer. Returns the ids released (empty = nothing to do).
+// currently connected to the foreman. Returns the ids released (empty = nothing to do).
 //
 // WHY THE MAGNET IS THE RIGHT UNIT: a chest lock is not separate state — it lives INSIDE the magnet
 // as `magnet.chest_locks`, precisely so that one clearMagnet() releases the job claim and every chest
 // with it (station_registry's Phase-3 note: "no separate registry, no orphaned locks on completion or
 // crash"). That holds for a bot that exits through its own disconnect handler. It does not hold when
 // the process dies without running one — and killing the server window kills every bot AND the
-// overseer at once, so no handler runs anywhere. The chair then sits on each surviving bot's DISK,
+// foreman at once, so no handler runs anywhere. The chair then sits on each surviving bot's DISK,
 // magnet and locks intact, and is read back as gospel on the next run.
 // Measured 2026-07-21: a single-bot continue run found the headframe chests "🔒 in use by
 // TessaBot" with TessaBot not in the session. Locked means wait-to-act, so those chests were held by
@@ -364,7 +366,7 @@ function releaseAbsentBotMagnets(connectedBotIds, selfId) {
   return released;
 }
 
-// Merge other bots' chairs from an overseer broadcast.
+// Merge other bots' chairs from an foreman broadcast.
 // Only writes to bot_boardroom — never touches local conference rooms or offices.
 function mergeBroadcastChairs(chairs) {
   const hq = _getCache();
@@ -375,7 +377,7 @@ function mergeBroadcastChairs(chairs) {
   _markDirty();
 }
 
-// Merge the overseer's relayed station map into logistics_confrence_room.stations
+// Merge the foreman's relayed station map into logistics_confrence_room.stations
 // (Phase 6 multi-bot sync). A station id is a unique world voxel, so the merge is
 // last-writer-wins per id keyed on the entry's `updated_at` stamp (station_registry
 // stamps every write). Incoming entries only overwrite when at least as fresh, so a
@@ -406,16 +408,16 @@ function mergeBroadcastStations(stations) {
   _markDirty();
 }
 
-// Merge the overseer's relayed fleet structures into building_confrence_room.
+// Merge the foreman's relayed fleet structures into building_confrence_room.
 // The fleet has ONE of each structure — a bot whose room lacks the headframe
 // ADOPTS the peer's established entry verbatim, so its own planner sees the
 // home as set (no duplicate buildspot) and every downstream consumer (mining
 // shaft site, building integrity, anchors) reads the same coordinates. The
 // merge rule (first-writer-wins on locked_at) lives in message_schema so bot
-// and overseer apply the identical contract (Law 16).
+// and foreman apply the identical contract (Law 16).
 function mergeBroadcastBuildings(buildings) {
   if (!buildings || typeof buildings !== 'object') return;
-  const { pickBuildingEntry } = require('@overseer/message_schema');
+  const { pickBuildingEntry } = require('@foreman/message_schema');
   const hq = _getCache();
   if (!hq.building_confrence_room) hq.building_confrence_room = {};
   const local = hq.building_confrence_room;

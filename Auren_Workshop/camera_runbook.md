@@ -286,7 +286,7 @@ node Auren_Workshop/fleet_control.js down                    # ends the cameras 
 
 (`letsplay-record` is the same run with a recorder; a copy without one refuses it before anything opens.)
 
-Each one rolls the world back to `sub_agent_01_fresh_start`, wipes HQ cold, sets dawn, raises the overseer
+Each one rolls the world back to `sub_agent_01_fresh_start`, wipes HQ cold, sets dawn, raises the foreman
 and the foreman with **no bots**, opens the seat you play, and starts the warden. Then you play, and you say
 `foreman get` in chat when you want a crew. The run is **untimed** — nothing ends it but you.
 
@@ -321,7 +321,7 @@ that copied them back each run would silently undo whatever you changed last ses
 
 `tools/camera_warden.js`, raised by the overlay on every camera run and reaped with it.
 
-**It watches the world, not the launcher.** It asks the overseer's registry who is standing, every 6
+**It watches the world, not the launcher.** It asks the foreman's registry who is standing, every 6
 seconds, and gives a camera to anyone who has none. That covers `foreman get`, a hand `bot-start`, a revive,
 and anything not yet written — because none of them is what it is watching.
 

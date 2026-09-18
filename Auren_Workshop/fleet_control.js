@@ -1,7 +1,7 @@
 // Auren_Workshop/fleet_control.js
 // Headless fleet operation — the one implementation of launch, command and teardown, and the only
 // console, built so an AI monitor (or any script) can run the whole stack
-// without GUI windows: Minecraft server, overseer, bots, operator verbs,
+// without GUI windows: Minecraft server, foreman, bots, operator verbs,
 // snapshots, teardown. It exists because the interactive surfaces (PowerShell
 // windows, readline consoles) assume a human at a keyboard; this tool assumes
 // nobody is watching and everything must be inspectable afterward (Law 6:
@@ -10,7 +10,7 @@
 //
 // It OPERATES the construct but is not part of it — no fragment, no signal
 // bus, no decisions inside the SPA loop. Verbs reach the fleet through the
-// overseer's one operator pathway ('operator_command' over the socket — the
+// foreman's one operator pathway ('operator_command' over the socket — the
 // TTY console's twin transport, Law 16). Graceful server stop goes through
 // RCON (localhost, enabled in server.properties) because a detached java
 // process has no reachable stdin and a hard kill risks world corruption.
@@ -29,24 +29,24 @@
 //   node fleet_control.js status
 //   node fleet_control.js server-start | server-stop        [--world=<name>]
 //   node fleet_control.js snapshot [--name=label]           [--world=<name>]
-//   node fleet_control.js overseer-start [--port=3001]
+//   node fleet_control.js foreman-launch [--port=3001]
 //   node fleet_control.js run [profile] [--dry]              THE COMMANDED START — reads architect_fleetrunbook_config
 //   node fleet_control.js runbook                            print the authored profiles and their answers
 //   node fleet_control.js foreman-start                        (the in-game clerk: get a bot / stop a bot)
 //   node fleet_control.js bot-start <Name> [--mode=homesteader|contractor]
 //   node fleet_control.js observer-start                     (RETIRED 2026-08-06 — prints where the data went)
 //   node fleet_control.js bot-start <BotId>
-//   node fleet_control.js local [--count=N]     THE LOCAL SERVER — world + overseer + foreman on THIS
+//   node fleet_control.js local [--count=N]     THE LOCAL SERVER — world + foreman on THIS
 //                                               machine, no bots, no online checks. For testing the
 //                                               contractor path while the DEDICATED (public) server stays
 //                                               up and untouched. Bots come from `foreman get`.
-//   node fleet_control.js up [--count=N] [--world=<name>]   (server + overseer + bots; no autonomy yet; default count = whole roster)
-//   node fleet_control.js bots-up [--count=N]   (overseer + bots only; FAILS if server isn't already up)
+//   node fleet_control.js up [--count=N] [--world=<name>]   (server + foreman + bots; no autonomy yet; default count = whole roster)
+//   node fleet_control.js bots-up [--count=N]   (foreman + bots only; FAILS if server isn't already up)
 //   node fleet_control.js repair [--count=N] [--autonomy-if-cold]
 //                                               IDEMPOTENT. Starts only what is missing and never tears
 //                                               down or sweeps fleet_logs — which is exactly what `up` and
 //                                               `bots-up` do first, so neither of them can be re-run
-//                                               against a half-live fleet. DEFAULT IS ZERO BOTS: overseer
+//                                               against a half-live fleet. DEFAULT IS ZERO BOTS: foreman
 //                                               and foreman only, because bots arrive on order.
 //   node fleet_control.js roster                (print the canonical roster, seniority order — the launchers read this)
 //   node fleet_control.js verb start [--stagger=45000] [--min-gap=1500]   paced by FIRST MOVEMENT, not a timer
@@ -73,7 +73,7 @@ const RUNTIME_FILE = path.join(BOT_DIR, 'fleet_control_runtime.json');
 // ROSTER derives from the canonical BOT_SENIORITY table — ordered by seniority so ROSTER[0] is the
 // eldest. Adding a bot is ONE edit in architect_config.js, not here (Law 16, single source of truth).
 // The `roster` command below prints this list so the PowerShell launchers read the same source too.
-const { BOT_SENIORITY, TERMINAL_SPAWN_MODE, BOT_MODES, FOREMAN_NAME, FOREMAN_PREFIX, SPAWN_PROTECTION_RADIUS } = require(paths.bot('Thinking_fragments/architect_config.js'));
+const { BOT_SENIORITY, TERMINAL_SPAWN_MODE, BOT_MODES, FOREMAN_NAME, FOREMAN_PREFIX } = require(paths.bot('Thinking_fragments/architect_config.js'));
 const VALID_BOT_MODES = new Set(Object.values(BOT_MODES));
 const ROSTER = Object.keys(BOT_SENIORITY).sort((a, b) => BOT_SENIORITY[a] - BOT_SENIORITY[b]);
 
@@ -86,14 +86,14 @@ const ROSTER = Object.keys(BOT_SENIORITY).sort((a, b) => BOT_SENIORITY[a] - BOT_
 // four places is a list that will be updated in three.
 //
 // ORDER IS THE TEARDOWN ORDER. Bots first (they persist HQ on the way out), then the foreman, then the
-// overseer they talk through — a process is never left addressing a socket that has already gone.
+// foreman they talk through — a process is never left addressing a socket that has already gone.
 // 'fleet-console' is in the list so `down` reaps it: it is read-only and harmless, but an observer
 // window left tailing a dead fleet is exactly the orphan the visible-window rule exists to prevent -
 // and one that would show a frozen story forever without ever saying the fleet had gone.
-const FLEET_PROCESSES = ['trace', 'fleet-console', ...ROSTER, 'foreman', 'overseer'];
+const FLEET_PROCESSES = ['trace', 'fleet-console', ...ROSTER, 'foreman'];
 const FLEET_PROCESSES_WITH_SERVER = [...FLEET_PROCESSES, 'server'];
 const SERVER_PORT = 25565;
-const OVERSEER_PORT_DEFAULT = 3001;
+const FOREMAN_PORT_DEFAULT = 3001;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -239,7 +239,7 @@ function launch(name, exe, argv, cwd, env, windowStyle) {
 // "can you place all the node powershells on one as well? i want a one stop shop to see all my
 //  terminals and i want the overseer one to scroll like it is."
 //
-// Every bot already writes into ONE merged story - the overseer trace - so the one-window console is not
+// Every bot already writes into ONE merged story - the foreman trace - so the one-window console is not
 // a new aggregation to build, it is that file, followed. `trace_monitor --follow` is the lens extended to
 // stream it (Law 26: a tool needing a fact out of a record calls a lens; when the lens cannot answer,
 // extend the lens rather than reading the file raw).
@@ -292,131 +292,10 @@ function setServerProperty(key, value) {
 }
 function setLevelName(world) { setServerProperty('level-name', world); }
 
-// Settings the fleet cannot run correctly without, asserted at launch instead of trusted.
-//
-// spawn-protection: the vanilla default, ON, and the value comes from architect_config's
-// SPAWN_PROTECTION_RADIUS rather than a literal here — the bots gate their own decisions on that same
-// constant, so the square the launcher enforces and the square they avoid cannot drift apart (Law 16).
-//
-// WHAT THE SETTING DOES: inside a Chebyshev square of that radius around world spawn — X/Z only, full
-// height — the server refuses block breaks and placements by non-op players. It refuses SILENTLY: no
-// revert, no error, nothing the client can see. mineflayer writes AIR into its own world model anyway
-// and reports the dig as done, so a bot inside the zone mines a phantom hole, walks into a block that
-// never left, and strands itself with 0 items and no error anywhere in the trace.
-//
-// THE WRONG TURN, TAKEN ONCE AND WORTH NOT RETAKING: this was `0` — the rule deleted from the world —
-// because the fleet had no way to see the refusal, and switching it off was the only thing that made the
-// silence stop. That trade trained the fleet on a world with a rule missing from it, so nothing in the
-// stack ever learned the rule exists; the moment a bot met a server that had it (any public or vanilla
-// one — this is the DEFAULT setting), the same maroon returns with nothing changed. The fix is the fleet
-// holding the rule itself: `perception_nodes.js/spawn_protection` gates target selection, route search
-// and both world-altering verbs on the square, so a protected cell is refused BEFORE the swing rather
-// than discovered as a phantom after it.
-//
-// Op-ing the bots would also silence it, and is the other wrong turn: exempting the construct from a
-// limit every other agent obeys is the Rogue Machine error Law 19 forbids. The fleet's own gate
-// therefore ignores op status entirely — an op'd bot is refused exactly like a non-op one, because a
-// constraint honoured only where it cannot be defeated is not a constraint (Invariant E).
-//
-// difficulty=hard keeps the HUNGER system fully live — food drains with activity and a bot can starve to
-// death at food 0 — which is what arms the eating subsystem (on peaceful, food never drains and the whole
-// eat tier is dormant, so the system would never be exercised).
-//
-// spawn-monsters=TRUE since 2026-08-03 (Architect: "go ahead and do a standard test. we will enable
-// monsters as well… every main feature added to the game now with combat"). It was FALSE from 2026-07-16
-// so a test could isolate the survival loop from combat while combat did not exist — the bot faced hunger,
-// not creepers. That reason has lapsed rather than been overruled: the counter arms, the engagement queue
-// and the combat journal all shipped, and every one of them is now unexercised by a run with nothing hostile in
-// it. Leaving the flag off would make the standard test quietly stop covering the feature the fleet spent
-// four sessions building, which is the same silence in a new place (Law 25).
-//
-// What this costs, named so a bad run is read correctly: the survival loop is no longer isolated. A bot
-// that starves during a monster-enabled run may have starved because combat interrupted the eat tier, and
-// hunger and combat can no longer be told apart from the outcome alone — they have to be told apart from
-// the record (trace_monitor's warnings; `--engagement` for the fights). Flip this back to 'false' for any run
-// whose question is about hunger, farming or building alone.
-//
-// All four load at JVM start, so a live server carrying the wrong values can only be reported and
-// restarted (handled below), never hot-corrected.
-//
-// Why here and not documentation: MinecraftServer/ is gitignored, so server.properties does NOT travel
-// between the Architect's two machines. A hand-sync checklist is a constraint enforced by memory —
-// exactly the defeatable kind (Invariant E), and it already failed once. The launcher touches every run
-// on every machine and is the only place that can assert this rather than ask.
-//
-// ── DIFFICULTY IS PEACEFUL WHILE THE DESK IS BEING BUILT (Architect 2026-08-30: "also set the mode to
-//    peaceful for now. while continuing to test") ─────────────────────────────────────────────────────
-// A TEMPORARY VALUE WITH A PERMANENT REASON RECORDED BESIDE IT, because the paragraphs above are the
-// argument FOR hard and they have not been overruled — they are being set aside while a different
-// subsystem is under construction, and a successor who reads `peaceful` here without them will conclude
-// the fleet was never meant to face hunger or combat at all.
-//
-// WHAT PEACEFUL COSTS, so a run is read correctly: food never drains, so the whole eat tier is dormant
-// and unexercised; no hostile spawns, so the counter arms, the engagement queue and every combat path
-// are unexercised too. A green run under peaceful says NOTHING about either. It also removes the one
-// exposure that killed a probe run outright — a partial explosion packet crashing mineflayer's physics
-// handler, three libraries down, under every client in the fleet — which is worth knowing when reading
-// this as a testing choice rather than only as a difficulty one.
-//
-// TO RESTORE: `difficulty` back to 'hard'. Nothing else changes; `spawn-monsters` is deliberately LEFT
-// TRUE so that restoring is one word rather than a hunt, and it costs nothing meanwhile — peaceful
-// suppresses hostile spawns whatever that flag says.
-// ── sync-chunk-writes=FALSE, AND THIS IS THE `FLEET FROZEN` FAULT (measured 2026-09-10) ────────────
-// Vanilla ships this TRUE, which makes the server thread fsync every chunk as it saves it. On this
-// machine that is the difference between a save and a stall, measured on the drive the world lives on:
-//
-//     8 KB write, no fsync :  25.5 ms
-//     8 KB write, fsync    : 144.5 ms      → 6x
-//
-// A save of ~1000 resident chunks is therefore ~150 SECONDS of blocking disk I/O on the one thread that
-// also runs the game. Observed directly, on a ONE-MINUTE run with four players:
-//
-//     [19:32:23] Saving chunks for level 'sub_agent_01'/minecraft:overworld
-//     [19:34:57] Saving chunks for level 'sub_agent_01'/minecraft:the_end      ← 2m34s later
-//
-// AND A CPU SAMPLE ACROSS THAT WINDOW SETTLES WHAT THE RECORD COULD NOT. bugsquashing §14.9 left two
-// candidates — the server doing heavy work, or the server starved of a core by the node fleet — and told
-// the next session to accept neither without a sample. Through the stall java held 0-5% of ONE core of
-// eight, node held 0%, and 22.6 GB of RAM was free: the tick thread was neither busy nor starved, it was
-// BLOCKED. That is a third cause and it is the one that fits every symptom on record.
-//
-// What it retro-explains: every client dropping in the SAME INSTANT with a client-side timeout (a >30s
-// block outlasts mineflayer's 30-second keep-alive, so the protocol is behaving correctly); no
-// OutOfMemoryError ever appearing; and §14.8's heap theory failing the way it did — a 4 GB heap froze
-// SOONER than 1 GB because more heap holds more chunks resident, and resident chunks are what a save has
-// to write. It is intermittent for the same reason: how much terrain two ranging bots dirtied before the
-// next autosave.
-//
-// THE COST, NAMED: an abruptly killed JVM can leave a torn chunk. This fleet restores its world from a
-// snapshot at the start of every run, so the exposure lasts exactly one run and is never carried.
-const REQUIRED_PROPS = {
-  'spawn-protection': String(SPAWN_PROTECTION_RADIUS), 'difficulty': 'peaceful', 'spawn-monsters': 'true', 'spawn-animals': 'true',
-  'sync-chunk-writes': 'false',
-};
-
-// ── REQUIRED GAMERULES (Architect 2026-08-09) ───────────────────────────────────────────────────────
-//   "can you make sure you turn mob griefing off repo wide? so when i do a standard test as well?"
-//
-// Gamerules, not server properties, and that difference decides where this lives. Properties are read
-// once at JVM start (serverStart can only WARN about a live one); a gamerule is world state settable over
-// rcon at any time — so it is applied on BOTH paths here, including a reused server, and a live server no
-// longer has to be restarted to be correct.
-//
-// It belongs at bring-up rather than in any one bench because it is a property of every run, and because
-// ROLLBACK REVERTS IT: the gamerule persists in the world's level.dat, so a snapshot restore silently puts
-// it back to whatever the snapshot held. Setting it once by hand would survive until the first rollback
-// and then quietly stop being true — which is why it is re-asserted every time the server comes up rather
-// than assumed. `lanista` used to author this itself; that copy is now a read-back check, so there is one
-// author and one verifier (Law 16).
-//
-// WHY mobGriefing IS OFF: a creeper detonation craters the ground the next wave is sited on, so each trial
-// was fought on terrain the previous trial had rearranged and the ladder was calling that difference the
-// bot. Turning it off costs no difficulty — the bot still takes the full blast damage, measured at 20.0 hp
-// from 2.3 b on 2026-08-09. Only the terrain is spared.
-// WHY doInsomnia IS OFF: phantoms were the only reason the fleet needed a bed, and the bed was the only
-// reason it needed wool. death_manager already returns a body to the headframe, so the bed bought nothing
-// else. Rule off, bed and hunt chain deleted (Architect 2026-08-14).
-const REQUIRED_GAMERULES = { mobGriefing: 'false', doInsomnia: 'false' };
+// THE SETTINGS AND GAMERULES THE FLEET NEEDS live in `js_kernel/utils/server_settings.js` since 2026-09-18,
+// with their reasoning, because the foreman now starts a local world itself and there must be one list of
+// what a world needs, read by both (Law 16). This file asserts the same list on the bench's own start.
+const { REQUIRED_PROPS, REQUIRED_GAMERULES } = require(paths.bot('js_kernel/utils/server_settings'));
 
 // Applied after the server answers, because rcon needs it up. Never fatal: a run whose gamerule could not
 // be set is still a run, and saying so beats refusing to start (Law 13 governs acting on uncertainty, not
@@ -455,7 +334,7 @@ async function applyGamerules() {
 // rather than reaching for `time set` themselves (Law 16 — one implementation, three callers).
 //
 // BOTH DIRECTIONS ARE ASSERTED, WHICH IS THE WHOLE REASON THIS IS NOT TWO LINES AT THE CALL SITE.
-// `doDaylightCycle` persists in the world's level.dat, exactly like the gamerules above: once a run
+// `advance_time` persists in the world's level.dat, exactly like the gamerules above: once a run
 // pins it false it stays false for every run afterwards, so a later 'dawn' run would sit at sunrise
 // forever while reporting that it set the clock and let it run. Stating the whole clock every time is
 // what makes each value mean the same thing on the hundredth run as on the first (Invariant B).
@@ -477,15 +356,17 @@ async function applyClock(clock) {
   const want = CLOCK_SETTINGS[clock];
   if (!want) throw new Error(`fleet_control: '${clock}' is not a clock this runner carries out.`);
   try {
-    await rconCommand(`gamerule doDaylightCycle ${want.cycle}`);
+    // `advance_time` is 26.1's name for what 1.21.x called `doDaylightCycle` — see the rename note on
+    // REQUIRED_GAMERULES above; the whole gamerule set moved to snake_case in that release.
+    await rconCommand(`gamerule advance_time ${want.cycle}`);
     // READ BACK, never trusted from the write — the same discipline applyGamerules uses, and for the
     // same reason: a rule accepted and not applied would leave the run walking into a night it just
     // reported it had frozen out.
-    const after = (await rconCommand('gamerule doDaylightCycle')) || '';
+    const after = (await rconCommand('gamerule advance_time')) || '';
     await rconCommand(`time set ${want.time}`);
     console.log(after.includes(`is currently set to: ${want.cycle}`)
       ? `run: world clock ${want.said}.`
-      : `run: ⚠ world time set, but doDaylightCycle would not take — server said "${after.trim()}". ` +
+      : `run: ⚠ world time set, but advance_time would not take — server said "${after.trim()}". ` +
         `The light WILL move during this run.`);
   } catch (e) {
     console.log(`run: ⚠ could not set the clock (${e.message}) — the world keeps whatever time it holds.`);
@@ -694,16 +575,21 @@ async function snapshot() {
   return ok;
 }
 
-async function overseerStart() {
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+async function foremanLaunch() {
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   if (await probePort(port)) {
-    console.log(`overseer: already listening on ${port} — reusing it.`);
+    console.log(`foreman: already listening on ${port} — reusing it.`);
     return true;
   }
-  launch('overseer', process.execPath, [path.join('overseer', 'overseer_server.js'), String(port)], BOT_DIR,
-    { NODE_PATH: nodePathEnv() });
-  const up = await waitFor(`overseer port ${port}`, () => probePort(port), 20000, 500);
-  if (up) console.log('overseer: up.');
+  // THE HUB RUNS INSIDE THE FOREMAN'S PROCESS (2026-09-18, scratchpad §32; the hub is the part once
+  // called the overseer), so raising it IS raising the foreman, filed under the foreman's name. The port opens the moment foreman.js loads, before
+  // its body has joined, so the wait below still measures the referee and nothing else.
+  launch('foreman', process.execPath, [path.join('foreman', 'foreman.js')], BOT_DIR,
+    // DEP0040 silenced by name, as start_auren does (the reasoning is there): the same foreman, the same window.
+    { NODE_PATH: nodePathEnv(), FOREMAN_PORT: String(port), FOREMAN_URL: `ws://localhost:${port}`,
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, '--disable-warning=DEP0040'].filter(Boolean).join(' ') });
+  const up = await waitFor(`foreman port ${port}`, () => probePort(port), 20000, 500);
+  if (up) console.log(`foreman: hub up on ${port} (the body joins the world next).`);
   return up;
 }
 
@@ -814,7 +700,7 @@ async function botStart(botId, mode = TERMINAL_SPAWN_MODE, owner = null) {
     console.error(`bot-start: --owner=${owner} was given for a homesteader. A homesteader answers to nobody, so there is no one for it to belong to.`);
     return false;
   }
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   const rt = readRuntime();
   if (rt[botId] && pidAlive(rt[botId])) {
     console.log(`${botId}: already running (pid ${rt[botId].pid}).`);
@@ -823,7 +709,7 @@ async function botStart(botId, mode = TERMINAL_SPAWN_MODE, owner = null) {
   // ── THE CORPSE PREFLIGHT (Architect's ruling: spawning, starting, getting and natural death all run
   //    identical logic) ──────────────────────────────────────────────────────────────────────────────
   // A bot whose last life ended dead never receives `spawn`, so master_core never initialises, so it
-  // never registers with the overseer — and delivery runs off that registry, so NO operator verb can
+  // never registers with the foreman — and delivery runs off that registry, so NO operator verb can
   // reach it. It survives `verb stop`. The process sits alive holding a roster name that cannot be
   // exited and cannot be handed to anyone else (Law 8: a lifecycle nothing can terminate).
   //
@@ -845,12 +731,12 @@ async function botStart(botId, mode = TERMINAL_SPAWN_MODE, owner = null) {
   // ── A SEAT DOES NOT REMEMBER ITS LAST OCCUPANT (Architect 2026-09-05) ──────────────────────────────
   //
   // *"durable player keyed HQ that exists until i hand delete them."* The durable half now lives in the
-  // overseer's per-player store; this is the half that makes his DELETION stick.
+  // foreman's per-player store; this is the half that makes his DELETION stick.
   //
   // A roster name is a seat that changes hands. Its working memory —
   // `js_kernel/corporate_headquarters.<botId>.json` — is not swept by anything: `resetRunArtifacts`
   // clears only `fleet_logs/`. So a body handed to a new person boots holding the last person's rooms
-  // and stations, and on its first `hq_delta` it broadcasts them back up to the overseer, which merges
+  // and stations, and on its first `hq_delta` it broadcasts them back up to the foreman, which merges
   // them and writes them to disk. **A player file he deleted by hand would reappear**, authored by a bot
   // that has no business remembering that person at all.
   //
@@ -860,7 +746,7 @@ async function botStart(botId, mode = TERMINAL_SPAWN_MODE, owner = null) {
   // stranger asked for it ten seconds ago and is released when they leave; it has nothing to carry that
   // is worth carrying, and everything it might carry belongs to somebody else.
   //
-  // WHAT IS NOT LOST: the crew's PLACES. Those live in the overseer's player store and arrive in the
+  // WHAT IS NOT LOST: the crew's PLACES. Those live in the foreman's player store and arrive in the
   // first `hq_broadcast` after this body registers — which is exactly the *"grab their hq and use that
   // as my base"* he described, and is why this deletion is safe rather than merely tidy.
   if (mode === BOT_MODES.CONTRACTOR) {
@@ -890,7 +776,7 @@ async function botStart(botId, mode = TERMINAL_SPAWN_MODE, owner = null) {
     // Travels the same road as the species for the same reason: a birth fact belongs in the environment
     // that created the process, where nothing running can rewrite it.
     ...(owner ? { BOT_OWNER: owner } : {}),
-    OVERSEER_URL: `ws://localhost:${port}`,
+    FOREMAN_URL: `ws://localhost:${port}`,
   });
   console.log(`${botId}: starting as ${mode.toUpperCase()}${owner ? ` for ${owner}` : ''}.`);
   return true;
@@ -944,16 +830,12 @@ async function playerPresent(name) {
 }
 
 async function foremanStart() {
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
   const rt = readRuntime();
   const already = rt.foreman && pidAlive(rt.foreman);
   if (already) console.log(`foreman: process already running (pid ${rt.foreman.pid}) — confirming it is actually in the world.`);
-  else {
-    launch('foreman', process.execPath, [path.join('foreman', 'foreman.js')], BOT_DIR, {
-      NODE_PATH: nodePathEnv(),
-      OVERSEER_URL: `ws://localhost:${port}`,
-    });
-  }
+  // ONE LAUNCH, NOT TWO. The hub lives in the foreman's process, so `foremanLaunch` is the one place that
+  // starts it; a second launch here would collide on the foreman's port and die (2026-09-18, §32).
+  else if (!(await foremanLaunch())) return false;
 
   // PRESENCE IS CONFIRMED, NOT ASSUMED (Law 25). A spawned process is not a foreman standing in the
   // world: it can die on a version mismatch, be refused by the whitelist, or fail to resolve the
@@ -1030,24 +912,24 @@ async function foremanToSpectator() {
 }
 
 async function sendVerb(verb, args = {}) {
-  const { OPERATOR_VERBS: VERBS } = require(paths.bot('overseer/message_schema'));   // one vocabulary, three processes (Law 16)
+  const { OPERATOR_VERBS: VERBS } = require(paths.bot('foreman/message_schema'));   // one vocabulary, three processes (Law 16)
   if (!VERBS.has(verb)) {
     console.error(`verb: '${verb}' is not an operator verb (${[...VERBS].join(' | ')}).`);
     return false;
   }
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   if (!(await probePort(port))) {
-    console.error(`verb: no overseer on port ${port}.`);
+    console.error(`verb: no foreman on port ${port}.`);
     return false;
   }
   const WebSocket = requireWs();
-  const { createEnvelope } = require(paths.bot('overseer/message_schema'));
+  const { createEnvelope } = require(paths.bot('foreman/message_schema'));
   const sent = await new Promise((resolve) => {
     const ws = new WebSocket(`ws://localhost:${port}`);
     ws.on('open', () => {
       ws.send(JSON.stringify(createEnvelope('operator_command', 'fleet_control', { verb, args })));
-      // The overseer answers nothing on this path; give the send a beat to land, then leave.
-      setTimeout(() => { ws.close(); console.log(`verb: '${verb}' sent to overseer.`); resolve(true); }, 500);
+      // The foreman answers nothing on this path; give the send a beat to land, then leave.
+      setTimeout(() => { ws.close(); console.log(`verb: '${verb}' sent to foreman.`); resolve(true); }, 500);
     });
     ws.on('error', (e) => { console.error(`verb: socket error — ${e.message}`); resolve(false); });
   });
@@ -1111,7 +993,7 @@ async function sendVerb(verb, args = {}) {
 // was never coming, and every one of those bots cost the full 45-second ceiling. Six bots took 235s to
 // start for that reason alone, nearly all of it spent waiting on a line that would never be written.
 //
-// THE UNIVERSAL SIGNAL IS THE PLANNING TOKEN, and it was already there. `overseer_link` runs the plan
+// THE UNIVERSAL SIGNAL IS THE PLANNING TOKEN, and it was already there. `foreman_link` runs the plan
 // phase as a FLEET-WIDE MUTEX — one bot plans at a time, losers park until promoted — so every bot,
 // whatever it decides to do, passes through acquire → plan → release. The release is therefore the exact
 // event this pacing wants ("this bot is done with the expensive part") and it is emitted by every bot
@@ -1208,7 +1090,7 @@ async function startStaggered() {
   const slow = [];
   for (let i = 0; i < online.length; i++) {
     const id = online[i];
-    // Per-bot, not broadcast: the overseer already routes `start` by `args.bot` (the `run` profile path
+    // Per-bot, not broadcast: the foreman already routes `start` by `args.bot` (the `run` profile path
     // uses the same call), so this needs no new vocabulary.
     // Read BEFORE the verb goes out — see waitForFirstMove. Taken here rather than inside the wait so
     // it cannot accidentally include anything this start caused.
@@ -1297,14 +1179,14 @@ async function resetRunArtifacts() {
   }
 }
 
-// Every start is a fresh run: tear down any lingering bot-side processes (trace, bots, overseer —
+// Every start is a fresh run: tear down any lingering bot-side processes (trace, bots, foreman —
 // NEVER the server) before the log flush, so no reused process survives to rewrite its in-memory
 // watcher story back over the cleared files (the stale-error-replay bug, Architect 2026-07-08).
 // A graceful `verb stop` first lets bots persist HQ before dying, so the fleet's memory is intact
 // on the next launch. Safe when nothing is running: probePort is false and the pids are dead, so it
 // is a no-op. HQ (corporate_headquarters*.json) is never touched here.
 async function teardownBotSide() {
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   const rt = readRuntime();
   if (await probePort(port)) {
     await sendVerb('stop');
@@ -1341,8 +1223,8 @@ function killTree(pid) {
 // separate --watch --exit-on-flag wake-arm). Teardown still reaps a 'trace' process defensively in
 // case one was launched by an older build, so those name-lists keep the entry harmlessly.
 
-// A launched bot process is NOT a ready bot: it still has to connect to the overseer and spawn into
-// the world (several seconds). A `verb start` sent into that gap is silently dropped by the overseer
+// A launched bot process is NOT a ready bot: it still has to connect to the foreman and spawn into
+// the world (several seconds). A `verb start` sent into that gap is silently dropped by the foreman
 // ("No bots connected — 'start' not sent") and the send still returns success, so the caller never
 // knows autonomy never began — the bots sit connected but idle. The bot announces readiness in its
 // own watcher story with "Online at (x, y, z)" (written on register + spawn); those files are cleared
@@ -1373,11 +1255,11 @@ function hqSurvivingSections(botId) {
 // The same defect the botOnline gate above fixes for `start`, one verb over: `verb flush` reported
 // success when the SOCKET WRITE landed (a 500ms setTimeout, then resolve(true)) — the performer's
 // criterion substituted for the asker's, which is "HQ is cold" (Law 25). It cost a real run: on
-// 2026-07-20 a scan test printed "verb: 'flush' sent to overseer", then the base-layout survey opened
+// 2026-07-20 a scan test printed "verb: 'flush' sent to foreman", then the base-layout survey opened
 // on 12 plots already locked and drove lock_all_buildspots into a recursive-judge loop. The run was
 // warm wearing a success flag.
 //
-// Delivery is unobservable on that path (the overseer answers nothing back), so this does NOT try to
+// Delivery is unobservable on that path (the foreman answers nothing back), so this does NOT try to
 // time the race better — a better guess is still a guess. It reads the real state the flush was
 // supposed to produce (Law 26: the translator verifies against world-state instead of modelling the
 // machine). waitFor returns on FIRST satisfaction, so observing cold once is the proof; a bot that
@@ -1414,7 +1296,7 @@ async function up() {
   await teardownBotSide();
   await resetRunArtifacts();
   if (!(await serverStart())) return false;
-  if (!(await overseerStart())) return false;
+  if (!(await foremanLaunch())) return false;
   for (let i = 0; i < count; i++) {
     await botStart(ROSTER[i]);
     if (i < count - 1) await new Promise(r => setTimeout(r, 2000));   // same spawn stagger as start_fleet
@@ -1424,7 +1306,7 @@ async function up() {
     console.error(`up: bot(s) launched but did not come online within 90s — missing [${roster.filter(b => !botOnline(b)).join(', ')}]. Check each process window. NOT ready for \`start\`.`);
     return false;
   }
-  console.log(`up: server + overseer + ${count} bot(s) ONLINE. Autonomy is NOT started — send \`verb start\` deliberately. Watch the run with .\\Auren_Workshop\\scripts\\dashboard.ps1`);
+  console.log(`up: server + foreman + ${count} bot(s) ONLINE. Autonomy is NOT started — send \`verb start\` deliberately. Watch the run with .\\Auren_Workshop\\scripts\\dashboard.ps1`);
   return true;
 }
 
@@ -1466,7 +1348,7 @@ async function local() {
   await teardownBotSide();
   await resetRunArtifacts();
   if (!(await serverStart())) return false;
-  if (!(await overseerStart())) return false;
+  if (!(await foremanLaunch())) return false;
   for (let i = 0; i < count; i++) {
     await botStart(ROSTER[i]);
     if (i < count - 1) await new Promise(r => setTimeout(r, 2000));
@@ -1475,14 +1357,15 @@ async function local() {
     console.error(`local: bot(s) launched but did not come online within 90s — missing [${ROSTER.slice(0, count).filter(b => !botOnline(b)).join(', ')}].`);
     return false;
   }
-  // THE FOREMAN IS THE POINT OF THIS VERB, so it is started even though `up` does not start one: `up`
-  // opens a RUN for the operator to drive, and this opens a SERVICE for a human to walk into. It goes
-  // last, after the world is up, because it joins the server as a player and has nothing to join before.
+  // THE FOREMAN IS THE POINT OF THIS VERB. Its process is already up (the hub lives in it, §32), so
+  // this is the step that CONFIRMS its body reached the world and parks it in spectator: `up` opens a RUN
+  // for the operator to drive and does not wait on the body, while this opens a SERVICE for a human to
+  // walk into, and a service with no clerk standing in it is not open.
   if (!(await foremanStart())) {
-    console.error('local: the world and the overseer are up, but the foreman never appeared in the player list — nobody in game can order a bot. Check the foreman window.');
+    console.error(`local: the world and the foreman's hub are up, but the foreman's body never appeared in the player list — nobody in game can order a bot. Check the foreman window.`);
     return false;
   }
-  console.log(`\nlocal: LOCAL SERVER UP — world + overseer + foreman${count ? ` + ${count} homesteader(s)` : ', no bots'} on localhost:${SERVER_PORT}.`);
+  console.log(`\nlocal: LOCAL SERVER UP — world + foreman${count ? ` + ${count} homesteader(s)` : ', no bots'} on localhost:${SERVER_PORT}.`);
   console.log('  Join it in Minecraft at:  localhost');
   console.log(`  Then say in chat:         ${FOREMAN_PREFIX} get`);
   console.log('  Take it down with:        node Auren_Workshop/fleet_control.js down\n');
@@ -1502,7 +1385,7 @@ async function botsUp() {
   }
   await teardownBotSide();
   await resetRunArtifacts();
-  if (!(await overseerStart())) return false;
+  if (!(await foremanLaunch())) return false;
   for (let i = 0; i < count; i++) {
     await botStart(ROSTER[i]);
     if (i < count - 1) await new Promise(r => setTimeout(r, 2000));
@@ -1515,7 +1398,7 @@ async function botsUp() {
   // Opened LAST and only once the bots are actually on: a console that starts before them shows an empty
   // trace, which reads like a fleet that has nothing to say rather than one that has not arrived yet.
   if (!has('no-console')) fleetConsole();
-  console.log(`bots-up: overseer + ${count} bot(s) ONLINE — server left untouched, each bot minimized to the taskbar.`);
+  console.log(`bots-up: foreman + ${count} bot(s) ONLINE — server left untouched, each bot minimized to the taskbar.`);
   console.log(`  Watch them all in the one window titled AUREN FLEET.`);
   console.log(`  Autonomy is NOT started — send \`verb flush\` then \`verb start\` deliberately. \`start\` paces itself.`);
   return true;
@@ -1523,7 +1406,7 @@ async function botsUp() {
 
 // WIPE THE FLEET'S MEMORY, ON DISK, WHILE NOTHING IS RUNNING.
 //
-// A DELETE AND NOT THE `flush` VERB: flush is addressed to running bots through the overseer, so it needs
+// A DELETE AND NOT THE `flush` VERB: flush is addressed to running bots through the foreman, so it needs
 // somebody to receive it. This is the cold path — the one that works when the whole machine is down, which
 // is the only state a world restore can happen in anyway. Absent is a legal HQ state; it is what a bot's
 // first-ever boot finds, and it writes a fresh one.
@@ -1565,7 +1448,7 @@ function wipeMemory() {
 // by that: a repair is the SAME run continuing, so its logs are this run's logs. Only a fresh `up` opens
 // a new one and only a fresh `up` clears them.
 //
-// EVERY STEP IS A PRIMITIVE THAT ALREADY GUARDS ITSELF (Law 16) — `overseerStart` reuses a live port,
+// EVERY STEP IS A PRIMITIVE THAT ALREADY GUARDS ITSELF (Law 16) — `foremanLaunch` reuses a live port,
 // `foremanStart` reuses a live pid and then re-confirms the clerk against the SERVER's player list, and
 // `botStart` skips a bot whose recorded pid is still verifiably ours. This function is a sequence, not an
 // implementation; the idempotence was already in the parts and had no caller that used only those parts.
@@ -1578,10 +1461,10 @@ function wipeMemory() {
 // machine slept and everything died at once.
 //
 // The coldness test lives HERE rather than in the caller because this is where the pid map and the
-// overseer probe already are; a second implementation in PowerShell would be a second thing to keep true.
+// foreman probe already are; a second implementation in PowerShell would be a second thing to keep true.
 // THE DEFAULT IS ZERO BOTS, and that is the ON-ORDER MODEL rather than a cautious setting. A bot exists
 // because somebody in the game ASKED the foreman for one, and it arrives as a CONTRACTOR owned by that
-// person, so a world serving people hosts the foreman and the overseer and nothing else. Homesteaders
+// person, so a world serving people hosts the foreman and nothing else. Homesteaders
 // standing in the world by default are player slots and a share of the tick budget spent on nobody's
 // request — and the whole reason the foreman exists is that this is on-order.
 //
@@ -1590,7 +1473,7 @@ function wipeMemory() {
 // different acts, and this is the service.
 async function repair() {
   const count = Math.min(parseInt(opt('count', '0'), 10), ROSTER.length);
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   const roster = ROSTER.slice(0, count);
 
   // Taken BEFORE anything is started, because the report has to distinguish "found running" from
@@ -1617,8 +1500,8 @@ async function repair() {
   }
 
   let ok = true;
-  if (!(await overseerStart())) {
-    console.error('repair: the overseer did not come up. Bots have nothing to register with, so they are NOT launched.');
+  if (!(await foremanLaunch())) {
+    console.error('repair: the foreman did not come up. Bots have nothing to register with, so they are NOT launched.');
     return false;   // the one hard dependency — every bot talks through it
   }
 
@@ -1647,10 +1530,10 @@ async function repair() {
   if (count === 0) {
     // The whole autonomy branch below is about not disturbing bots. With none asked for there are none to
     // disturb and none to start, so saying anything about it would be noise on the one line he reads.
-    console.log(`repair: overseer up, foreman ${foremanOk ? 'on duty' : 'NOT on duty'}, no homesteaders (on-order).`);
+    console.log(`repair: foreman hub up, body ${foremanOk ? 'on duty' : 'NOT on duty'}, no homesteaders (on-order).`);
     return ok && foremanOk;
   }
-  console.log(`repair: overseer up, ${alreadyUp.length} bot(s) already there, ${started.length} started`
+  console.log(`repair: foreman up, ${alreadyUp.length} bot(s) already there, ${started.length} started`
     + `${started.length ? ' [' + started.join(', ') + ']' : ''}, foreman ${foremanOk ? 'on duty' : 'NOT on duty'}.`);
 
   if (!has('autonomy-if-cold')) {
@@ -1690,7 +1573,7 @@ async function repair() {
 // once, explains itself in its own comments, and reads back the same on round nine as on round one.
 //
 // EVERY STEP HERE CALLS A PRIMITIVE THAT ALREADY EXISTED (Law 16). This function is a sequence, not
-// an implementation — snapshotRestore, serverStart, overseerStart, foremanStart, botStart, sendVerb
+// an implementation — snapshotRestore, serverStart, foremanLaunch, foremanStart, botStart, sendVerb
 // and down are the fleet's own, unchanged. A runner carrying its own copy of "start a bot" would be
 // a second launcher to keep in step, which is exactly how `--bot` came to be silently dropped.
 async function snapshotRestore(world, snap) {
@@ -1721,7 +1604,7 @@ function stopAnyRecording() {
 }
 
 async function down() {
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   const rt = readRuntime();
   if (await probePort(port)) {
     await sendVerb('stop');
@@ -1801,7 +1684,7 @@ function forceKill(label, pid) {
 // choice — may (Law 19/21). It is the manual twin of the stop-tuple: one command, the whole fleet down.
 async function takeover() {
   console.log('takeover: force-stopping the ENTIRE fleet (bots + server) — operator kill switch.');
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   const rt = readRuntime();
 
   // 1. Brief graceful courtesy so the world can flush when it's able (bounded — this is still a force stop).
@@ -1830,12 +1713,12 @@ async function takeover() {
   // 4. Verify and report — a glance confirms it is really down.
   await new Promise(r => setTimeout(r, 1500));
   const serverDown = !(await probePort(SERVER_PORT));
-  const overseerDown = !(await probePort(port));
-  console.log(`takeover: server ${serverDown ? 'DOWN' : 'STILL UP'} · overseer ${overseerDown ? 'DOWN' : 'STILL UP'}.`);
-  console.log(serverDown && overseerDown
+  const foremanDown = !(await probePort(port));
+  console.log(`takeover: server ${serverDown ? 'DOWN' : 'STILL UP'} · foreman ${foremanDown ? 'DOWN' : 'STILL UP'}.`);
+  console.log(serverDown && foremanDown
     ? 'takeover: fleet fully stopped — nothing left running.'
     : 'takeover: something is STILL UP — check `status` and Task Manager.');
-  return serverDown && overseerDown;
+  return serverDown && foremanDown;
 }
 
 // One-shot RCON passthrough for operator world-edits (Law 22 recovery: a physically-broken
@@ -1926,23 +1809,23 @@ async function moveTest() {
 
 // ── THERE IS NO `drive` VERB, AND THE RULING THAT REMOVED IT IS WORTH THE PARAGRAPH ─────────────────
 // A `drive` verb lived here for one afternoon on 2026-08-11: a sibling of `move` that teleported a fleet
-// bot and dispatched combat locomotion at it through the overseer. The Architect struck the METHOD, not
+// bot and dispatched combat locomotion at it through the foreman. The Architect struck the METHOD, not
 // the measurement — "read fleet runbook and use testbot. thats how you test individual pieces of bots
 // live" — and `tools/combat_drive_probe.js` is the measurement in its ratified home.
 //
 // It is not a preference between two working routes. The verb route needs the whole fleet standing
-// (server + overseer + a bot whose login survives its own playerdata), so a locomotion question is
+// (server + foreman + a bot whose login survives its own playerdata), so a locomotion question is
 // answered only when everything unrelated to locomotion happens to be healthy; the same afternoon it was
 // unanswerable because a fleet bot's corpse bricked the login. The probe needs a server and nothing
 // else. Two routes to one measurement is Law 16 regardless, and this is the one that fails for fewer
 // reasons — so do not reintroduce a verb here when a piece of the bot needs driving in isolation.
 
 async function status() {
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   const rt = readRuntime();
   const serverUp = await probePort(SERVER_PORT);
   console.log(`server (${SERVER_PORT}):   ${serverUp ? 'UP' : 'down'}`);
-  console.log(`overseer (${port}): ${(await probePort(port)) ? 'UP' : 'down'}`);
+  console.log(`foreman (${port}): ${(await probePort(port)) ? 'UP' : 'down'}`);
 
   // WHO IS ACTUALLY IN THE WORLD, asked of the server rather than inferred from pids. A pid says a
   // process exists; only the player list says a body arrived, and the two disagree for the whole of
@@ -1991,7 +1874,7 @@ function forceKill(label, pid) {
 
 async function takeover() {
   console.log('takeover: forcing the whole stack down (bots + server), graceful-first…');
-  const port = parseInt(opt('port', String(OVERSEER_PORT_DEFAULT)), 10);
+  const port = parseInt(opt('port', String(FOREMAN_PORT_DEFAULT)), 10);
   const rt = readRuntime();
 
   // 1) Courtesy graceful pass — let bots persist HQ and the world flush if those paths still work.
@@ -2021,9 +1904,9 @@ async function takeover() {
   }
 
   const serverDown = !(await probePort(SERVER_PORT));
-  const overseerDown = !(await probePort(port));
-  console.log(`takeover: server ${serverDown ? 'down' : 'STILL UP'}, overseer ${overseerDown ? 'down' : 'STILL UP'}.`);
-  return serverDown && overseerDown;
+  const foremanDown = !(await probePort(port));
+  console.log(`takeover: server ${serverDown ? 'down' : 'STILL UP'}, foreman ${foremanDown ? 'down' : 'STILL UP'}.`);
+  return serverDown && foremanDown;
 }
 
 // ── THE NAMED TESTS AND THE AUTHORED PROFILES ARE GONE (2026-09-10) ─────────────────────────────────
@@ -2069,12 +1952,31 @@ function runScript(name, argv) {
 //
 // It is NBT and there is no rcon verb that will answer this: `data get` reaches entities, blocks and
 // storage, never the level. That is why this parses the file instead of asking the running server.
+//
+// ── level.dat HAS HAD TWO SHAPES FOR THIS ONE FACT, AND BOTH ARE READ HERE (2026-09-17) ─────────────
+// Through 1.21.x the spawn point was three loose ints on `Data` — `SpawnX`, `SpawnY`, `SpawnZ`. 26.1
+// restructured `Data` and replaced them with a `spawn` COMPOUND holding `pos` (an int array of the three)
+// alongside `pitch`, `yaw` and `dimension`; the old keys are gone entirely, so reading them on a 26.1
+// world returns three `undefined`s and this function answered `null`. That `null` is honest and it is
+// fatal by design one caller up: `run.js` cannot measure the person's distance from world spawn without
+// it, so the whole run refuses before the crew is ever called. It is exactly how this was found — the
+// first 26.1 soak stopped here, 17 seconds in, naming the missing keys.
+//
+// BOTH SHAPES, ONE ANSWER, and that is a TRANSLATION rather than a branch in anyone's logic: the list
+// below is the list of shapes this file has ever had, read in newest-first order, and every caller still
+// receives the single `{x, y, z}` it always did. The alternative — reading only 26.1's shape, since 26.1
+// is what `SERVER_MINECRAFT_VERSION` authors — would refuse every run on a world a stranger is still
+// hosting on 1.21.x, for a fact that is sitting in their file under its old name. Neither shape is
+// guessed at: an absent or malformed one falls through to the next, and an exhausted list is still `null`.
 async function worldSpawn(worldName) {
   const file = path.join(serverDir(), worldName, 'level.dat');
   if (!fs.existsSync(file)) return null;
   const nbt = moduleHomes.requireFromHomes('prismarine-nbt');
   const parsed = (await nbt.parse(fs.readFileSync(file))).parsed.value.Data.value;
-  const x = parsed.SpawnX?.value, y = parsed.SpawnY?.value, z = parsed.SpawnZ?.value;
+
+  const pos = parsed.spawn?.value?.pos?.value;                                  // 26.1 and later
+  const triple = Array.isArray(pos) ? pos : [parsed.SpawnX?.value, parsed.SpawnY?.value, parsed.SpawnZ?.value];
+  const [x, y, z] = triple;
   if (![x, y, z].every(Number.isFinite)) return null;
   return { x, y, z };
 }
@@ -2107,12 +2009,12 @@ async function worldSpawn(worldName) {
       }
       return snapshotRestore(opt('world', null) || effectiveWorld(), snapName);
     },
-    'overseer-start': overseerStart,
+    'foreman-launch': foremanLaunch,
     'observer-start': observerStart,
     'bot-start': () => botStart(positional[0], opt('mode', TERMINAL_SPAWN_MODE), opt('owner') || null),
     'foreman-start': foremanStart,
     // --bot ADDRESSES the verb to one bot instead of the whole fleet. It was accepted on the command
-    // line and silently dropped here, so `verb stop --bot=X` stopped EVERY bot — the overseer's
+    // line and silently dropped here, so `verb stop --bot=X` stopped EVERY bot — the foreman's
     // broadcastCommand has taken an `only` addressee since `move` needed one, and this caller simply
     // never handed it over.
     // `verb start` with no --bot is the one verb that must not be a broadcast — see startStaggered.
@@ -2121,7 +2023,7 @@ async function worldSpawn(worldName) {
       ? startStaggered()
       : sendVerb(positional[0], opt('bot') ? { bot: opt('bot') } : {}),
     'up': up,
-    // THE LOCAL SERVER — this machine, world + overseer + foreman, no bots.
+    // THE LOCAL SERVER — this machine, world + foreman, no bots.
     'local': local,
     'bots-up': botsUp,
     'repair': repair,

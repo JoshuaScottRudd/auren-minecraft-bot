@@ -27,13 +27,13 @@
 // ── OWNER-STAMPED, LIKE EVERY OTHER SHELF ────────────────────────────────────────────────────────
 // Rows are keyed by owner-then-item, so one crew's requirements are unreadable to another by the same
 // mechanism their chests are: a bot can only form its own key (see station_registry.stationKey). The
-// overseer keeps one ledger; a crew narrows it to its own.
+// foreman keeps one ledger; a crew narrows it to its own.
 // LAZY, unlike the two below it, and the asymmetry is the point. This module serves two processes: a bot,
-// which owns a corporate_headquarters, and the OVERSEER, which must never acquire one — it has no BOT_ID,
+// which owns a corporate_headquarters, and the FOREMAN, which must never acquire one — it has no BOT_ID,
 // so the file it opened would carry a name no bot answers to and no reader could explain (Invariant D,
-// Law 6). The overseer uses only the pure rules; requiring the HQ at load would hand it the one dependency
+// Law 6). The foreman uses only the pure rules; requiring the HQ at load would hand it the one dependency
 // its whole design excludes, just by loading the file. Required inside the storage wrapper instead, which
-// no overseer path reaches. The normaliser and the catalogue stay at load because the PURE rules use them:
+// no foreman path reaches. The normaliser and the catalogue stay at load because the PURE rules use them:
 // they are part of what a request IS, not part of where one is kept.
 const { normalizeItemName } = require('@utils/fragment_utils');
 const { isRequestable } = require('@kernel/requestable_catalogue');
@@ -42,12 +42,12 @@ const ROOM = 'requests_confrence_room';
 const CHAIR = 'standing';
 
 // The ledger is one flag holding `{ "<owner>|<item>": row }`. Flat rather than nested per owner because
-// the overseer's merge works on flat id→entry maps and a nested shape would need its own merge (Law 16).
+// the foreman's merge works on flat id→entry maps and a nested shape would need its own merge (Law 16).
 function rowKey(ownerKey, item) { return `${ownerKey}|${normalizeItemName(item)}`; }
 
-// WHOSE ROWS THESE ARE. A bot derives it from its own mandate and can form no other; the OVERSEER
+// WHOSE ROWS THESE ARE. A bot derives it from its own mandate and can form no other; the FOREMAN
 // passes it explicitly, because it is not a bot, has no mandate, and is the one process that must write
-// on behalf of whichever human spoke (§8.3 — the overseer owns the fact, the bot owns whether it cares).
+// on behalf of whichever human spoke (§8.3 — the foreman owns the fact, the bot owns whether it cares).
 // One implementation with the key as a parameter rather than two copies of the rules (Law 16).
 function _ownerKey(explicit) {
   if (explicit) return explicit;
@@ -66,11 +66,11 @@ function _write(rows) { _hq().writeConfRoomFlag(ROOM, CHAIR, rows); }
 // ── THE RULES ARE PURE; THE STORAGE IS A WRAPPER ─────────────────────────────────────────────────
 // applyPost/applyCancel/rowsFor take a rows object and return one. They touch no disk and require no
 // mandate, which is what lets TWO processes of different kinds share one implementation of the rules:
-// a BOT keeps its rows in corporate_headquarters, and the OVERSEER keeps them in memory beside its
+// a BOT keeps its rows in corporate_headquarters, and the FOREMAN keeps them in memory beside its
 // station map — it has no HQ of its own and must not acquire one, because a second HQ writer with no
 // BOT_ID would author a file no bot reads and no name explains (Invariant D, Law 6).
 //
-// The alternative was the overseer restating the rules over its own map, which is the parallel route
+// The alternative was the foreman restating the rules over its own map, which is the parallel route
 // that drifts (Law 16): the desk would come to disagree with the crews about what "asking twice" means,
 // and nothing would report it.
 function applyPost(rows, item, quantity, asker, ownerKey) {
@@ -160,13 +160,13 @@ function status(haveOf) {
   });
 }
 
-// allRows() → the whole ledger, every owner. FOR THE OVERSEER ONLY, which is the one party entitled to
+// allRows() → the whole ledger, every owner. FOR THE FOREMAN ONLY, which is the one party entitled to
 // see across crews because it is the one that must broadcast to all of them. A bot has no use for this
 // and no reason to call it: its own rows come from outstanding(), narrowed by the only key it can form.
 function allRows() { return _all(); }
 
-// mergeBroadcast(rows) → adopt the overseer's ledger wholesale. Not a merge in the station sense: the
-// overseer is the SOLE author of requests, so a bot's copy is a mirror rather than a contribution, and
+// mergeBroadcast(rows) → adopt the foreman's ledger wholesale. Not a merge in the station sense: the
+// foreman is the SOLE author of requests, so a bot's copy is a mirror rather than a contribution, and
 // reconciling it against local state would be inventing a second author (Invariant D). Every broadcast
 // restates the whole truth, so a missed one self-heals on the next.
 function mergeBroadcast(rows) {
@@ -175,7 +175,7 @@ function mergeBroadcast(rows) {
 }
 
 module.exports = {
-  applyPost, applyCancel, rowsFor,                 // pure rules — the overseer's side
+  applyPost, applyCancel, rowsFor,                 // pure rules — the foreman's side
   post, cancel, outstanding, status, allRows, mergeBroadcast,   // HQ-backed — a bot's side
   rowKey, ROOM, CHAIR,
 };

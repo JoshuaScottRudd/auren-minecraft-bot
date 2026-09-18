@@ -1,16 +1,16 @@
-// js_kernel/overseer_link.js
-// Bot-side WebSocket client for overseer communication.
+// js_kernel/foreman_link.js
+// Bot-side WebSocket client for foreman communication.
 //
-// Four capabilities (de-confliction taxonomy lives in overseer_brain.js):
+// Four capabilities (de-confliction taxonomy lives in foreman_brain.js):
 //   1. sendUpdate() — sends this bot's boardroom chair + shared logistics/
-//      structure state to the overseer for broadcast. Callable from anywhere
+//      structure state to the foreman for broadcast. Callable from anywhere
 //      (Law 15 API).
 //   2. requestClaim(key) / releaseClaim(key) — arbiter flavor (a): exclusive
 //      hold on a world object ('anchor:…', 'tree:…', 'cell:…' — lock the
 //      object, not the bot). Resolves { granted, reason? }; can be rejected.
 //   3. acquirePlanningToken() / releasePlanningToken() — arbiter flavor (b):
 //      the plan-phase mutex. Never rejected; a loser parks until promoted.
-//   4. forwardLog(line) — mirrors this bot's watcher stream to the overseer's
+//   4. forwardLog(line) — mirrors this bot's watcher stream to the foreman's
 //      combined console (display only).
 //
 // Every granted claim is mirrored into this bot's boardroom chair
@@ -18,16 +18,16 @@
 // locked (Law 6: what a bot is working on is inspectable state, not hidden
 // arbiter internals).
 //
-// When no overseer is configured or the connection drops, the bot falls back
+// When no foreman is configured or the connection drops, the bot falls back
 // to local-only mode: requestClaim always grants, sendUpdate is a no-op.
 //
-// Law 16: one pathway. Connected = overseer arbitrates. Disconnected = local.
+// Law 16: one pathway. Connected = foreman arbitrates. Disconnected = local.
 
 'use strict';
 
 const WebSocket = require('ws');
 const watcher = require('@kernel/watcher');
-const { createEnvelope, parseEnvelope } = require('@overseer/message_schema');
+const { createEnvelope, parseEnvelope } = require('@foreman/message_schema');
 const { guardExternalSync } = require('@utils/external_library_guard');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,14 +36,14 @@ const { guardExternalSync } = require('@utils/external_library_guard');
 
 let _ws = null;
 let _botId = null;
-let _overseerUrl = null;
+let _foremanUrl = null;
 let _connected = false;
 let _reconnectTimer = null;
 
 let _pendingClaim = null;
 let _bodyCellTimer = null;
 
-// Planning token (plan-phase mutex — arbiter flavor b, see overseer_brain.js
+// Planning token (plan-phase mutex — arbiter flavor b, see foreman_brain.js
 // taxonomy). Distinct from _pendingClaim: an object claim can be REJECTED and
 // resolves fast; a planning acquire is never rejected — the bot parks until
 // 'planning_granted' arrives, so there is no timeout on the wait.
@@ -52,7 +52,7 @@ let _planningRenewTimer = null;    // heartbeat while holding the token
 
 const RECONNECT_INTERVAL_MS = 5000;
 const CLAIM_TIMEOUT_MS = 10000;
-// Renew at 4x the overseer's 2s TTL rate so a plan phase that yields the event
+// Renew at 4x the foreman's 2s TTL rate so a plan phase that yields the event
 // loop (the 100ms signal-bus hop) keeps its token even if a sweep runs long.
 // Capped: if release never comes (leaked chain), renewal stops and the TTL
 // frees the fleet rather than deadlocking it (Law 13: default = available).
@@ -80,7 +80,7 @@ function getBotId() {
 }
 
 // Sends this bot's boardroom chair, its logistics station map, and its fleet structure
-// entries to the overseer for broadcast. The chair carries the magnet + chest locks; the
+// entries to the foreman for broadcast. The chair carries the magnet + chest locks; the
 // stations carry the shared registry (chests/furnaces + in-flight furnace orders); the
 // building conference carries established buildspots so the fleet converges on ONE home
 // (a peer adopts it instead of finding its own). All pushed together on every update so
@@ -129,8 +129,8 @@ function _dropClaimFromChair(key) {
   }
 }
 
-// Asks the overseer to grant a claim key (category or object). Returns
-// Promise<{ granted, reason? }>. In single-bot mode (no overseer), always
+// Asks the foreman to grant a claim key (category or object). Returns
+// Promise<{ granted, reason? }>. In single-bot mode (no foreman), always
 // grants immediately — claims only arbitrate between bots, and there is one.
 function requestClaim(key) {
   if (!isConnected()) {
@@ -139,13 +139,13 @@ function requestClaim(key) {
   }
 
   if (_pendingClaim) {
-    return Promise.reject(new Error('overseer_link: another claim is already pending'));
+    return Promise.reject(new Error('foreman_link: another claim is already pending'));
   }
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       _pendingClaim = null;
-      reject(new Error('overseer_link: claim response timed out'));
+      reject(new Error('foreman_link: claim response timed out'));
     }, CLAIM_TIMEOUT_MS);
 
     _pendingClaim = { key, resolve, reject, timeout };   // reject is kept: a claimant-side key fault is a throw, not an answer (see 'claim_rejected')
@@ -160,11 +160,11 @@ function requestClaim(key) {
 
 // ── Planning token (plan-phase mutex) ────────────────────────────────────────
 // acquirePlanningToken() resolves ONLY when this bot holds the token — a loser
-// parks in the overseer's FIFO and resolves later, on promotion. Local mode
-// (no overseer) grants instantly: a lone bot cannot race anyone. While held,
-// a renewal heartbeat keeps the overseer's short crash-TTL from freeing a
+// parks in the foreman's FIFO and resolves later, on promotion. Local mode
+// (no foreman) grants instantly: a lone bot cannot race anyone. While held,
+// a renewal heartbeat keeps the foreman's short crash-TTL from freeing a
 // slow-but-alive planner. This is NOT requestClaim (object exclusivity) and
-// NOT the magnet (task identity) — see the taxonomy in overseer_brain.js.
+// NOT the magnet (task identity) — see the taxonomy in foreman_brain.js.
 
 function _startPlanningRenewal() {
   _stopPlanningRenewal();
@@ -174,9 +174,9 @@ function _startPlanningRenewal() {
       _stopPlanningRenewal();   // stop feeding a leaked hold — let the TTL free it
       return;
     }
-    // The heartbeat only refreshes a hold the overseer's TTL will free anyway, so a send that does not
+    // The heartbeat only refreshes a hold the foreman's TTL will free anyway, so a send that does not
     // land costs one interval, not correctness.
-    guardExternalSync('overseer_link', 'send planning_request renewal', () => _ws.send(JSON.stringify(createEnvelope('planning_request', _botId, {}))));
+    guardExternalSync('foreman_link', 'send planning_request renewal', () => _ws.send(JSON.stringify(createEnvelope('planning_request', _botId, {}))));
   }, PLANNING_RENEW_INTERVAL_MS);
   if (_planningRenewTimer.unref) _planningRenewTimer.unref();
 }
@@ -196,22 +196,22 @@ function acquirePlanningToken() {
   if (_pendingPlanning) {
     // Law 4 makes two concurrent plan phases impossible in a correct system —
     // a second acquire is a coding violation, not a wait-your-turn (Law 13).
-    return Promise.reject(new Error('overseer_link: planning token acquire already pending'));
+    return Promise.reject(new Error('foreman_link: planning token acquire already pending'));
   }
 
   return new Promise((resolve) => {
     _pendingPlanning = { resolve };
     _ws.send(JSON.stringify(createEnvelope('planning_request', _botId, {})));
-    watcher.summary('overseer_link', 'Requested planning token.');
+    watcher.summary('foreman_link', 'Requested planning token.');
   });
 }
 
 function releasePlanningToken() {
   _stopPlanningRenewal();
   if (!isConnected()) return;
-  // A release that does not land is freed by the overseer's TTL instead — later, but never lost.
-  if (guardExternalSync('overseer_link', 'send planning_release', () => _ws.send(JSON.stringify(createEnvelope('planning_release', _botId, {})))).ok) {
-    watcher.summary('overseer_link', 'Released planning token.');
+  // A release that does not land is freed by the foreman's TTL instead — later, but never lost.
+  if (guardExternalSync('foreman_link', 'send planning_release', () => _ws.send(JSON.stringify(createEnvelope('planning_release', _botId, {})))).ok) {
+    watcher.summary('foreman_link', 'Released planning token.');
   }
 }
 
@@ -258,7 +258,7 @@ function getPeerBodyCells() {
 
 // Startup-only situational report: where this bot spawned, its pocket inventory, and (if any other bot
 // is connected) how far the nearest one is. Called once, after a short delay so peer chairs have arrived
-// over the overseer (a peer publishes its body cell within ~1s of its own spawn). Reuses the same peer
+// over the foreman (a peer publishes its body cell within ~1s of its own spawn). Reuses the same peer
 // body cells the navigator avoids — no separate position channel (Law 16).
 //
 // IT GOES TO THE LOG AND NOWHERE ELSE (2026-09-06, and the name changed with it — it used to be
@@ -295,12 +295,12 @@ function recordStartupPosition(bot) {
   }
   const inv = `Startup inventory: ${invList}.`;
 
-  watcher.summary('overseer_link', `${where} ${inv}`);
+  watcher.summary('foreman_link', `${where} ${inv}`);
 }
 
-// Forward one already-formatted watcher line to the overseer so it can show both bots' streams in
+// Forward one already-formatted watcher line to the foreman so it can show both bots' streams in
 // one place. Must stay SILENT — no watcher calls, no throws — or a log would recurse into itself.
-// No-op when there's no overseer (single-bot mode just logs to its own console as before).
+// No-op when there's no foreman (single-bot mode just logs to its own console as before).
 // UNGUARDED, AND IT IS THE ONE SEND IN THIS FILE THAT MAY NOT BE. The guard reports by calling the
 // watcher, and this function is called BY the watcher — routing it through the guard would make a
 // failed log line emit a log line, on the socket that just failed. That is the same recursion the
@@ -309,14 +309,14 @@ function recordStartupPosition(bot) {
 // escaping here is a defect and not a dropped packet (Law 26 — the interface must not report through
 // the channel it is reporting about).
 // `level` is the watcher's own word for which of its three channels wrote this line ('summary' |
-// 'warn' | 'error' | 'context'). It rides beside the text rather than inside it so the overseer can
+// 'warn' | 'error' | 'context'). It rides beside the text rather than inside it so the foreman can
 // count faults without reading a sentence — see watcher._forward's note.
 function forwardLog(line, level) {
   if (!isConnected() || typeof line !== 'string') return;
   _ws.send(JSON.stringify(createEnvelope('log', _botId, { line, level: level || null })));
 }
 
-// Tells the overseer this bot is done with a key. Fire-and-forget.
+// Tells the foreman this bot is done with a key. Fire-and-forget.
 function releaseClaim(key) {
   _dropClaimFromChair(key);
   if (!isConnected()) return;
@@ -346,29 +346,29 @@ function releaseAllClaims() {
 // SECTION 3 — Connection management
 // ─────────────────────────────────────────────────────────────────────────────
 
-function connect(overseerUrl, botId) {
-  _overseerUrl = overseerUrl;
+function connect(foremanUrl, botId) {
+  _foremanUrl = foremanUrl;
   _botId = botId;
 
-  if (!_overseerUrl) {
-    watcher.summary('overseer_link', 'No overseer URL configured — running in local-brain mode.');
+  if (!_foremanUrl) {
+    watcher.summary('foreman_link', 'No foreman URL configured — running in local-brain mode.');
     return;
   }
 
-  watcher.summary('overseer_link', `Connecting to overseer at ${_overseerUrl} as '${_botId}'...`);
+  watcher.summary('foreman_link', `Connecting to foreman at ${_foremanUrl} as '${_botId}'...`);
   _attemptConnect();
 }
 
 function _attemptConnect() {
-  if (!_overseerUrl) return;
+  if (!_foremanUrl) return;
 
-  const opened = guardExternalSync('overseer_link', `new WebSocket(${_overseerUrl})`, () => new WebSocket(_overseerUrl));
+  const opened = guardExternalSync('foreman_link', `new WebSocket(${_foremanUrl})`, () => new WebSocket(_foremanUrl));
   if (!opened.ok) { _scheduleReconnect(); return; }
   _ws = opened.value;
 
   _ws.on('open', () => {
     _connected = true;
-    watcher.summary('overseer_link', `Connected to overseer at ${_overseerUrl}.`);
+    watcher.summary('foreman_link', `Connected to foreman at ${_foremanUrl}.`);
 
     // Send registration with current boardroom chair
     const hqModule = require('@kernel/corporate_headquarters');
@@ -376,10 +376,10 @@ function _attemptConnect() {
     const stations = hqModule.readConfRoomFlag('logistics_confrence_room', 'stations', {}) || {};
     const buildings = hqModule.readOffice('building_confrence_room') || {};
 
-    // THE SPECIES TRAVELS ON REGISTRATION because the overseer routes on it and cannot read it any
+    // THE SPECIES TRAVELS ON REGISTRATION because the foreman routes on it and cannot read it any
     // other way — a mandate is an environment fact of THIS process and nothing outside it can see one.
     // It is the bot's own answer about itself, which is the only kind of claim about a species that
-    // can be made: the overseer is the party that OBSERVES where a command entered the fleet (which
+    // can be made: the foreman is the party that OBSERVES where a command entered the fleet (which
     // door it arrived at), and the bot is the party that KNOWS what it is. Neither can supply the
     // other's half, so both are stated at the one moment they meet.
     const envelope = createEnvelope('register', _botId, {
@@ -387,7 +387,7 @@ function _attemptConnect() {
       logistics_stations: stations,
       building_conference: buildings,
       mode: require('@kernel/bot_mandate').currentMode(),
-      // WHOSE it is, travelling beside WHAT it is, because the overseer routes a human's command on
+      // WHOSE it is, travelling beside WHAT it is, because the foreman routes a human's command on
       // both and can read neither any other way. Null for a homesteader is the answer, not an omission.
       owner: require('@kernel/bot_mandate').currentOwner(),
     });
@@ -397,7 +397,7 @@ function _attemptConnect() {
   _ws.on('message', (raw) => {
     const parsed = parseEnvelope(raw.toString());
     if (!parsed.ok) {
-      watcher.warn('overseer_link', `Bad message from overseer, discarded: ${parsed.reason}`);
+      watcher.warn('foreman_link', `Bad message from foreman, discarded: ${parsed.reason}`);
       return;
     }
     _handleMessage(parsed.msg);
@@ -409,7 +409,7 @@ function _attemptConnect() {
     _ws = null;
 
     if (wasConnected) {
-      watcher.warn('overseer_link', 'Disconnected from overseer — falling back to local brain.');
+      watcher.warn('foreman_link', 'Disconnected from foreman — falling back to local brain.');
     }
 
     if (_pendingClaim) {
@@ -419,7 +419,7 @@ function _attemptConnect() {
       _pendingClaim = null;
     }
 
-    // A planner waiting in the overseer's queue must not hang on a dead socket —
+    // A planner waiting in the foreman's queue must not hang on a dead socket —
     // disconnected = local mode = a lone bot, which always plans freely.
     _stopPlanningRenewal();
     if (_pendingPlanning) {
@@ -432,7 +432,7 @@ function _attemptConnect() {
   });
 
   _ws.on('error', (err) => {
-    watcher.warn('overseer_link', `WebSocket error: ${err.message}`);
+    watcher.warn('foreman_link', `WebSocket error: ${err.message}`);
   });
 }
 
@@ -440,8 +440,8 @@ function _scheduleReconnect() {
   if (_reconnectTimer) return;
   _reconnectTimer = setTimeout(() => {
     _reconnectTimer = null;
-    if (!_connected && _overseerUrl) {
-      watcher.summary('overseer_link', 'Attempting reconnect to overseer...');
+    if (!_connected && _foremanUrl) {
+      watcher.summary('foreman_link', 'Attempting reconnect to foreman...');
       _attemptConnect();
     }
   }, RECONNECT_INTERVAL_MS);
@@ -455,16 +455,16 @@ function _handleMessage(msg) {
   switch (msg.type) {
     case 'registered':
       if (msg.payload.success) {
-        watcher.summary('overseer_link', 'Registration confirmed by overseer.');
+        watcher.summary('foreman_link', 'Registration confirmed by foreman.');
       } else {
-        watcher.warn('overseer_link', `Registration rejected: ${msg.payload.reason}`);
+        watcher.warn('foreman_link', `Registration rejected: ${msg.payload.reason}`);
         _connected = false;
       }
       break;
 
     case 'hq_broadcast': {
       const hqModule = require('@kernel/corporate_headquarters');
-      // GHOST HOLDS FIRST. Any magnet on this bot's disk belonging to a bot the overseer does not
+      // GHOST HOLDS FIRST. Any magnet on this bot's disk belonging to a bot the foreman does not
       // currently see is void — and with the magnet goes every chest_lock inside it, which is the
       // real damage (locked means wait-to-act, so a dead bot's locks stall live work forever).
       // Runs BEFORE the merge on purpose: a peer that is genuinely connected has its fresh chair in
@@ -476,7 +476,7 @@ function _handleMessage(msg) {
       if (Array.isArray(roster)) {
         const freed = hqModule.releaseAbsentBotMagnets(roster, _botId);
         if (freed.length) {
-          watcher.warn('overseer_link',
+          watcher.warn('foreman_link',
             `Released stale magnet(s) held by disconnected bot(s): ${freed.join(', ')} — chest locks and job claims freed. `
             + `A magnet outliving its bot means that bot did not shut down cleanly (a killed window, not a 'down').`);
         }
@@ -485,7 +485,7 @@ function _handleMessage(msg) {
       if (chairs && typeof chairs === 'object') {
         hqModule.mergeBroadcastChairs(chairs);
       }
-      // Phase 6: merge the overseer's relayed station map (LWW per voxel by updated_at).
+      // Phase 6: merge the foreman's relayed station map (LWW per voxel by updated_at).
       // No log: this fires on every broadcast heartbeat, so a summary here is per-step
       // noise (Law 5), not a phase of work. The merged map is inspectable in HQ (Law 6).
       const stations = msg.payload.logistics_stations;
@@ -499,7 +499,7 @@ function _handleMessage(msg) {
         hqModule.mergeBroadcastBuildings(buildings);
       }
       // Standing requests: what each human has asked for. ADOPTED WHOLE rather than merged, because the
-      // overseer is their sole author — a bot contributes nothing here and reconciling would invent a
+      // foreman is their sole author — a bot contributes nothing here and reconciling would invent a
       // second writer (Invariant D). A crew narrows the map to its own rows when it reads.
       const requests = msg.payload.standing_requests;
       if (requests && typeof requests === 'object') {
@@ -507,6 +507,7 @@ function _handleMessage(msg) {
       }
       // `death_piles` used to be merged here and is now IGNORED if an older peer still sends it — see the
       // hq_delta builder above for why the ledger was deleted rather than replaced with a shared scan.
+      _markFirstBroadcast();
       break;
     }
 
@@ -521,7 +522,7 @@ function _handleMessage(msg) {
       break;
 
     case 'claim_rejected':
-      watcher.summary('overseer_link', `Claim rejected for '${msg.payload.key}': ${msg.payload.reason}.`);
+      watcher.summary('foreman_link', `Claim rejected for '${msg.payload.key}': ${msg.payload.reason}.`);
       if (_pendingClaim) {
         clearTimeout(_pendingClaim.timeout);
         // TWO KINDS OF REFUSAL ARRIVE ON ONE MESSAGE, and only one of them is an answer about the
@@ -544,8 +545,8 @@ function _handleMessage(msg) {
           // the one outcome worse than the loop this replaces (Law 8: whoever raised the lifecycle ends
           // it). Rejected, it surfaces inside the executor's own await, where watcher.track and
           // master_core report it as the coding violation it is.
-          pending.reject(new Error(`overseer_link: CODING VIOLATION (Law 13) — the overseer could not read `
-            + `claim key '${key}': ${reason}. A claim key's namespace must be listed in overseer_brain's `
+          pending.reject(new Error(`foreman_link: CODING VIOLATION (Law 13) — the foreman could not read `
+            + `claim key '${key}': ${reason}. A claim key's namespace must be listed in foreman_brain's `
             + `OBJECT_KEY_PREFIXES; until it is, that object can never be claimed by anyone.`));
           break;
         }
@@ -558,7 +559,7 @@ function _handleMessage(msg) {
       // No pending acquire = a late/duplicate grant (e.g. after a TTL round
       // trip) — ignore silently; the renewal heartbeat covers a live hold.
       if (_pendingPlanning) {
-        watcher.summary('overseer_link', 'Planning token granted — plan phase is ours.');
+        watcher.summary('foreman_link', 'Planning token granted — plan phase is ours.');
         const resolve = _pendingPlanning.resolve;
         _pendingPlanning = null;
         _startPlanningRenewal();
@@ -567,14 +568,14 @@ function _handleMessage(msg) {
       break;
 
     case 'command': {
-      // Operator verb relayed by the overseer. Executes through the same
+      // Operator verb relayed by the foreman. Executes through the same
       // operator_commands pathway the local console uses (Law 16).
       const verb = msg.payload.verb;
       // Forwarded unchanged from the operator; the verb's own case validates it (Law 3: this is
       // transport, it does not inspect the cargo).
       const args = msg.payload.args || {};
-      // WHERE THE COMMAND ENTERED THE FLEET, carried from the overseer and NOT defaulted here.
-      // The overseer is the only party that can know this truthfully — it stamps the origin from
+      // WHERE THE COMMAND ENTERED THE FLEET, carried from the foreman and NOT defaulted here.
+      // The foreman is the only party that can know this truthfully — it stamps the origin from
       // WHICH SOCKET spoke, never from anything the sender claims about itself (Law 23) — so this
       // side passes the stamp through untouched and lets the mandate judge it. An `|| TERMINAL`
       // here would be this process inventing the one fact the isolation turns on, and it would
@@ -582,18 +583,18 @@ function _handleMessage(msg) {
       const origin = msg.payload.origin;
       const operatorCommands = require('@kernel/operator_commands');
       if (!operatorCommands.VERBS.has(verb)) {
-        watcher.warn('overseer_link', `Ignoring command with unknown verb '${verb}'.`);
+        watcher.warn('foreman_link', `Ignoring command with unknown verb '${verb}'.`);
         break;
       }
-      watcher.summary('overseer_link', `Executing overseer command '${verb}' (origin: ${origin}).`);
+      watcher.summary('foreman_link', `Executing foreman command '${verb}' (origin: ${origin}).`);
       operatorCommands.execute(verb, args, origin).catch((e) => {
-        watcher.error('overseer_link', `Command '${verb}' failed: ${e && e.stack ? e.stack : String(e)}`);
+        watcher.error('foreman_link', `Command '${verb}' failed: ${e && e.stack ? e.stack : String(e)}`);
       });
       break;
     }
 
     default:
-      watcher.warn('overseer_link', `Unhandled message type '${msg.type}' from overseer.`);
+      watcher.warn('foreman_link', `Unhandled message type '${msg.type}' from foreman.`);
   }
 }
 
@@ -618,8 +619,37 @@ function disconnect() {
   _connected = false;
 }
 
+// ── THE FIRST BROADCAST IS WHERE A BODY LEARNS ITS BASE (Architect 2026-09-18) ────────────────────────
+// *"Bots can't set their own points now"*. The foreman writes every site into its memory before spawning a
+// body, and the hub broadcasts that memory the moment the body registers. So "has this body heard the
+// foreman yet" is the question a start must ask before it reads its base; before the first broadcast, an
+// empty building room means "not heard yet", not "no base".
+let _firstBroadcastSeen = false;
+const _firstBroadcastWaiters = [];
+function _markFirstBroadcast() {
+  if (_firstBroadcastSeen) return;
+  _firstBroadcastSeen = true;
+  for (const w of _firstBroadcastWaiters.splice(0)) w(true);
+}
+// awaitFirstBroadcast(timeoutMs) → Promise<boolean>: true once the foreman's memory has arrived, false when
+// the wait ran out. Resolves at once when it already has.
+function awaitFirstBroadcast(timeoutMs) {
+  if (_firstBroadcastSeen) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const waiter = (v) => { clearTimeout(t); resolve(v); };
+    const t = setTimeout(() => {
+      const i = _firstBroadcastWaiters.indexOf(waiter);
+      if (i >= 0) _firstBroadcastWaiters.splice(i, 1);
+      resolve(false);
+    }, timeoutMs);
+    if (t.unref) t.unref();
+    _firstBroadcastWaiters.push(waiter);
+  });
+}
+
 module.exports = {
   connect,
+  awaitFirstBroadcast,
   disconnect,
   isConnected,
   getBotId,

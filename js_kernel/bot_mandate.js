@@ -61,8 +61,10 @@ const {
 // Taken from the schema all three processes share rather than declared again here — a second copy
 // of a vocabulary is the exact failure OPERATOR_VERBS' own header records: a value added to one copy
 // and not the other, accepted by the sender and unknown to the receiver, dying silently in between.
-const { COMMAND_ORIGIN: ORIGIN, VALID_ORIGINS, BUILDING_ROOM_SEPARATOR } = require('@overseer/message_schema');
+const { COMMAND_ORIGIN: ORIGIN, VALID_ORIGINS, BUILDING_ROOM_SEPARATOR } = require('@foreman/message_schema');
 const VALID_MODES = new Set(Object.values(BOT_MODES));
+// The species that answer to nobody and therefore hold a commons of their own, keyed by their own name.
+const COMMONS_MODES = new Set([BOT_MODES.HOMESTEADER, BOT_MODES.BUILDER]);
 
 // The mandate is read ONCE and frozen. Re-reading env per call would let a mode change mid-life,
 // which is precisely what "decided at birth" forbids.
@@ -117,21 +119,23 @@ function readMandate(env = process.env) {
       'with --owner=<player>.'
     );
   }
-  if (mode === BOT_MODES.HOMESTEADER && owner !== '') {
+  // A HOMESTEADER AND A BUILDER BOTH ANSWER TO NOBODY, so an owner on either names a relationship nothing
+  // can honour. Each holds a commons of its own instead (`ownerKeyFor`).
+  if (COMMONS_MODES.has(mode) && owner !== '') {
     throw new Error(
-      `CODING VIOLATION (Law 13): BOT_MODE=homesteader with BOT_OWNER='${owner}'. A homesteader answers ` +
+      `CODING VIOLATION (Law 13): BOT_MODE=${mode} with BOT_OWNER='${owner}'. A ${mode} answers ` +
       'to nobody, so it cannot belong to anyone. Either the mode or the owner is wrong.'
     );
   }
-  // A PLAYER MAY NOT BE NAMED AFTER THE COMMONS. `stationOwnerKey` stamps a homesteader's shelves with
-  // this mode's own name, so a human called the same thing would have their crew's chests indexed under
-  // the key every homesteader reads — two owners silently sharing one shelf, which is the exact fault
-  // the owner axis exists to make impossible. Refused here rather than at the stamp because a name is a
-  // birth fact: the contradiction is knowable the moment the process is handed one.
-  if (mode === BOT_MODES.CONTRACTOR && owner.toLowerCase() === BOT_MODES.HOMESTEADER) {
+  // A PLAYER MAY NOT BE NAMED AFTER A COMMONS. `stationOwnerKey` stamps a homesteader's shelves with
+  // that mode's own name, and a builder's with its own, so a human called either would have their crew's
+  // chests indexed under the key a whole species reads — two owners silently sharing one shelf, which is
+  // the exact fault the owner axis exists to make impossible. Refused here rather than at the stamp
+  // because a name is a birth fact: the contradiction is knowable the moment the process is handed one.
+  if (mode === BOT_MODES.CONTRACTOR && COMMONS_MODES.has(owner.toLowerCase())) {
     throw new Error(
-      `CODING VIOLATION (Law 13): BOT_OWNER='${owner}' collides with the commons key '${BOT_MODES.HOMESTEADER}'. ` +
-      'Station ownership stamps that word for shelves every homesteader shares, so this crew would read ' +
+      `CODING VIOLATION (Law 13): BOT_OWNER='${owner}' collides with the commons key '${owner.toLowerCase()}'. ` +
+      'Station ownership stamps that word for shelves a whole species shares, so this crew would read ' +
       'and write the commons as if it owned it. This player cannot be given a crew under that name.'
     );
   }
@@ -163,17 +167,30 @@ function readMandate(env = process.env) {
   const nearGiven = rawNear === undefined || rawNear === null ? '' : String(rawNear).trim();
   const startNear = nearGiven || (mode === BOT_MODES.CONTRACTOR ? owner : '');
 
+  // No `site` field: a body is never handed its base (2026-09-18). The foreman writes every site into its own
+  // memory before spawning, and the body reads it from the first broadcast (`start_injector`).
   mandate = Object.freeze({ botId: String(botId).trim(), mode, owner: owner || null, autostart, startNear: startNear || null });
   return mandate;
 }
 
 function currentMode() { return readMandate().mode; }
-// currentOwner — the player this body belongs to, or null for a homesteader. Null is the ANSWER here
-// rather than a missing value: readMandate refuses to produce an ownerless contractor, so no consumer
+// currentOwner — the player this body belongs to, or null for a homesteader or builder. Null is the ANSWER
+// here rather than a missing value: readMandate refuses to produce an ownerless contractor, so no consumer
 // has to tell "answers to nobody" apart from "the owner was never read".
 function currentOwner() { return readMandate().owner; }
 function isContractor() { return currentMode() === BOT_MODES.CONTRACTOR; }
 function isHomesteader() { return currentMode() === BOT_MODES.HOMESTEADER; }
+function isBuilder() { return currentMode() === BOT_MODES.BUILDER; }
+
+// fearsTheNight — does darkness close outdoor work for this species? A SPECIES FACT, read by the two gates
+// that hold work after dusk (`job_gates.nightGate` and `obtainableGate`), so the one question has one answer.
+//
+// A BUILDER DOES NOT, BY CONSTITUTION, and it must not merely happen not to. The night gate already reads
+// peaceful difficulty as permanent day (`architect_config.isNightTime`), so on the speedrun world it is off
+// today — for the wrong reason. A builder is defined as expecting no monsters (§20), and that has to hold
+// whatever difficulty the world is set to; tied to peaceful, one server setting would silently re-lock a
+// species designed without the lock (Architect 2026-09-17: *"remove that lock for builders only"*).
+function fearsTheNight() { return !isBuilder(); }
 
 // beginsWorkAtBirth — does this body inject its own start signal on spawn, or stand there waiting to be
 // told? Asked once, by master_core, at the end of the spawn sequence.
@@ -230,7 +247,25 @@ function startNearPlayer() { return readMandate().startNear; }
 // another owner's shelves because the only key it can form is its own. The restriction is not a rule
 // anything enforces — it is the shape of the function (Law 27: constitute the fact, do not police the
 // actor). Nothing a human says in the world reaches this value; it is fixed before the body spawns.
-function stationOwnerKey() { return isContractor() ? currentOwner() : BOT_MODES.HOMESTEADER; }
+function stationOwnerKey() { return ownerKeyFor(currentMode(), currentOwner()); }
+
+// ownerKeyFor(mode, owner) — the same answer as `stationOwnerKey`, for a caller that HAS NO MANDATE of its own
+// and must name the crew it is asking about: the foreman, finding out whether a base already exists before
+// it spawns anybody into it. PURE, so it grants nothing — it spells a key, it writes nothing, and every
+// write still goes through `buildingRoomKey`, which takes no owner argument (Law 27). One rule, two askers
+// (Law 16): the body's own key is this function applied to its own mandate.
+//   a contractor → the person it belongs to
+//   a homesteader or a builder → that species' commons, its own name
+function ownerKeyFor(mode, owner) {
+  if (!VALID_MODES.has(mode)) {
+    throw new Error(`CODING VIOLATION (Law 13): ownerKeyFor needs a species, got '${mode}' — valid: ${[...VALID_MODES].join(' | ')}.`);
+  }
+  if (mode === BOT_MODES.CONTRACTOR) {
+    if (!owner) throw new Error('CODING VIOLATION (Law 13): ownerKeyFor(contractor) needs the person it belongs to.');
+    return owner;
+  }
+  return mode;
+}
 
 // buildingRoomKey(name) — WHICH BASE THIS STRUCTURE BELONGS TO, in the one form building_confrence_room
 // indexes by: the structure, then whose base it is.
@@ -264,7 +299,7 @@ function buildingRoomKey(name) {
 // and naming a string, which is the same fact written in as many places as it is needed — and the day a
 // third species exists, or either name changes, they diverge one at a time with nothing reporting it
 // (Law 16). Consumers ask what home is; they never decide it.
-function homeBlueprint() { return isContractor() ? 'contractor_house' : 'headframe'; }
+function homeBlueprint() { return isContractor() ? 'contractor_house' : 'headframe'; }   // a builder's hub is the headframe (§29.4)
 
 // mountsHumanChannels — THE ONE QUESTION, asked by every in-game-facing subsystem before it installs
 // itself: the foreman's ear, the order desk, the acknowledgement line.
@@ -370,6 +405,9 @@ const MAGNET_FILTERS = Object.freeze({
   // BUSYWORK STAYS OUT, and it is the one category that does not follow the same argument: it is idle
   // filler a bot invents for itself with nobody asking, which is exactly what a hired crew must not do.
   [BOT_MODES.CONTRACTOR]:  Object.freeze(['preconditions', 'bot', 'contractor', 'blueprint', 'chest']),
+  // BUILDER — the homesteader's board minus busywork. A speedrun crew has exactly one project, and a bot
+  // that wanders off to dig a standing cell is a bot not on the build. No `contractor`: it hears no human.
+  [BOT_MODES.BUILDER]:     Object.freeze(['preconditions', 'bot', 'blueprint', 'chest']),
 });
 
 // ── LOAD-TIME VALIDATION — THE THREE WAYS THIS TABLE GOES WRONG SILENTLY ─────────────────────────────
@@ -458,9 +496,9 @@ function describeMandate() {
   // DO. A contractor that takes only two of the five categories and a contractor that takes all five
   // print the same first half of this line, and the difference between them is the whole of this change.
   const magnet = ` · magnet: ${MAGNET_FILTERS[m.mode].join(', ')}`;
-  return m.mode === BOT_MODES.CONTRACTOR
-    ? `${m.botId}: CONTRACTOR — answers to ${m.owner} (spawned in-game)${magnet}`
-    : `${m.botId}: HOMESTEADER — answers to nobody (started from the terminal)${magnet}`;
+  if (m.mode === BOT_MODES.CONTRACTOR) return `${m.botId}: CONTRACTOR — answers to ${m.owner} (spawned in-game)${magnet}`;
+  if (m.mode === BOT_MODES.BUILDER) return `${m.botId}: BUILDER — answers to nobody, fears no night (spawned by the foreman)${magnet}`;
+  return `${m.botId}: HOMESTEADER — answers to nobody (started from the terminal)${magnet}`;
 }
 
 // Tests and the probe harness need a clean slate between simulated boots. Deliberately NOT exported
@@ -475,9 +513,12 @@ module.exports = {
   buildingRoomKey,
   isContractor,
   isHomesteader,
+  isBuilder,
   beginsWorkAtBirth,
   startNearPlayer,
+  fearsTheNight,
   stationOwnerKey,
+  ownerKeyFor,
   homeBlueprint,
   mountsHumanChannels,
   claimableCategories,

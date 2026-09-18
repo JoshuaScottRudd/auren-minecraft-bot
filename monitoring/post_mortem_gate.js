@@ -94,7 +94,7 @@ function refuseIfLive(file, { live = false } = {}) {
     + `  ${file}\n`
     + `  A lens reconstructs a run that is OVER.\n`
     + `\n`
-    + `  IF YOU ARE A PROGRAM: ask the fleet instead. Its own door (foreman/overseer_door.js) answers who\n`
+    + `  IF YOU ARE A PROGRAM: ask the fleet instead. Its own door (foreman/foreman_door.js) answers who\n`
     + `  is registered, what each bot holds, how many lines of each level it has written, and whether it\n`
     + `  still has a body — live, with no record in between. Architect 2026-09-16: "Nothing should be\n`
     + `  using trace monitor while the bot is online, its post Mortem only... talk directly."\n`

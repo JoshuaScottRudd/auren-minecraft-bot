@@ -215,8 +215,12 @@ function describeRoots(short) {
 // job during the day would put clear_canopy above respawn_recover and eat_food, sending a starving bot
 // to prune trees. Ruled out on that ground — do not reintroduce it as an obvious improvement. The
 // dispatch table's own order IS the preference; this only ever removes rows from it.
+//
+// A SPECIES THAT FEARS NO NIGHT IS NEVER HELD HERE (`bot_mandate.fearsTheNight` — a builder, §29.7). Asked of
+// the species rather than of the difficulty, so the builder's constitution holds on any world.
 function nightGate(job) {
     if (!isNightTime()) return null;
+    if (!require('@kernel/bot_mandate').fearsTheNight()) return null;
     return isDaylightOnlyJob(job) ? 'outdoor verb after dusk' : null;
 }
 
@@ -599,6 +603,7 @@ function obtainableGate(job) {
     if (job.type !== SUPPLY) return null;          // mining/canopy verbs have no recipe to walk
     if (!(job.need > 0)) return null;
     if (mayGatherOutdoors(job)) return null;
+    if (!require('@kernel/bot_mandate').fearsTheNight()) return null;   // a builder's routes never close at dusk
     const short = rootsStillNeeded(job);
     // Named roots rather than "unreachable": the reason line is the only place a held order explains
     // itself, and "needs 1x logs" tells the reader what arriving material would release it.

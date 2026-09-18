@@ -42,10 +42,12 @@ const BOT_ROOT = path.resolve(__dirname, '..', '..');
 const ABOVE_BOT = path.dirname(BOT_ROOT);
 const ARCHITECT_FILE = path.join(ABOVE_BOT, 'Architect_workstation', 'workstation.json');
 
-// Minecraft decides this number, not this file: 1.20.5 and every release after it refuse to start under a
-// Java older than 21. An older Java on PATH is therefore not "a Java" for this purpose, and it is skipped
-// rather than handed to a server that will crash on its first class load.
-const JAVA_FLOOR = 21;
+// Minecraft decides this number, not this file: each release states the Java it needs in its own version
+// manifest (`javaVersion.majorVersion`), and 26.1 — the version SERVER_MINECRAFT_VERSION names — says 25.
+// An older Java on PATH is therefore not "a Java" for this purpose, and it is skipped rather than handed
+// to a server that will crash on its first class load. Raised from 21 on 2026-09-17 with the server jar:
+// 21 was 1.20.5's floor and would have picked a Java 21 that 26.1 refuses to boot under.
+const JAVA_FLOOR = 25;
 
 // architectPaths(kind) → the exact paths his workstation file lists for `kind`, absolute, in his order.
 // An empty list when the file is absent, which is every stranger's machine.
@@ -83,7 +85,7 @@ function findJava() {
 }
 
 function javaRefusal(tried) {
-  return [`No Java ${JAVA_FLOOR} or newer was found. A Minecraft server (1.20.5 and later) will not start under anything older.`,
+  return [`No Java ${JAVA_FLOOR} or newer was found. A Minecraft server (26.1 and later) will not start under anything older.`,
           `  tried: ${tried.join(', ')}`,
           `  Install a Java ${JAVA_FLOOR}+ runtime (for example Eclipse Temurin), then open a new terminal.`].join('\n');
 }

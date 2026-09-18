@@ -1,4 +1,4 @@
-// overseer/owner_memory.js
+// foreman/owner_memory.js
 // THE PLAYER'S OWN MEMORY, AND THE ONLY THING IN THIS FLEET THAT OUTLIVES THE BODIES THAT MADE IT.
 //
 // THE ASK (Architect 2026-09-05): *"what i want is durable player keyed HQ that exists until i hand
@@ -14,28 +14,28 @@
 // measured 2026-09-05:
 //
 //   1. `corporate_headquarters.<BOT_ID>.json` — the fleet's memory is filed under the BODY.
-//   2. `mergedBuildings` and `mergedStations` in overseer_server are plain `let x = {}`: a live mirror,
-//      empty on every overseer start, never loaded from anywhere.
-//   3. The overseer wrote NOTHING to disk.
+//   2. `mergedBuildings` and `mergedStations` in foreman_hub are plain `let x = {}`: a live mirror,
+//      empty on every foreman start, never loaded from anywhere.
+//   3. The foreman wrote NOTHING to disk.
 //
 // So a player's house survived only inside files named after whichever bots happened to have built it,
 // and the plan to hand a fresh pair of bodies to every visitor would have quietly destroyed every
 // player's places. This module is the floor those three facts were missing.
 //
-// ── WHY THE OVERSEER OWNS IT AND THE BOTS DO NOT (Invariant D, and a documented hazard) ─────────────
+// ── WHY THE FOREMAN OWNS IT AND THE BOTS DO NOT (Invariant D, and a documented hazard) ─────────────
 // The literal shape — rename the HQ file after the owner so a crew shares one document — puts TWO bot
 // processes on ONE json, which is precisely what the current naming exists to prevent. The line that
 // does it says so: *"two bot processes on one host must never flush into the same JSON (2s debounce
 // would silently stomp the other's state)."* Each bot flushes its WHOLE in-memory cache; two writers
 // means last-writer-wins and a lost buildspot is not recoverable from the world.
 //
-// The overseer is already the merge authority for exactly these two rooms — every bot sends them up in
+// The foreman is already the merge authority for exactly these two rooms — every bot sends them up in
 // `hq_delta` and receives the merged result back — and it is the only single long-lived process that
 // sees all of them. Giving that mirror a disk is a smaller change than giving two writers a lock, and
 // it leaves the bots' own flush path untouched. **One writer, by construction rather than by rule.**
 //
 // The bot-side half of his sentence needs no code: a fresh contractor receives its owner's buildings and
-// stations in the first `hq_broadcast` after it registers, because the overseer now starts with them
+// stations in the first `hq_broadcast` after it registers, because the foreman now starts with them
 // already loaded. "Grab their HQ and use it as my base" is what the broadcast already does — it simply
 // had nothing to hand over across a restart until now.
 //
@@ -69,7 +69,7 @@ const TAG = 'owner_memory';
 //
 // ONE PATH, SO THERE IS NOTHING TO CHOOSE AND NOTHING TO DECLARE (Law 16). There used to be a second
 // store selected by an environment variable, and the variable was the whole hazard: chosen wrongly in
-// either direction it was silent, because an overseer serves an empty store perfectly well and says
+// either direction it was silent, because an foreman serves an empty store perfectly well and says
 // nothing while the real rows sit in the other folder. A single path cannot be pointed at the wrong
 // folder, which is the constitutional form of that guarantee rather than a rule about setting a flag
 // correctly (Law 27).
@@ -120,12 +120,12 @@ function ownerOf(key) {
 // ── LOAD ────────────────────────────────────────────────────────────────────────────────────────────
 //
 // loadAll() → { buildings, stations } — every player's places, merged into the two flat maps the
-// overseer already keeps them in, so the caller needs no new shape and no new merge.
+// foreman already keeps them in, so the caller needs no new shape and no new merge.
 //
 // A DIRECTORY THAT IS NOT THERE IS A FIRST RUN; A FILE THAT WILL NOT PARSE IS A STOP FOR THAT PLAYER
 // ONLY. Same split `corporate_headquarters._loadFromDisk` makes, and for the same reason — absent means
 // nothing to lose, present-but-unreadable means memory exists and cannot be reached. The difference is
-// the RADIUS: a bot refuses to boot because its own memory is the only memory it has, while the overseer
+// the RADIUS: a bot refuses to boot because its own memory is the only memory it has, while the foreman
 // serving six players must not refuse every one of them because one file is damaged. So a bad file is
 // reported loudly and skipped, and — this is the load-bearing half — that player's rows are then never
 // SAVED over, because nothing was loaded to merge them with and the save only writes owners it has rows
@@ -161,7 +161,7 @@ function loadAll(report) {
       () => JSON.parse(fs.readFileSync(path.join(MEMORY_DIR, name), 'utf-8')));
     if (!read.ok) {
       report(`${TAG}: ${name} is present but unreadable (${read.reason}). SKIPPED — that player's places are `
-           + `not loaded and will not be overwritten. Move or repair the file, then restart the overseer.`);
+           + `not loaded and will not be overwritten. Move or repair the file, then restart the foreman.`);
       continue;
     }
     const doc = read.value;
@@ -170,7 +170,7 @@ function loadAll(report) {
     for (const [k, v] of Object.entries(doc.stations  || {})) { out.stations[k]  = v; stations++; }
     players++;
     // A CHAIR ON DISK AT LOAD TIME IS A LIE, ALWAYS. Nothing is connected yet — this process has not
-    // opened its socket — so any chair here belongs to a body that stopped while the last overseer was
+    // opened its socket — so any chair here belongs to a body that stopped while the last foreman was
     // down and could not prune it. Chairs are never read back into the live mirror (see the two loops
     // above: only places are), so this write is not about correctness of state; it is about the file
     // telling the truth to the Architect the moment he opens it, which is the whole reason chairs are
@@ -196,11 +196,11 @@ function loadAll(report) {
 // ── SAVE ────────────────────────────────────────────────────────────────────────────────────────────
 //
 // save(buildings, stations, chairsByOwner, report) — debounced. The caller hands the whole merged view
-// and this splits it by owner; nothing here decides anything (Law 3 — the overseer's stores are a merge,
+// and this splits it by owner; nothing here decides anything (Law 3 — the foreman's stores are a merge,
 // and this is that merge reaching disk).
 //
 // EVERY SAVE REWRITES A PLAYER'S FILE WHOLE, which is correct here and is NOT the hazard the two-writer
-// case had: there is exactly one writer, and the map it writes from is the overseer's merged view, which
+// case had: there is exactly one writer, and the map it writes from is the foreman's merged view, which
 // already contains everything any bot has ever sent up this run PLUS everything loaded at start. There is
 // no other party whose rows could be lost.
 //
@@ -208,7 +208,7 @@ function loadAll(report) {
 // connected would litter the store; deleting one because this run has nothing to say about it would be
 // this process making his hand-deletion decision for him.
 // LEADING EDGE, NOT TRAILING — the first change after a quiet spell reaches disk NOW, and only a BURST
-// is coalesced. A pure trailing debounce means an idle overseer holds a brand-new buildspot in memory for
+// is coalesced. A pure trailing debounce means an idle foreman holds a brand-new buildspot in memory for
 // twenty seconds, and this process has no exit path of its own: `down` terminates it by pid, so a signal
 // handler that flushed on the way out is a handler a hard kill never runs. Bounding the exposure is worth
 // more than a graceful-shutdown hook that only works on the shutdowns that were already gentle. The
@@ -216,7 +216,7 @@ function loadAll(report) {
 // `forceOwners` — owners whose file must be written EVEN IF they now have nothing to say. It exists for
 // exactly one caller, the wipe, and without it the wipe silently does nothing on disk: the rule below is
 // that an owner with no rows is not written, so striking a player's LAST building leaves their old file
-// standing with the house still in it, and the next overseer start loads it straight back. The emptiness
+// standing with the house still in it, and the next foreman start loads it straight back. The emptiness
 // is the news in that case, and this is how it gets told (Architect: *"that owner can wipe the memory"*).
 function save(buildings, stations, chairsByOwner, report, forceOwners) {
   _pending = { buildings, stations, chairsByOwner, report, forceOwners };
@@ -274,7 +274,7 @@ function _saveNow() {
       stations: doc.stations,
       chairs: doc.chairs,
     };
-    // REPORTED, NEVER THROWN. A failed save must not take the overseer down — it is serving live bots,
+    // REPORTED, NEVER THROWN. A failed save must not take the foreman down — it is serving live bots,
     // and the merged view in memory is still authoritative and still gets another chance on the next
     // save. durableWrite is all-or-nothing, so a failure has changed nothing on disk.
     const wrote = guardExternalSync(TAG, `durable replace of ${fileFor(owner)}`,

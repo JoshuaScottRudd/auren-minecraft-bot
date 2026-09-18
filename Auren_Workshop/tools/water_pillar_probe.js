@@ -50,7 +50,10 @@ const { BLOCK_REACH } = require('@utils/fragment_utils');
 
 const HOST = process.env.PROBE_HOST || 'localhost';
 const PORT = Number(process.env.PROBE_PORT || 25565);
-const VERSION = process.env.PROBE_VERSION || '1.21.5';
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const { SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
+const VERSION = process.env.PROBE_VERSION || SERVER_MINECRAFT_VERSION;
 const NAME = process.env.PROBE_NAME || 'testbot';
 const TESTS = Number(process.env.PROBE_TESTS || 3);
 const RADIUS = Number(process.env.PROBE_RADIUS || 48);

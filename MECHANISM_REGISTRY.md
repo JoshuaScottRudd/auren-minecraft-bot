@@ -113,11 +113,11 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 
 - **bot_mandate** — what species this process is, decided at birth and never again. A homesteader has no chat listener mounted at all, not a filtered one. `js_kernel/bot_mandate.js`
 - **bot_voice** — a contractor says one thing and one thing only: whether it is available. `js_kernel/bot_voice.js`
-- **operator_commands** — start / stop / flush / wipe and the bench verbs, as one implementation behind two transports (the per-bot console, and the overseer's broadcast). `js_kernel/operator_commands.js`
+- **operator_commands** — start / stop / flush / wipe and the bench verbs, as one implementation behind two transports (the per-bot console, and the foreman's broadcast). `js_kernel/operator_commands.js`
 - **body_recovery** — the two acts of putting a dead body back on its feet, owned in one place. `js_kernel/body_recovery.js`
-- **the foreman** — the in-game desk. A human in the world asks and a crew arrives where they are standing; everything is hired from inside the game and that is the only way. `foreman/` (foreman, foreman_channel, foreman_record, foreman_vocabulary, correction, overseer_door)
-- **the overseer** — claim arbitration, which is its only decision; everything else it does is pure relay (Law 3). `overseer/` (overseer_brain, overseer_server, owner_memory, message_schema)
-- **overseer_link** — the bot-side WebSocket client. `js_kernel/overseer_link.js`
+- **the foreman** — the in-game desk. A human in the world asks and a crew arrives where they are standing; everything is hired from inside the game and that is the only way. `foreman/` (foreman, foreman_channel, foreman_record, foreman_vocabulary, correction, foreman_door)
+- **the foreman** — claim arbitration, which is its only decision; everything else it does is pure relay (Law 3). `foreman/` (foreman_brain, foreman_hub, owner_memory, message_schema)
+- **foreman_link** — the bot-side WebSocket client. `js_kernel/foreman_link.js`
 - **crew_log** · **crew_board** — what the crew said, and what the crew agrees about. `custom_api/`
 
 ## G. Diagnostics and the boundary
@@ -130,7 +130,7 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 ## H. Birth
 
 - **start_bot.js** — the one birth. A bot exists because this ran.
-- **start_overseer.js** — the referee alone.
+- **start_overseer.js** — DELETED 2026-09-18: the referee (now the foreman's hub) runs inside `foreman/foreman.js`.
 - **start_auren.js** — the desk and the referee together; the one way in for a user.
 - **master_core.js** — what a bot runs once it has been told who it is.
 - **child_fleet** — how a parent process raises and holds bots. `js_kernel/utils/child_fleet.js`

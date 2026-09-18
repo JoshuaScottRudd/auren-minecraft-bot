@@ -111,7 +111,7 @@ function placeVoxelsAt(building, origin) {
 
 // ----------------------------------------------------------------------------
 // loadSite: read the headframe's locked site from corporate_headquarters.json
-// (building_confrence_room.headframe.set_buildspot), written by set_buildspot.js.
+// (building_confrence_room.headframe.set_buildspot), written by the foreman's hub (foreman_hub.lockSite).
 // Carries the build_center find_buildingspot proved a safe diagonal staircase can descend
 // from (.staircase), plus the proven-safe depth. Law 13: a missing chair or missing
 // .staircase is a coding violation -- the descent cannot be generated for a site never

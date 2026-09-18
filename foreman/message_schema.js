@@ -1,6 +1,6 @@
-// overseer/message_schema.js
+// foreman/message_schema.js
 // Typed message envelope for all WebSocket communication between bots and the
-// overseer. Both sides require this file so the contract stays in one place.
+// foreman. Both sides require this file so the contract stays in one place.
 //
 // Law 10: every message conforms to a defined schema.
 // Law 7: names are plain and self-documenting.
@@ -12,7 +12,7 @@
 
 const { guardExternalSync } = require('../js_kernel/utils/external_library_guard');
 
-// Bot → Overseer:
+// Bot → Foreman:
 //   'register'       — bot announces itself on first connect (payload: boardroom_chair,
 //                      logistics_stations)
 //   'hq_delta'       — bot sends its boardroom chair + logistics station map + fleet
@@ -21,32 +21,32 @@ const { guardExternalSync } = require('../js_kernel/utils/external_library_guard
 //   'claim_request'  — bot wants exclusive hold on a world object ('anchor:…',
 //                      'tree:…', 'cell:…' — lock the object, not the bot;
 //                      payload: { key }). Arbiter flavor (a) — see the taxonomy
-//                      in overseer_brain.js.
+//                      in foreman_brain.js.
 //   'claim_release'  — bot releases a key it previously claimed (payload: { key })
 //   'planning_request' — bot asks for the planning token (plan-phase mutex,
 //                      arbiter flavor b; no payload). Never rejected: a loser is
 //                      QUEUED and receives 'planning_granted' when its turn
 //                      comes. A re-request from the holder is a renewal heartbeat.
 //   'planning_release' — bot has finished its plan phase (magnet claimed AND
-//                      synced); the overseer promotes the next waiter (no payload)
-//   'log'            — one already-formatted watcher line, forwarded so the overseer can print every
+//                      synced); the foreman promotes the next waiter (no payload)
+//   'log'            — one already-formatted watcher line, forwarded so the foreman can print every
 //                      bot's stream in one place tagged by bot (payload: { line, level }). `level` is
 //                      the writer's own name for the channel it used — 'summary' | 'warn' | 'error' |
-//                      'context' — and the overseer TALLIES it per bot so a live supervisor can ask
+//                      'context' — and the foreman TALLIES it per bot so a live supervisor can ask
 //                      whether this fleet has errored without reading anything (see handleLog and
-//                      'fleet_state'). Still no interpretation (Law 3): the overseer counts the field
+//                      'fleet_state'). Still no interpretation (Law 3): the foreman counts the field
 //                      the writer stated and never inspects the text.
 //
-// Operator → Overseer (fleet_control, headless surface):
+// Operator → Foreman (fleet_control, headless surface):
 //   'operator_command' — a console verb arriving over the socket instead of the
-//                      overseer's TTY (payload: { verb: 'start' | 'stop' | 'flush' | 'wipe' | … }).
+//                      foreman's TTY (payload: { verb: 'start' | 'stop' | 'flush' | 'wipe' | … }).
 //                      Same validation, same broadcast pathway as a typed verb
 //                      (Law 16: two transports, one implementation). bot_id is the
 //                      operator client's label, not a bot.
 //
-// Overseer → Bot:
-//   'registered'      — overseer acknowledges the bot
-//   'hq_broadcast'    — overseer sends all other bots' boardroom chairs, the merged
+// Foreman → Bot:
+//   'registered'      — foreman acknowledges the bot
+//   'hq_broadcast'    — foreman sends all other bots' boardroom chairs, the merged
 //                       logistics station map, and the merged fleet structures
 //                       (payload: bot_boardroom, logistics_stations, building_conference)
 //   'claim_granted'   — object claim approved, bot may proceed
@@ -81,7 +81,7 @@ const VALID_TYPES = new Set([
   'fleet_state',
   // A REQUEST IS NOT AN OPERATOR VERB and travels as its own type: a verb is a command delivered to
   // bodies now, a request is a fact written down that no body is told about. Both ends of it were built
-  // — the desk sends it, the overseer answers it — and this table was not, so every `request`, `cancel`
+  // — the desk sends it, the foreman answers it — and this table was not, so every `request`, `cancel`
   // and read-back a human spoke died at `createEnvelope` with the desk telling them the fleet does not
   // know the message. A typed contract that does not name a message in use is not a stricter contract,
   // it is a wire nothing can cross (Law 10).
@@ -143,7 +143,7 @@ function roomKeyOwner(key) {
 // entries collide (split-brain reconnect, crash recovery), the FIRST writer
 // wins — freshness (stations' LWW) would be wrong here, because a later
 // duplicate spot must never beat the original home. Lives in this file because
-// bot and overseer must apply the IDENTICAL rule or their merged views diverge
+// bot and foreman must apply the IDENTICAL rule or their merged views diverge
 // (Law 16: one definition). Deterministic on ties (Law 19): coordinate string.
 //
 // THE OWNER IN THE KEY IS WHAT MAKES THIS RULE CORRECT AGAIN rather than merely deterministic. Two crews
@@ -234,23 +234,24 @@ function parseEnvelope(raw) {
 
 // OPERATOR_VERBS — the operator vocabulary, in the file all three processes already share.
 //
-// It lived in THREE places (fleet_control's sendVerb, the overseer's runOperatorVerb, the bot's
+// It lived in THREE places (fleet_control's sendVerb, the foreman's runOperatorVerb, the bot's
 // operator_commands) and a verb had to be added to all three or it died silently in the middle: the
-// sender accepted it, the overseer answered 'unknown verb' to its own log, and the bot never heard.
+// sender accepted it, the foreman answered 'unknown verb' to its own log, and the bot never heard.
 // Law 16: one capability, one definition — centralizing the vocabulary here removes that failure mode.
 //
 // Here and not in operator_commands (which is the natural owner of the BEHAVIOUR) because the other
-// two are separate OS processes: requiring operator_commands into the overseer would boot a bot's
+// two are separate OS processes: requiring operator_commands into the foreman would boot a bot's
 // watcher inside the coordinator. A vocabulary is data and travels; the implementation stays put.
 const OPERATOR_VERBS = new Set([
   'start',          // begin the autonomous planning loop
-  'stop',           // stop the bots cleanly (overseer + server stay up)
+  'stop',           // stop the bots cleanly (foreman + server stay up)
   'flush',          // cold-reset corporate HQ — EVERY owner's, fleet-wide
   'wipe',           // clear ONE owner's places — their stations and their buildings, nobody else's
   'surveylayout',   // dry-run base-layout pre-flight; locks nothing
   'sentry',         // combat in isolation — the planning recursion stays off
   'move',           // one live locomotion leg to an authored cell — the test verb, no recursion
   'respawn',        // send the respawn packet to a dead body — the ONLY route in from outside the process
+  'shutdown',       // end the run: bots exit, the world the foreman started is stopped and saved, the foreman exits
 ]);
 
 // INGAME_VERBS — the subset a human speaking inside the world may say. A STRICT SUBSET of the set above,
@@ -266,9 +267,9 @@ const OPERATOR_VERBS = new Set([
 // is running, `sentry` switches the planner off with no in-game word to switch it back — and one,
 // `flush`, was actively dangerous (see below).
 //
-// THE SET IS ENFORCED BY THE OVERSEER, NOT BY THE FOREMAN, and that is the whole reason it lives here.
-// The foreman is the only thing that speaks on the in-game door today, so a check inside the foreman
-// would be the foreman promising to behave — and the two-listener design exists precisely because a
+// THE SET IS ENFORCED BY THE HUB, NOT BY THE DESK, and that is the whole reason it lives here.
+// The desk is the only thing that speaks on the in-game door today, so a check inside the desk
+// would be the desk promising to behave — and the two-listener design exists precisely because a
 // guarantee resting on a sender's honesty is not one (Law 23: an inbound field is a claim). runOperatorVerb
 // refuses a verb outside this set when the origin it OBSERVED is INGAME, which is a fact about which
 // socket accepted the connection rather than anything the sender said about itself.
@@ -304,7 +305,7 @@ for (const verb of INGAME_VERBS) {
 // reach one from a human in the world. Same verb, same bot, different answer, and the only thing
 // that separates the two cases is where the words came from. So origin travels with every command.
 //
-// WHO IS ALLOWED TO SAY IT: the overseer, and only from what it OBSERVED — which socket spoke. It is
+// WHO IS ALLOWED TO SAY IT: the foreman, and only from what it OBSERVED — which socket spoke. It is
 // never copied from a claim the sender makes about itself, because a claim is exactly what Law 23
 // says an inbound message is. A bot receiving a command cannot verify the stamp, which is the whole
 // reason the stamping has to happen at the one place that can.
@@ -317,11 +318,11 @@ const VALID_ORIGINS = new Set(Object.values(COMMAND_ORIGIN));
 // THE IN-GAME DOOR IS A SECOND LISTENER, AND THAT IS WHAT MAKES THE ORIGIN OBSERVED RATHER THAN CLAIMED.
 //
 // The origin table above is only worth having if the stamp is a FACT. On one socket it cannot be: every
-// client reaches the same listener, so the overseer has nothing to read but a label the sender chose for
+// client reaches the same listener, so the foreman has nothing to read but a label the sender chose for
 // itself — and a sender able to name its own origin can name the privileged one, leaving the two species
 // separated by the honesty of whoever connected (Law 23: an inbound field is a claim, never a fact).
 //
-// Two listeners make it a fact with no check anywhere. The overseer stamps by WHICH OF ITS OWN SERVERS
+// Two listeners make it a fact with no check anywhere. The foreman stamps by WHICH OF ITS OWN SERVERS
 // accepted the connection, which is something it observed rather than something it was told, and no
 // message on the in-game door can carry terminal authority however it is spelled. This is the Law 26
 // translator: the door is the interface a mind reaches the machine through, and the machine's guarantee

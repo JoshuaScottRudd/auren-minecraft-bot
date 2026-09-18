@@ -497,7 +497,7 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
 
 // ── The warden ───────────────────────────────────────────────────────────────────────────────────
 // Raised here because filming is this file's business and the fleet's is not: the warden watches the
-// overseer's registry and gives a camera to any bot that appears, which is the missing half of "one
+// foreman's registry and gives a camera to any bot that appears, which is the missing half of "one
 // camera per bot" on a run whose bots are hired in chat after the take has started. See its own
 // header for why it senses the world rather than hooking the launcher.
 //

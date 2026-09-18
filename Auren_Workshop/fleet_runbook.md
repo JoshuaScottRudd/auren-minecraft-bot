@@ -15,7 +15,7 @@
 A run is a set of real, detached, windowless OS processes:
 
 - **Minecraft server** (`java … server.jar`) on port 25565.
-- **Overseer** (`overseer/overseer_server.js`) on port 3001 — the one coordinator. Holds the planning
+- **Foreman** (`foreman/foreman_hub.js`) on port 3001 — the one coordinator. Holds the planning
   token, merges every bot's trace into one stream, and carries every operator verb (Law 16).
 - **One bot process per roster entry** (`master_core.js`, `BOT_ID=AurenBot|TessaBot|IrisBot|…`). The
   roster is `BOT_SENIORITY` in `Thinking_fragments/architect_config.js`; `node fleet_control.js roster`
@@ -47,7 +47,7 @@ after it (§3a). `run.js` asks the world whether it is there and never asks who 
 |---|---|---|
 | node | `node` on `PATH`, at least `engines.node` in `package.json` | the exact paths in `../Architect_workstation/workstation.json` |
 | npm | the npm inside whichever node was picked | — |
-| java | `java` on `PATH`, Java 21 or newer (Minecraft 1.20.5+ refuses anything older) | the same file's `java` list |
+| java | `java` on `PATH`, Java 25 or newer (26.1 refuses anything older — its own manifest says 25) | the same file's `java` list |
 | the Minecraft server folder | `AUREN_SERVER_DIR` — a folder holding `server.properties` | the same file's `server` list |
 | node_modules | `Auren_Bot/node_modules` | the same file's `node_modules` list |
 
@@ -98,7 +98,7 @@ server an equal first-class one, and that is the fact that moves the answer.
 a 12,797 ms tick stall from vanilla chunk handling, which timed out a whole fleet. Paper-only: entity
 activation ranges, mob spawning and chunk behaviour — the layer a pathfinding bot sits on, and a vanilla
 user never meets it. Paper also does **not** fix the disconnect it would be adopted for: the 30-second
-keep-alive lives in vanilla's packet handler and Paper 1.21.5 exposes no key for it.
+keep-alive lives in vanilla's packet handler and Paper exposes no key for it.
 
 **THE INVARIANT THAT ACTUALLY BUYS COMPATIBILITY — NO BOT CODE MAY BRANCH ON SERVER FLAVOUR.** The fleet
 is a mineflayer client speaking the vanilla protocol and holds zero references to Paper, Spigot, Bukkit or
@@ -117,8 +117,13 @@ never travel through git, so each machine does this for itself. `$S` below is YO
 
 ```
 $S = & node js_kernel\utils\workstation.js server
-# newest 1.21.5 build; EVERY 1.21.5 Paper build is channel ALPHA, so pick the highest id, not STABLE
-$b = Invoke-RestMethod 'https://fill.papermc.io/v3/projects/paper/versions/1.21.5/builds' -Headers @{'User-Agent'='auren'}
+# The version is READ from the one authored answer, never typed here (Law 16) — a number written into
+# this block is a second answer that goes stale the day the fleet moves, which is what happened to the
+# `1.21.5` that used to be on these two lines. Pick the highest build id rather than channel STABLE: a
+# just-released version's Paper builds are all ALPHA. If Paper has no build for it yet, that is a reason
+# to stay vanilla rather than to pin the fleet backwards.
+$ver = & node -e "process.stdout.write(require('./Thinking_fragments/architect_config.js').SERVER_MINECRAFT_VERSION)"
+$b = Invoke-RestMethod "https://fill.papermc.io/v3/projects/paper/versions/$ver/builds" -Headers @{'User-Agent'='auren'}
 $dl = ($b | Sort-Object id -Descending | Select-Object -First 1).downloads.'server:default'
 Copy-Item "$S\server.jar" "$S\server-vanilla.jar"        # keep the way back
 Invoke-WebRequest $dl.url -OutFile "$S\server.jar"
@@ -167,7 +172,7 @@ working.**
 
 ## 2b. Pointing the fleet at a world on another machine
 
-**`Auren_Bot/your_server.js` is the single source** (Law 16, 2026-09-11). `SERVER_ENDPOINT` in
+**`Auren_Bot/foreman_config.js` is the single source** (Law 16, 2026-09-11). `SERVER_ENDPOINT` in
 `Thinking_fragments/architect_config.js` is a re-export of it and nothing else, so the two can never
 disagree; every body, the foreman, the camera rig, the seed scanner and `run.js` all land on that one
 file. It is also the one page a downloader is expected to open, which is why it sits at the top of the bot
@@ -228,7 +233,7 @@ node Auren_Workshop/tools/seed_scanner.js log
 
 Per seed the hunt stops the JVM, deletes the candidate world folder, writes `level-seed`, starts the
 server, joins one spectator-weight client (`Seed_Scout`), reads the biome map with the fleet's own
-`biome_scanner`, walks a 441-column relief grid, judges, records, and rolls on. No fleet, no overseer, no
+`biome_scanner`, walks a 441-column relief grid, judges, records, and rolls on. No fleet, no foreman, no
 autonomy.
 
 | criterion | default | owner |
@@ -354,7 +359,7 @@ therefore never tries to start anything.
 **Six names are NOT on this page** and typing any of them is refused by name rather than read and ignored:
 
 - `server` — the whole question of who starts the world. There is no such question now; the verb you ran is the answer.
-- `host`, `port`, `rconPort`, `rconPassword` — in `Auren_Bot/your_server.js` (§2b). One page for the address, read by everything, not just by `run.js`. A hosted run is handed a freshly minted console password through the environment and never sees one on any page.
+- `host`, `port`, `rconPort`, `rconPassword` — in `Auren_Bot/foreman_config.js` (§2b). One page for the address, read by everything, not just by `run.js`. A hosted run is handed a freshly minted console password through the environment and never sees one on any page.
 - `downloadRoot` — went with the stranger-download copy when the workshop moved inside the bot: the tree in place IS the shipped tree now.
 
 **Every field is a whitelist.** A value that is not on its list is refused BY NAME before the server is
@@ -393,7 +398,7 @@ Every run does this, in this order:
    are what gets tested — into a folder with nothing above it;
 2. `npm install`s it the way the README says to;
 3. launches `start_auren.js` from that download **in a stripped environment**, with every `AUREN_/BOT_/
-   OVERSEER_` variable removed, so the run cannot inherit this machine's configuration and certify a
+   FOREMAN_` variable removed, so the run cannot inherit this machine's configuration and certify a
    build that works on one box in the world;
 4. seats `person` in the world through `proxy_human`;
 5. **has that person type `foreman get <crew>`** down their own stdin;
@@ -478,8 +483,8 @@ gets a snapshot copy of `Auren_Bot/` with no history, the day a build works.
 
 ## 3h. The local server — a world on this machine, for testing
 
-`local` brings up this machine's own world with the overseer and the foreman and **no bots**; `down`
-takes it away again. Address `localhost`, Java 1.21.5, world folder under `MinecraftServer/`. It prints
+`local` brings up this machine's own world with the foreman and **no bots**; `down`
+takes it away again. Address `localhost`, Java Edition 26.1, world folder under `MinecraftServer/`. It prints
 no ONLINE — that word belongs to a server strangers can reach, and on a world only this machine can reach
 every step of that check is meaningless or cannot fail.
 
@@ -489,12 +494,12 @@ start a world on this machine and send the bots, the foreman and every contracto
 it overrode something.
 
 ```
-node Auren_Workshop/fleet_control.js local                  # world + overseer + foreman, NO bots
-node Auren_Workshop/fleet_control.js down                   # world + overseer + foreman down
+node Auren_Workshop/fleet_control.js local                  # world + foreman, NO bots
+node Auren_Workshop/fleet_control.js down                   # world + foreman down
 # there is no -Count any more: a crew is asked for in chat, or by a configured run (§3)
 ```
 
-Then join in Minecraft at **`localhost`** (Java **1.21.5**) and say `foreman get` in ordinary chat.
+Then join in Minecraft at **`localhost`** (Java Edition **26.1**) and say `foreman get` in ordinary chat.
 
 **It comes up with zero bots on purpose**, exactly like a world serving people: the thing under test is
 `foreman get`, the path a real arrival walks. `-Count N` is for the other kind of test, where
@@ -504,7 +509,7 @@ homesteaders are the subject.
 the run's records belong to it alone. Use `repair` to restart a piece without throwing the run away.
 
 **A note the proving produced:** `fleet_control bot-start` returns when the PROCESS is launched, while a
-body enters the overseer's registry only after it connects, spawns and `master_core` initialises — those
+body enters the foreman's registry only after it connects, spawns and `master_core` initialises — those
 are seconds apart. The desk polls the registry for up to 90s rather than reading it once. **Only a real
 player slot catches faults of this shape**: `preflight` passed throughout, every process window was
 clean, and the only thing wrong was a sentence said to a human about a fact that had not happened yet.
@@ -640,8 +645,8 @@ is what carries this claim now that the mid-read bench is retired.
 ## 4a. Self-cleaning starts and the mid-run recovery path
 
 **`up`/`bots-up` self-clean every start.** A start tears down lingering processes from a prior run
-(trace, bots, overseer) and flushes all logs — every `watcher_*.jsonl`, `fleet_logs/*.log` except
-`server.log`, and every arena tape under `fleet_logs/arena/` — then launches fresh. A reused overseer
+(trace, bots, foreman) and flushes all logs — every `watcher_*.jsonl`, `fleet_logs/*.log` except
+`server.log`, and every arena tape under `fleet_logs/arena/` — then launches fresh. A reused foreman
 cannot replay a prior run's error into a fresh watch.
 
 **HQ memory is never touched by a start** — only `verb flush` clears `corporate_headquarters*.json`. Logs
@@ -651,7 +656,7 @@ flush on every start; the memory does not.
 fleet changes between runs, so rows written a week apart never measured the same system. What lasts is
 the write-up someone makes from a session.
 
-**Recovery on a mid-run wake:** stop bots only — `verb stop` (persists tail state; overseer and server
+**Recovery on a mid-run wake:** stop bots only — `verb stop` (persists tail state; foreman and server
 stay up) — inspect, fix the code, then `bots-up` → `verb start`. **No `verb flush` on this path** —
 flushing would discard the in-progress HQ the stall interrupted.
 
@@ -831,7 +836,16 @@ node Auren_Workshop/fleet_control.js server-start                 # the entire p
 node Auren_Workshop/tools/water_pillar_probe.js                   # scaffold_movement.pillarStep, live
 node Auren_Workshop/tools/combat_drive_probe.js                   # combat_navigator + gunner, live
 node Auren_Workshop/tools/stone_column_probe.js                   # stone_column_scanner's verdict, live
+node Auren_Workshop/tools/build_bench.js <blueprint> [--keep]     # build_executor on any blueprint, ~1 min
 ```
+
+**`build_bench` is the one-minute answer to "does the builder build this blueprint".** It lays a stone pad
+off spawn, gives one survival body exactly the blueprint's materials over RCON, runs the real
+`build_executor` with `test: true`, and reads every voxel back off the world — including an optional fifth
+voxel element, the block state the cell must show (`test_house` carries thirteen: stairs in every
+direction and both halves, and a chest, all from one stand). It names no blueprint and
+carries no expected count, so it moves with the code. Its header holds why the materials are given rather
+than simulated, and why it stands in for `recursive_judge` in its own process.
 
 **A probe that drives a SCANNER audits the verdict independently or it proves nothing.**
 `stone_column_probe` re-derives every field of the returned column from `bot.blockAt` directly, never
@@ -879,7 +893,7 @@ itself: **blows thrown from beyond the bot's 3.0 reach** and **an engagement wit
 > could it run with no Minecraft installed? Then it is monitoring. `monitoring/README.md` holds the split;
 > `monitoring/LENSES.md` holds every question and the flag that answers it.
 
-Default trace is `fleet_logs/traces/watcher_overseer.jsonl`, merged on read with every per-bot file. Run
+Default trace is `fleet_logs/traces/watcher_fleet.jsonl`, merged on read with every per-bot file. Run
 from the repo root.
 
 > **Node resolution.** The bare `node …` form works where `node` is on PATH. On a portable-node machine
@@ -944,7 +958,7 @@ diagnosing), `error()` (❌, auto-dumps buffered context). Nothing finer-grained
 - **Operative static** (checked in, at `Auren_Bot/` root): the structural laws, this runbook, and
   `camera_runbook.md`. Must exist on both machines cold.
 - **Live runtime exhaust** (`Auren_Bot/fleet_logs/`, gitignored): fleet consoles
-  (`server/overseer/trace.log` + one `<BotId>.log` per roster entry), the arena tapes, and
+  (`server/foreman/trace.log` + one `<BotId>.log` per roster entry), the arena tapes, and
   `fleet_control_runtime.json`. **The entire directory is emptied at the start of every `up`** — by
   clearing the room rather than matching filenames, so a record added by a future instrument cannot
   quietly outlive its run. Also gitignored: `corporate_headquarters*.json`, `find_buildingspot.json`, and
@@ -1017,6 +1031,10 @@ background, watches the live trace, and exits on the first error; that exit is t
    node Auren_Workshop/fleet_control.js up --count=2 [--world=<name>]
    node Auren_Workshop/fleet_control.js verb start
    ```
+   **This path works only for a crew that already has a base in memory** (a continue). Since 2026-09-18 a
+   body never sites its own base — the foreman sites it before spawning and hands it over — so a fresh crew
+   raised this way refuses at `start` with *"NOT STARTED — this body has no base"*. A fresh run goes through
+   the foreman: `Auren_Workshop/run.js` (the one run script).
 2. Launch the watch **in the background**:
    ```
    node Auren_Bot/monitoring/trace_monitor.js --watch --exit-on-flag --max-minutes=60

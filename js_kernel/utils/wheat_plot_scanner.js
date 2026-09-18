@@ -598,7 +598,7 @@ function settleLine(s) {
 }
 
 // describeScan — the scan's account of itself, one line per question a field raises. The ONE formatter (Law 16):
-// the base-layout survey, wheat_site_probe and wheat_ab_test print the same words from the same numbers.
+// the base-layout survey and wheat_site_probe print the same words from the same numbers.
 function describeScan(scan, target) {
   const b = scan.bank;
   const goal = Number.isFinite(target) ? `/${target}` : ' (every plot in view)';

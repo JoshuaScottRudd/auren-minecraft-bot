@@ -21,7 +21,7 @@
 //
 // WHICH HQ file: each bot writes its OWN corporate_headquarters.<BotId>.json, a full mirror of
 // shared HQ plus its own boardroom chair. Shared rooms (structures, job board, logistics, mining,
-// exploration) are read from the FRESHEST file by `updated_at` — a coherent overseer-synced
+// exploration) are read from the FRESHEST file by `updated_at` — a coherent foreman-synced
 // snapshot. Each bot's "doing now" is read from that bot's OWN file, which is authoritative and
 // freshest for itself (Law 23 — verify against the freshest source, don't trust a stale mirror).
 // Only bots present in the freshest boardroom are shown, so a run of N bots never surfaces a

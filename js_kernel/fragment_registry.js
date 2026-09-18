@@ -40,7 +40,9 @@ const furnaceExecutor     = require('@action/furnace_executor.js');
 // find_buildingspot + set_buildspot are LIBRARIES now: their reactive `receive`s — the lazy per-blueprint
 // locate route — are retired under Law 16 (one pathway), so they are no longer signal-dispatch targets
 // and carry no registry entry. lock_all_buildspots requires them directly (locate/lock) as the ONE locator.
-const lockAllBuildspots   = require('@action/lock_all_buildspots.js');
+// lock_all_buildspots IS A LIBRARY NOW TOO (2026-09-18): its `receive` served the body's own siting job,
+// which is deleted — the foreman sites the base and `start_injector` records the handed site by calling
+// `recordHandedSite` directly. No signal routes to it, so it carries no entry here.
 const setWoodPreference   = require('@action/set_wood_preference.js');
 const idlePark            = require('@action/idle_park.js');
 // land_prep + farm_executor are LIBRARIES now: farm_manager owns the tend loop and calls their verbs
@@ -112,7 +114,6 @@ module.exports = {
   delivery_executor:   deliveryExecutor,
   furnace_executor:    furnaceExecutor,
   build_executor:      buildExecutor,
-  lock_all_buildspots: lockAllBuildspots,
   set_wood_preference: setWoodPreference,
   idle_park:        idlePark,
   torch_executor:   torchExecutor,

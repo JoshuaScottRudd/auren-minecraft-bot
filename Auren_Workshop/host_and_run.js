@@ -1,6 +1,8 @@
 // module: host_and_run
-// purpose: THE OVERLAY FOR A MACHINE THAT HOSTS THE WORLD ITSELF. It starts the server, runs `run.js`
-//          untouched, and stops the server afterwards — one command, one pass.
+// purpose: THE OVERLAY FOR A MACHINE THAT HOSTS THE WORLD ITSELF. It checks nothing is left over, rolls
+//          the world back to its snapshot, and runs `run.js` untouched with the world set to 'local' — and
+//          run.js's foreman then starts the server, and stops it at the end (since 2026-09-18). One command,
+//          one pass.
 //
 //     . .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\host_and_run.js
 //
@@ -12,8 +14,12 @@
 // commands should overlay ontop of strangers commands and there should be a clear seperation between what
 // is architect and what is user."*
 //
-//     HOSTING A WORLD   this file          stop · roll back to a snapshot · mint a console password · start
-//     RUNNING A CREW    run.js             join a world that is there · work · read the record · come down
+//     HOSTING A WORLD   this file          check nothing is left over · roll back to a snapshot
+//     RUNNING A CREW    run.js             its foreman starts the world · work · read the record · come down
+//
+// (The two lines above were redrawn 2026-09-18: minting the console password and starting and stopping the
+// world moved into the foreman, on *"Who owns the process? Foreman does."* The rest of this 2026-09-11
+// reasoning stands for what is left here; where it says run.js asks the world, run.js now asks the foreman.)
 //
 // **`run.js` IS RUN AS A CHILD PROCESS, NOT IMPORTED AND NOT REIMPLEMENTED.** That is what makes "his run
 // is identical to a stranger's run" a structural fact rather than a promise two files are trying to keep:
@@ -44,9 +50,7 @@ const paths = require('./workshop_paths');
 paths.registerAliases();
 const workstation = require(paths.bot('js_kernel/utils/workstation'));
 const consoleWindow = require(paths.bot('js_kernel/utils/console_window'));
-const rcon = require(paths.bot('js_kernel/utils/rcon_link'));
 const serverSettings = require(paths.bot('js_kernel/utils/server_settings'));
-const { guardExternal } = require(paths.bot('js_kernel/utils/external_library_guard'));
 // The run's own report of itself. THIS script needs it as much as `run.js` does, and for a sharper
 // reason: a bring-up failure never reaches `run.js` at all, so without this the only record of what went
 // wrong is console text. That is exactly the case the Architect named on 2026-09-16 — no Java on the
@@ -88,7 +92,7 @@ if (!SERVER_FOLDER) {
           ``,
           `  If you start your Minecraft server yourself, you do not want this script at all —`,
           `  start your server and run Auren_Workshop/run.js, which is the same run without the`,
-          `  hosting. Its address is in Auren_Bot/your_server.js.`]);
+          `  hosting. Its address is in Auren_Bot/foreman_config.js.`]);
 }
 const PROPS_FILE = path.join(SERVER_FOLDER, 'server.properties');
 
@@ -136,33 +140,6 @@ function propsValue(key) {
   return m ? m[1].trim() : '';
 }
 
-// ── THE MINT HAPPENS AFTER THE OLD SERVER IS STOPPED, AND THAT ORDER IS THE FIX (2026-09-10) ────────
-// It once ran before anything else, and destroyed the credential needed to stop the server that was
-// already up: `server-stop` reads the password from this same file, so it presented the NEW one to a JVM
-// booted with the OLD one and got `rcon auth refused`. The stop then correctly refused to hard-kill a live
-// world, the rollback hit a locked `session.lock`, and the run halted with nothing started — a sequence
-// whose every step was right and whose order was wrong. The symptom reads as a wrong password and is
-// actually a stale process.
-//
-// So: the file holds the RUNNING server's password until that server is gone, and only then is a new one
-// written. Called exactly once, between the stop and the start.
-//
-// WHY MINT AT ALL (Architect 2026-09-10: *"no password at all for local server. theres no ports open."*).
-// A literally blank one is not available, and Minecraft rather than this file settles that: with
-// `rcon.password=` empty the server answers *"No rcon password set in server.properties, rcon disabled!"*
-// and the port never opens, so blanking it removes the console rather than the password. Minting removes
-// it from HIS side instead — nothing to choose, nothing to remember, nothing typed, and no credential
-// sitting in a tracked file for the extract to carry.
-//
-// THE MINT ITSELF IS `server_settings.prepare` — the same writer a stranger's `start_auren.js` uses, so
-// the settings the fleet needs and the one-time password have one author (Law 16). `serverUp: false` is a
-// sensed fact at the one call site: the start refuses above if any world is answering.
-function mintConsolePassword() {
-  const prep = serverSettings.prepare(SERVER_FOLDER, { serverUp: false });
-  for (const c of prep.changes) say(`server.properties  ${c.key}  — ${c.why}`);
-  return prep.password;
-}
-
 (async () => {
   console.log(`\n══ host_and_run — this machine hosts the world (${SERVER_FOLDER}) ══`);
   say(`the world      ${CONFIG.world === 'fresh' ? `rolled back to '${CONFIG.snapshot}'` : 'carried forward as it stands'}`);
@@ -192,8 +169,6 @@ function mintConsolePassword() {
   say('no terminals open, and no world answering');
 
   phase(`the world (${CONFIG.world})`);
-  const password = mintConsolePassword();
-  say('a fresh console password was minted for this run');
   if (CONFIG.world === 'fresh') {
     if (!fleetControl(['snapshot-restore', `--world=${CONFIG.worldName}`, `--snapshot=${CONFIG.snapshot}`])) {
       console.error(`\n  host_and_run: the world could not be rolled back to '${CONFIG.snapshot}'. NOTHING was`);
@@ -205,62 +180,26 @@ function mintConsolePassword() {
     say('left as the last run finished it');
   }
 
-  phase('start the world');
-  if (!fleetControl(['server-start'])) {
-    console.error(`\n  host_and_run: the server did not come up, so nothing joined it.\n`);
-    blocked('server_start', 'the server did not come up, so nothing joined it — the server-start output above carries the reason it gave');
-  }
-  say('the world is up');
-
-  // ── THE HAND-OFF: THE ENVIRONMENT, AND NOTHING ELSE ───────────────────────────────────────────────
-  // `Auren_Bot/your_server.js` reads these two before its own values, and `run.js` reads that file. So the
-  // minted password reaches the run down the SAME path a stranger's typed one does, and there is no
-  // argument, no flag and no file this run could inspect to discover that a host started its world.
-  // The port is read back off `server.properties` rather than assumed, because that file is what the JVM
-  // that is now running actually booted from (Law 23).
-  const rconPort = propsValue('rcon.port') || '25575';
-  process.env.AUREN_RCON_PASSWORD = password;
-  process.env.AUREN_RCON_PORT = rconPort;
-
-  phase('run.js — the same run a stranger runs');
+  // ── THE FOREMAN STARTS THE WORLD NOW, AND STOPS IT (Architect 2026-09-18) ─────────────────────────────
+  // *"Foreman starts first before the server… Who owns the process? Foreman does."* This file used to
+  // mint a console password, start the JVM through `fleet_control server-start`, and stop it afterwards.
+  // All three moved into the foreman (`foreman/foreman_world.js`), which run.js starts in 'local' mode:
+  // it writes the settings, mints the one-time password, launches the server in its own window, says why
+  // if it fails, and stops and saves it when the run ends. What stays here is what needs the world DOWN —
+  // the leftover check and the rollback above — done before the foreman exists.
+  phase('run.js — the same run a stranger runs; its foreman starts this world');
   const child = spawn(process.execPath, [paths.workshop('run.js')],
-    { stdio: 'inherit', env: process.env });
+    { stdio: 'inherit', env: { ...process.env, AUREN_SERVER_WHERE: 'local' } });
 
   const code = await new Promise(resolve => child.on('exit', c => resolve(c === null ? 1 : c)));
 
-  // ── THE WORLD COMES DOWN UNLESS SOMEBODY IS STILL STANDING IN IT ──────────────────────────────────
-  // A failed run is not a reason to leave a JVM holding the world folder: the next pass starts by
-  // restoring a snapshot into it, and a live server there is the locked `session.lock` this project has
-  // already lost a run to. So the default is down, including after a failure.
-  //
-  // THE ONE EXCEPTION IS READ FROM THE WORLD, NOT FROM THE CONFIG PAGE (Law 1, same rule as the hand-off
-  // above). `run.js`'s `teardown: 'leave-up'` deliberately leaves the desk and the crew standing to be
-  // poked at by hand, and killing the server under them would delete the very thing that mode exists to
-  // preserve. This file does not read the run's settings to find that out — it asks the SERVER who is in
-  // the world, which is the same question `run.js` asks and the only roster not written by the thing under
-  // test. Anyone left in there means somebody is still using this world; nobody means the run finished and
-  // cleaned up after itself.
-  // The console read goes through `external_library_guard` rather than a hand-written try/catch, which is
-  // the one pathway to the outside in this project (Law 16) and is machine-checked by preflight pass 4. An
-  // unreachable console comes back `ok: false` and means the world is already gone or wedged — either way
-  // the stop below is the right move, so the failure needs no branch of its own.
-  phase('stop the world');
-  const roster = await guardExternal('host_and_run', 'who is still in the world', () =>
-    rcon.once(['list'], { creds: { port: Number(rconPort), password } }));
-  const listed = roster.ok && /players online:\s*(.*)$/.exec((roster.value[0] && roster.value[0].body) || '');
-  const stillInside = listed ? listed[1].split(',').map(s => s.trim()).filter(Boolean) : [];
-  if (stillInside.length) {
-    say(`LEFT UP — ${stillInside.join(', ')} ${stillInside.length === 1 ? 'is' : 'are'} still in the world.`);
-    say(`They are yours to reap:  node Auren_Workshop/fleet_control.js down`);
-    say(`Then stop the world:     node Auren_Workshop/fleet_control.js server-stop`);
+  // A world still answering after the run is a `leave-up` run, or a foreman that had not finished saving.
+  // It is said, never stopped from here: the foreman that started it is its one stopper.
+  if (await serverSettings.serverAnswers(serverPort)) {
+    say(`the world is STILL UP on port ${serverPort} — the run left it up, or its foreman had not finished.`);
+    say(`To end it with its foreman:  node Auren_Workshop/fleet_control.js verb shutdown`);
   } else {
-    // `down`, NOT `server-stop` (2026-09-11: *"you had like 20-30 terminals open"*). `down` stops the world
-    // AND reaps the windows no other teardown owns: the merged fleet-console (it ends by waiting for Enter)
-    // and each crew bot's follower (the foreman's own close never runs on Windows), every one of them from
-    // console_window's ledger. A bare server-stop left those on the desktop after every hosted run. `down`
-    // then looks again and prints what is still open, which is how this end of the run CHECKS.
-    fleetControl(['down']);
-    say('the world this script started is down again, with every window it opened');
+    say('the world this machine hosts is down again');
   }
 
   console.log(`\n══ host_and_run finished — the run ${code === 0 ? 'PASSED' : `exited ${code}`} ══\n`);

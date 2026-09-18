@@ -69,7 +69,7 @@ async function sweep(reader, origin) {
 }
 
 async function main() {
-    const bot = mineflayer.createBot({ host: 'localhost', port: 25565, username: 'Siting_AB', version: '1.21.5', auth: 'offline' });
+    const bot = mineflayer.createBot({ host: 'localhost', port: 25565, username: 'Siting_AB', version: require('@thinking/architect_config').SERVER_MINECRAFT_VERSION, auth: 'offline' });
     bot.on('error', e => { log('boot', `socket error: ${e.message}`); process.exit(1); });
     bot.on('kicked', r => { log('boot', `kicked: ${JSON.stringify(r)}`); process.exit(1); });
     await new Promise(r => bot.once('spawn', r));

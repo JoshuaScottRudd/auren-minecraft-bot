@@ -58,7 +58,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/fore
 //          able to read or cancel the first player's requirements. Without those three, V17-V19 score
 //          identically against a ledger that accepts everything from everybody.
 //          V24 is the round trip and the only question here that involves a body doing anything: a
-//          figure measured inside a crew, posted to its chair, relayed by the overseer and spoken by
+//          figure measured inside a crew, posted to its chair, relayed by the foreman and spoken by
 //          the desk. It is graded against the crew's own chair as well as the reply, so a silent desk
 //          can be told from a crew that never looked.
 //
@@ -67,7 +67,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/fore
 // nobody asked — the fault this probe exists to catch, committed by the probe. It is checked against
 // the server's player list before each of those verdicts is written.
 //
-// Run (server must be UP; the foreman, the overseer and every bot are raised BY this probe and taken
+// Run (server must be UP; the foreman (with its hub) and every bot are raised BY this probe and taken
 // down with it — Law 8. A foreman already on duty is REUSED and left standing, so this can be pointed
 // at a live contractor bench instead of only at an empty server):
 //   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\foreman_probe.js --phase=1
@@ -75,7 +75,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/fore
 //
 // THE RUN IS CUT IN TWO BY WHAT CAN ANSWER A QUESTION, not by subject — see THE PHASE below the
 // requires for the full statement and for what phase 1 is not allowed to claim. In short: phase 1
-// raises no overseer and no bots (a stand-in holds the in-game door), so it answers every question
+// raises no foreman and no bots (a stand-in holds the in-game door), so it answers every question
 // about what the DESK said or put on the wire in seconds; phase 2 raises the real fleet, answers only
 // what a BODY can answer, and ends when the filed requests are MET rather than when the fleet goes
 // quiet — a still fleet may simply be holding its whole board at the gates.
@@ -128,10 +128,10 @@ const ROSTER_LOWER = Object.keys(BOT_SENIORITY).map(n => n.toLowerCase());
 paths.registerAliases();
 const { OPERATOR_VERBS, CREW_SIZE } = require(paths.bot('foreman/foreman_vocabulary'));
 // THE FLEET'S OWN DOOR CLIENT, borrowed rather than re-spelled. Two questions here need a fact only the
-// overseer holds — which bots are registered, and under whose name and species — and a second socket
+// foreman holds — which bots are registered, and under whose name and species — and a second socket
 // client written in this file would be a parallel route to it that drifts the day the envelope changes
 // (Law 16). It is used to OBSERVE, never to command: every verb in this probe is spoken in the world.
-const door = require(paths.bot('foreman/overseer_door'));
+const door = require(paths.bot('foreman/foreman_door'));
 
 const net = require('net');
 
@@ -139,7 +139,9 @@ const HUMAN = 'ProxyHuman';
 // The second person in the world. Every ownership question needs somebody who did NOT ask for the bot;
 // with one player, "only the owner may command it" and "anyone may command it" produce identical runs.
 const HUMAN_B = 'ProxySecond';
-const VERSION = '1.21.5';
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const VERSION = require(paths.bot('Thinking_fragments/architect_config.js')).SERVER_MINECRAFT_VERSION;
 // The bot the HUMAN fetches (a contractor by construction) and the one the OPERATOR starts (a
 // homesteader, because a terminal launch stamps one). Two different names so the species control is a
 // question about what a bot IS and not about whichever bot happened to be up.
@@ -148,11 +150,11 @@ const HOMESTEADER_NAME = 'TessaBot';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── THE PHASE, AND WHY THE RUN IS CUT IN TWO ───────────────────────────────────
-// PHASE 1 — THE DESK. No overseer, no bots, no world work. A stand-in sits on the overseer's in-game
+// PHASE 1 — THE DESK. No foreman, no bots, no world work. A stand-in sits on the foreman's in-game
 //   door (`foreman_door_standin`) and the foreman relays into it, unmodified: same socket, same
 //   envelope, same port. Every question answerable from what the desk SAID or from what it PUT ON THE
 //   WIRE lives here, and the phase ends when they are asked — there is nothing to wait for.
-// PHASE 2 — THE FLEET. The real overseer, a real crew, real work. Only the questions a BODY can answer
+// PHASE 2 — THE FLEET. The real foreman, a real crew, real work. Only the questions a BODY can answer
 //   live here: which bots a verb actually reached, where a contractor stands, whether a filed
 //   requirement is met by work. It ends when the requests are FILLED (see the completion watch).
 //
@@ -160,7 +162,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // tester and have it acknowledge verbs without executing them. That installs a branch that only ever
 // runs under test — so the fast phase would exercise a desk no human meets (Law 16) — and it gives the
 // desk the power to treat one speaker specially, which is the power V5/V8/V12 exist to prove it does
-// not have. Cutting at the DOOR needs no branch: `overseer_door`'s rule is that origin is decided by
+// not have. Cutting at the DOOR needs no branch: `foreman_door`'s rule is that origin is decided by
 // which door is knocked on, never by a field, so the desk cannot tell the difference and nothing in it
 // had to be told.
 //
@@ -183,6 +185,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // a redundant route (Law 16); this is its one replacement.
 const PHASE_ARG = process.argv.find(a => a.startsWith('--phase='));
 const PHASE = PHASE_ARG ? parseInt(PHASE_ARG.slice('--phase='.length), 10) : null;
+// PHASE 1 HAS NO SEAM LEFT TO STAND IN (2026-09-18). It cut at the socket between the desk and the
+// foreman, and since the merge (scratchpad §32) the two are one process that calls each other directly,
+// so a stand-in on the door port is a door the desk never knocks on. It is refused rather than run,
+// because run as written it would grade a desk that is not talking to it (Law 25).
+if (PHASE === 1) {
+  console.error('foreman_probe: --phase=1 cannot run since 2026-09-18. The desk and the hub are one process now, '
+    + 'so there is no socket between them for the stand-in to sit on. Use --phase=2.');
+  process.exit(1);
+}
 if (PHASE !== 1 && PHASE !== 2) {
   console.error([
     'foreman_probe: --phase=1 (the desk, no fleet) or --phase=2 (the fleet, run to completion) is required.',
@@ -253,7 +264,7 @@ function writeFindings(extra = {}) {
 // then landed on the slot they were sitting in. What a run raises it takes down on EVERY path out, and
 // the sweep is the launcher's own `verb exit` rather than a kill: the same route the successful path
 // uses, so there is one teardown and not a second one that only the crash reaches (Law 16).
-let RAISED = { foreman: null, overseer: false, crew: false };
+let RAISED = { foreman: null, hub: false, crew: false };
 let dying = false;
 async function dieHonestly(kind, err) {
   if (dying) return;   // a second fault while the first is being written must not restart the record
@@ -271,7 +282,7 @@ async function dieHonestly(kind, err) {
     console.log(swept ? 'teardown: crew swept.' : 'teardown: the sweep did not answer in 20s — check for bots left in the world.');
   }
   if (RAISED.foreman) { RAISED.foreman.kill(); console.log('teardown: foreman taken down (this run raised it).'); }
-  if (RAISED.overseer) { await runFleetControl(['down', '--keep-server']); }
+  if (RAISED.hub) { await runFleetControl(['down', '--keep-server']); }
   process.exit(1);
 }
 process.on('uncaughtException', e => dieHonestly('uncaughtException', e));
@@ -289,47 +300,51 @@ async function main() {
   // and one of them detonating killed a run outright inside a third-party physics handler with twenty
   // verdicts already measured. A tester whose answer depends on whether a creeper wandered past is not
   // measuring the thing it names (Law 19 — determinism is a faculty this side owns; spending it here is
-  // free). `doDaylightCycle` is turned off as well as the time set, because a set alone drifts back into
+  // free). `advance_time` is turned off as well as the time set, because a set alone drifts back into
   // night across a twenty-five minute run, which is exactly the length these questions take.
   await cmd('time set 0');
-  await cmd('gamerule doDaylightCycle false');
+  await cmd('gamerule advance_time false');
   console.log('server: clock held at dawn, daylight cycle off — no hostiles for the length of the run.');
 
-  // THE OVERSEER FIRST, because the door the command questions test is one of its listeners and a bot
+  // THE FOREMAN FIRST, because the door the command questions test is one of its listeners and a bot
   // that comes up without one never registers — every verb would then reach nobody for a reason that
-  // has nothing to do with what is being measured. `overseer-start` reuses a live one, so a probe run
+  // has nothing to do with what is being measured. `foreman-launch` reuses a live one, so a probe run
   // inside an existing session does not raise a second (Law 8: only what this raises is taken down).
-  // PHASE 1 PUTS A STAND-IN WHERE THE OVERSEER'S IN-GAME DOOR WOULD BE and raises nothing else. The
+  // PHASE 1 PUTS A STAND-IN WHERE THE FOREMAN'S IN-GAME DOOR WOULD BE and raises nothing else. The
   // desk is unchanged and cannot tell — it opens the same port and writes the same envelope — so what
   // this phase measures is the production desk, not a desk that knows it is being watched.
   //
-  // IT REFUSES TO RUN BESIDE A LIVE OVERSEER rather than binding a second door or quietly reusing the
+  // IT REFUSES TO RUN BESIDE A LIVE FOREMAN rather than binding a second door or quietly reusing the
   // real one. Both silent options are worse than stopping: binding fails on a port already held, and
   // reusing means phase 1 commands a live fleet while reporting that nothing was executed — a false
   // statement about the world made by the instrument built to catch exactly that (Law 25, Law 13).
   let standin = null;
-  let overseerWasUp = false;
+  let foremanProcessWasUp = false;
   if (PHASE === 1) {
     if (await portOpen(3001)) {
-      console.error('phase 1 needs the overseer DOWN — its in-game door is the seam this phase stands in for.');
+      console.error('phase 1 needs the foreman DOWN — its in-game door is the seam this phase stands in for.');
       console.error('Something is serving 3001. Take the fleet down, or run --phase=2 against it.');
       rcon.close(); process.exit(1);
     }
-    standin = require('./foreman_door_standin').start({ overseerPort: 3001 });
-    console.log(`phase 1: stand-in door up on ${standin.port} — no overseer, no bots behind it.`);
+    standin = require('./foreman_door_standin').start({ foremanPort: 3001 });
+    console.log(`phase 1: stand-in door up on ${standin.port} — no foreman, no bots behind it.`);
   } else {
-    overseerWasUp = await portOpen(3001);
-    if (!overseerWasUp) {
-      await runFleetControl(['overseer-start']);
+    foremanProcessWasUp = await portOpen(3001);
+    if (!foremanProcessWasUp) {
+      await runFleetControl(['foreman-launch']);
       for (let i = 0; i < 20 && !(await portOpen(3001)); i++) await sleep(1000);
     }
-    RAISED.overseer = !overseerWasUp;
-    const overseerUp = await portOpen(3001);
-    console.log(`overseer: ${overseerUp ? (overseerWasUp ? 'already up — reused.' : 'raised by this probe.') : 'DID NOT COME UP.'}`);
-    if (!overseerUp) { rcon.close(); process.exit(1); }
+    RAISED.hub = !foremanProcessWasUp;
+    // The hub lives in the foreman's process (§32), so a foreman raised just now is already on its way
+    // into the world. It is confirmed through the launcher's own step rather than spawned a second time,
+    // which would collide on the foreman's port. Raised this way it is torn down with the foreman.
+    if (!foremanProcessWasUp) await runFleetControl(['foreman-start']);
+    const foremanUp = await portOpen(3001);
+    console.log(`foreman: ${foremanUp ? (foremanProcessWasUp ? 'already up — reused.' : 'raised by this probe.') : 'DID NOT COME UP.'}`);
+    if (!foremanUp) { rcon.close(); process.exit(1); }
   }
 
-  // THE FOREMAN IS REUSED IF ONE IS ALREADY STANDING, exactly as the overseer above is, and for a
+  // THE FOREMAN IS REUSED IF ONE IS ALREADY STANDING, exactly as the hub above is, and for a
   // reason that is not only tidiness: a foreman holds a PLAYER SLOT under a fixed name, so a second one
   // logs the first out and the probe would then be measuring the clerk it just displaced. Reusing also
   // makes this instrument runnable INSIDE the bench the Architect actually works in — the contractor
@@ -497,7 +512,7 @@ async function main() {
   // TWO WITNESSES TO THE SPECIES, and which one is available depends on who raised the clerk. The
   // LAUNCHER's own line in the foreman's console is the party that stamped it, so it is preferred; a
   // reused foreman writes that line into a window this process does not own, and the fallback is the
-  // OVERSEER'S REGISTRY — the mode each bot declared when it registered, which is the same fact the
+  // FOREMAN'S REGISTRY — the mode each bot declared when it registered, which is the same fact the
   // ownership filter runs on. Neither is inferred from the bot merely being present (Law 25), and the
   // verdict says which witness answered rather than flattening the two into one claim.
   // ── PHASE 2 OPENS HERE. `get` is the one verb that starts an OS PROCESS rather than crossing the door
@@ -524,7 +539,7 @@ async function main() {
   // into an answer, but a missing package throws before the socket exists — and an instrument that dies
   // on its second question reports nothing about the twenty-odd after it. A failed look is an
   // observation here, never the end of the run (Law 16: a terminus that names what it caught).
-  // ASKED OF THE OVERSEER, AND ASKED AGAIN, because registration is a second event after joining and the
+  // ASKED OF THE FOREMAN, AND ASKED AGAIN, because registration is a second event after joining and the
   // two are seconds apart — a single look taken at the wrong moment reports a healthy bot as missing.
   // What it must NOT do is give up and call the first answer the truth (Invariant B: re-sense).
   ownerCrew = async function (attempts = 6) {
@@ -549,10 +564,10 @@ async function main() {
     .filter(id => worldList.includes(id.toLowerCase()) && !registeredContractors.includes(id));
   record('V4', `Does \`foreman get\` fetch a WHOLE crew of ${CREW_SIZE}, every one of them a live CONTRACTOR?`,
     `world said: ${JSON.stringify(v4)} | launcher stamp in the foreman window: ${foreman ? stampedContractor : 'n/a (reused foreman — its console is its own window)'} `
-    + `| registered with the overseer as ${HUMAN}'s contractors: ${JSON.stringify(registeredContractors)} `
+    + `| registered with the foreman as ${HUMAN}'s contractors: ${JSON.stringify(registeredContractors)} `
     + `| in the world but NOT registered: ${JSON.stringify(inWorldNotRegistered)} | server player list: ${players}`,
     registeredContractors.length >= CREW_SIZE && inWorldNotRegistered.length === 0
-      ? `YES — all ${CREW_SIZE} came up, and the overseer holds every one of them as this player's CONTRACTOR. Every bot the foreman gets is a contractor by construction; there is no other spawn path in it.`
+      ? `YES — all ${CREW_SIZE} came up, and the foreman holds every one of them as this player's CONTRACTOR. Every bot the foreman gets is a contractor by construction; there is no other spawn path in it.`
       : inWorldNotRegistered.length
         ? `NO — ${JSON.stringify(inWorldNotRegistered)} holds a player slot and never registered. That is a bot that JOINED and never came up: its process is alive, it emitted no spawn, and no operator verb can reach it because delivery runs off the registry it is not in — so it cannot be exited, and its name cannot be handed to anyone else (Law 8). The usual cause is a login onto a corpse: a player whose last life ended dead never receives spawn, and \`tools/fleet_revive.js\` is the one thing that can repair it, from outside the process the corpse prevents from starting.`
         : `NO — only ${registeredContractors.length} of ${CREW_SIZE} registered and nothing else is holding a name. The crew is short, and a half crew cannot share the work a crew is defined by.`);
@@ -631,7 +646,7 @@ async function main() {
   // ── V6-V15: THE COMMAND SYSTEM AND THE TWO ENDS OF A CONTRACTOR'S LIFE ──────────────────────
   // FLEET QUESTIONS, EVERY ONE. What they measure is which bots a verb REACHED — the ownership filter,
   // the species filter, the terminal override, where a body stands when it is fetched and when it dies.
-  // All of that is decided inside the overseer and inside a body, so phase 1 has nothing to observe:
+  // All of that is decided inside the foreman and inside a body, so phase 1 has nothing to observe:
   // its stand-in deliberately implements no ownership filter, and a phase that scored these against an
   // authored one would be grading a copy of the rule living inside the instrument (Law 16, Law 25).
   //
@@ -668,8 +683,8 @@ async function main() {
   await recordAnswered('V7', 'Does a bare `foreman start` reach the speaker\'s bots through the in-game door?',
     `world said: ${JSON.stringify(v7)}`,
     /sent to your \d+ bot/i.test(v7line)
-      ? 'DELIVERED — one unaddressed word crossed the in-game door and the overseer reported how many of the SPEAKER\'S bots it reached. This is DELIVERY, not proof the bot began planning: nothing observable from outside the process says that, and the foreman\'s wording does not claim it.'
-      : `NOT DELIVERED — ${v7line || 'no answer'}. Either the door is not listening, the bot never registered with the overseer, or the ownership filter matched nobody.`);
+      ? 'DELIVERED — one unaddressed word crossed the in-game door and the foreman reported how many of the SPEAKER\'S bots it reached. This is DELIVERY, not proof the bot began planning: nothing observable from outside the process says that, and the foreman\'s wording does not claim it.'
+      : `NOT DELIVERED — ${v7line || 'no answer'}. Either the door is not listening, the bot never registered with the foreman, or the ownership filter matched nobody.`);
 
   // ── V8 — THE OWNERSHIP CONTROL. A second person must not command the first person's bot. ──────
   // THIS IS THE ONE THAT MAKES V7 MEAN ANYTHING. A door that delivers to everybody delivers to the
@@ -689,7 +704,7 @@ async function main() {
       : !survivedB
         ? 'CONTROL FAILS — a second player spoke and another person\'s bot left the world. Ownership is decorative: anyone in the world commands everyone\'s bots, and V7 above is a demonstration of that rather than of a working command system.'
         : /none of those are yours|no bots out/i.test(v8line)
-          ? `CONTROL HOLDS — B said the identical words and was refused by ownership ("${v8line.slice(0, 120)}"). A's bot is still in the world. The filter is the overseer's delivery set, read off the owner each bot declared at birth — not anything the foreman decides.`
+          ? `CONTROL HOLDS — B said the identical words and was refused by ownership ("${v8line.slice(0, 120)}"). A's bot is still in the world. The filter is the foreman's delivery set, read off the owner each bot declared at birth — not anything the foreman decides.`
           : `PARTIAL — B's command did not touch A's bot, but the refusal did not name ownership ("${v8line.slice(0, 120)}"). The bot is safe for a reason this probe cannot identify.`);
 
   // ── V9 — the owner's own exit, graded on the SERVER'S player list ─────────────────────────────
@@ -756,7 +771,7 @@ async function main() {
   await sleep(6000);
 
   // THE REFUSAL MUST NAME THE SPECIES, AND NOTHING ELSE COUNTS AS THE CONTROL HOLDING. A bot that is in
-  // the world has not necessarily registered with the overseer yet, and an unregistered bot is refused
+  // the world has not necessarily registered with the foreman yet, and an unregistered bot is refused
   // as "nobody is out" — which looks identical from outside to being refused for what it IS. Reading
   // that as a pass would grade a startup race as a species test and report a guarantee nobody proved
   // (Law 25). So the probe retries until the fleet answers about the species, and says INCONCLUSIVE if
@@ -806,7 +821,7 @@ async function main() {
     !beforeOverride
       ? 'INCONCLUSIVE — nothing was standing to be overridden. See V12.'
       : !afterOverride
-        ? 'YES — the same word V12 watched a human say and be refused took the bot down from the console. The two are separated by WHICH DOOR the words arrived through, which the overseer observes; the operator is outside the ownership model rather than a bigger owner inside it.'
+        ? 'YES — the same word V12 watched a human say and be refused took the bot down from the console. The two are separated by WHICH DOOR the words arrived through, which the foreman observes; the operator is outside the ownership model rather than a bigger owner inside it.'
         : 'NO — the console said exit and the bot stayed. The operator has lost the one route that always reaches every species, and there is now no way to stop a homesteader from outside its own process.');
 
   // ═══ WHERE A CONTRACTOR STANDS — AT BIRTH, AND AFTER DYING ════════════════════════════════════
@@ -999,7 +1014,7 @@ async function main() {
     return { rows, measured, unreadable, witness: 'crew kernel files' };
   }
 
-  // A WAIT FOR A BROADCAST THAT ONLY EXISTS IN PHASE 2. These pauses let the overseer's requirement map
+  // A WAIT FOR A BROADCAST THAT ONLY EXISTS IN PHASE 2. These pauses let the foreman's requirement map
   // reach the crew's own files before a question reads them. With no crew, there is nothing in flight:
   // the stand-in's ledger holds the row the moment the door call returns, so the wait buys nothing and
   // was most of what remained of the run's length after the reply windows were fixed.
@@ -1302,7 +1317,7 @@ async function main() {
   // ── V24 — THE ROUND TRIP: a figure measured in a body reaches the person who asked ────────────
   // The only question in this block that needs a crew to DO something, and the whole pipeline is in it:
   // a body measures its own shelves with the same lens its supply assessor stands down on, posts it to
-  // its chair, the overseer relays the freshest per item, the desk speaks it. Graded on the crew's OWN
+  // its chair, the foreman relays the freshest per item, the desk speaks it. Graded on the crew's OWN
   // chair as well as the reply, because those are two different failures — a crew that never looked
   // and a relay that lost what it measured send a reader to different places.
   // VOID IN PHASE 1 RATHER THAN RETRIED AGAINST NOTHING. The figure this asks for is measured INSIDE a
@@ -1326,7 +1341,7 @@ async function main() {
       : /\d+ so far|done, \d+ on the shelf/.test(progressReply)
       ? 'YES — a number measured inside a body arrived at the desk and was spoken to the person who asked. The desk holds no owner key and cannot see which chests are the crew\'s, so this figure could only have come from a body.'
       : chairMeasured.length
-        ? 'NO — the crew measured its requests and wrote them to its chair, and the desk still says nothing. The measurement exists and the relay is where it stops: the chair reaches the overseer, or the overseer picks the freshest per item, and one of those two is not happening.'
+        ? 'NO — the crew measured its requests and wrote them to its chair, and the desk still says nothing. The measurement exists and the relay is where it stops: the chair reaches the foreman, or the foreman picks the freshest per item, and one of those two is not happening.'
         : 'NO — no crew chair carries a measurement at all, so nothing was there to relay. The body never measured its own requests; the desk\'s silence is honest and the fault is upstream of it.');
 
   // ── V25 — a structure is a STAGE, never a count ───────────────────────────────────────────────
@@ -1577,7 +1592,7 @@ async function main() {
 
   // ── V28 — withdrawing the LAST requirement ───────────────────────────────────────────────────
   // THE EMPTY CASE IS ITS OWN QUESTION and it is asked separately because it travels a different road:
-  // V26 withdrew one row out of several, so the ledger the overseer broadcast was still non-empty and
+  // V26 withdrew one row out of several, so the ledger the foreman broadcast was still non-empty and
   // a crew adopting it whole necessarily lost the row. Emptying the ledger has nothing left to carry
   // the news — and "no rows" is the state a person leaves behind every time they finish with the fleet,
   // so it is the state that outlives the session (Invariant B: the crew must re-sense, not remember).
@@ -1719,17 +1734,17 @@ phase 2: watching until every filed request is MET (bound ${WATCH_MS / 60000} mi
   // deliberate and idempotent — it catches anything that came up between the two, and a teardown that
   // relies on a measurement step having run is a teardown that stops working the day the question moves.
   await runFleetControl(['verb', 'exit']);
-  // The overseer comes down only if this probe was the thing that raised it. Killing one that was
+  // The foreman comes down only if this probe was the thing that raised it. Killing one that was
   // already serving a live session would take the fleet with it — a teardown that reaches past what it
   // started is the same fault as one that stops short.
-  if (!overseerWasUp) {
+  if (!foremanProcessWasUp) {
     await runFleetControl(['down', '--keep-server']);
-    console.log('overseer: taken down (this probe raised it).');
+    console.log('foreman: taken down (this probe raised it).');
   } else {
-    console.log('overseer: left up (it was already running before this probe).');
+    console.log('foreman: left up (it was already running before this probe).');
   }
   // Law 8 — the stand-in was raised by this run and is taken down by it. Left up, it holds the port the
-  // real overseer needs, and the next phase-2 run fails to raise a fleet for a reason nothing names.
+  // real foreman needs, and the next phase-2 run fails to raise a fleet for a reason nothing names.
   if (standin) { await standin.close(); console.log('phase 1: stand-in door closed.'); }
   rcon.close();
   human.quit();

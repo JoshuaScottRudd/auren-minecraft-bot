@@ -109,7 +109,7 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
   // seconds. `relSec` survives as the RETURN ADDRESS — the stamp that finds the line in the trace by eye,
   // which is the one thing the ISO is bad at.
   //
-  // WHICH clock was used is REPORTED, not assumed. The merged overseer trace drops the ISO prefix when
+  // WHICH clock was used is REPORTED, not assumed. The merged foreman trace drops the ISO prefix when
   // it forwards a bot's line, so reading this lens against the fleet file gives whole seconds while the
   // per-bot file gives milliseconds — the same rendering, `0.0s`, meaning two different things. A reader
   // must be told which one they are holding (Law 25: a number carries its confidence).

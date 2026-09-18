@@ -400,11 +400,11 @@ async function readArenaMobs(rcon) {
 // (Law 23). The gamerule goes FIRST — setting the time while the cycle still runs is a value that starts
 // drifting the same tick, which is how a 90-second fight that began at midnight can end in daylight.
 async function applyWorld(rcon, w) {
-  await rcon.command(`gamerule doDaylightCycle ${w.daylightCycle}`);
+  await rcon.command(`gamerule advance_time ${w.daylightCycle}`);
   await rcon.command(`time set ${w.time}`);
   await rcon.command(`weather ${w.weather} 1000000`);
   await rcon.command(`difficulty ${w.difficulty}`);
-  // ── mobGriefing IS READ HERE, NOT SET ───────────────────────────────────────────────────────────────
+  // ── mob_griefing IS READ HERE, NOT SET ───────────────────────────────────────────────────────────────
   // It is authored ONCE, at server bring-up, by fleet_control's REQUIRED_GAMERULES — which is where the
   // full reasoning lives and where a rollback's reversion is handled. This file only VERIFIES, because
   // two authors of one condition is the redundant pathway Law 16 forbids and the failure would be silent:
@@ -422,10 +422,10 @@ async function applyWorld(rcon, w) {
   return {
     time: ((await rcon.command('time query daytime')) || '').trim(),
     difficulty: ((await rcon.command('difficulty')) || '').trim(),
-    cycle: ((await rcon.command('gamerule doDaylightCycle')) || '').trim(),
+    cycle: ((await rcon.command('gamerule advance_time')) || '').trim(),
     // Read back for applyWorld's stated reason: a rule that was accepted and not applied must not be
     // recorded as applied.
-    griefing: ((await rcon.command('gamerule mobGriefing')) || '').trim(),
+    griefing: ((await rcon.command('gamerule mob_griefing')) || '').trim(),
   };
 }
 
@@ -748,7 +748,7 @@ async function clearArena(rcon) {
 
 // ── THE WORLD'S OWN HOSTILES ────────────────────────────────────────────────────────────────────────
 //
-// `gamerule doMobSpawning false` stops NEW spawns and says nothing whatever about the ones already
+// `gamerule spawn_mobs false` stops NEW spawns and says nothing whatever about the ones already
 // saved in the chunks a trial is about to load. Those two are not the same fact, and the bench spent a
 // run treating them as one.
 //
@@ -1497,7 +1497,7 @@ async function cleanupOnly() {
 // sentence, and a stack trace for "the server is not up" is not one.
 async function openArena({ quiet = false } = {}) {
   const scout = createScout({
-    host: '127.0.0.1', port: 25565, version: '1.21.5', username: SCOUT_NAME,
+    host: '127.0.0.1', port: 25565, version: require('@thinking/architect_config').SERVER_MINECRAFT_VERSION, username: SCOUT_NAME,
     onReady: () => log('scout', 'connected'),
     onEnd: why => log('scout', `down — ${why}`),
     log: (lvl, m) => log('scout', m),
@@ -1537,7 +1537,7 @@ async function openArena({ quiet = false } = {}) {
   const ambient = await purgeAmbientHostiles(rcon, null);
   if (!quiet && ambient) {
     log('purge', `${ambient} hostile(s) the world already owned were removed from the loaded chunks. ` +
-      `doMobSpawning=false stops new ones; it does not touch these.`);
+      `spawn_mobs=false stops new ones; it does not touch these.`);
   }
 
   return {

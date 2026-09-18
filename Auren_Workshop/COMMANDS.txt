@@ -67,7 +67,7 @@
     snapshot   a snapshot name          what fresh rolls back to
     worldName  the world folder         what it restores INTO
 
-  WHERE YOUR SERVER IS:  Auren_Bot\your_server.js   (address, port, console)
+  WHERE YOUR SERVER IS:  Auren_Bot\foreman_config.js   (address, port, console)
 
 
 ================================================================================
@@ -127,7 +127,7 @@
   node Auren_Workshop/fleet_control.js local          # world + desk, no bots
   node Auren_Workshop/fleet_control.js bots-up        # ...plus the roster
 
-  Join at localhost, Java 1.21.5.
+  Join at localhost, Java Edition 26.1.
 
 --------------------------------------------------------------------------------
   SNAPSHOTS  (the engine is told which server folder with -Root)
@@ -153,5 +153,5 @@
   Runs and the fleet     Auren_Workshop\fleet_runbook.md
   Filming                Auren_Workshop\camera_runbook.md
   Every tool, and why    Auren_Workshop\tools\README.md
-  Where your server is   your_server.js
+  Where your server is   foreman_config.js
   The laws               Auren_Structural_Laws.md

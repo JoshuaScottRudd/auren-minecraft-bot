@@ -29,7 +29,7 @@
 //
 // ── WHY THIS FILE IS NOT ITSELF BEHIND THE DOOR ─────────────────────────────────────────────────────
 // It is the door. A gate that gated its own opening would be a room with no handle on the inside. It
-// therefore sits at the top of the bot beside `start_auren.js` and `your_server.js` — the three files a
+// therefore sits at the top of the bot beside `start_auren.js` and `foreman_config.js` — the three files a
 // person is ever expected to open — and it is the ONLY ungated thing that mentions the workshop exists.
 
 const fs = require('fs');

@@ -24,7 +24,7 @@
 // the rig emits through. It carries no regexes of its own for those lines: a second copy of the grammar
 // drifts the first time a field is added (Law 26 — one interface, both ends importing it; Law 16).
 //
-// The camera trace carries no run boundary to segment on. The overseer's `start` broadcast is what splits
+// The camera trace carries no run boundary to segment on. The foreman's `start` broadcast is what splits
 // a bot trace into runs, and no camera process hears it — but every start flushes `watcher_*.jsonl`
 // wholesale, so a camera file already holds exactly one session. Inventing a boundary here would be this
 // lens deciding something the record already answers.

@@ -399,8 +399,8 @@ inside `_selfFault` itself, which is the one terminal swallow in the fleet (if `
 closed stderr there is no remaining channel to report a failure to report). A fourth shape **fails the
 pass**, immediately and hard.
 
-**The overseer link carries the same structural bend, and is left UNGUARDED rather than exempted.**
-`overseer_link.forwardLog` sends the watcher's own lines up the socket; the guard reports by calling the
+**The foreman link carries the same structural bend, and is left UNGUARDED rather than exempted.**
+`foreman_link.forwardLog` sends the watcher's own lines up the socket; the guard reports by calling the
 watcher, and this function is called *by* the watcher, so guarding it recurses on exactly the failure it
 would report. It is precluded instead of caught: an `isConnected()` precondition proves `readyState ===
 OPEN`, which is the only thing `ws.send` refuses on (Law 26 — the interface must not report through the

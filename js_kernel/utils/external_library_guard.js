@@ -65,9 +65,9 @@
 'use strict';
 
 // RELATIVE, NOT `@kernel/watcher`, AND IT MUST STAY RELATIVE. This module is required from processes
-// that do NOT register module-alias — the overseer is launched with NODE_PATH only, and every require
-// under `overseer/` is relative for exactly that reason. An alias here is unresolvable there, and the
-// failure is a hard MODULE_NOT_FOUND at overseer startup: the port never binds, the bring-up times out
+// that do NOT register module-alias — the foreman is launched with NODE_PATH only, and every require
+// under `foreman/` is relative for exactly that reason. An alias here is unresolvable there, and the
+// failure is a hard MODULE_NOT_FOUND at foreman startup: the port never binds, the bring-up times out
 // after 20 s, and the message names the guard rather than the caller that dragged it across.
 // This is the fleet's most widely-required module. It may not assume the alias table exists (Law 26 —
 // the shared piece depends only on what BOTH sides can resolve).
@@ -75,8 +75,8 @@
 // THE CHAIN IS NOT ACTUALLY CLOSED HERE, AND THIS LINE USED TO CLAIM IT WAS. The old wording said
 // *"watcher itself takes only `fs`/`path`, so the relative chain is closed here and does not cascade."*
 // The first half is true of watcher's module scope and the conclusion does not follow: `watcher.js:367`
-// lazily requires `./overseer_link` in order to forward a line, and `overseer_link` opens with
-// `@kernel/watcher`, `@overseer/message_schema` and `@utils/external_library_guard`. So the alias
+// lazily requires `./foreman_link` in order to forward a line, and `foreman_link` opens with
+// `@kernel/watcher`, `@foreman/message_schema` and `@utils/external_library_guard`. So the alias
 // dependency is real, it is one hop further out than this comment looked, and it is reached by the
 // ordinary act of LOGGING rather than by anything exotic.
 // MEASURED 2026-09-10: `start_auren.js` gained a boundary call and printed
@@ -84,7 +84,7 @@
 // require stack naming this file as the crossing. Watcher's self-fault path absorbed it, which is why
 // nothing broke and also why nobody had noticed. Every entry point registers the table now; the
 // remaining latent case is any FUTURE alias-less process that logs, and the fix for that is to make
-// `overseer_link`'s three requires relative — not done here, because this file is not its owner.
+// `foreman_link`'s three requires relative — not done here, because this file is not its owner.
 const watcher = require('../watcher');
 
 const VIOLATION_MARKER = 'CODING VIOLATION';

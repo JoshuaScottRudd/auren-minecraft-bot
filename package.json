@@ -13,7 +13,7 @@
     "@kernel": "js_kernel",
     "@js_kernel": "js_kernel",
     "@utils": "js_kernel/utils",
-    "@overseer": "overseer"
+    "@foreman": "foreman"
   },
   "engines": {
     "node": ">=22"

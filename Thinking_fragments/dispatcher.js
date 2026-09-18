@@ -60,12 +60,9 @@ const MANAGER_MAP = {
     // proactive canopy clearing (camera framing) — one-shot: fell one wild tree in a blueprint's clear
     // ring and leave. Straight to its executor; no gap-closing loop to manage.
     canopy:    'canopy_clear_executor',
-    // startup base-layout lock — one-shot: locate + lock EVERY base blueprint in one pass (headframe
-    // first as the anchor, satellites within the spread gate), so a bad seed / too-strict criterion
-    // surfaces early. Straight to its fragment; no gap-closing loop (it locks all-or-Law13 in one run).
-    // Posted by `assessors/base_layout` at base_layout_lock priority (just under home_base) while any
-    // base blueprint lacks a locked center, so the batch wins the locate race over the lazy find routes.
-    base_layout: 'lock_all_buildspots',
+    // `base_layout: 'lock_all_buildspots'` was here and is DELETED (2026-09-18) with the job that fed it: a
+    // body no longer sites its own base. The foreman sites it before the body exists and the body records
+    // it at start (`lock_all_buildspots.recordHandedSite`, called by `start_injector`).
     // startup wood-preference lock — one-shot: scan the surface for logs, publish the most abundant
     // species to the fleet's boardroom, leave. Straight to its fragment; it operates on the record only
     // (no walk, no dig, no place), so there is nothing for a manager to sequence.
@@ -160,7 +157,7 @@ function _getClaimedJobIds(excludeBotId) {
 // SECTION 2 — Magnet management
 // ─────────────────────────────────────────────────────────────────────────────
 
-// The MAGNET: advisory task-identity marker (see the taxonomy in overseer_brain.js).
+// The MAGNET: advisory task-identity marker (see the taxonomy in foreman_brain.js).
 // Reliable only because this write happens under the planning token — no peer is
 // planning while it propagates.
 function _claimJob(botId, job) {
@@ -233,14 +230,14 @@ function clearMagnet(botId) {
     // abandoned mid-await (Law 15) — leaving its anchor claim held for the full 5-min
     // STALE_CLAIM_MS TTL, long enough to starve a peer into an infinite-loop kill. Release here so
     // a dead/idle holder never squats a claim the survivor needs — one task, one LIVE owner (Law 4 / Invariant D).
-    // A REAL BOUNDARY — releaseAllClaims crosses the socket to the overseer, so a failure is the
+    // A REAL BOUNDARY — releaseAllClaims crosses the socket to the foreman, so a failure is the
     // network's and not ours.
     const release = require('@utils/external_library_guard')
-        .guardExternalSync(TAG, 'overseer releaseAllClaims', () => require('@kernel/overseer_link').releaseAllClaims());
+        .guardExternalSync(TAG, 'foreman releaseAllClaims', () => require('@kernel/foreman_link').releaseAllClaims());
     if (release.ok && release.value > 0) watcher.summary(TAG, `Released ${release.value} object claim(s) held by ${botId} on magnet clear.`);
 
     // THE CLEAR MUST BE BROADCAST, FOR THE SAME REASON THE CLAIM IS. A peer never reads this bot's chair
-    // off disk — it reads the copy the overseer relayed (mergeBroadcastChairs replaces a chair wholesale),
+    // off disk — it reads the copy the foreman relayed (mergeBroadcastChairs replaces a chair wholesale),
     // so a magnet cleared only in local HQ is still held everywhere it is consulted. _claimJob is followed
     // by sendUpdate() and this path was not, which made the release depend on an unrelated event: the
     // releaseClaim above reaches _dropClaimFromChair, which sends an update as a side effect — so the
@@ -257,7 +254,7 @@ function clearMagnet(botId) {
     // A REAL BOUNDARY — crosses the socket, so a failure is the network's and not ours, and the clear must
     // not be undone by it (the magnet is already gone locally; the update is what tells everyone else).
     require('@utils/external_library_guard')
-        .guardExternalSync(TAG, 'overseer sendUpdate', () => require('@kernel/overseer_link').sendUpdate());
+        .guardExternalSync(TAG, 'foreman sendUpdate', () => require('@kernel/foreman_link').sendUpdate());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,12 +459,12 @@ function _run() {
     // being true, and nothing else in the world tells them.
     require('@kernel/bot_voice').backToWork();
 
-    // A REAL BOUNDARY — this crosses a socket to the overseer, so a failure here is the network's and not
+    // A REAL BOUNDARY — this crosses a socket to the foreman, so a failure here is the network's and not
     // ours, and the dispatch must not be undone by it (the claim already happened; the update is telemetry
     // riding along). It goes through the guard because the previous form swallowed silently: a fleet that
     // had stopped reporting its dispatches looked identical to one that had stopped dispatching.
     require('@utils/external_library_guard')
-        .guardExternalSync(TAG, 'overseer sendUpdate', () => require('@kernel/overseer_link').sendUpdate());
+        .guardExternalSync(TAG, 'foreman sendUpdate', () => require('@kernel/foreman_link').sendUpdate());
 
     routeSignal(TAG, managerName, {
         job,
@@ -483,14 +480,14 @@ module.exports = {
     // End of the plan phase: the planning token (acquired by job_board) is
     // released on EVERY exit path, but only after _run() returns — on the
     // dispatch path _run has already claimed the magnet AND sendUpdate()'d it,
-    // so the overseer rebroadcasts this magnet BEFORE it grants the token to
+    // so the foreman rebroadcasts this magnet BEFORE it grants the token to
     // the next planner (per-socket message order guarantees the sequencing).
     // Release-before-sync would hand the next bot a stale view — never reorder.
     receive(signalType, payload) {
         require('@utils/external_library_guard').withCleanupSync(
             TAG, 'planning pass',
             () => _run(),
-            () => require('@kernel/overseer_link').releasePlanningToken());
+            () => require('@kernel/foreman_link').releasePlanningToken());
     },
     clearMagnet,
     // Exported for fragment_registry's load-time completeness assert (see the note there). Nothing else

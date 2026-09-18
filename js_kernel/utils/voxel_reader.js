@@ -155,7 +155,7 @@ function tableFor(version) {
 // drops into any existing scan. `.fast` reports which path it took — true = type table, false = full read.
 function makeVoxelReader(bot, opts = {}) {
     const needs = opts.needs || ['type'];
-    const version = opts.version || bot?.version || '1.21.5';
+    const version = opts.version || bot?.version || require('@thinking/architect_config').SERVER_MINECRAFT_VERSION;
     const unmet = needs.filter(n => !TYPE_DERIVABLE.has(n));
     const stats = { reads: 0, unloaded: 0, columnHits: 0, columnMisses: 0 };
     // A caller may hand us something that is not a live mineflayer bot — the virtual playground's bot, a

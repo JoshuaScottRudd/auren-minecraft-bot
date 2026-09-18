@@ -311,10 +311,21 @@ function _armBlastRecorder(bot) {
     // deferred health read: only true this instant (a tick later the body is gone from the table).
     // Independent of the bot's OWN body being readable — the fatal case is exactly when one read is
     // missing and the other is not. See BLAST_CENTRE_RADIUS for why this replaced a timing window.
+    //
+    // ── THE CENTRE HAS HAD TWO SHAPES, AND BOTH ARE READ (2026-09-17) ──────────────────────────────
+    // Through 1.21.x the explosion packet carried `x`, `y` and `z` as three loose f64s. 26.1 replaced
+    // them with a single `center` vector and added `radius`, `blockCount` and block particles beside it.
+    // The old read returns three `undefined`s, `Math.hypot` of those is NaN, and `NaN <= radius` is
+    // false for every entity — so this set would come back EMPTY on every blast and nobody would ever
+    // be attributed to one. Nothing throws and nothing warns; the blast line still gets written, with
+    // the "who was standing in it" half quietly reduced to nothing (Law 26 — the falsehood is
+    // well-formed, and only a check against what the packet actually carries can see it).
+    // The list below is the list of shapes the packet has had, newest first; one centre comes out.
+    const centre = p.center || p;
     _lastBlastIds = new Set();
     for (const e of Object.values(bot.entities || {})) {
       if (!e || !e.position || e === bot.entity) continue;
-      if (Math.hypot(e.position.x - p.x, e.position.y - p.y, e.position.z - p.z) <= BLAST_CENTRE_RADIUS) {
+      if (Math.hypot(e.position.x - centre.x, e.position.y - centre.y, e.position.z - centre.z) <= BLAST_CENTRE_RADIUS) {
         _lastBlastIds.add(e.id);
       }
     }
@@ -658,7 +669,7 @@ let _waveMeterLines = [];
 // DO NOT REINTRODUCE — nor a softer version: no "yield if a peer is closer", no per-mob cooldown
 // between bots, no target-diversity steering. The ONLY gates on attacking a mob are physical: in
 // reach, weapon charged.
-// TASK locks untouched (overseer_link object claims, dispatcher job claims): a job is a task; a
+// TASK locks untouched (foreman_link object claims, dispatcher job claims): a job is a task; a
 // mob never was.
 
 // ── WHAT THIS FILE NO LONGER DOES ───────────────────────────────────────────────────────────────

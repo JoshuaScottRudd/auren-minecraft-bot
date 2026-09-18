@@ -26,7 +26,7 @@
 const hq      = require('@kernel/corporate_headquarters');
 const blueprintRegistry = require('@kernel/blueprint_registry');
 // Building room keys carry an owner; this strips one back to the structure name (Law 16 — one rule, one place).
-const { roomKeyName } = require('@overseer/message_schema');
+const { roomKeyName } = require('@foreman/message_schema');
 const blueprintSurvey   = require('@perception/blueprint_survey');   // footprintExtent — the blueprint's true XZ reach (Law 1: a fragment may read a perception node directly)
 const Vec3    = require('vec3');
 

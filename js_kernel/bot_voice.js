@@ -165,16 +165,4 @@ function greet() {
 function goneIdle()  { _availability('idle', IDLE, true); }
 function backToWork() { _availability('working', WORKING); }
 
-// baseSited(center) — the homestead's one line, said by the bot that locks the headframe (see THE ONE LINE
-// A HOMESTEAD SPEAKS above). Once per base by construction: the base-layout batch locks a headframe once,
-// and every later pass finds it already locked.
-function baseSited(center) {
-  const bot = global.bot;
-  if (!bot || typeof bot.chat !== 'function') return false;   // pre-spawn / headless: no world to speak into
-  const line = `base set — headframe at ${center.x} ${center.y} ${center.z}.`;
-  const sent = guardExternalSync(TAG, 'bot.chat base sited', () => bot.chat(line));
-  if (sent.ok) watcher.summary(TAG, `announced the base in chat: "${line}"`);
-  return sent.ok;
-}
-
-module.exports = { greet, goneIdle, backToWork, baseSited, MIN_GAP_MS };
+module.exports = { greet, goneIdle, backToWork, MIN_GAP_MS };

@@ -9,7 +9,7 @@
 // `tools/machine_load_sampler.js` answers a different question — *did the box have headroom while a run
 // filmed* — and answers it for the WHOLE machine over time, which is right for that question and wrong for
 // this one. A whole-machine before/after delta would fold three things into one number that must be kept
-// apart: the Minecraft server (which may not even be on the same machine as the bots), the overseer (one
+// apart: the Minecraft server (which may not even be on the same machine as the bots), the foreman (one
 // per fleet, not one per bot), and whatever else the operator happens to be doing on that desktop while
 // the probe runs. Attribution is the entire point here, so this reads per-process counters
 // and reports each role separately. Neither instrument can answer the other's question; there is no
@@ -268,7 +268,7 @@ async function probe(seconds, note) {
     console.log(`PER BOT (mean of ${bots.length}):   ${coreEach.toFixed(1)}% of one core   ${memEach.toFixed(0)} MB peak resident`);
     console.log(`PER PAIR (one human):  ${(coreEach * 2).toFixed(1)}% of one core   ${(memEach * 2).toFixed(0)} MB peak resident`);
     console.log('');
-    // Stated separately BECAUSE it does not multiply: one overseer serves the fleet, and the Minecraft
+    // Stated separately BECAUSE it does not multiply: one foreman serves the fleet, and the Minecraft
     // server is not on the bot host at all in the target architecture.
     const shared = rows.filter(r => !r.died && !isBot(r.role));
     if (shared.length) {

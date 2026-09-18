@@ -112,7 +112,7 @@ function announceFirstMove(steps) {
 // it does not false-fire.
 //
 // WHY warn() AND NOT error() — do not re-promote this to be "louder". It WAS error() for one day,
-// borrowed as the loud channel because error() forwards to the overseer and trips wake-on-error. That
+// borrowed as the loud channel because error() forwards to the foreman and trips wake-on-error. That
 // broke the attended loop within 8 minutes on 2026-07-20: a non-fatal error is PERMANENT in the trace
 // and --watch wakes on errors at ANY index, so every re-arm re-woke on the same historical tripwire,
 // forever, with no new event. The root fault was a category error (Law 26) — the prose said "NON-FATAL,

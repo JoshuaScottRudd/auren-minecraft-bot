@@ -1,13 +1,13 @@
-// overseer/overseer_brain.js
-// Claim arbiter — the overseer's only decision-making role. Everything else the
-// overseer does is pure relay (Law 3); arbitration is the sanctioned exception:
+// foreman/foreman_brain.js
+// Claim arbiter — the foreman's only decision-making role. Everything else the
+// foreman does is pure relay (Law 3); arbitration is the sanctioned exception:
 // it orders ACCESS to things, it never decides WHAT a bot should do.
 //
 // ── The de-confliction taxonomy (canonical — all site comments point here) ──
 //
 //   MAGNET (not this file — dispatcher.js writes it, boardroom chair carries it):
 //     A soft, ADVISORY marker of "which job I am doing". Eventually consistent —
-//     broadcast through the overseer, so a peer's view can lag. It de-conflicts
+//     broadcast through the foreman, so a peer's view can lag. It de-conflicts
 //     JOB IDENTITY only, and only reliably because the planning token (below)
 //     guarantees no two bots ever plan against a stale peer view.
 //
@@ -34,7 +34,7 @@
 
 'use strict';
 
-// Pure data, no aliases — safe to require in both the bot and overseer processes.
+// Pure data, no aliases — safe to require in both the bot and foreman processes.
 const { BOT_SENIORITY } = require('../Thinking_fragments/architect_config');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ const { BOT_SENIORITY } = require('../Thinking_fragments/architect_config');
 // silently gone. The cost is that a NEW claimant whose prefix is missing is refused every time — its
 // object is permanently unclaimable, which reads at the executor as "a peer holds every candidate" and
 // ends as a concede-reclaim loop nobody can diagnose from the executor's own line. That is why the
-// rejection now carries `fault: 'claimant'` and overseer_link throws on it: the refusal must arrive as
+// rejection now carries `fault: 'claimant'` and foreman_link throws on it: the refusal must arrive as
 // the coding violation it is, not as a world condition (Law 13).
 // 'stone_column:' — stone_prospect_executor, one key per surface column it opens.
 // 'grass:' — seed_picker, one key per tuft, held for a single punch (Architect 2026-09-15). Exact-block:
@@ -298,7 +298,7 @@ function releaseForBot(botId) {
 // THE ARBITER'S DECISIONS BELONG IN THE RUN RECORD, NOT ONLY ON A CONSOLE
 // (2026-09-10). Every line this file writes went to `console.log` and nowhere
 // else, so the one component that decides which bot may think was absent from
-// `watcher_overseer.jsonl` entirely — no grant, no queue entry, no TTL
+// `watcher_fleet.jsonl` entirely — no grant, no queue entry, no TTL
 // expiry, nothing a lens could read.
 //
 // Measured cost of that, the day it was fixed: a 15-minute standard run died at
@@ -314,7 +314,7 @@ function releaseForBot(botId) {
 // server, no transport and no side effects), so it cannot reach for the
 // server's writer itself. The server registers its persister at listen time;
 // with nothing registered the lines still print, which is what a cold require
-// and a bare `node overseer_brain.js` should do.
+// and a bare `node foreman_brain.js` should do.
 // ─────────────────────────────────────────────────────────────────────────────
 
 let _logSink = null;
@@ -325,7 +325,7 @@ function onLog(callback) {
 
 function log(msg) {
   const ts = new Date().toISOString();
-  const line = `[${ts}] [OVERSEER_BRAIN] ${msg}`;
+  const line = `[${ts}] [FOREMAN_BRAIN] ${msg}`;
   console.log(line);
   if (_logSink) _logSink(line);
 }

@@ -38,7 +38,7 @@
 'use strict';
 
 const { relativeTime, percent } = require('./report_formatting');
-const { buildEpisodes, jobToken, OVERSEER_UNITS } = require('./trace_read');
+const { buildEpisodes, jobToken, FOREMAN_UNITS } = require('./trace_read');
 // The one writer to stdout. `padRight`/`padLeft` are no longer imported here because this lens no longer
 // owns a single space in its own output — data_out computes every column width from the data.
 const out = require('./data_out');
@@ -210,7 +210,7 @@ function reduceWoodLedger({ seg = [], bot: botFilter = null } = {}) {
   let censusFirst = null, censusLast = null;
 
   for (const l of seg) {
-    if (!l.bot || OVERSEER_UNITS.has(l.bot)) continue;
+    if (!l.bot || FOREMAN_UNITS.has(l.bot)) continue;
     if (botFilter && l.bot !== botFilter) continue;
     const s = seat(l.bot);
     let m;

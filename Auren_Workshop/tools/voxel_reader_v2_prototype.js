@@ -182,7 +182,7 @@ const MEMO_XZ_RANGE = 1023;   // +/- 1023 blocks from origin; a search past that
 function packKey(dx, dz, y) { return ((dx + 1024) << 20) | ((dz + 1024) << 9) | (y + 64); }
 
 function makeVoxelReaderV2(bot, opts = {}) {
-    const version = opts.version || bot?.version || '1.21.5';
+    const version = opts.version || bot?.version || require('@thinking/architect_config').SERVER_MINECRAFT_VERSION;
     const stats = { reads: 0, unloaded: 0, columnHits: 0, columnMisses: 0, memoHits: 0, memoMisses: 0 };
     const table = tableFor(version);
 

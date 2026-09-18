@@ -2,7 +2,7 @@
   "_meta": {
     "purpose": "What every hostile DOES — its own tactics, not the bot's counters. Read monster_tactics_registry.js before using this.",
     "authored": "2026-07-30",
-    "game_version": "Java 1.21.5 (matches master_core.js:54)",
+    "game_version": "Java 26.1 (architect_config.SERVER_MINECRAFT_VERSION is the one authored answer)",
     "difficulty_basis": "normal — melee damage is typically x1.5 on hard and x0.5 on easy; several effects (cave spider poison, husk hunger) do not apply on easy at all",
     "CONFIDENCE": {
       "warning": "This document is AUTHORED FROM KNOWLEDGE, NOT MEASURED IN-WORLD. Nothing here has been observed by this fleet. Treat every field as a CLAIM to verify (Law 23), never as a sensed fact — a counter built on a wrong number will fail in a way that looks like bad tactics rather than bad data.",

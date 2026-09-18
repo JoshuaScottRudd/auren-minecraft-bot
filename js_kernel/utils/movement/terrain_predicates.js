@@ -84,9 +84,16 @@ const _binByState = new Map();
 // a door's collision is one full-height slab against a wall (`[0,0,0,0.1875,1,1]`), so rim is 1.0 and the
 // centre column is empty, and rim-minus-nothing looks exactly like an infinitely deep pit. It is the
 // opposite — a partial WALL. A body never rests in that cell at all; it stands on the block below and this
-// predicate is not the question being asked. Measured against the whole 1.21.5 block table: with the
-// support clause, five block families answer true (composter and the four cauldrons) and nothing else;
-// without it, fifty-four do, including every door and every trapdoor.
+// predicate is not the question being asked. Measured against the WHOLE block table, every state of every
+// block: with the support clause, five block families answer true (composter and the four cauldrons) and
+// nothing else; without it, every door and every trapdoor joins them.
+//
+// RE-MEASURED ON 26.1 (2026-09-17, when the fleet left 1.21.5) and the rule is unchanged where it counts:
+// still exactly those five families with the clause. The count WITHOUT the clause moved 54 → 66, because
+// 26.1 added more door and trapdoor variants — which is the clause earning its place a second time rather
+// than a result that needs acting on. Re-run it after any version bump: it is a few lines over
+// `prismarine-registry(<version>)` walking `minStateId..maxStateId` per block, and a bump that changes the
+// five is a bump that changes what a body can climb out of.
 function _binFromShapes(shapes) {
   if (!Array.isArray(shapes) || shapes.length === 0) return false;
   let rim = 0;
@@ -121,7 +128,7 @@ function isOpenTopContainer(block) {
 // guarantee's permanent home is a throw in the module that owns the data, never a test file). Literal
 // geometry rather than a live registry: the claim under test is the ARITHMETIC, and a registry dependency
 // in the fleet's hottest leaf module would risk every bot's startup to check it. Every array below is
-// COPIED FROM prismarine-registry 1.21.5, never hand-drawn — an invented shape tests the fiction it was
+// COPIED FROM prismarine-registry (originally 1.21.5, re-checked on 26.1), never hand-drawn — an invented shape tests the fiction it was
 // drawn from, which is a well-formed falsehood wearing a pass (Law 26). oak_door and hopper are here as
 // the two near-misses that a plausible simplification of the rule gets wrong in each direction.
 for (const [name, shapes, mustBeBin] of [

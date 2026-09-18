@@ -91,7 +91,7 @@ function assess() {
         if (buildable) {
             // scope:'local' — UNLIKE the shaft: many buildable cells at once, so every bot claims
             // dig_cell concurrently and mining_manager fans them onto DIFFERENT cells. The fleet-wide
-            // `cell:<id>` lock (overseer-arbitrated; selection skips heldByPeer) gives each cell one
+            // `cell:<id>` lock (foreman-arbitrated; selection skips heldByPeer) gives each cell one
             // owner. 'shared' capped the field at one miner and left the fan-out dormant. Law 4: one
             // cell per bot, one bot per cell — the cell lock, not the job magnet, is the exclusivity.
             jobs.push({

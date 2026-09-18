@@ -162,14 +162,14 @@ async function _selectAndDispatchCell(payload, bot, miningPass) {
         }
 
         // Arbiter flavor (a) — physical exclusivity on the cell, chosen at execution time from live
-        // perception (the planning token can't cover it; taxonomy in overseer_brain.js).
+        // perception (the planning token can't cover it; taxonomy in foreman_brain.js).
         // Lazily required here as well as in `receive` — the two are separate functions, and this helper
         // had been reading `receive`'s binding, which it never had. Every claim threw a ReferenceError, and
         // the guard that used to stand here reported it as an errored claim and returned undispatched, so no
         // cell was mined for a day while the log read like ordinary contention (Law 13, Law 16). Kept lazy to
         // match `receive`: require's cache makes the repeat free.
-        const overseerLink = require('@kernel/overseer_link');
-        const claim = await overseerLink.requestClaim(`cell:${candidate.id}`);
+        const foremanLink = require('@kernel/foreman_link');
+        const claim = await foremanLink.requestClaim(`cell:${candidate.id}`);
         if (!claim.granted) { heldByPeer.add(candidate.id); continue; }
 
         const cell = candidate;
@@ -278,7 +278,7 @@ module.exports = {
     hasMiningLight,
     receive: watcher.track(TAG, async function (signalType, payload) {
         if (signalType !== TAG) return;
-        const overseerLink = require('@kernel/overseer_link');
+        const foremanLink = require('@kernel/foreman_link');
 
         const botId = process.env.BOT_ID || 'default';
         const magnet = hq.readBoardroomChair(botId, {})?.magnet;
@@ -360,7 +360,7 @@ module.exports = {
                 const maintenance = !!cell.maintenance;
 
                 if (capsule.cell_clean) {
-                    overseerLink.releaseClaim(`cell:${cell.id}`);
+                    foremanLink.releaseClaim(`cell:${cell.id}`);
                     miningCellGraph.markCellComplete(cell.id);
                     // Growth completion grows the A* frontier; a maintenance repair does not
                     // (its neighbours were registered when it first completed — idempotent, skip).
@@ -396,7 +396,7 @@ module.exports = {
                     // bot can get to. Block for inspection rather than fake-complete (Law 13). A stuck
                     // REPAIR blocks as 'maint_stuck' so it's skipped (bounded) yet stays inspectable;
                     // the cell is still physically built, just can't finish this repair.
-                    overseerLink.releaseClaim(`cell:${cell.id}`);
+                    foremanLink.releaseClaim(`cell:${cell.id}`);
                     const stuck = maintenance ? 'maint_stuck' : 'stuck';
                     miningCellGraph.markCellBlocked(cell.id, stuck);
                     watcher.warn(TAG, `cell ${cell.id} ${maintenance ? 'repair ' : ''}stuck — ${remaining} step(s) unreachable after a no-progress pass; blocked (${stuck}) for inspection.`);
@@ -407,7 +407,7 @@ module.exports = {
                 // Shrinking — more progress possible. Re-pass the same cell up to the cap, then surface
                 // (job_board may re-select it later for another batch; progress is recorded, so it resumes).
                 if (capReached) {
-                    overseerLink.releaseClaim(`cell:${cell.id}`);
+                    foremanLink.releaseClaim(`cell:${cell.id}`);
                     await _exitMine(bot, site, `cell ${cell.id} ${maintenance ? 'repairing' : 'progressed'} — batch cap (${N}) reached, ${remaining} step(s) left`);
                     return;
                 }

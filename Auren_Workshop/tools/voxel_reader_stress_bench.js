@@ -48,7 +48,10 @@ const DIST     = Number(arg('dist', 64));
 const REPEAT   = Number(arg('repeat', 6));
 const MAXNODES = Number(arg('nodes', 30000));
 const CHURN_N  = Number(arg('churn', 120));
-const VERSION  = arg('version', '1.21.5');
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const { SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
+const VERSION  = arg('version', SERVER_MINECRAFT_VERSION);
 // ONE `..` — __dirname is Auren_Workshop/tools, so this lands in Auren_Bot/fleet_logs beside every other
 // record. It carried two, which resolved to the REPO ROOT and created a second, untracked fleet_logs/
 // there on each run — a shadow copy of the directory the monitors read, which is the second pathway

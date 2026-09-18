@@ -29,30 +29,30 @@
 //   3. Judge the WHOLE layout at once: a satellite that finds no valid site, or the field finding ZERO plots,
 //      is the failure. A field SHORT of FARM_PLOT_COUNT is NOT a failure — a partial ad-hoc field still feeds
 //      the fleet; the unfilled instances idle (the one place the batch forgoes whole-or-nothing, on purpose).
-//   4. All found → lock them all (set_buildspot.lock). A genuine miss → Law 13, lock NOTHING (default-stopped).
+//   4. All found → return them as the site (the foreman's hub writes them). A genuine miss → Law 13, NOTHING returned.
 //      A transient (world still streaming: no water in the loaded area yet) soft-fails for a retry.
+//
+// IT ONLY SURVEYS, AND THE FOREMAN IS ITS ONE CALLER (2026-09-18). The desk surveys before any body exists
+// and its hub writes the answer (`foreman_hub.lockSite`); a body never runs this and never writes a site
+// (*"Bots can't set their own points now"*).
 //
 // NO NAVIGATION HERE (2026-09-11). A walk-and-rescan lived here for one afternoon and was ruled out: *"water
 // biome only, bank only, cluster only. that way it can find what it needs the first time instead of walk anc
 // check again… id rather the walk be farther because it will setup its base there."* The survey waits for
 // the loaded area to arrive, reads it once, and locks the biggest sea-level water clusters in it wherever
-// they are; the crew walks there to build, which is the only walk a base needs. The bot that locks the headframe
-// says where in chat (bot_voice.baseSited), so a person watching a crew walk off knows why. This fragment
-// joins no build pathway. Reuses
-// the extracted engines: wheat_trident_scanner (field siting) + find_buildingspot.locate (satellite siting)
-// + set_buildspot.lock (commit) — Law 16, one siter per field, one lock primitive.
+// they are; the crew walks there to build, which is the only walk a base needs. The desk says where in chat
+// before the crew is fetched. This fragment joins no build pathway. Reuses the extracted engines:
+// wheat_trident_scanner (field siting) + find_buildingspot.locate (satellite siting) — Law 16, one siter per
+// field. The commit is the hub's (`site_chairs` builds the rows it writes).
 
 'use strict';
 
 const watcher = require('@kernel/watcher');
 const hq      = require('@kernel/corporate_headquarters');
-const { routeToJudge } = require('@utils/signal_utils');
 const { locate, loadBlueprintDims, getExistingFootprints, footprintBox } = require('@action/find_buildingspot');
-const { lock } = require('@action/set_buildspot');
 const { footprintExtent } = require('@perception/blueprint_survey');   // a plot's reach at its own rotation
 const { plotRotation, loadedAreaSettled, settleLine, SETTLE_MAX_MS } = require('@utils/wheat_plot_scanner');
 const { scanWheatTrident, describeTrident } = require('@utils/wheat_trident_scanner');
-const { baseSited } = require('@kernel/bot_voice');
 const { MIN_BLUEPRINT_SPACING, FARM_BLUEPRINT_NAME, FARM_PLOT_COUNT, FARM_ROOM_KEYS,
         BOT_MODES } = require('@thinking/architect_config');
 
@@ -151,6 +151,8 @@ function baseLayoutComplete() {
   // different jobs, and a shared answer would mean a contractor reporting incomplete forever over a farm
   // it will never site (which re-posts the job, which reports incomplete, which is the loop Law 27 names).
   if (require('@kernel/bot_mandate').isContractor()) return !!readLockedCenter(CONTRACTOR_ROOM_KEY);
+  // A builder's hub is the headframe; its blueprint site joins this answer when builder siting is written.
+  if (require('@kernel/bot_mandate').isBuilder()) return !!readLockedCenter('headframe');
   if (!readLockedCenter(FARM_ROOM_KEYS[0])) return false;
   return SATELLITES.every(s => !!readLockedCenter(s.roomKey));
 }
@@ -223,18 +225,17 @@ async function surveyOne(bot, spec, origin, pendingRaw, unlocked) {
   });
 }
 
-// run(bot, { dryRun, species }) — the batch core, and THE ONE SITER for a base (Law 16). Surveys all
-// blueprints, judges the whole layout, and (unless dryRun) locks them.
-// Returns { ok, report:[lines], locked:[roomKeys] } · { ok:false, problems:[...] } when the ground cannot
+// run(bot, { dryRun: true, species }) — the batch core, and THE ONE SITER for a base (Law 16). Surveys all
+// blueprints and judges the whole layout; it writes nothing.
+// Returns { ok, report:[lines], site:[rows], anchor } · { ok:false, problems:[...] } when the ground cannot
 // hold the layout · { ok:false, transient:true } when the world is not streamed in yet.
 //
-// TWO CALLERS, AND THE SECOND ONE IS WHY `dryRun` AND `species` EXIST (Architect 2026-09-12):
-//   · the BODY, at startup, with dryRun off — it locks.
-//   · the FOREMAN, before it spawns anybody, with dryRun on — it asks *can a base be raised where this
-//     person stands*, and refuses to launch when the answer is no. *"if foreman cant set the blueprints
-//     then it refuses to spawn the bots and explains that it cant."*
-// One function answers both, so a desk that lets a crew through and a crew that then cannot site itself
-// is not a reachable pair of outcomes.
+// ONE DECIDING CALLER — THE FOREMAN, BEFORE IT SPAWNS ANYBODY (Architect 2026-09-12, finished 2026-09-18).
+// It asks *can a base be raised here*, refuses to launch when the answer is no (*"if foreman cant set the
+// blueprints then it refuses to spawn the bots and explains that it cant"*), and otherwise hands `site` to
+// every body it launches. The body used to run this same survey again and lock its own answer; now it
+// records the desk's (*"its no longer a job any bots do… so the bots come in and get straight to work"*).
+// `surveylayout` and a bot's `test_locklayout` also call it, and both only look.
 //
 // `species` IS PASSED RATHER THAN SENSED, for the desk's sake. The body branch below read
 // `bot_mandate.isContractor()` — its own constitution — which is exactly right for a body and impossible
@@ -261,12 +262,19 @@ function surveyOrigin(bot, surveyFrom) {
 }
 
 async function run(bot, opts = {}) {
-  const dryRun = !!opts.dryRun;
+  // THE SURVEY ONLY LOOKS (2026-09-18). Its locking tail had one caller — the body's own `lock_base_layout`
+  // job — and that job is deleted: the foreman sites the base before any body exists and its hub writes the
+  // answer (`foreman_hub.lockSite`). A caller still asking this to lock is wired for the old shape, and is refused
+  // loudly rather than quietly handed a survey it thinks was committed.
+  if (opts.dryRun !== true) {
+    throw new Error(`[${TAG}] CODING VIOLATION (Law 13): run() surveys and never locks — pass { dryRun: true }. `
+      + "A base is locked only by the foreman's hub (foreman_hub.lockSite), with the rows this survey returns.");
+  }
+  const dryRun = true;
   if (!bot?.entity?.position) {
     throw new Error(`[${TAG}] CODING VIOLATION: run() needs a body with a position. The bot must be registered before the batch runs.`);
   }
-  const species = opts.species
-    || (require('@kernel/bot_mandate').isContractor() ? BOT_MODES.CONTRACTOR : BOT_MODES.HOMESTEADER);
+  const species = opts.species || require('@kernel/bot_mandate').currentMode();
   // CARRIED AS AN ARGUMENT, NOT A MODULE FLAG. A flag would be process state two callers share, and the
   // one that forgot to clear it would silently blind a body to its own HQ (Law 8 — nothing outlives its
   // owner; here the owner is this one call). `origin` rides the same way and for the same reason.
@@ -282,6 +290,15 @@ async function _run(bot, { dryRun, species, unlocked, surveyFrom }) {
   // needs flat ground.
   if (species === BOT_MODES.CONTRACTOR) {
     return runContractorLayout(bot, dryRun, unlocked, surveyFrom);
+  }
+  // A BUILDER'S LAYOUT IS NOT THIS SURVEY. Its base is one downloaded blueprint with the headframe beside it
+  // and stone near both (§29.4) — no water, no farm anchor — and it is sited by the foreman from a build plan.
+  // Running it through the estate path below would hunt a shoreline for a farm the species never plants.
+  // Refused rather than approximated until the builder's own siting is written (scratchpad §29.13, item 2).
+  if (species === BOT_MODES.BUILDER) {
+    throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a builder's base is sited from its build plan by the foreman, `
+      + 'and that siting is not written yet. This survey is the homestead\'s and the contractor\'s, and would site a '
+      + 'wheat farm for a species that has none.');
   }
 
   const report = [];
@@ -428,6 +445,22 @@ async function _run(bot, { dryRun, species, unlocked, surveyFrom }) {
   return finish(dryRun, report, toLock, problems, transient);
 }
 
+// siteRow — one surveyed-and-passing structure as the desk hands it to a body: the plain room name (the
+// owner half is the body's own), the blueprint, and the four candidate fields `lock` writes.
+function siteRow({ spec, candidate }) {
+  const bc = candidate.build_center;
+  return {
+    blueprint: spec.blueprint,
+    roomKey: spec.roomKey,
+    candidate: {
+      build_center: { x: bc.x, y: bc.y, z: bc.z },
+      footprint: candidate.footprint || null,
+      staircase: candidate.staircase || null,
+      rotation: candidate.rotation ?? 0,
+    },
+  };
+}
+
 // finish — the shared judgment tail: emit the survey report, then transient-soft / Law-13 / lock-all.
 function finish(dryRun, report, toLock, problems, transient) {
   watcher.summary(TAG, `Base-layout survey:\n  ${report.join('\n  ')}`);
@@ -467,60 +500,14 @@ function finish(dryRun, report, toLock, problems, transient) {
     return c ? { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z) } : null;
   };
 
-  if (dryRun) {
-    watcher.summary(TAG, `Dry run: all ${toLock.length} blueprint(s) would lock (nothing written).`);
-    return { ok: true, dryRun: true, report, locked: [], anchor: anchorOf(toLock) };
-  }
-
-  const locked = [];
-  for (const { spec, candidate } of toLock) {
-    lock(candidate, spec.blueprint, spec.roomKey);
-    locked.push(spec.roomKey);
-  }
-  // The base is where the headframe is, and a person watching the crew walk off to it needs to hear where
-  // that is (bot_voice's one homestead line). Only the pass that locked it speaks; a later pass finds it
-  // already locked and has nothing in `toLock` for it.
-  const headframe = toLock.find(t => t.spec.roomKey === 'headframe');
-  if (headframe) baseSited(headframe.candidate.build_center);
-  watcher.summary(TAG, `✅ Base layout locked as one unit: ${locked.length ? locked.join(', ') : 'nothing new (all already locked)'}.`);
-  return { ok: true, report, locked, anchor: anchorOf(toLock) };
+  // THE SITE ITSELF, returned so the desk's hub can WRITE IT (Architect 2026-09-18: *"Bots can't set their own
+  // points now"*). Each row carries exactly the fields `site_chairs.siteChairs` reads, and nothing the survey
+  // computed on the way.
+  watcher.summary(TAG, `Survey: all ${toLock.length} blueprint(s) would lock (nothing written here — the foreman's hub writes the site).`);
+  return { ok: true, dryRun: true, report, locked: [], anchor: anchorOf(toLock), site: toLock.map(siteRow) };
 }
 
 module.exports = {
   run,
   baseLayoutComplete,
-  receive: watcher.track(TAG, async function (signalType, payload) {
-    if (signalType !== TAG) return; // strict contract
-    const bot = global.bot;
-
-    const result = await run(bot, { dryRun: false });
-
-    if (result.transient) {
-      routeToJudge(TAG, {
-        ...payload,
-        result: 'base_layout_pending', success: false,
-        readable: `${TAG}: world not loaded yet — retry base-layout lock`,
-      });
-      return;
-    }
-    // GROUND THAT WILL NOT HOLD THE LAYOUT — reported, never thrown (see `finish`). A body should rarely
-    // reach this: the foreman surveys the same ground with `dryRun` before it launches anybody, so an
-    // unsuitable spot is normally refused at the desk with nobody spawned. It stays handled here because
-    // the desk's survey and this one are seconds apart and the world can move between them (a player
-    // walks, water freezes), and because a body raised any other way than by the desk still lands here.
-    if (!result.ok) {
-      routeToJudge(TAG, {
-        ...payload,
-        result: 'base_layout_refused', success: false,
-        readable: `${TAG}: base layout cannot be placed from here — ${result.problems.join('; ')}. Nothing locked.`,
-      });
-      return;
-    }
-    routeToJudge(TAG, {
-      ...payload,
-      result: 'base_layout_locked', success: true,
-      lock_all_buildspots: { locked: result.locked },
-      readable: `${TAG}: base layout locked (${result.locked.join(', ') || 'all already locked'}) -> recursive_judge`,
-    });
-  }),
 };

@@ -582,7 +582,7 @@ function extractEvent(line) {
   const tag = line.match(/\[([A-Z][A-Z_]+)\]/);
   if (!tag) return null;
   const sys = tag[1];
-  if (sys === 'OVERSEER_LINK' && line.includes('Online at')) {
+  if (sys === 'FOREMAN_LINK' && line.includes('Online at')) {
     return { kind: 'cut', type: 'OPENING', at: xyz(line.match(PAREN)) };
   }
   if ((sys === 'SET_BUILDSPOT' && line.includes('build_center'))

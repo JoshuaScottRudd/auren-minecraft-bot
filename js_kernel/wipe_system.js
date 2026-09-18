@@ -3,7 +3,7 @@
 // their base.
 //
 // ── WHY THIS IS NOT flush WITH AN ARGUMENT ────────────────────────────────────────────────────────────
-// `flush` resets corporate_headquarters WHOLE and the overseer clears its shared mirror alongside it, so
+// `flush` resets corporate_headquarters WHOLE and the foreman clears its shared mirror alongside it, so
 // it erases every owner's stations, every owner's structures and every human's standing requests at once.
 // That radius is correct for the terminal, where the whole fleet is one person's responsibility. It is
 // wrong for a human standing in the world, who is accountable for their own crew and nobody else's — and
@@ -19,7 +19,7 @@
 //
 // ── THE SCOPE IS THE KEY, NOT AN ARGUMENT (Law 27) ────────────────────────────────────────────────────
 // NOTHING IS PASSED IN. The owner is read from this process's own mandate, exactly as station_registry
-// reads it to WRITE a row. The verb is delivered only to the asker's own bots (the overseer's owner
+// reads it to WRITE a row. The verb is delivered only to the asker's own bots (the foreman's owner
 // filter), and each of those bots can form only its own owner's keys — so "wipe my things" needs no
 // argument saying whose, and no argument exists in which to name somebody else's. A wipe that took an
 // owner would be a permission check waiting to be got wrong; this cannot address a foreign row because
@@ -34,7 +34,7 @@
 // travels; an absence is not (Law 16 — one pathway for removal, and station_registry already owns it).
 //
 // usage:
-//  - console/overseer: the 'wipe' verb via operator_commands (Law 16: one pathway)
+//  - console/foreman: the 'wipe' verb via operator_commands (Law 16: one pathway)
 //  - in-game: the foreman's `wipe`, which is the only reason it exists
 
 'use strict';
@@ -43,7 +43,7 @@ const watcher = require('@kernel/watcher');
 const hq = require('@kernel/corporate_headquarters');
 const botMandate = require('@kernel/bot_mandate');
 const stationRegistry = require('@perception/station_registry');
-const { roomKeyOwner, isBuildingTombstone } = require('@overseer/message_schema');
+const { roomKeyOwner, isBuildingTombstone } = require('@foreman/message_schema');
 
 const TAG = 'wipe_system';
 

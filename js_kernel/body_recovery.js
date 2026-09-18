@@ -206,7 +206,7 @@ async function teleportTo(bot, at, { name = null } = {}) {
 //     silently for any player standing outside the caller's view distance — which, on an open-chat desk
 //     that hears the whole map, is most of them.
 //   · The caller here is the FOREMAN, which holds no handle on the body it is moving: contractors are
-//     separate OS processes and the desk knows them only through the overseer's registry.
+//     separate OS processes and the desk knows them only through the foreman's registry.
 //
 // ── IT REPORTS `sent`, NOT `moved`, AND THAT WORD IS THE WHOLE DISCLOSURE ────────────────────────────
 // `teleportTo`'s header says the fleet's two recovery acts share one property: *"neither act trusts its

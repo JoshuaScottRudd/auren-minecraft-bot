@@ -59,17 +59,40 @@ const PERSON_CLEAR_OF_SPAWN = 50;
 //
 // THE ENV OVERRIDE EXISTS FOR THE SAME REASON THE ENDPOINT'S DOES, one paragraph down: this value is a
 // fact about SOMEBODY ELSE'S SERVER, and the moment the bot runs on a machine that is not the Architect's
-// it is a fact we do not know. `1.21.5` stays the authored default because it is what his world runs and
+// it is a fact we do not know. `26.1` stays the authored default because it is what his world runs and
 // what every bench is pinned to; the override is what lets a stranger on 1.21.1 start a bot without
 // editing tracked code — an edit that would travel to every machine through git and be wrong on all but
 // one. Read once, here, and nowhere else. `start_bot.js --version` is what sets it.
 //
-// NOT VALIDATED against a list of known versions, deliberately. The set of valid values belongs to
+// ── WHY 26.1 AND NOT THE NEWEST MINECRAFT (raised 2026-09-17, from 1.21.5) ───────────────────────────
+// The ceiling is not Mojang's latest release; it is the newest protocol the client library can SPEAK.
+// Mojang's newest at this writing is 26.3. `minecraft-protocol` 1.68.0 — the newest published — ends its
+// supported list at `26.1` (protocol 775), and `mineflayer` 4.39.0 lists `26.1` as its newest TESTED
+// version. 26.2 is protocol 776 and no published release of either package handles it, so the fleet
+// cannot reach it however new the server jar is. Every package in `package.json` was already at its
+// newest published version when this was raised, so there was nothing to upgrade underneath.
+//
+// The one number that matters to a server folder: 26.1 and 26.1.2 share protocol 775, so a 26.1.2 jar
+// would also work; the AUTHORED value stays exactly 26.1 because that is the version whose block and
+// item registry minecraft-data hands the bot, and a registry that matches the server exactly is worth
+// more here than two patch releases of server-side bugfixes.
+//
+// NO LIST OF VALID VERSIONS LIVES IN THIS FILE, deliberately. The set of valid values belongs to
 // minecraft-data and changes every time that package updates; a list here would be a second, staler copy
-// of somebody else's fact (Law 16), and would refuse a version that actually works. A wrong value fails
-// inside minecraft-data with a message that names the version and lists what it does support, which is a
-// better error than any this file could author.
-const SERVER_MINECRAFT_VERSION = process.env.AUREN_MINECRAFT_VERSION || '1.21.5';
+// of somebody else's fact (Law 16), and would refuse a version that actually works.
+//
+// IT IS CHECKED, THOUGH — AND NOT BY THIS FILE (added 2026-09-17). `preflight.js` carries a **Version
+// ceiling** pass that reads `minecraft-protocol.supportedVersions` and `mineflayer.testedVersions` off
+// the installed packages, intersects them, and compares the value above against the result by PROTOCOL
+// NUMBER. Same principle, moved to where it belongs: the lists stay the libraries', and nothing here
+// copies them. It refuses when this value is not a version both libraries carry, and it PRINTS — without
+// failing — when they have moved ahead of it.
+//
+// That last case is why the pass exists at all, and it is the thing a comment could never do: **the
+// ceiling rises when somebody runs `npm update`, not when anybody decides anything.** Read the paragraph
+// above as the reason 26.1 was chosen, and the pass as the thing that will tell you when it stops being
+// the answer. Do not re-derive those two fields by hand; run preflight.
+const SERVER_MINECRAFT_VERSION = process.env.AUREN_MINECRAFT_VERSION || '26.1';
 
 // SERVER_ENDPOINT — where a body connects to reach the world. It lived as a literal `localhost:25565` in
 // master_core's createBot call, twice more in the camera rig's two clients, and as a private env pair in
@@ -82,18 +105,18 @@ const SERVER_MINECRAFT_VERSION = process.env.AUREN_MINECRAFT_VERSION || '1.21.5'
 // git and be wrong on all but one. `AUREN_SERVER_HOST` / `AUREN_SERVER_PORT` are read once, here, and
 // nowhere else — `fleet_control` spawns bots with `{...process.env}`, so a value set in the launching
 // shell reaches every body without any of them knowing it was overridden.
-// THE VALUE AND THE ENV HANDLING BOTH MOVED TO `Auren_Bot/your_server.js` (2026-09-11), and this is now
+// THE VALUE AND THE ENV HANDLING BOTH MOVED TO `Auren_Bot/foreman_config.js` (2026-09-11), and this is now
 // a re-export rather than a second answer. Same defaults, same overrides, same validation — what changed
 // is only WHERE a person edits them. This file is the fleet's brain: nine hundred lines of reach
 // distances, job tiers, blueprint names and seniority, none of which a downloader should have to open in
-// order to say "my server is on a different port". `your_server.js` is that page, it sits at the top of
+// order to say "my server is on a different port". `foreman_config.js` is that page, it sits at the top of
 // the bot beside the README, and it holds nothing else.
 //
 // THE RE-EXPORT STAYS because the endpoint is read by name in the foreman, the camera rig and the seed
 // scanner, and one of those is a shipped tool a stranger runs. Renaming the constant across them would
 // buy nothing; having two files each compute `process.env.AUREN_SERVER_HOST || 'localhost'` would be the
 // parallel-array fault this file exists to prevent (Law 16), and that is what this line avoids.
-const SERVER_ENDPOINT = require('../your_server');
+const SERVER_ENDPOINT = require('../foreman_config');
 
 // Fleet pecking order for peer tiebreaks. Lower = elder = higher priority; a bot absent from this table
 // ranks most-junior and yields to all.
@@ -239,7 +262,9 @@ const JOB_TYPES = [
         // cannot be exercised, and the daylight-gate check below would then guard a name no job carries.
         // Removing it shifts the rungs beneath it by one and changes no PAIRWISE order, which is all a
         // band comparison reads. Reasons: `assessor_registry`'s note, and bugsquashing §7.
-        { key: 'base_layout_lock',       stage: null },
+        // `base_layout_lock` was here and is DELETED (2026-09-18): a body no longer sites its own base — the
+        // foreman does it before spawning and the body records the handed site at start. Same argument as the
+        // seek_biome note above: a whitelist entry for a job nothing can post claims a permission nobody holds.
         { key: 'wood_preference_lock',   stage: null },
         { key: 'ground_salvage',         stage: null },
     ]],
@@ -513,7 +538,7 @@ function mayGatherOutdoors(job) {
 
 // The boardroom-chair field the wood preference travels in, named here because one writer and one reader
 // holding the same literal in two files is how the two silently stop agreeing (Law 7 / Law 16). It rides
-// the CHAIR because one bot decides this for the whole fleet, so it needs a channel the overseer
+// the CHAIR because one bot decides this for the whole fleet, so it needs a channel the foreman
 // broadcasts; the chair already carries per-bot facts, every writer read-modify-writes it, and it has
 // exactly one owner so no merge conflict can arise (Invariant D). Not the building conference — three
 // consumers iterate that room's keys expecting buildings.
@@ -1306,10 +1331,14 @@ const FOREMAN_NAME = 'Foreman';
 //                 does not refuse a human's instruction: it has no ear to receive one.
 //   contractor  — purpose-built for human use. Spawned from IN-GAME chat, hears humans, works their
 //                 orders, and yields to their instructions except where its own safety is at stake.
+//   builder     — a speedrun crew for one large downloaded blueprint (Architect 2026-09-17). Answers to
+//                 nobody, like a homesteader, but EXPECTS NO MONSTERS: no night gate, no farm, no busywork.
+//                 It holds its own commons ('builder'), so a builder crew and a homestead crew in one world
+//                 never share a headframe or a shelf. See scratchpad §29.8 for the whole species sheet.
 // The isolation lives in WHICH CODE IS LOADED, never in a permission consulted at call time — that is
 // the difference between two species and one species with a rule, and why the mandate is read once at
 // boot rather than checked per command.
-const BOT_MODES = Object.freeze({ HOMESTEADER: 'homesteader', CONTRACTOR: 'contractor' });
+const BOT_MODES = Object.freeze({ HOMESTEADER: 'homesteader', CONTRACTOR: 'contractor', BUILDER: 'builder' });
 
 // The mode stamped on a terminal launch. Stated here rather than defaulted at the read site: bot_mandate
 // throws on an ABSENT mode, and fleet_control stamps this so the field is never absent. A default at the
@@ -1332,9 +1361,16 @@ const TERMINAL_SPAWN_MODE = BOT_MODES.HOMESTEADER;
 //
 // A CONTRACTOR'S LIST IS ITS HOUSE ALONE. It is the minimum that makes a contractor useful to a person; a farm
 // is the person's to request, never imposed.
+//
+// A BUILDER'S LIST IS THE HEADFRAME ALONE — no farm, because a peaceful speedrun has no hunger to feed (§20).
+// His ruling narrows it further, to ONE CHEST rather than the whole headframe (*"make that gate smaller to just
+// build only the headframe until theres 1 chest"*, §29.6). THAT NARROWING IS NOT BUILT YET: as written, a builder
+// holds every other structure until the headframe is WHOLE. Nothing can spawn a builder until the foreman's
+// config path exists, so the wider gate is inert until then — and the one-chest gate lands with that path.
 const SETUP_ORDER = Object.freeze({
     [BOT_MODES.HOMESTEADER]: Object.freeze(['headframe', FARM_STRUCTURE]),
     [BOT_MODES.CONTRACTOR]:  Object.freeze(['contractor_house']),
+    [BOT_MODES.BUILDER]:     Object.freeze(['headframe']),
 });
 // ── THE HEADFRAME CLOCK: DAWN TO DUSK (Architect 2026-09-15) ────────────────────────────────────────────────────
 // *"the headframe must be built within 11.5 minutes. its a dawn to dusk timer. so there should be an 11.5 minute

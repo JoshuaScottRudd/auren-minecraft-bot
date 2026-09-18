@@ -9,7 +9,7 @@ moduleAlias.addAliases({
   '@js_kernel': __dirname + '/js_kernel',
   '@utils': __dirname + '/js_kernel/utils',
   '@thinking': __dirname + '/Thinking_fragments',
-  '@overseer': __dirname + '/overseer'
+  '@foreman': __dirname + '/foreman'
 });
 
 // THE MANDATE IS READ FIRST — before the banner, before mineflayer, before anything can act.
@@ -26,7 +26,7 @@ const mineflayer = require('mineflayer');
 const readline = require('readline');
 const { pathfinder } = require('mineflayer-pathfinder');
 const { inject: runPerceptionFragmentTester } = require('@perception/perception_fragment_tester.js');
-const overseerLink = require('@kernel/overseer_link.js');
+const foremanLink = require('@kernel/foreman_link.js');
 // The protocol version is authored in the config, not here: the virtual playground reads the SAME value to
 // pull block facts (material, harvestTools) out of the registry, and a bench on a different Minecraft than
 // the body would grade this fleet against a game it is not playing (Law 16 — one authored answer).
@@ -42,8 +42,8 @@ function delayedChat(bot, message, delay = 1) {
 global.delayedChat = delayedChat;
 
 // Startup banner (bright cyan, bold) — a bot window's own story is silenced (it streams to the
-// overseer), so this banner is nearly all a bot terminal ever prints. It exists purely to make a bot
-// window instantly distinguishable from the overseer's live log stream. Cyan, deliberately NOT
+// foreman), so this banner is nearly all a bot terminal ever prints. It exists purely to make a bot
+// window instantly distinguishable from the foreman's live log stream. Cyan, deliberately NOT
 // warning-yellow or error-red so those stay meaningful.
 //
 // The SPECIES is on the banner because the two are indistinguishable at a glance otherwise, and the
@@ -55,7 +55,7 @@ global.delayedChat = delayedChat;
   console.log(`${C}${bar}${R}`);
   console.log(`${C}  🤖  BOT WINDOW  ·  ${MANDATE.botId}${R}`);
   console.log(`${C}      ${botMandate.describeMandate()}${R}`);
-  console.log(`${C}      logs stream to the OVERSEER terminal — this window`);
+  console.log(`${C}      logs stream to the FOREMAN terminal — this window`);
   console.log(`${C}      is just to run the bot (type: start | stop | flush | wipe)${R}`);
   console.log(`${C}${bar}${R}`);
 })();
@@ -110,6 +110,43 @@ bot.loadPlugin(pathfinder);
 // well-formed falsehood — and worlds this fleet generates spawn at x=0,z=0, the one value that would
 // make the gap invisible. The full argument lives on the module (Law 13, Law 26).
 require('@perception/spawn_protection').armSpawnProtection(bot);
+
+// ── BOUNDARY TRANSLATOR: on 26.1 the difficulty packet carries a NAME and upstream indexes with it ──
+// The same seam and the same legal form as the explosion translator in the spawn handler below, for a
+// fault found the day the fleet moved from 1.21.5 to 26.1 (2026-09-17). It sits HERE, beside the spawn
+// square's latch and for that latch's exact reason: the `difficulty` packet arrives during LOGIN — it was
+// observed on the wire immediately after the login packet and before `spawn` — so a listener registered
+// in the spawn handler would be registered after the only packet it exists to catch.
+//
+// mineflayer/lib/plugins/game.js:134-135 does:
+//     bot._client.on('difficulty', (packet) => {
+//       bot.game.difficulty = ['peaceful','easy','normal','hard'][packet.difficulty]
+//     })
+// Through 1.21.x `packet.difficulty` was the ORDINAL (0..3) and that index was correct. 26.1 declares
+// the field as an enum and the server sends the NAME — observed on the wire as
+// `{"difficulty":"peaceful","difficultyLocked":false}` — so the array is indexed by a string, which is
+// `undefined`, and `bot.game.difficulty` is never set for the whole life of the process.
+//
+// WHAT IT COSTS, WHICH IS WHY IT IS NOT COSMETIC. `architect_config.isPeacefulWorld()` reads exactly
+// this field, and its stated rule is UNKNOWN IS NOT PEACEFUL (Law 13, default-stopped). So a permanently
+// undefined field reads as a hostile world forever: the night gate closes at dusk on a world where
+// nothing can spawn, and a homesteader hands back half of every day it is given. Nothing errors, nothing
+// warns — this is Law 26's well-formed falsehood, and the only reason it is visible at all is that the
+// field's value can be checked against what the server said.
+//
+// THE TRANSLATION IS A PREPENDED REWRITE, exactly like the explosion one: the name is turned back into
+// the ordinal upstream's own line already handles, so upstream still does the assigning and there is one
+// author of `bot.game.difficulty`. A packet already carrying an ordinal is passed through untouched, so
+// this is inert on 1.21.x and on any server that goes back to numbers. Delete it the day upstream reads
+// its own schema. A name that is not one of the four is left alone rather than guessed at — upstream
+// then writes `undefined`, which is the honest answer and the one isPeacefulWorld already refuses on.
+const DIFFICULTY_NAMES = ['peaceful', 'easy', 'normal', 'hard'];
+bot._client.prependListener('difficulty', (packet) => {
+  if (typeof packet.difficulty !== 'string') return;      // already an ordinal — upstream is correct
+  const ordinal = DIFFICULTY_NAMES.indexOf(packet.difficulty);
+  if (ordinal !== -1) packet.difficulty = ordinal;
+});
+
 
 // ── A CORPSE CANNOT ANNOUNCE ITSELF ───────────────────────────────────────────────────────────────
 // A body that died and was stopped is saved to playerdata dead, and on the next login mineflayer's
@@ -180,7 +217,7 @@ bot.once('spawn', () => {
   // 🧪 This triggers the server to resend recipe information
   bot._client.write('client_command', { payload: 0 });
 
-  // ── BOUNDARY TRANSLATOR: mineflayer's explosion handler crashes the process on 1.21.5 ──────────────
+  // ── BOUNDARY TRANSLATOR: mineflayer's explosion handler crashes the process on 1.21.3 and later ────
   // Law 16's one legal catch — a third-party fault converted into a Law 13 outcome at the seam, logged,
   // never silently swallowed. This is not a workaround for our code; it is upstream reading a field it
   // just proved absent.
@@ -230,7 +267,7 @@ bot.once('spawn', () => {
   // that can stall a swept-AABB scan. On a reject the knockback is DROPPED WHOLE rather than clamped:
   // a clamped vector is an invented physics event, and there is no honest number to substitute here.
   // The raw vector is logged because it is also the open question — whether the server sends f64 where
-  // minecraft-data's 1.21.5 schema declares `["option","vec3f"]` is unverified, and these numbers are
+  // minecraft-data's schema declares `["option","vec3f64"]` is unverified, and these numbers are
   // the evidence that would settle it.
   const EXPLOSION_KNOCKBACK_MAX_BPT = 10;
   // UNGUARDED, and the two `try` blocks that used to be here were deleted 2026-09-10 when preflight's
@@ -258,7 +295,6 @@ bot.once('spawn', () => {
     }
   });
 
-  // NO SPAWN GREETING. `👋 Hello players, I just spawned!` was said here by every body on every spawn —
   // two lines of open chat for a crew of two, plus two more from announceStartupPosition, before either
   // bot had done a thing. It told the world something the world could see. A person's crew is announced
   // once, by the foreman, in the reply to the `get` that asked for it (Law 16: one arrival, one voice).
@@ -316,9 +352,9 @@ bot.once('spawn', () => {
   // nothing to capture at the moment of dying — the drops announce themselves for as long as they exist,
   // and a record of them could only outlive them. Deleted with the whole death-pile chain.
 
-  // Connect to overseer if URL is configured (env var OVERSEER_URL).
+  // Connect to foreman if URL is configured (env var FOREMAN_URL).
   // If not set, the bot runs in local-brain mode — no change to behavior.
-  const overseerUrl = process.env.OVERSEER_URL || null;
+  const foremanUrl = process.env.FOREMAN_URL || null;
   const botId = process.env.BOT_ID || bot.username || 'AurenBot';
 
   // A BOOTING BOT HOLDS NOTHING — say so before registering (Law 8: a lifecycle terminates with the
@@ -328,18 +364,18 @@ bot.once('spawn', () => {
   // that is the normal case, because relaunching the fleet kills the bots outright.
   //
   // releaseAbsentBotMagnets does NOT cover this: it is keyed on the holder being absent from the
-  // overseer's roster, and a relaunched bot re-registers under the same id, so it is present and its
+  // foreman's roster, and a relaunched bot re-registers under the same id, so it is present and its
   // own ghost claim is skipped by both the connected-check and the self-check. Absent-holder and
   // reborn-holder are two different failures; that one owns the first, this owns the second.
   // Not a second release pathway (Law 16) — same clearMagnet(), a boundary it did not reach.
   require('@thinking/dispatcher.js').clearMagnet(botId);
 
-  overseerLink.connect(overseerUrl, botId);
-  overseerLink.startBodyCellPublisher(bot);
+  foremanLink.connect(foremanUrl, botId);
+  foremanLink.startBodyCellPublisher(bot);
 
-  // Startup only: after peer chairs have had a moment to arrive over the overseer, announce
+  // Startup only: after peer chairs have had a moment to arrive over the foreman, announce
   // our spawn position and the distance to the nearest other bot (if one is connected).
-  setTimeout(() => overseerLink.recordStartupPosition(bot), 4000);
+  setTimeout(() => foremanLink.recordStartupPosition(bot), 4000);
 
   // ── A CONTRACTOR IS BORN STARTED (Architect 2026-09-01) ──────────────────────────────────────────
   // *"getting the bots also starts them. theres no reason why they should be seperate commands."*
@@ -360,8 +396,8 @@ bot.once('spawn', () => {
   // owns it, and its header carries the 2026-09-09 live finding that a crew launcher must stamp the
   // decision at birth because the shipped layer has no second sender for the verb.
   //
-  // AFTER THE SEATS AND THE OVERSEER LINK, deliberately. The planning recursion reads the job board and
-  // claims through the overseer, so injecting before `connect` would run the first plan cycle against a
+  // AFTER THE SEATS AND THE FOREMAN LINK, deliberately. The planning recursion reads the job board and
+  // claims through the foreman, so injecting before `connect` would run the first plan cycle against a
   // bot with no peer arbitration — every claim granted locally, which is exactly the split-brain the
   // planning token exists to prevent (Law 4).
   // ── ANNOUNCED FROM THE OUTCOME, NOT FROM THE CALL (2026-09-10) ──────────────────────────────────
@@ -403,13 +439,14 @@ bot.once('spawn', () => {
         testInjector.inject();
         break;
       case 'test_locklayout': {
-        // test_locklayout [lock] — drive the startup base-layout batch directly (no autonomous loop).
-        // Default is a DRY RUN: survey the anchor (wheat farm) + all satellites, report each satellite's
-        // closeness to the anchor, write nothing. Pass `lock` to actually lock them. The full survey
-        // lands on watcher_<BotId>.json under 'lock_all_buildspots'.
-        const dryRun = !args.includes('lock');
-        require('@action/lock_all_buildspots').run(global.bot, { dryRun })
-          .then(r => console.log(`🧪 lock_all_buildspots ${dryRun ? '(dry run)' : ''}: ok=${r.ok} transient=${!!r.transient} locked=[${(r.locked || []).join(', ')}]`))
+        // test_locklayout — run the base-layout survey from where this body stands and REPORT it (no
+        // autonomous loop, nothing written). The full survey lands on watcher_<BotId>.json under
+        // 'lock_all_buildspots'.
+        // IT ONLY LOOKS. A `lock` option used to commit the result, and it was the last route by which a
+        // body could site its own base; siting is the foreman's alone, before any body spawns (Architect
+        // 2026-09-18), so a body may see what a survey would say and never act on it.
+        require('@action/lock_all_buildspots').run(global.bot, { dryRun: true })
+          .then(r => console.log(`🧪 lock_all_buildspots (dry run): ok=${r.ok} transient=${!!r.transient} would lock=[${(r.site || []).map(s => s.roomKey).join(', ')}]`))
           .catch(e => console.log(`🧪 lock_all_buildspots threw (expected on a bad layout): ${e.message.split('\n')[0]}`));
         break;
       }
@@ -483,7 +520,7 @@ function shutdownFlush() {
 bot.on('end', (reason) => {
   // Emit a LOUD error first: a disconnect halts the signal loop mid-flight (any in-progress
   // fragment just stops), which is exactly as serious as a judge-kill and must be as visible.
-  // The overseer websocket is separate from the Minecraft connection, so this still forwards to
+  // The foreman websocket is separate from the Minecraft connection, so this still forwards to
   // the aggregated trace even when the game connection is what dropped — no more silent death
   // where the last navigator loop appears to run forever with no ❌ (the 'Timed out' case).
   // The watcher cannot throw out of itself — every catch inside it reports through `_selfFault()` or
@@ -525,9 +562,9 @@ bot.on('end', (reason) => {
 // environmental failures soft-fail to recursive_judge and never surface as an uncaught
 // throw. This is the ONLY way a signal ends outside a judge — so it must be as LOUD as a
 // judge-kill. The old handlers logged via console.error (raw local stderr), which the
-// watcher does NOT forward to the overseer — so in the aggregated fleet trace the signal
+// watcher does NOT forward to the foreman — so in the aggregated fleet trace the signal
 // just vanished (only the magnet-clear summary showed) and the bot sat idle looking alive.
-// Route through watcher.error instead: it forwards to the overseer AND dumps the buffered
+// Route through watcher.error instead: it forwards to the foreman AND dumps the buffered
 // context, so a signal death is always visible and inspectable (Law 5, Law 13).
 function reportCrash(kind, err) {
   const detail = (err && (err.stack || err.message)) || String(err);

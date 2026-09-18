@@ -36,6 +36,7 @@ const { FOREMAN_CHANNELS, FOREMAN_CHANNEL, FOREMAN_PREFIX } = require('@thinking
 // conversation is ignored without comment, because a clerk that answers unaddressed remarks is noise
 // in a recording.
 function listenOpenChat(bot, onCommand, log) {
+  bot.once('end', () => departed.add(bot));
   bot._client.on('player_chat', (packet) => {
     // The message body. 1.21.5 signs chat, and a signed message carries its text in `plainMessage`;
     // `unsignedChatContent` is the fallback the protocol uses when a client sends unsigned. Reading
@@ -85,6 +86,12 @@ const MS_BETWEEN_LINES = 1000;
 const pending = [];
 let pumping = false;
 
+// A LINE QUEUED FOR A BODY THAT HAS SINCE LEFT IS DROPPED, NOT SENT (2026-09-18). The foreman's body can
+// now leave and come back while the process lives on, because the process carries the fleet's memory.
+// A line queued a second before a kick would otherwise fire `chat` on a closed connection from a timer,
+// where nothing can answer for it. `listen` marks the body when it ends; the queue checks at send time.
+const departed = new WeakSet();
+
 function pump() {
   const next = pending.shift();
   if (!next) { pumping = false; return; }
@@ -118,7 +125,7 @@ function wrapLine(text, width) {
 function replyOpenChat(bot, to, text) {
   const prefix = `${to}: `;
   for (const chunk of wrapLine(text, MAX_CHAT_LINE - prefix.length)) {
-    enqueue(() => bot.chat(prefix + chunk));
+    enqueue(() => { if (!departed.has(bot)) bot.chat(prefix + chunk); });
   }
 }
 

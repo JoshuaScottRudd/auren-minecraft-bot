@@ -1,23 +1,30 @@
 // module: run
 // purpose: THE ONE SCRIPT. Reads `run_config.js`'s `run` block once, then performs the whole run without
-//          being driven. **It joins a world that is already running.**
+//          being driven. **The foreman it starts brings the world** — starting a local server itself, or
+//          joining a remote one — per `Auren_Bot/foreman_config.js` (2026-09-18, see the section below).
 //
-//     1. start your Minecraft server
-//     2. . .\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\run.js
+//     ..\Auren_Workshop\scripts\_node.ps1 ; $n = Get-AurenNode ; & $n Auren_Workshop\run.js
 //
 // There are no flags. Everything a run can be told is on the page next door, which is the point
 // (Architect 2026-09-10: *"you make all the configurations before you start anything on one page then
 // you click the same runscript and it runs according to the configure"*). A flag here would be a second
 // place to say the same thing, and the two would disagree the first time somebody used both (Law 16).
 //
-// ── IT DOES NOT START, STOP OR ROLL BACK A WORLD, AND THAT IS ITS DEFINITION (Architect 2026-09-11) ───
+// ── SUPERSEDED 2026-09-18: THE FOREMAN NOW STARTS AND STOPS THE WORLD ─────────────────────────────────
+// *"Foreman starts first before the server… Who owns the process? Foreman does."* This script starts the
+// foreman first and asks IT whether the world came up (`worldFromForeman`), and at teardown asks it to shut
+// down. It still never starts a JVM or touches a server folder itself — the foreman does. The 2026-09-11
+// ruling below is kept as the record of what this replaced; its one question is now asked of the foreman
+// that owns the world rather than of the world directly.
+//
+// ── (2026-09-11) IT DOES NOT START, STOP OR ROLL BACK A WORLD, AND THAT IS ITS DEFINITION ───
 // *"i have a script that autostarts the server, then when its the bots turn to connect its a seperate
 // piece that only cares if the server is there not if the script runs correctly? so law 1. isolated verb.
 // my script autostarts server then foreman check to see if the server is there not if i started it with
 // the script. this is so a stranger can use it. i want an architect and a user start to be identical."*
 //
 // This file asks the world exactly ONE question — **are you there** — and gets its answer from the world,
-// by dialling the address in `Auren_Bot/your_server.js` and speaking to it. It never asks, and cannot
+// by dialling the address in `Auren_Bot/foreman_config.js` and speaking to it. It never asks, and cannot
 // find out, who started that world. A stranger starts theirs by hand; `host_and_run.js` starts his in the
 // same pass and then runs THIS FILE as a child process. Both arrive here identical, because the thing
 // that differs happened outside and left no trace in the config this file reads (Law 1, decoupled).
@@ -102,7 +109,7 @@ const PERMITTED = {
 // WHAT CAN WAKE A WATCH, AND WHY THE LIST SHRANK (Architect 2026-09-16). These used to be
 // `trace_monitor` SIGNATURE names, because the watch was a lens reading the trace file. The watch now
 // asks the live fleet, so the list names facts THE FLEET STATES ABOUT ITSELF: `error` is the watcher's
-// own error level, counted by the overseer as it arrives; `death` is job_board's own answer about
+// own error level, counted by the foreman as it arrives; `death` is job_board's own answer about
 // whether there is a body, carried on the boardroom chair.
 //
 // `halt` IS GONE BECAUSE IT HAD ALREADY STOPPED WORKING, not because the watch changed. Its signature
@@ -125,7 +132,7 @@ const SHAPE = {
   //   `worldName`                Now `hosting.world` / `.snapshot` / `.worldName`, same page, other block.
   //                              What `world: 'fresh'` also did — wiping the bots' notes — stayed here
   //                              and is now `memory: 'clear'`, which anybody can do.
-  //   `host` `port` `rconPort` — in `Auren_Bot/your_server.js`, the one page a downloader edits and the
+  //   `host` `port` `rconPort` — in `Auren_Bot/foreman_config.js`, the one page a downloader edits and the
   //                              one answer the bots, the foreman, the camera rig and the seed scanner
   //                              all read. This script is only one of that file's readers (Law 16).
   //   `rconPassword`           — same file, or `AUREN_RCON_PASSWORD`. A hosted run is handed a freshly
@@ -133,7 +140,7 @@ const SHAPE = {
 };
 
 // WHERE THE WORLD IS — read from the one page a downloader edits, never restated here (Law 16).
-const WORLD = require(paths.bot('your_server.js'));
+const WORLD = require(paths.bot('foreman_config.js'));
 const NAME_OK = /^[A-Za-z0-9_]{3,16}$/;
 const COORDS_OK = /^-?\d+\s+-?\d+\s+-?\d+$/;
 
@@ -193,33 +200,21 @@ function validate(c) {
 }
 validate(CONFIG);
 
-// ── THE ONE THING THIS SCRIPT NEEDS FROM THE WORLD, AND THE ONLY WAY IT CAN GET IT ──────────────────
-// A crew is placed beside a person through the server's console (RCON), so a console this script cannot
-// reach is a run it cannot do. `WORLD` is `Auren_Bot/your_server.js`, which reads the environment first
-// and its own values second — so a hosted run, which mints a password and exports it before spawning this
-// file, arrives here through the SAME two lines a stranger's typed-in password does. There is no branch
-// for who set it, because there is nothing in either case to branch on.
-//
-// A BLANK PASSWORD IS NOT A BLANK FIELD, and Minecraft rather than this file settles that: with
-// `rcon.password=` empty in server.properties the server answers
-//     [Server thread/WARN]: No rcon password set in server.properties, rcon disabled!
-// and never opens the port at all. So a blank one removes the console rather than the password, which is
-// why it is refused here by name instead of tried and failed on later (Law 13).
-const CREDS = { port: WORLD.rconPort, password: WORLD.rconPassword };
-if (!CREDS.password) {
-  refuse([`No console password has been given for the world at ${WORLD.host}:${WORLD.port}.`,
-          `  A crew cannot be placed beside a person without that world's console, so the run stops`,
-          `  rather than guessing at it.`,
-          ``,
-          `  THE SPOT TO CHANGE:  Auren_Bot/your_server.js   ->   rconPassword`,
-          `  (or set AUREN_RCON_PASSWORD, which wins over that file.) It must match rcon.password in`,
-          `  your server.properties, and that server needs enable-rcon=true.`,
-          ``,
-          `  If this machine HOSTS the world, run Auren_Workshop/host_and_run.js instead — it starts the`,
-          `  server, mints a password for it and hands it to this script, and there is nothing to type.`]);
+// ── THE WORLD'S CONSOLE, LEARNED AFTER THE FOREMAN HAS THE WORLD (2026-09-18) ──────────────────────────
+// A crew is placed beside a person through the server's console (RCON), and this script reads the world
+// through it too (who is in, where they stand). It used to need the password BEFORE anything started, because
+// a host had minted it upstream. The foreman now starts or reaches the world itself (foreman/foreman_world.js),
+// so the password exists only once the foreman has said the world is up:
+//   local   the foreman wrote a fresh one into the server's server.properties; read from there.
+//   remote  the world's owner gave it, in foreman_config.js (or AUREN_RCON_PASSWORD).
+let CREDS = null;
+function worldConsole() {
+  return WORLD.where === 'remote'
+    ? { port: WORLD.rconPort, password: WORLD.rconPassword }
+    : rcon.readServerProperties();
 }
 const EXTRACT = paths.bot();     // the tree this file lives in — see clearMemory's header for why there is no copy
-const TRACE = path.join(EXTRACT, 'fleet_logs', 'traces', 'watcher_overseer.jsonl');
+const TRACE = path.join(EXTRACT, 'fleet_logs', 'traces', 'watcher_fleet.jsonl');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const say = m => console.log(`  ${m}`);
@@ -297,14 +292,14 @@ function launch(label, file, args, cwd) {
   return handle;
 }
 
-// THE ENVIRONMENT A STRANGER HAS. Every AUREN_/BOT_/OVERSEER_ variable this machine exports is stripped
+// THE ENVIRONMENT A STRANGER HAS. Every AUREN_/BOT_/FOREMAN_ variable this machine exports is stripped
 // before the fleet is launched: leaving them lets the run inherit his own configuration and certify a
 // build that works on one box in the world. The rcon password is handed back in as a FLAG, because
 // typing it is what somebody else would do.
 function strangerEnv() {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (/^(AUREN_|BOT_|OVERSEER)/.test(k) || k === 'NODE_PATH') delete env[k];
+    if (/^(AUREN_|BOT_|FOREMAN)/.test(k) || k === 'NODE_PATH') delete env[k];
   }
   return env;
 }
@@ -501,11 +496,11 @@ function consoleTail(label, lines) {
   return all.length ? all.slice(-lines) : null;
 }
 
-function teardown(why) {
+async function teardown(why) {
   if (CONFIG.teardown === 'leave-up') {
     console.log(`\n  teardown: 'leave-up' — the desk, the crew and the person are STILL IN THE WORLD.`);
     console.log(`  Their console windows are open and still following — read them there.`);
-    console.log(`  They are yours to reap:  node Auren_Workshop/fleet_control.js down\n`);
+    console.log(`  To end it all, the foreman included (it stops a world it started):  node Auren_Workshop/fleet_control.js verb shutdown\n`);
     return;
   }
   console.log(`\n  taking it down (${why})`);
@@ -514,6 +509,20 @@ function teardown(why) {
     overlay.reap('the run ended');
   }
   keepConsoles();
+  // ── THE FOREMAN IS ASKED TO SHUT DOWN, NOT KILLED (Architect 2026-09-18: *"how does shutting down a server
+  // work after a soak or a problem?… I want foreman to handle that."*) ───────────────────────────────────
+  // It sends every bot home and, if it started the world, stops it and waits for the save. A killed desk
+  // would leave that server running and holding the world folder. The wait is the foreman's own save limit
+  // plus a margin; whatever is still standing after it is ended below, and said.
+  const desk = children.find(c => c.label === 'desk');
+  if (desk && desk.child.exitCode === null) {
+    fleetControl(['verb', 'shutdown']);
+    const until = Date.now() + SHUTDOWN_WAIT_MS;
+    while (desk.child.exitCode === null && Date.now() < until) await sleep(1000);
+    say(desk.child.exitCode === null
+      ? `the foreman had not finished shutting down after ${SHUTDOWN_WAIT_MS / 1000}s — it is being ended; check the world with the server's own window.`
+      : 'the foreman shut down: the bots are home and a world it started is stopped and saved.');
+  }
   for (const c of children.slice().reverse()) {
     if (c.child.exitCode === null) { try { c.child.kill(); } catch (_) { /* already gone */ } }
     // The window goes with the process it was watching. Left open it would sit on a file the next run
@@ -527,13 +536,22 @@ function teardown(why) {
   // the run, the run shall check and close all terminals"*). The world's terminal is not this run's.
   const reaped = consoleWindow.closeWindows({ except: ['server'] });
   say(`terminals: closed ${reaped.closed.length}; ${consoleWindow.describeWindows(reaped.stillOpen)}.`);
-  // THE WORLD IS LEFT RUNNING, ALWAYS. This script did not start it and has no business ending it —
-  // whoever did owns that, and on a hosted run that is `host_and_run.js`, after this process returns.
-  say('desk, crew and person are down. The world is left exactly as it was found: running.');
+  // THE WORLD IS THE FOREMAN'S TO STOP, and it has (a local one) or has left it alone (a remote one).
+  say(`desk, crew and person are down. The world: ${WORLD.where === 'local' ? 'stopped by the foreman that started it' : 'left running — somebody else owns it'}.`);
 }
 
 // ── THE RUN ─────────────────────────────────────────────────────────────────────────────────────────
-(async () => {
+// ── A NAMED FUNCTION CALLED AT THE END OF THE FILE, NOT AN IIFE HERE (fixed 2026-09-18) ─────────────
+// This was `(async () => { … })()`, and the wrong turn is worth naming because it looks correct and is
+// invisible until the exact right shape of run. An async function runs SYNCHRONOUSLY until its first
+// real suspension, and everything above `await worldFromForeman(desk)` — the terminal check, preflight,
+// the record sweep, the memory wipe, `npm install`, spawning the desk — is synchronous. So the IIFE
+// reached that call before the module body had finished evaluating, and every `const` declared BELOW it
+// was still in its temporal dead zone: the first hosted run under the new foreman died on `Cannot access
+// 'WORLD_WAIT_MS' before initialization`, after the server and the desk were already up. Declaring the
+// work as a function and calling it on the last line makes the whole module initialized before any of it
+// runs, whatever gets added above the first await later.
+async function main() {
   console.log(`\n══ run — ${CONFIG.crew} · ${CONFIG.soak} min · memory ${CONFIG.memory}`
     + `${CONFIG.watch ? ' · watched' : ''}${CONFIG.record !== 'off' ? ` · ${CONFIG.record}` : ''} ══`);
   say(`the fleet      ${EXTRACT}`);
@@ -572,47 +590,38 @@ function teardown(why) {
   }
   say('the tree loads');
 
-  // ── IS THE SERVER THERE. THAT IS THE WHOLE QUESTION (Architect 2026-09-11, Law 1) ─────────────────
-  // *"when its the bots turn to connect its a seperate piece that only cares if the server is there not
-  // if the script runs correctly… foreman check to see if the server is there not if i started it with
-  // the script."*
-  //
-  // The answer comes from the WORLD, by speaking to it — not from a flag, a lock file, a PID, or an exit
-  // code handed down by whatever started it. That is what makes this script indifferent to who did: a
-  // world started by hand ten minutes ago and one started by `host_and_run.js` four seconds ago are the
-  // same fact at this line, and there is nothing here that could tell them apart even if it wanted to.
-  //
-  // ASKED FIRST, BEFORE ANYTHING IS SWEPT OR LAUNCHED, because everything after it needs the console and
-  // the cheapest failure is the earliest one.
-  //
-  // THE ADDRESS IS ASSUMED, SO A WRONG ONE MUST SAY WHERE IT IS WRITTEN (*"so assume the server is there,
-  // if not crash and report pointing to the spot where to change"*). Nothing here probes for a server,
-  // scans a port range or falls back to a second address — the one in `your_server.js` is tried and that
-  // is all. This is the only place that assumption can be wrong, so it is the place that names the file,
-  // the fields, and what was actually attempted.
-  phase('is the world there');
-  const reach = await rcon.probe({ creds: CREDS });
-  if (!reach.ok) {
-    check('a server is up with rcon enabled', false, reach.reason);
-    console.error(`\n  Nothing answered at ${WORLD.host}:${WORLD.port} (console port ${WORLD.rconPort}).`);
-    console.error(`  This script does not start servers. Start your world, then run it again.`);
-    console.error(``);
-    console.error(`  THE SPOT TO CHANGE:  Auren_Bot/your_server.js`);
-    const field = (name, value, why) => console.error(`      ${name.padEnd(13)}${String(value).padEnd(12)}<- ${why}`);
-    field('host', WORLD.host, 'the computer the world runs on');
-    field('port', WORLD.port, 'server-port in your server.properties');
-    field('rconPort', WORLD.rconPort, 'rcon.port, and enable-rcon must be true');
-    field('rconPassword', WORLD.rconPassword ? '(set)' : '(EMPTY)', 'must equal rcon.password there');
-    console.error(``);
-    console.error(`  If your server IS running with those numbers, it is the console that is off:`);
-    console.error(`  set enable-rcon=true in server.properties and restart it.`);
-    console.error(``);
-    console.error(`  If this machine HOSTS the world, run Auren_Workshop/host_and_run.js — it starts the`);
-    console.error(`  server first and then runs this exact script.\n`);
-    return finish('the world could not be reached');
+  // ── THE FOREMAN FIRST, AND IT BRINGS THE WORLD (Architect 2026-09-18) ────────────────────────────────
+  // *"You give everything you need to foreman. Foreman starts first before the server… If any part of the
+  // process fails then the Foreman is a live process that can troubleshoot… Who owns the process? Foreman
+  // does."* This script no longer checks for a world before it starts: it starts the foreman the way a
+  // stranger does, and ASKS THE FOREMAN, through its door, whether the world came up — and if not, why.
+  clearRecords();
+  clearMemory();
+  install();
+
+  phase('node start_auren.js  — the one door, and the foreman brings the world');
+  // `--records keep` because clearRecords() above already swept; a second sweep deleted console_desk.log
+  // out from under this runner's open handle on every run (start_auren.js's sweep site has the mechanism).
+  // `--where` and, for a remote world, its address and console travel as FLAGS, because strangerEnv()
+  // strips this machine's AUREN_ variables and typing them is what somebody else would do.
+  const deskArgs = ['start_auren.js', '--where', WORLD.where, '--records', 'keep'];
+  if (WORLD.where === 'remote') {
+    deskArgs.push('--host', WORLD.host, '--port', String(WORLD.port),
+      '--rcon-password', WORLD.rconPassword, '--rcon-port', String(WORLD.rconPort));
   }
+  const desk = launch('desk', process.execPath, deskArgs, EXTRACT);
+
+  phase(`is the world there — asked of the foreman (${WORLD.where})`);
+  const world = await worldFromForeman(desk);
+  if (!check('the foreman has the world', world.state === 'up',
+    world.state === 'up'
+      ? `${world.where} world at ${world.host}:${world.port}${world.ours ? ', started by the foreman' : ', run by somebody else'}`
+      : `${world.state}: ${world.reason}`)) {
+    return finish('the world did not come up');
+  }
+  CREDS = worldConsole();
   const before = (await playersOnline()) || [];
-  check('a server is up with rcon enabled', true, `${before.length} player(s) already in the world`);
+  say(`${before.length} player(s) in the world`);
 
   // THE CLOCK IS A RUN INPUT, AUTHORED WHILE NOTHING IS RUNNING (Law 26). Not gated: a fleet on a dark
   // world is still a fleet running, so a clock that would not set is worth SEEING and never worth
@@ -622,19 +631,6 @@ function teardown(why) {
     say(`clock: ${CONFIG.clock}`);
   }
 
-  clearRecords();
-  clearMemory();
-  install();
-
-  // ── THE DESK, FROM THE DOWNLOAD, IN A STRANGER'S SHELL ────────────────────────────────────────────
-  phase('node start_auren.js  — the one door');
-  // `--records keep` because STEP 4 ALREADY SWEPT, and reported the count as a check. Without it the
-  // desk swept a second time, after this runner had created `console_desk.log` and handed over its
-  // descriptor — deleting the desk's console out from under the open handle, silently, on every single
-  // run.js-driven run. `start_auren.js`'s sweep site carries the mechanism.
-  const deskArgs = ['start_auren.js', '--host', WORLD.host, '--port', String(WORLD.port),
-    '--rcon-password', CREDS.password, '--rcon-port', String(WORLD.rconPort), '--records', 'keep'];
-  const desk = launch('desk', process.execPath, deskArgs, EXTRACT);
   const deskUp = await waitForPlayer('Foreman', 60000);
   if (!check('the desk joined the world', deskUp,
     deskUp ? 'Foreman is in the server player list' : `no Foreman after 60s. It said: ${desk.read().slice(-400)}`)) {
@@ -810,9 +806,9 @@ function teardown(why) {
   // (§6.10). A lens is a POST-MORTEM instrument — it reconstructs a run that is over — and pointing one
   // at a fleet that is still moving asks it to be something it is not.
   //
-  // What replaces it is the first hop and nothing after it: the overseer receives every bot's error()
+  // What replaces it is the first hop and nothing after it: the foreman receives every bot's error()
   // the instant it fires (that forward has always existed; it just threw the fact away), so it now keeps
-  // the count, and `overseer_door.query()` is the proper function for asking it. One process, one
+  // the count, and `foreman_door.query()` is the proper function for asking it. One process, one
   // question, no file and no record in between.
   phase(`letting the crew work for ${CONFIG.soak} min${CONFIG.watch ? ' — watched' : ''}`);
   // ── AND THE ONE WINDOW HE ACTUALLY READS IS OPENED WITH IT (Architect 2026-09-10) ─────────────────
@@ -821,7 +817,7 @@ function teardown(why) {
   // terminals and i want the overseer one to scroll like it is."* `fleet-console` is that window and this
   // one-button script never opened it, so the view existed and a run did not produce it.
   //
-  // OPENED HERE, not at bring-up, because it follows `watcher_overseer.jsonl` and that file is written by
+  // OPENED HERE, not at bring-up, because it follows `watcher_fleet.jsonl` and that file is written by
   // the fleet — before the crew has arrived there is nothing to tail. By this line the traces exist.
   //
   // It is a LENS rather than a raw console, which is why it is the right window to put in front of him
@@ -871,7 +867,7 @@ function teardown(why) {
   }
 
   // ── THE RUN IS JUDGED BY THE FLEET'S OWN REPORT OF ITSELF (Architect 2026-09-16) ──────────────────
-  // The bar is the watcher's ERROR level, asked of the live overseer rather than reconstructed from the
+  // The bar is the watcher's ERROR level, asked of the live foreman rather than reconstructed from the
   // record afterwards. Warnings are deliberately NOT the bar: the first run of a fresh download is
   // legitimately full of them (the loudest being that a bot's headquarters file does not exist yet,
   // which is the correct state of a bot that has never seen a world), and gating on those would make a
@@ -889,7 +885,7 @@ function teardown(why) {
   // (Law 13 — prove it is safe to continue, never assume it).
   // A DEPARTED BOT'S ERRORS COUNT TOO, and this is where forgetting them would hurt most: a bot that
   // errored and then crashed is absent from the roster, so counting only what is still connected would
-  // let the worst run of all — the one that lost a body — report zero errors (Law 25). The overseer
+  // let the worst run of all — the one that lost a body — report zero errors (Law 25). The foreman
   // keeps a crashed bot's tally, so both lists are read as one.
   const present = final.ok ? final.bots : [];
   const gone = final.ok ? (final.departed || []) : [];
@@ -923,10 +919,12 @@ function teardown(why) {
   }
 
   return finish(woke ? 'the watch woke' : 'the window closed');
-})().catch(e => {
+}
+
+async function runFailed(e) {
   console.error(`\n  run stopped on an error it could not grade: ${e && e.message}`);
   if (e && e.stack) console.error(e.stack.split('\n').slice(1, 4).join('\n'));
-  teardown('an ungraded error');
+  await teardown('an ungraded error');
   // THE CRASH PATH STATES ITS OUTCOME TOO, and it is the path that needed it most: before this, an
   // ungraded error left a stack trace and exit 1, and a reader had to scroll a console to learn whether
   // the fleet had even started. CRASHED is its own value — a run that fell over is not a run that
@@ -936,11 +934,35 @@ function teardown(why) {
     checks, woke, wokeOn, startedAt: RUN_STARTED_AT,
     ranMin: (Date.now() - Date.parse(RUN_STARTED_AT)) / 60000, exitCode: 1,
   }));
-});
+}
+
+// worldFromForeman(desk) → the foreman's own account of the world: { state:'up'|'failed'|..., reason, ... }.
+// Polled through the door until the foreman says up or failed. A local first boot generates terrain, so the
+// ceiling is the foreman's own startup limit plus a margin. A desk that exits before answering is a failure
+// with its console tail as the reason — the foreman prints its diagnosis there before it ends.
+const WORLD_WAIT_MS = 6 * 60 * 1000;
+const SHUTDOWN_WAIT_MS = 240000;   // the foreman's own save limit is 180 s, plus the bots' grace
+async function worldFromForeman(desk) {
+  const end = Date.now() + WORLD_WAIT_MS;
+  let last = null;
+  while (Date.now() < end) {
+    if (desk.child.exitCode !== null) {
+      return { state: 'failed', reason: `the foreman ended before the world came up. It said: ${desk.read().slice(-600)}` };
+    }
+    const r = await fleetFaults();
+    if (r.ok && r.world) {
+      if (r.world.state !== (last && last.state)) say(`foreman: the world is ${r.world.state}`);
+      last = r.world;
+      if (r.world.state === 'up' || r.world.state === 'failed') return r.world;
+    }
+    await sleep(2000);
+  }
+  return { state: 'failed', reason: `the foreman did not report the world up within ${WORLD_WAIT_MS / 60000} min (last: ${last ? last.state : 'no answer'})` };
+}
 
 // ── ASKING THE LIVE FLEET, WHICH IS THE ONLY THING THIS SCRIPT DOES WHILE BOTS ARE UP ───────────────
 // (Architect 2026-09-16) *"Make sure no live code program uses a lens or monitor and talks directly to
-// the system needed."* This is that one door. `overseer_door` is the fleet's own request/response
+// the system needed."* This is that one door. `foreman_door` is the fleet's own request/response
 // channel — the same one `camera_warden` and the foreman use, so there is no second route to keep in
 // step (Law 16) — and it resolves rather than throwing, which is why every caller above tests `ok`.
 const WATCH_POLL_MS = 6000;
@@ -950,7 +972,7 @@ const WATCH_POLL_MS = 6000;
 const DESK_SILENT_POLLS = 5;
 let _door = null;
 function fleetDoor() {
-  if (!_door) _door = require(paths.bot('foreman', 'overseer_door.js'));
+  if (!_door) _door = require(paths.bot('foreman', 'foreman_door.js'));
   return _door;
 }
 // The fleet's answer about itself: who is registered, what each is holding, how many lines of each
@@ -977,7 +999,7 @@ function wakeReason(state) {
   // ── A CRASH IS AN ABSENCE, AND AN ABSENCE HAD TO BE MADE VISIBLE (Architect 2026-09-16) ────────────
   // *"if bots crash it should still end the run and wake you to investigate."* A bot that dies hard
   // stops logging, so the error count it never wrote cannot wake anything; it simply stopped being in
-  // the fleet. The overseer holds the socket that closed and now remembers the departure, so this reads
+  // the fleet. The foreman holds the socket that closed and now remembers the departure, so this reads
   // a stated FACT rather than diffing two polls of its own and guessing which absence is new.
   for (const d of state.departed || []) {
     return `${d.id} left the fleet at ${d.gone_at} and did not come back`
@@ -1053,7 +1075,7 @@ async function finish(why) {
   console.log(`\n══ ${failed.length ? 'FAIL' : 'PASS'} — ${checks.length - failed.length}/${checks.length} check(s) · ${why} ══`);
   for (const f of failed) say(`FAILED  ${f.name} — ${f.detail}`);
   // The desk's last words, in the verdict rather than in a folder the next run empties. Printed only on
-  // a FAIL, because that is the one case where a fault may live OUTSIDE every bot's trace — the overseer
+  // a FAIL, because that is the one case where a fault may live OUTSIDE every bot's trace — the foreman
   // and the foreman run in the desk process, and a lens can only read what a watcher wrote.
   if (failed.length) {
     const tail = consoleTail('desk', 25);
@@ -1062,7 +1084,7 @@ async function finish(why) {
       for (const l of tail) console.log(`     ${l}`);
     }
   }
-  teardown(why);
+  await teardown(why);
   // THE ONE LENS READ IN THIS FILE, AND IT IS HERE BECAUSE HERE IS AFTER THE FLEET IS DOWN. Everything
   // above this line asked the live fleet directly; the record is only opened once nobody is writing it.
   await sayHeadframeClock();
@@ -1082,3 +1104,8 @@ async function finish(why) {
     exitCode: failed.length ? 2 : 0,
   }));
 }
+
+// ── THE LAST LINE OF THE FILE, AND THAT POSITION IS THE POINT ───────────────────────────────────────
+// See main()'s header: the run performs its whole opening synchronously, so starting it anywhere above
+// this line puts every constant declared below the call site in its temporal dead zone.
+main().catch(runFailed);

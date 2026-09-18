@@ -47,7 +47,10 @@ const rconLink = require(paths.bot('js_kernel/utils/rcon_link'));
 
 const HOST = process.env.PROBE_HOST || 'localhost';
 const PORT = Number(process.env.PROBE_PORT || 25565);
-const VERSION = process.env.PROBE_VERSION || '1.21.5';
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const VERSION = process.env.PROBE_VERSION
+  || require(paths.bot('Thinking_fragments/architect_config.js')).SERVER_MINECRAFT_VERSION;
 
 const EAR = 'ChatProbe';       // stands for a contractor bot — the LISTENER
 const HUMAN = 'ProxyHuman';    // stands for the Architect at a keyboard — the SPEAKER
@@ -151,7 +154,7 @@ async function main() {
   const MSG1 = 'auren spawn contractor';
   const c1 = await utterance(() => human.chat(MSG1));
   const c1heard = chatsIn(c1).find(e => e.message === MSG1);
-  record('C1', "Does bot.on('chat') fire when ANOTHER PLAYER speaks on 1.21.5, and is the sender's username correct?",
+  record("C1", `Does bot.on("chat") fire when ANOTHER PLAYER speaks on ${VERSION}, and is the sender's username correct?`,
     `packets: [${packetsIn(c1).join(', ') || 'none'}] | 'chat' events: ${JSON.stringify(chatsIn(c1).map(e => [e.username, e.message]))} | messagestr: ${JSON.stringify(c1.events.filter(e => e.event === 'messagestr').map(e => e.text))}`,
     !c1heard
       ? (c1.wire.length === 0
@@ -163,7 +166,7 @@ async function main() {
 
   // ── C2 — which packet actually carries it (so a wire tap is possible if the event is not) ───────
   const c1first = c1.wire[0];
-  record('C2', 'Which wire packet carries a player-origin chat message on 1.21.5?',
+  record('C2', `Which wire packet carries a player-origin chat message on ${VERSION}?`,
     `distinct packets during C1: ${JSON.stringify(packetsIn(c1))} | first payload keys: ${JSON.stringify(c1first ? Object.keys(c1first.raw) : null)} | sender-ish fields: ${c1first ? JSON.stringify(Object.keys(c1first.raw).filter(k => /sender|uuid|name|account/i.test(k))) : 'n/a'}`,
     !c1first
       ? 'NOTHING ON THE WIRE — no packet-level fallback exists; C1 is final.'

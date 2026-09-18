@@ -59,7 +59,10 @@ const flag = k => argv.includes(`--${k}`);
 const DIST     = Number(arg('dist', 32));
 const REPEAT   = Number(arg('repeat', 5));
 const MAXNODES = Number(arg('nodes', 8000));
-const VERSION  = arg('version', '1.21.5');
+// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+const { SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
+const VERSION  = arg('version', SERVER_MINECRAFT_VERSION);
 const HOST     = arg('host', 'localhost');
 const PORT     = Number(arg('port', 25565));
 const USERNAME = arg('username', 'ReaderV2_AB');

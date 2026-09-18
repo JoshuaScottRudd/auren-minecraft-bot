@@ -13,8 +13,9 @@ const { currentBiome } = require('@thinking/assessors/shared');
 // Posted high-priority on a fresh run while unset, the same shape as locking the blueprint locations, and
 // once set it is done forever. One bot counts species around the base, publishes the most abundant; later
 // log scans SORT by it (never filter — fragment header). "Done" asked of the performer via
-// woodPreferenceSet() — same re-post-forever rule as assessors/base_layout. scope:'shared' — mutates fleet
-// state, one owner (Law 4); the shared claim is the dedup mechanism. Biome-gated like base_layout:
+// woodPreferenceSet() — a gate that computes its own "done" can demand more than the performer delivers and
+// re-post forever. scope:'shared' — mutates fleet state, one owner (Law 4); the shared claim is the dedup
+// mechanism. Biome-gated:
 // deciding in a biome the fleet will leave publishes a species that isn't where building happens —
 // remembered state whose world left (Invariant B).
 function assess() {

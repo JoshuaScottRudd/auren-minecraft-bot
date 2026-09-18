@@ -45,7 +45,7 @@ const stationRegistry  = require('@perception/station_registry');
 const { applyGates, setupWaitingOn } = require('@thinking/job_gates');
 const jobRanking = require('@thinking/job_ranking');
 const inventoryLens = require('@kernel/inventory_lens');
-const overseerLink = require('@kernel/overseer_link');
+const foremanLink = require('@kernel/foreman_link');
 const registry = require('@thinking/assessor_registry');
 const { TAG } = require('@thinking/assessors/shared');
 
@@ -155,7 +155,7 @@ function _sweep() {
     // HOW FAR THIS CREW'S STANDING REQUESTS HAVE GOT, posted for the same reason and by the same route as
     // the inventory beside it: a body is the only party that can measure them (it alone holds the owner
     // key that says which chests are its own), and the chair is already the channel by which everything a
-    // body knows reaches the overseer and the people reading it. A second sync for one more fact would be
+    // body knows reaches the foreman and the people reading it. A second sync for one more fact would be
     // the parallel route Law 16 exists to refuse.
     //
     // It carries its own timestamp because it is a MEASUREMENT rather than a stored target: whoever speaks
@@ -180,7 +180,7 @@ function _sweep() {
     // A supervisor watching a run has always needed to know that a bot died, and until this date the
     // only route to that fact was a lens matching the ☠️ line below out of the trace FILE while the
     // fleet was still running. The predicate is right here, one line above the warning, and the chair is
-    // already the channel by which everything a body knows reaches the overseer — so the fact travels as
+    // already the channel by which everything a body knows reaches the foreman — so the fact travels as
     // a field instead of as a sentence somebody else has to find. Same argument as request_progress
     // above: a second sync for one more fact would be the parallel route Law 16 refuses.
     //
@@ -406,7 +406,7 @@ function _sweep() {
     boardroom.materials_wanted = wanted;
     boardroom.materials_wanted_at = now;
     hq.writeBoardroomChair(botId, boardroom);
-    overseerLink.sendUpdate();
+    foremanLink.sendUpdate();
 
     // The board's writes are unguarded for the same reason the scans above are: hq is ours, and a
     // warn-and-continue here published a summary describing jobs no consumer ever received.
@@ -528,18 +528,18 @@ function _sweep() {
 // ── Singleton export ──
 module.exports = {
     // The plan phase (this sweep → dispatcher's magnet claim → HQ sync) runs under
-    // the overseer's planning token: exactly one bot plans at a time, so every
+    // the foreman's planning token: exactly one bot plans at a time, so every
     // sweep sees every peer's FRESH magnet and job dedup cannot race. Acquired
     // here (parks until granted — FIFO, seniority-tiebroken); released by the
     // dispatcher AFTER it has synced its magnet, never before (releasing pre-sync
     // would hand the next planner a stale view — the exact bug this kills).
     async receive(signalType, payload) {
-        const overseerLink = require('@kernel/overseer_link');
-        await overseerLink.acquirePlanningToken();
+        const foremanLink = require('@kernel/foreman_link');
+        await foremanLink.acquirePlanningToken();
         // Unguarded. The catch that stood here released the planning token before rethrowing, to spare a
         // peer the crash TTL — an optimisation on a path that only runs when the sweep has already failed
         // in a way that stops this bot. The TTL exists precisely for a holder that died, so the compensation
-        // duplicated a recovery the overseer already owns (Law 16), and it had to be written as a catch
+        // duplicated a recovery the foreman already owns (Law 16), and it had to be written as a catch
         // around our own code to do it.
         _sweep();
         routeSignal(TAG, 'dispatcher', {});

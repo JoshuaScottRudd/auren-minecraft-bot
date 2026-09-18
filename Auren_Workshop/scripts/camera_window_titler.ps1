@@ -2,7 +2,7 @@
 # OBS can tell them apart.
 #
 # WHY THIS EXISTS. Every Minecraft camera window carries the identical OS title ("Minecraft
-# 1.21.5"), the identical window class (GLFW) and the identical executable (javaw.exe). OBS's
+# <version>"), the identical window class (GLFW) and the identical executable (javaw.exe). OBS's
 # Window Capture identifies a window by exactly those three fields - so with all three identical
 # it cannot distinguish Cam 1 from Cam 2, grabs "a window of that type" at random, and on a
 # camera restart (new OS window handle, same title) reattaches to whichever - the cameras appear

@@ -1,7 +1,7 @@
 // js_kernel/operator_commands.js
 // The operator verbs — start / stop / flush / wipe and the bench verbs — as ONE implementation
 // shared by both invocation surfaces: the per-bot readline console and the
-// overseer's broadcast `command` message (Law 16: two transports, one pathway).
+// foreman's broadcast `command` message (Law 16: two transports, one pathway).
 // These are the only verbs the operator uses to run a fleet; anything else
 // (inject/see/teleport/kill) is a single-bot debug tool and stays local-only.
 
@@ -10,7 +10,7 @@
 const watcher = require('@kernel/watcher');
 const botMandate = require('@kernel/bot_mandate');
 
-const { OPERATOR_VERBS: VERBS } = require('@overseer/message_schema');   // one vocabulary, three processes (Law 16)
+const { OPERATOR_VERBS: VERBS } = require('@foreman/message_schema');   // one vocabulary, three processes (Law 16)
 const { guardExternalSync } = require('@utils/external_library_guard');
 
 // Unknown verbs are a coding violation — both surfaces validate against VERBS
@@ -146,7 +146,7 @@ async function execute(verb, args = {}, origin) {
     case 'wipe': {
       // THE SCOPED TWIN OF flush, AND THE ONLY DESTRUCTIVE VERB A HUMAN IN THE WORLD MAY SAY.
       //
-      // flush erases every owner's memory and the overseer's shared mirror with it; wipe strikes only the
+      // flush erases every owner's memory and the foreman's shared mirror with it; wipe strikes only the
       // rows stamped with THIS body's owner. The scope is not an argument and is not checked — it is read
       // from this process's own mandate, so the verb cannot address a foreign row because there is no way
       // to spell one (Law 27). See wipe_system.js for why the removal is a tombstone rather than a delete.

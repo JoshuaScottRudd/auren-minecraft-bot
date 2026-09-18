@@ -158,9 +158,10 @@ function assess() {
         }
     }
 
-    // Coordinates/paster steps owned by the startup batch lock_all_buildspots (Law 16 — one pathway) —
-    // locks every center in one pass. So this posts ONLY the STRUCTURE build: a coords/paster
-    // firstUnsatisfied means base_layout (higher priority) is already on it; post nothing.
+    // Coordinates/paster steps are the FOREMAN'S (Law 16 — one pathway): it sites the whole base before any
+    // body exists, and `start_injector` records the handed site and refuses to start a body without one
+    // (2026-09-18). So this posts ONLY the STRUCTURE build: a coords/paster firstUnsatisfied means this body
+    // has no base, which the start gate already refused — post nothing rather than invent a siting job.
     if (firstUnsatisfied && !materialsGated && firstUnsatisfied.type === TYPE_STRUCTURE_COMPLETE) {
         const bc = hq.readBuildingChair(firstUnsatisfied.field, 'set_buildspot')?.build_center || null;
 

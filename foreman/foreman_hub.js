@@ -1,13 +1,13 @@
-// overseer/overseer_server.js
-// WebSocket server — the overseer process that coordinates multiple bots.
+// foreman/foreman_hub.js
+// WebSocket server — the foreman process that coordinates multiple bots.
 //
 // Two jobs:
 //   1. Real-time HQ sync: receives boardroom chair updates from bots, broadcasts
 //      all other bots' chairs back. Pure state relay — no interpretation.
 //   2. Atomic claim arbitration: grants or rejects locked-category claims via
-//      overseer_brain. Prevents two bots from claiming the same job.
+//      foreman_brain. Prevents two bots from claiming the same job.
 //
-// Launch: node overseer/overseer_server.js [port]
+// Launch: node foreman/foreman_hub.js [port]
 // Default port: 3001
 
 'use strict';
@@ -16,8 +16,11 @@ const WebSocket = require('ws');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
-const { createEnvelope, parseEnvelope, pickBuildingEntry } = require('./message_schema');
-const brain = require('./overseer_brain');
+const { createEnvelope, parseEnvelope, pickBuildingEntry, isBuildingTombstone, BUILDING_ROOM_SEPARATOR } = require('./message_schema');
+const brain = require('./foreman_brain');
+// What the world is doing (started, reached, failed, stopping) — the foreman's own hold on it, reported in
+// fleetState so a caller on the socket door (run.js) can ask instead of guessing.
+const foremanWorld = require('./foreman_world');
 
 // The operator vocabulary comes from the shared envelope contract, never a local copy (Law 16 — see
 // OPERATOR_VERBS there for the silent failure a per-process copy caused).
@@ -25,19 +28,19 @@ const { OPERATOR_VERBS, INGAME_VERBS, COMMAND_ORIGIN: ORIGIN, VALID_ORIGINS, ING
   roomKeyOwner } = require('./message_schema');
 
 // The species vocabulary, from the Architect's table rather than a local literal. This is the only
-// thing the overseer takes from the config graph: it routes on a species and a second spelling of
+// thing the foreman takes from the config graph: it routes on a species and a second spelling of
 // 'contractor' here would silently route in-game commands to nobody (Law 16).
 const { BOT_MODES } = require('../Thinking_fragments/architect_config');
 
 // THE @-ALIASES AND THE MODULE HOMES, registered here for the same reason every other entry point in the
-// tree registers them: this is a process root, and a process root is the only place that can. The overseer
+// tree registers them: this is a process root, and a process root is the only place that can. The foreman
 // resolved everything relatively while it needed nothing from the kernel; the request rules changed that,
 // and they reach `@utils/...` and `@kernel/...` four levels down where no relative path from this file
 // can help. Bare `module-alias/register` is not used because it walks up from the module's INSTALL dir and
 // can land on a package.json carrying no _moduleAliases, registering nothing silently — the explicit form
 // names the package.json that owns them (the reasoning preflight and fleet_revive both spell out).
 //
-// The module homes come from the one file that answers where packages live on this machine, so an overseer
+// The module homes come from the one file that answers where packages live on this machine, so an foreman
 // started BY HAND resolves the same as one started by the launcher, which passes NODE_PATH in. A process
 // that only works when its parent remembered to set an environment variable fails in the hand-started case
 // nobody tests (Law 16 — one resolver, asked by everyone).
@@ -45,7 +48,7 @@ require('../js_kernel/utils/node_module_homes').bootstrapModulePath();
 require('module-alias')(path.resolve(__dirname, '..'));
 
 // The request rules, taken as PURE FUNCTIONS over this process's own map — never the ledger's HQ-backed
-// calls. The overseer has no corporate_headquarters and must not acquire one: it has no BOT_ID, so the
+// calls. The foreman has no corporate_headquarters and must not acquire one: it has no BOT_ID, so the
 // file it opened would carry a name no bot answers to and no reader could explain (Invariant D, Law 6).
 // The requirements live in memory here exactly as the station map does, and reach disk only inside the
 // bots that receive the broadcast.
@@ -64,23 +67,30 @@ require('module-alias')(path.resolve(__dirname, '..'));
 // loading the rules here costs this process nothing and cannot give it an HQ.
 const requestLedger = require('@kernel/request_ledger');
 
-const PORT = parseInt(process.argv[2], 10) || 3001;
+// ── ONE PROCESS WITH THE FOREMAN (Architect 2026-09-18) ──────────────────────────────────────────
+// *"What I want is one body that isn’t a bit a single process controls… you have to justify to me why each
+// of these merit seperate processes"* None earned it, so this file is no longer started on its own:
+// `foreman/foreman.js` requires it first thing, and the port is opened as a side effect of that require.
+// The port therefore comes from the environment every launcher already stamps (FOREMAN_PORT), never from
+// argv. The foreman's argv is not this file's to read, and a flag of the desk's read as a port number
+// would open the fleet on a port nobody dials.
+const PORT = parseInt(process.env.FOREMAN_PORT, 10) || 3001;
 const INGAME_DOOR_PORT = PORT + INGAME_DOOR_PORT_OFFSET;
 
-// Combined fleet trace: every line printed here (bot logs forwarded from both bots + the overseer's
+// Combined fleet trace: every line printed here (bot logs forwarded from both bots + the foreman's
 // own events) is also persisted to one file, mirroring the console so both bots can be reviewed
 // after the fact in a single place. Lives beside the per-bot watcher files, in the records room the
 // watcher itself writes to — asked of `record_homes` rather than spelled, because a writer holding its
 // own copy of that path is how a reader ends up reporting an empty run out of the wrong directory
 // (Law 16).
-// APPEND-ONLY, and holding ONLY the overseer's own lines (Architect 2026-08-12). Both properties were
+// APPEND-ONLY, and holding ONLY the foreman's own lines (Architect 2026-08-12). Both properties were
 // decided the day a power cut returned all three traces as pure NUL bytes at exactly the right length —
 // the whole-file rewrite's data sat in the page cache while NTFS journalled only the rename. The full
 // reasoning lives once, in js_kernel/watcher.js's _writeWatcherFile; this is the same writer, smaller.
 // The 20000-line ring cap went with the rewrite: a ring needs to re-serialise the whole story to drop
 // its head, and there is nothing to cap for — `fleet_control up` clears the story files at every run, so
 // growth is bounded by one run's length (a 39-minute soak wrote 1.5 MB).
-const COMBINED_LOG_FILE = require('../js_kernel/utils/record_homes').traceFile('overseer');
+const COMBINED_LOG_FILE = require('../js_kernel/utils/record_homes').traceFile('fleet');
 const { guardExternalSync } = require('@utils/external_library_guard');
 const COMBINED_FLUSH_MS = 1000;   // matches the bots' cadence; see watcher.js for why it is not 40
 let _unwritten = [];
@@ -98,7 +108,7 @@ function persistCombined(line) {
     // (a bad path, EMFILE). Both failure routes put the lines back rather than dropping them. The
     // hand-written `try` this replaces was silent, so a persistently failing append looked identical
     // to a working one (found 2026-09-10, when the catch-shape gate was first allowed to see this file).
-    const appended = guardExternalSync('overseer_server', 'fs.appendFile(combined trace)', () => {
+    const appended = guardExternalSync('foreman_hub', 'fs.appendFile(combined trace)', () => {
       fs.appendFile(COMBINED_LOG_FILE, chunk.map(l => JSON.stringify(l)).join('\n') + '\n', (err) => {
         // Put the lines BACK on a failed append rather than dropping them — the next flush retries.
         // Unshifted, so a retry cannot re-order the story it is trying to preserve.
@@ -116,22 +126,22 @@ const botClients = new Map();
 // Merged logistics station map across all bots (Phase 6). A station id is a unique world
 // voxel, so entries from different bots never collide except when two bots edited the SAME
 // voxel — resolved last-writer-wins by the entry's `updated_at` stamp. Pure relay/merge, no
-// interpretation (Law 3): the overseer never inspects station contents, only freshness.
+// interpretation (Law 3): the foreman never inspects station contents, only freshness.
 //
 // A REMOVAL RIDES IN AS AN ENTRY, never as a missing key. The loop below reads incoming keys only, so
 // an absent key is no-news and this map would otherwise keep a dug-up station for the life of the run
 // and reinstall it on every bot at the next broadcast — which is what it did. station_registry marks a
-// removed station with `removed_at` and stamps it fresh; the overseer relays it like any other row
+// removed station with `removed_at` and stamps it fresh; the foreman relays it like any other row
 // (still no interpretation — it does not read the flag), and each bot's registry drops it on read.
 let mergedStations = {};
 
 // STANDING REQUESTS — what each human has asked their crew for, held here for the same reason the
-// station map is: the foreman is not a bot, has no HQ of its own, and the overseer is the one process
-// that sees every crew (§8.3 — the overseer owns the fact, the bot owns whether it cares).
+// station map is: the foreman is not a bot, has no HQ of its own, and it is the one process
+// that sees every crew (§8.3 — the foreman owns the fact, the bot owns whether it cares).
 //
 // NO MERGE FUNCTION AND NO LAST-WRITER-WINS. Stations are merged because many bots observe them; a
 // request has exactly ONE author — the person who spoke it — so there is nothing to reconcile. The
-// overseer is the sole writer and the bots are readers, which is the whole point of moving the fact
+// foreman is the sole writer and the bots are readers, which is the whole point of moving the fact
 // here rather than letting crews each keep a copy.
 let standingRequests = {};
 
@@ -160,19 +170,101 @@ function mergeBuildingsInto(incoming) {
   }
 }
 
+// ── A BOT CANNOT SET A POINT (Architect 2026-09-18: *"Bots can't set their own points now"*) ──────────
+// The foreman is the one writer of where a building stands (`lockSite` below), so a bot's copy of a building
+// is accepted only when its location is the one the foreman wrote. A bot legitimately re-sends the rows it
+// received (every broadcast echoes back), and those pass. What does not pass is a bot establishing a
+// location the foreman never set, moving one, or striking one: each of those rows is dropped whole, and the
+// drop is reported, because a bot writing a location is a code fault rather than a disagreement (Law 13).
+// Reported once per bot and room, so a bot that keeps echoing the same bad row does not flood the stream.
+const _refusedLocation = new Set();
+function sameLocation(a, b) {
+  const x = a && a.set_buildspot, y = b && b.set_buildspot;
+  if (!x || !y) return false;
+  const p = x.build_center || {}, q = y.build_center || {};
+  return x.locked_at === y.locked_at && p.x === q.x && p.y === q.y && p.z === q.z;
+}
+function botBuildingsOnly(incoming, botId) {
+  if (!incoming || typeof incoming !== 'object') return incoming;
+  const kept = {};
+  for (const [key, entry] of Object.entries(incoming)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const held = mergedBuildings[key];
+    const heldDead = isBuildingTombstone(held);
+    let why = null;
+    if (isBuildingTombstone(entry)) {
+      if (!heldDead) why = 'struck a building the foreman did not strike';
+    } else if (entry.set_buildspot) {
+      if (!held || heldDead || !sameLocation(entry, held)) why = 'set a location the foreman did not set';
+    }
+    if (!why) { kept[key] = entry; continue; }
+    const mark = `${botId}|${key}`;
+    if (!_refusedLocation.has(mark)) {
+      _refusedLocation.add(mark);
+      warn(`CODING VIOLATION (Law 13): bot '${botId}' ${why} ('${key}'). Only the foreman sets points — the row was dropped.`);
+    }
+  }
+  return kept;
+}
+
+// lockSite(rows) — THE ONE WRITER OF A LOCATION. Called by the desk after its survey, before any body exists.
+// Each row becomes the two chairs `site_chairs` builds, written straight into the fleet's memory, saved to
+// the owner's file and broadcast, so a body spawned next receives its base on registration.
+//
+// ONE BASE HAS ONE SITE. A room already holding a live location at the same centre is left as it is (the
+// desk handed back an existing base); at a different centre it is refused, because moving a base is not a
+// thing a survey may do by accident. A struck (wiped) room is re-established — the later event wins.
+//
+// THE OWNER HALF OF THE KEY IS THE DESK'S TO STATE. A survey row names the structure only ('headframe'); the
+// memory is keyed `<structure>|<owner>` (`bot_mandate.buildingRoomKey`), and a body used to add its own half at
+// the write. The hub has no mandate, so the desk passes the crew's key (`bot_mandate.ownerKeyFor`) and it is
+// joined here, once. A row that already carries a separator is refused: two halves stated twice is a wiring fault.
+function lockSite(rows, ownerKey) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): lockSite needs the rows the desk sited, got ${JSON.stringify(rows)}.`);
+  }
+  if (typeof ownerKey !== 'string' || !ownerKey || ownerKey.includes(BUILDING_ROOM_SEPARATOR)) {
+    throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): lockSite needs the crew's owner key (ownerKeyFor), got ${JSON.stringify(ownerKey)}.`);
+  }
+  const { siteChairs } = require('@kernel/site_chairs');
+  const locked = [];
+  const already = [];
+  for (const row of rows) {
+    if (typeof row.roomKey !== 'string' || !row.roomKey || row.roomKey.includes(BUILDING_ROOM_SEPARATOR)) {
+      throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): a site row names its plain structure ('headframe'), got roomKey ${JSON.stringify(row.roomKey)}.`);
+    }
+    const key = `${row.roomKey}${BUILDING_ROOM_SEPARATOR}${ownerKey}`;
+    const held = mergedBuildings[key];
+    const bc = row.candidate && row.candidate.build_center;
+    if (held && !isBuildingTombstone(held) && held.set_buildspot && held.set_buildspot.build_center) {
+      const h = held.set_buildspot.build_center;
+      if (bc && h.x === bc.x && h.y === bc.y && h.z === bc.z) { already.push(key); continue; }
+      throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): '${key}' is already sited at (${h.x},${h.y},${h.z}); `
+        + `the desk asked for (${bc && bc.x},${bc && bc.y},${bc && bc.z}). One base has one site — the desk hands an existing base back, it never surveys over it.`);
+    }
+    mergedBuildings[key] = siteChairs(row, 'foreman');
+    locked.push(key);
+  }
+  log(`Sited: locked [${locked.join(', ') || 'nothing new'}]${already.length ? `, already held [${already.join(', ')}]` : ''}.`);
+  savePlayerMemory();
+  ownerMemory.flushNow();
+  broadcastBoardroom();
+  return { locked, already };
+}
+
 // ── THE FLOOR UNDER BOTH MIRRORS (Architect 2026-09-05) ─────────────────────────────────────────────
 //
 // *"each player must have a permanent corpoate hq on my computer that stays forever that they control."*
 //
 // The two maps above are a LIVE MIRROR and were never anything else: plain `let x = {}`, empty on every
-// overseer start, repopulated only by whatever bots happened to reconnect and re-send. That was survivable
+// foreman start, repopulated only by whatever bots happened to reconnect and re-send. That was survivable
 // while bodies were permanent and their own files carried the memory. It stops being survivable the moment
 // a visitor is handed a fresh pair of bodies, because then the only durable copy of that person's house
 // lives in a file named after a bot somebody else is about to be given.
 //
 // `owner_memory` is the disk under these two maps and nothing more — it does not merge, decide or
 // interpret (Law 3). It splits the rows that are already owner-keyed into one file per player, and hands
-// them back at startup. See its header for why the overseer owns this and the bots do not.
+// them back at startup. See its header for why the foreman owns this and the bots do not.
 const ownerMemory = require('./owner_memory');
 
 // SAVED ON EVERY MERGE, DEBOUNCED INSIDE THE MODULE. Called from the two places a row can change and from
@@ -182,7 +274,7 @@ const ownerMemory = require('./owner_memory');
 // set answers one question — "may this owner's file be written empty?" — and the answer stays yes once
 // they have wiped, because every later save must keep telling the truth about a player who now has
 // nothing. Forgetting a name here would mean the wipe held until the next unrelated save and then quietly
-// stopped holding. It is bounded by the number of distinct people who wipe between overseer restarts.
+// stopped holding. It is bounded by the number of distinct people who wipe between foreman restarts.
 const wipedOwners = new Set();
 
 function savePlayerMemory() {
@@ -208,17 +300,17 @@ const _restored = ownerMemory.loadAll((m) => log(m));
 // ledger that fed them: salvage is now each bot's own live scan of its own entity table, and an entity
 // table is not shareable state. Relaying "there is an item at (x,y,z)" would hand a peer a claim it cannot
 // verify and that may already be false (Law 23), which is the ghost-offer failure the whole swap removed.
-// Kept as a note rather than a silent deletion because "why doesn't the overseer share drops" is a
+// Kept as a note rather than a silent deletion because "why doesn't the foreman share drops" is a
 // question a successor will ask, and the answer is a decision, not an omission.
 
 function log(msg) {
-  const line = `[${new Date().toISOString()}] [OVERSEER] ${msg}`;
+  const line = `[${new Date().toISOString()}] [FOREMAN] ${msg}`;
   console.log(line);
   persistCombined(line);
 }
 
 function warn(msg) {
-  const line = `[${new Date().toISOString()}] [OVERSEER] ⚠️ ${msg}`;
+  const line = `[${new Date().toISOString()}] [FOREMAN] ⚠️ ${msg}`;
   console.warn(line);
   persistCombined(line);
 }
@@ -264,9 +356,9 @@ function broadcastBoardroom() {
     // is what lets a second bot see the first's chests, furnace orders, and cooked output.
     // Merged fleet structures ride along the same way (first-writer-wins on both sides,
     // so re-sending a bot its own entry is idempotent too).
-    // THE CONNECTED ROSTER — ground truth on who is actually here, and the overseer is the only
+    // THE CONNECTED ROSTER — ground truth on who is actually here, and the foreman is the only
     // party that holds it. It is sent on EVERY broadcast, not just on a disconnect event, because
-    // the event cannot be relied on: killing the server window takes the overseer down with the
+    // the event cannot be relied on: killing the server window takes the foreman down with the
     // bots, so no 'close' handler ever runs anywhere, and every bot's disk keeps a chair for a peer
     // that no longer exists. A peer chair carries a magnet, and a magnet carries chest_locks — so a
     // dead bot goes on holding chests for the rest of the world's life.
@@ -285,7 +377,7 @@ function broadcastBoardroom() {
     // at the one moment it matters most: mergeBroadcast writes only what it is given, so the LAST cancel —
     // the one that empties the ledger — sends a payload with no requests key at all, every crew keeps the
     // rows it already mirrored, and a withdrawn requirement is worked on forever by bots nobody can call
-    // off. The empty map is a FACT the overseer authored, not an absence of news (Invariant B: the mirror
+    // off. The empty map is a FACT the foreman authored, not an absence of news (Invariant B: the mirror
     // follows the authority, and `{}` is something the authority is saying).
     payload.standing_requests = standingRequests;
     if (buildingsPresent) payload.building_conference = mergedBuildings;
@@ -345,7 +437,7 @@ function handleRegister(ws, msg) {
     last_sync: null,
   });
   mergeStationsInto(msg.payload.logistics_stations);
-  mergeBuildingsInto(msg.payload.building_conference);
+  mergeBuildingsInto(botBuildingsOnly(msg.payload.building_conference, msg.bot_id));
 
   const declaredOwner = botClients.get(botId).owner;
   log(`Bot '${botId}' registered as ${mode.trim().toUpperCase()}${declaredOwner ? ` for ${declaredOwner}` : ''}. Total bots: ${botClients.size}`);
@@ -367,7 +459,7 @@ function handleHqDelta(ws, msg) {
   client.boardroom_chair = msg.payload.boardroom_chair || client.boardroom_chair;
   client.last_sync = new Date().toISOString();
   mergeStationsInto(msg.payload.logistics_stations);
-  mergeBuildingsInto(msg.payload.building_conference);
+  mergeBuildingsInto(botBuildingsOnly(msg.payload.building_conference, msg.bot_id));
 
   broadcastBoardroom();
   savePlayerMemory();
@@ -403,7 +495,7 @@ function handleClaimRelease(ws, msg) {
   brain.handleClaimRelease(botId, key);
 }
 
-// Planning token transport (arbiter flavor b — see overseer_brain.js taxonomy).
+// Planning token transport (arbiter flavor b — see foreman_brain.js taxonomy).
 // The brain decides WHO gets the token; this callback is the one pathway every
 // grant (immediate, on-release promotion, TTL-expiry promotion) travels to reach
 // the winning bot (Law 16). The request handler itself never replies — a queued
@@ -416,9 +508,9 @@ brain.onPlanningGrant((botId) => {
 
 // The brain's own lines into the run record, beside this file's. Registered here rather than in the
 // brain because the brain must stay require-able cold (preflight loads it with no server); `persistCombined`
-// is passed unwrapped so the brain's `[OVERSEER_BRAIN]` tag survives into the trace and a lens can tell
+// is passed unwrapped so the brain's `[FOREMAN_BRAIN]` tag survives into the trace and a lens can tell
 // the arbiter's decisions apart from the transport's. Without this the one component that decides which
-// bot may think wrote nothing any lens could read — see the header of overseer_brain.js SECTION 4 for the
+// bot may think wrote nothing any lens could read — see the header of foreman_brain.js SECTION 4 for the
 // run that cost.
 brain.onLog(persistCombined);
 
@@ -454,10 +546,10 @@ function handlePlanningRelease(ws, msg) {
 // thrown away. This is the first hop, and it is the only one that has a witness: every bot's error()
 // forwards here the instant it fires.
 //
-// IT IS A COUNT OF A FIELD, NOT A READING OF A LINE (Law 3 — the overseer stays passive). The watcher
+// IT IS A COUNT OF A FIELD, NOT A READING OF A LINE (Law 3 — the foreman stays passive). The watcher
 // states which channel it used and that word arrives as `level`; nothing here inspects the text, decides
 // what a fault is, or ranks one line above another. A line whose level is absent is counted as
-// `unlabelled` rather than guessed at, so an old bot build talking to a new overseer under-reports
+// `unlabelled` rather than guessed at, so an old bot build talking to a new foreman under-reports
 // visibly instead of being silently scored as clean (Law 25).
 //
 // `last_error` is the bot's OWN line, carried verbatim. The bot participated in the decision it is
@@ -475,7 +567,7 @@ const logTally = new Map();   // bot_id → { summary, warn, error, context, unl
 // been two and had nothing to compare against; the run soaked out its whole window beside a dead crew.
 //
 // AN ABSENCE IS ONLY A FAULT AGAINST A MEMORY OF PRESENCE. That memory is this map, and it is the whole
-// mechanism: the departure is a FACT the overseer witnessed (it held the socket that closed), not an
+// mechanism: the departure is a FACT the foreman witnessed (it held the socket that closed), not an
 // inference anybody downstream has to make by diffing two polls of their own.
 //
 // It rides in `fleet_state` as its own key rather than inside `bots`, because every existing reader of
@@ -513,7 +605,7 @@ function handleLog(msg) {
   const tagged = idx >= 0
     ? `${line.slice(0, idx + 1)} [${botId}]${line.slice(idx + 1)}`
     : `[${botId}] ${line}`;
-  // PRINTED, NOT PERSISTED (Architect 2026-08-12). The overseer console is still the one place a human
+  // PRINTED, NOT PERSISTED (Architect 2026-08-12). The foreman console is still the one place a human
   // watches the whole fleet live, so the tagged line goes to stdout — but the bot already wrote this
   // exact line to its own story file, and persisting it here stored every fleet event twice and made a
   // second source of truth for the same event (Law 16 / Invariant D). readTrace now merges the per-bot
@@ -521,17 +613,17 @@ function handleLog(msg) {
   console.log(tagged);
 }
 
-// Relay one fleet verb to every registered bot. The overseer stays passive (Law 3): it
+// Relay one fleet verb to every registered bot. The foreman stays passive (Law 3): it
 // validates the verb and forwards it unchanged — each bot executes locally through the same
 // operator_commands pathway its own console uses (Law 16). Returns the number of bots reached.
-// `only` addresses a single bot when the operator named one. Still passive (Law 3): the overseer
+// `only` addresses a single bot when the operator named one. Still passive (Law 3): the foreman
 // makes no decision, it delivers to the address it was given. It exists because `move` walks a body
 // to an authored cell — broadcasting that to a three-bot fleet would send three bots to one voxel,
 // which is three occupants of one scope (Law 4). Verbs with no addressee broadcast exactly as before.
 // `origin` rides along on every command because the fleet now holds TWO SPECIES and the difference
 // between them is a question about TRANSPORT, not vocabulary: a homesteader must still take `exit`
-// from the operator's console and must never take anything from a human in the world. The overseer
-// stamps it because the overseer is the only party that KNOWS it — it can see which socket spoke —
+// from the operator's console and must never take anything from a human in the world. The foreman
+// stamps it because the foreman is the only party that KNOWS it — it can see which socket spoke —
 // whereas a bot receiving the message cannot verify a claim about where the message came from
 // (Law 23). Passive still (Law 3): stamping a fact it observed is not deciding anything.
 //
@@ -543,7 +635,7 @@ function handleLog(msg) {
 //
 // IT IS ROUTED HERE RATHER THAN GUARDED AT THE BOT, and that placement is the whole isolation. The
 // receiving bot cannot verify a claim about where a message came from (Law 23), so a check there would
-// be trusting the sender's word about the sender. The overseer is the one party that KNOWS, because it
+// be trusting the sender's word about the sender. The foreman is the one party that KNOWS, because it
 // observed which door the socket arrived at — so the fact is used at the only place it exists.
 //
 // ── AND ONTO ONE PERSON'S BOTS WITHIN THAT ──────────────────────────────────────────────────────
@@ -559,7 +651,7 @@ function handleLog(msg) {
 //
 // WHY `asker` IS TRUSTED FROM THE DOOR WHEN A SPECIES CLAIM WOULD NOT BE. Each party states only what
 // it alone observed, and nothing states anything about itself: the bot declares its own owner at birth
-// (an environment fact it cannot rewrite), the overseer stamps the origin from which of its own
+// (an environment fact it cannot rewrite), the foreman stamps the origin from which of its own
 // listeners accepted the socket, and the foreman reports which player spoke — read off the authenticated
 // chat packet's sender, the same wire-level fact that already keeps the console from impersonating a
 // player. Three observations, three observers, none of them vouching for itself (Law 23).
@@ -621,7 +713,7 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
   // Not in the foreman, and the placement is the whole point. The foreman is the only thing that speaks
   // on the in-game door today, so a check inside it would be the sender promising to behave — and the
   // two-listener design exists precisely because a guarantee resting on a sender's honesty is not one
-  // (Law 23). This refuses on the origin the overseer OBSERVED (which of its own servers accepted the
+  // (Law 23). This refuses on the origin the foreman OBSERVED (which of its own servers accepted the
   // socket), so no message from the world can carry a bench verb however the foreman is edited.
   //
   // WHAT IS EXCLUDED AND WHY, in one sentence each, because "the human's set is smaller" invites a
@@ -633,6 +725,15 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
     warn(`Refusing '${verb}' from ${asker} inside the world — it is an operator verb, not one of the `
       + `in-game vocabulary (${[...INGAME_VERBS].join(' | ')}). The terminal keeps it.`);
     return { ...nil, reason: 'not_ingame_verb' };
+  }
+  // ── 'shutdown' ENDS THE WHOLE RUN, AND ONLY THE TERMINAL MAY SAY IT (Architect 2026-09-18) ──────────
+  // *"how does shutting down a server work after a soak or a problem?… I want foreman to handle that."*
+  // It is not delivered to any bot: it hands the foreman's own shutdown road the reason, and that road sends
+  // every bot `stop`, stops a world this process started, and ends the process. The in-game gate above
+  // already refuses it from inside the world — it is not in INGAME_VERBS.
+  if (verb === 'shutdown') {
+    const begun = foremanWorld.askShutdown(`the terminal's 'shutdown' (${source})`);
+    return { ...nil, reason: begun ? 'shutting_down' : 'no_shutdown_road' };
   }
   // ── 'wipe' IS SETTLED HERE, ABOVE THE no_bots GATE, AND IT NEEDS NO BODY AT ALL ──────────────────
   //
@@ -723,7 +824,7 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
   }
 
   // 'flush' means "fresh server" fleet-wide: the bots wipe their own corporate_headquarters,
-  // but this long-lived overseer also mirrors fleet HQ (merged stations + structures) and
+  // but this long-lived foreman also mirrors fleet HQ (merged stations + structures) and
   // would otherwise re-broadcast the pre-flush home straight back into the freshly-blank bots —
   // which now trips set_buildspot's Law-13 guard. Clear the mirror here so the fleet is truly
   // fresh. Done before the broadcast so a bot's immediate post-reset (empty) update can't be
@@ -791,17 +892,23 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
 // Delivery is not outcome and this says only what it knows — how many bots the verb reached and why it
 // reached no more than that (Law 25). What those bots then DO with it is not observable from here.
 function handleOperatorCommand(ws, msg, origin) {
-  const verb = msg.payload && msg.payload.verb;
-  const args = (msg.payload && msg.payload.args) || {};
-  // `asker` is read off the payload and is meaningful ONLY on the in-game door, where the foreman is the
+  const payload = operatorResult(msg.payload || {}, `socket:${msg.bot_id}`, origin);
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(createEnvelope('command_result', 'foreman', payload)));
+  }
+}
+
+// The verdict half of the handler above, shared by the socket and by the desk living in this process.
+function operatorResult(p, source, origin) {
+  const verb = p.verb;
+  const args = p.args || {};
+  // `asker` is read off the payload and is meaningful ONLY on the in-game origin, where the foreman is the
   // party that observed which player spoke. On the terminal door there is no asker and none is read:
   // the operator is not a participant in ownership (see broadcastCommand).
-  const asker = typeof msg.payload?.asker === 'string' && msg.payload.asker.trim() ? msg.payload.asker.trim() : null;
-  const result = runOperatorVerb(typeof verb === 'string' ? verb.trim() : '', `socket:${msg.bot_id}`, args, origin, asker)
+  const asker = typeof p.asker === 'string' && p.asker.trim() ? p.asker.trim() : null;
+  const result = runOperatorVerb(typeof verb === 'string' ? verb.trim() : '', source, args, origin, asker)
     || { sent: 0, skippedSpecies: 0, skippedOwner: 0, reason: 'refused' };
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(createEnvelope('command_result', 'overseer', { verb, origin, ...result })));
-  }
+  return { verb, origin, ...result };
 }
 
 // WHO IS OUT THERE, AND WHOSE — answered from the live registry rather than from the PID file.
@@ -837,7 +944,13 @@ function handleOperatorCommand(ws, msg, origin) {
 // registry holds connection rather than life — so its error count survives its body, which is exactly
 // what a run verdict needs.
 function handleFleetQuery(ws, msg) {
-  const bots = [...botClients.entries()].map(([id, c]) => ({
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(createEnvelope('fleet_state', 'foreman', fleetState())));
+  }
+}
+
+function fleetState() {
+  const bots =[...botClients.entries()].map(([id, c]) => ({
     id,
     mode: c.mode,
     owner: c.owner,
@@ -852,9 +965,21 @@ function handleFleetQuery(ws, msg) {
   // Departed bots ride beside the roster, never inside it — see departedBots' header for why that
   // separation is load-bearing for the foreman and the camera warden.
   const departed = [...departedBots.entries()].map(([id, d]) => ({ id, ...d, ...tallyOf(id) }));
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(createEnvelope('fleet_state', 'overseer', { bots, departed })));
+  // THE SITES THAT ALREADY EXIST, READ-ONLY (2026-09-18). The desk sites every base before it spawns a body,
+  // so it must know whether one is already there — *"if theres already a partially constructed building then
+  // it again spawns bots nearby"*. Without this it surveys blind to the fleet's own memory and hands a new
+  // site that the crew's existing lock contradicts. Each row is the `set_buildspot` + `blueprint_paster`
+  // chairs of one live building, keyed `<structure>|<owner>`; wiped rows are left out.
+  //
+  // A READ, SO THE DOOR STAYS WHAT IT IS. The door refuses to be an HQ writer, because a writer here would let
+  // anyone who can open this socket plant a base; reading where bases already stand grants nothing, and it is
+  // the same "read everyone's" every body's own siting has always done (`find_buildingspot`).
+  const buildings = {};
+  for (const [key, entry] of Object.entries(mergedBuildings)) {
+    if (!entry || isBuildingTombstone(entry) || !entry.set_buildspot) continue;
+    buildings[key] = { set_buildspot: entry.set_buildspot, blueprint_paster: entry.blueprint_paster || null };
   }
+  return { bots, departed, buildings, world: foremanWorld.status() };
 }
 
 // handleRequestCommand — a person's standing requirement, arriving from the desk.
@@ -873,7 +998,7 @@ function handleFleetQuery(ws, msg) {
 // PURE RELAY, NO ARITHMETIC (Law 3). Every figure here was computed inside a body by the same lens its
 // own supply assessor stands down on; this picks the freshest report per item and forwards it untouched.
 // The desk cannot compute these — it holds no owner key, so it cannot tell which chests belong to whom —
-// and the overseer must not either: counting the merged station map here would be a second answer to
+// and the foreman must not either: counting the merged station map here would be a second answer to
 // "how much have we got", disagreeing with the crews the moment a claim is held (Law 16, Law 25).
 //
 // FRESHEST WINS, PER ITEM, and it is chosen per item rather than per bot because a crew's members sync
@@ -903,44 +1028,39 @@ function crewProgress(asker) {
 }
 
 function handleRequestCommand(ws, msg) {
-  const { action, item, quantity, asker } = msg.payload || {};
-  const answer = (payload) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(createEnvelope('request_result', 'overseer', payload)));
-    }
-  };
+  const payload = requestResult(msg.payload || {});
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(createEnvelope('request_result', 'foreman', payload)));
+  }
+}
+
+// The verdict half of the handler above, shared by the socket and by the desk living in this process.
+function requestResult({ action, item, quantity, asker }) {
   if (!asker) {
     warn('In-game door: a request naming no asker was refused.');
-    answer({ ok: false, reason: 'no_asker' });
-    return;
+    return { ok: false, reason: 'no_asker' };
   }
 
   const ledger = requestLedger;
 
   if (action === 'post') {
     const result = ledger.applyPost(standingRequests, item, quantity, asker, asker);
-    if (result.ok) {
-      standingRequests = result.rows;
-      log(`Request: ${asker} asks for ${quantity} ${item}.`);
-      answer({ ok: true, item: result.row.item, quantity: result.row.quantity, replaced: result.replaced });
-    } else {
-      answer({ ok: false, reason: result.reason, blockedBy: result.blockedBy || null });
-    }
-    return;
+    if (!result.ok) return { ok: false, reason: result.reason, blockedBy: result.blockedBy || null };
+    standingRequests = result.rows;
+    log(`Request: ${asker} asks for ${quantity} ${item}.`);
+    return { ok: true, item: result.row.item, quantity: result.row.quantity, replaced: result.replaced };
   }
   if (action === 'cancel') {
     const { rows, removed } = ledger.applyCancel(standingRequests, item, asker);
     standingRequests = rows;
     log(`Request: ${asker} withdrew ${item} (${removed} row(s)).`);
-    answer({ ok: true, removed });
-    return;
+    return { ok: true, removed };
   }
   if (action === 'status') {
-    answer({ ok: true, rows: ledger.rowsFor(standingRequests, asker), progress: crewProgress(asker) });
-    return;
+    return { ok: true, rows: ledger.rowsFor(standingRequests, asker), progress: crewProgress(asker) };
   }
   warn(`In-game door: request action '${action}' is not spoken here.`);
-  answer({ ok: false, reason: `unknown_action: ${action}` });
+  return { ok: false, reason: `unknown_action: ${action}` };
 }
 
 // ── THE IN-GAME DOOR ─────────────────────────────────────────────────────────────────────────────
@@ -1049,15 +1169,15 @@ wss.on('connection', onConnection);
 // A PORT ALREADY IN USE IS THE FIRST ERROR A NEW PERSON MEETS, and it reached them as an unhandled
 // 'error' event: a nine-line Node stack naming `websocket-server.js` and the word EADDRINUSE, which
 // says nothing about what they did or what to do. The commonest cause is the most innocent one —
-// running a launcher twice, or leaving yesterday's overseer alive — so it is a world-fact rather than a
+// running a launcher twice, or leaving yesterday's foreman alive — so it is a world-fact rather than a
 // coding violation, and it is refused in the world's terms with the two things that actually fix it
 // (Law 13: every failure states exactly what caused it; Law 25: a message that does not say what to do
 // costs a search). Anything else is re-thrown untouched rather than swallowed into this one diagnosis.
 const listenFailure = (which) => (err) => {
   if (err && err.code === 'EADDRINUSE') {
-    console.error(`\n  The overseer cannot start: something is already using port ${err.port || PORT}`
+    console.error(`\n  The foreman cannot start: something is already using port ${err.port || PORT}`
       + ` (${which}).\n`
-      + `\n  Almost always this is an overseer that is already running — a second launcher, or one left`
+      + `\n  Almost always this is an foreman that is already running — a second launcher, or one left`
       + `\n  over from earlier. There is only meant to be one.\n`
       + `\n  Either use the one that is running, or close it and start again.\n`);
     process.exit(1);
@@ -1077,32 +1197,32 @@ ingameDoor.on('error', listenFailure('the in-game door'));
 // Startup banner (bright magenta, bold) — deliberately a DIFFERENT colour from the bots' cyan banner
 // so the two window types are told apart at a glance. This is the one window that carries the whole
 // fleet's live log stream; the bot windows are near-silent by design.
-(function overseerBanner() {
+(function hubBanner() {
   const M = '\x1b[95m\x1b[1m', R = '\x1b[0m';
   const bar = '═'.repeat(50);
   console.log(`${M}${bar}${R}`);
-  console.log(`${M}  🛰️   OVERSEER  ·  fleet log stream + command hub${R}`);
+  console.log(`${M}  🛰️   FOREMAN HUB  ·  fleet log stream + command hub${R}`);
   console.log(`${M}      every bot's logs appear here, tagged [BotId]${R}`);
   console.log(`${M}${bar}${R}`);
 })();
 
 // ── THE MIRROR STARTS FULL, NOT EMPTY ───────────────────────────────────────────────────────────────
-// Before this line ran, `mergedBuildings` and `mergedStations` began every overseer life as `{}` and a
+// Before this line ran, `mergedBuildings` and `mergedStations` began every foreman life as `{}` and a
 // player's places existed only for as long as some bot that had built them kept reconnecting. This is the
 // line that makes a player's HQ outlive the bodies — and it must run BEFORE the first bot can register,
 // which is why it sits with the startup banner rather than inside an async warm-up.
 Object.assign(mergedBuildings, _restored.buildings);
 Object.assign(mergedStations,  _restored.stations);
 
-log(`Overseer WebSocket server listening on ws://localhost:${PORT}`);
+log(`Foreman WebSocket server listening on ws://localhost:${PORT}`);
 log(`In-game door listening on ws://127.0.0.1:${INGAME_DOOR_PORT} — verbs arriving here reach CONTRACTORS only.`);
 log(`Waiting for bot connections...`);
-log(`Operator console ready — type a verb + Enter to command every bot: start | exit | flush.`);
+log(`Operator console ready — type a verb + Enter to command every bot: start | stop | flush | shutdown.`);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 6 — Operator console (TTY transport into runOperatorVerb — Law 16:
 // the socket 'operator_command' is the other transport, same one pathway).
-// The overseer stays passive (Law 3): it only validates and forwards, never decides.
+// The foreman stays passive (Law 3): it only validates and forwards, never decides.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -1112,3 +1232,30 @@ rl.on('line', (input) => {
   if (!verb) return;
   runOperatorVerb(verb, 'console', {}, ORIGIN.TERMINAL);   // the operator's own keyboard IS the terminal
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 7 — The desk's entrance (the foreman lives in this process)
+// ─────────────────────────────────────────────────────────────────────────────
+// The foreman used to reach this file through the in-game socket, from a second process. Now that it is
+// the same process, it calls the same three answers directly. They are the functions the socket handlers
+// call, so the desk and a socket caller cannot come to hear different answers (Law 16). The origin is
+// fixed HERE as in-game, exactly as the in-game listener fixes it: the desk relays a player's words, and
+// a player's words never carry console authority, whatever road they took. The socket door stays open
+// for the readers that are still other processes (run.js, the camera warden).
+const desk = Object.freeze({
+  fleetState: () => fleetState(),
+  operator: (payload) => operatorResult(payload || {}, 'desk', ORIGIN.INGAME),
+  request: (payload) => requestResult(payload || {}),
+  // The one writer of a location (see lockSite). The desk calls it after its survey, before any spawn.
+  lockSite: (rows, ownerKey) => lockSite(rows, ownerKey),
+  // THE FLEET STOPS WHEN THE RUN ENDS (Architect 2026-09-18: *"The body is needed, it’s not an optional
+  // process"*, and *"Who owns the process? Foreman does."*). Not a player's word, so it does not ride
+  // `operator`: this is the process ending its own run, and `stop` is the operator verb every bot already
+  // obeys from the terminal. It is a function of its own so no caller can pass an origin in.
+  stopFleet: (why) => {
+    warn(`STOPPING THE FLEET — ${why}`);
+    return runOperatorVerb('stop', 'foreman-body', {}, ORIGIN.TERMINAL);
+  },
+});
+
+module.exports = { desk };

@@ -16,7 +16,7 @@
 // ── IT WATCHES THE WORLD, NOT THE LAUNCHER ──────────────────────────────────────────────────────────
 // The obvious wiring is a hook in `foreman get`, or in `fleet_control botStart`, firing a camera launch
 // beside each bot launch. It is the wrong joint twice over. First, `bot-start` RETURNS WHEN THE PROCESS
-// IS LAUNCHED — a body enters the overseer's registry only after it connects, spawns and master_core
+// IS LAUNCHED — a body enters the foreman's registry only after it connects, spawns and master_core
 // initialises, seconds later — so a camera raised on the launcher's return is a camera aimed at a bot
 // that is not in the world yet. That is the exact defect the foreman's own crew loop was rebuilt to fix
 // (Law 26: the launcher's fact and the world's fact are different facts). Second, it would put the film
@@ -24,7 +24,7 @@
 // behaviour would depend on whether it was being filmed — which is the one thing filming must never do
 // (Law 19, and the camera runbook's opening rule: the film crew observes, it does not act).
 //
-// So the warden SENSES instead. It asks the overseer's registry who is standing, every few seconds, and
+// So the warden SENSES instead. It asks the foreman's registry who is standing, every few seconds, and
 // gives a camera to anyone who has none. That covers `foreman get`, a hand `bot-start`, a revive, and
 // anything not yet written, because none of them is what it is watching (Invariant B — re-sense the
 // world, never track it from remembered events).
@@ -82,13 +82,13 @@ const SCRIPTS = paths.workshop('scripts');
 const KERNEL = paths.bot('js_kernel');
 
 // THE FLEET'S OWN DOOR CLIENT, borrowed rather than re-spelled — the same borrow tools/foreman_probe
-// makes, and for the same reason: the one fact this file needs is which bots the overseer has
+// makes, and for the same reason: the one fact this file needs is which bots the foreman has
 // REGISTERED, and a second socket client written here would be a parallel route to it that drifts the
 // day the envelope changes (Law 16). It is used to OBSERVE and never to command; the warden issues no
 // verb to any bot, which is what keeps the film crew out of the fleet's pathways (Law 19).
 // The aliases are registered because the door is written for a process that has them.
 paths.registerAliases();
-const door = require(path.join(BOT_DIR, 'foreman', 'overseer_door.js'));
+const door = require(path.join(BOT_DIR, 'foreman', 'foreman_door.js'));
 
 // How often the registry is asked. Six seconds is well under how long a body takes to join (the
 // foreman allows ninety), so a contractor is filmed within a few seconds of standing up, and the cost
@@ -241,7 +241,7 @@ async function main() {
   } catch (e) { say(`⚠ could not record my own pid (${e.message}) — teardown still finds me by command line.`); }
 
   const filmed = new Set(SEED);
-  say(`up. Watching the overseer's registry every ${POLL_MS / 1000}s for bots with no camera.`);
+  say(`up. Watching the foreman's registry every ${POLL_MS / 1000}s for bots with no camera.`);
   say(`overlay '${OVERLAY}'${HOST_ON ? ', host seat on' : ''}${ARCHITECT_ON ? ", Architect's eye on" : ''}` +
     `, ceiling ${MAX_CAMERAS} window(s).` +
     (filmed.size ? ` Already filmed: ${[...filmed].join(', ')}.` : ' No crew yet — say "foreman get" in game.'));

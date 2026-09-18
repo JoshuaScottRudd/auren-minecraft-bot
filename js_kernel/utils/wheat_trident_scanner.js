@@ -29,8 +29,8 @@
 // ── WHICH TINES MAKE THE FIELD ──────────────────────────────────────────────────────────────────────────
 // Longest first (nearest A0 on a tie), each taken only if it touches no tine already taken and its A0 has a route,
 // until `target` plots; the last tine is cut to the rows still needed. `capacity` is every tine the view holds,
-// packed the same way uncut, WITHOUT the route check (a route search per tine in view is the census's job).
-// `reachCensus: true` also route-checks the anchor prime of every capacity tine — for the bench, not a live crew.
+// packed the same way uncut, WITHOUT the route check (a route search per tine in view floods the reachable area
+// for every prime that has none, which a live crew cannot afford).
 
 'use strict';
 
@@ -119,7 +119,7 @@ function tineRows(t, rows) {
 // scanWheatTrident(bot, { origin, start, target, seaY }) → the chosen tines as anchors and build steps.
 //   origin — where "nearest" is measured from; start — the FLOOR cell the route search starts on (default: origin's
 //   feet − 1). Both are the person spot on a snapshot, the body on a live crew.
-async function scanWheatTrident(bot0, { origin, start, target = FARM_PLOT_COUNT, seaY = DEFAULT_SEA_Y, combatGate = true, reachCensus = false } = {}) {
+async function scanWheatTrident(bot0, { origin, start, target = FARM_PLOT_COUNT, seaY = DEFAULT_SEA_Y, combatGate = true } = {}) {
   if (typeof bot0?.world?.getColumns !== 'function') {
     throw new Error('[wheat_trident_scanner] CODING VIOLATION (Law 13): the scan reads the whole loaded area and this bot exposes no world.getColumns().');
   }
@@ -199,25 +199,11 @@ async function scanWheatTrident(bot0, { origin, start, target = FARM_PLOT_COUNT,
   const capacity = await pack(Infinity, false);
   const picked = await pack(target, true);
 
-  let census = null;
-  if (reachCensus) {
-    // Over the CAPACITY tines — the view packed uncut, the tines a field could actually be made of. Every tine start in
-    // view is several hundred searches, and a prime with no route floods the whole reachable area to prove it
-    // (d2, 2026-09-15: 431 primes, 353 s); a multi-goal search is slower still, its heuristic scans every goal per node.
-    const primes = new Map();
-    for (const t of capacity.chosen) primes.set(`${t.prime.x},${t.prime.z}`, t.prime);
-    const why = {};
-    let ok = 0;
-    for (const p of primes.values()) { const r = await routeTo(p); if (r.ok) ok++; else why[r.why] = (why[r.why] || 0) + 1; }
-    const lostPlots = capacity.chosen.filter(t => !routeMemo.get(`${t.prime.x},${t.prime.z}`).ok).reduce((n, t) => n + 2 * t.rows, 0);
-    census = { primes: primes.size, reachable: ok, unreachable: primes.size - ok, why, tines: capacity.chosen.length, lostPlots };
-  }
-
   const base = {
     columnsSwept: cols.length, openWaterCells: openCells, bodiesFound: bodySizes.length,
     candidates: candidates.length, longestTine: candidates.reduce((m, c) => Math.max(m, c.length), 0),
     capacityPlots: capacity.plots, capacityTines: capacity.chosen.length,
-    skippedNoRoute: picked.noRoute, census, start: from,
+    skippedNoRoute: picked.noRoute, start: from,
   };
 
   const field = [], tines = [];
@@ -254,8 +240,7 @@ function describeTrident(s) {
   const head = 'wheat trident: ';
   const why = `${s.candidates} tine starts over ${s.columnsSwept} chunks (${s.openWaterCells} open water cells in ${s.bodiesFound} bodies), ` +
     `longest ${s.longestTine}; the view packs ${s.capacityPlots} plots in ${s.capacityTines} tines uncut.`;
-  const route = `${s.skippedNoRoute.length} tine(s) skipped for no route to anchor prime` +
-    (s.census ? `; census over the view's ${s.census.tines} capacity tines: ${s.census.reachable}/${s.census.primes} anchor primes have a route (${s.census.lostPlots}/${s.capacityPlots} plots lost${s.census.unreachable ? ` — ${Object.entries(s.census.why).map(([k, v]) => `${k} ${v}`).join(', ')}` : ''})` : '');
+  const route = `${s.skippedNoRoute.length} tine(s) skipped for no route to anchor prime`;
   if (!s.found) return `${head}SHORT — ${s.field.length} plots from ${s.tines.length} tines.\n      ↳ ${why}\n      ↳ ${route}`;
   return [
     `${head}FOUND ${s.field.length} plots in ${s.pieces} tine(s) ${s.tines.map(t => `${t.rows}${t.rows < t.fullLength ? `/${t.fullLength}` : ''}`).join('+')} rows, ` +

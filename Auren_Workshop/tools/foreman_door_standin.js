@@ -1,7 +1,7 @@
 'use strict';
 
 // THE ALIASES ARE REGISTERED HERE rather than left to a caller. This stand-in requires
-// `@overseer/message_schema` and used to work only when something upstream had already booted the map —
+// `@foreman/message_schema` and used to work only when something upstream had already booted the map —
 // which is a dependency on a caller's habit, not on anything this file can check (Law 16: one route,
 // asked by everyone). Idempotent, so a caller that already booted pays nothing.
 require('../workshop_paths').registerAliases();
@@ -14,9 +14,9 @@ require('../workshop_paths').registerAliases();
 // message — and a body cannot make those answers any truer. Those questions were paying a fleet's
 // startup and a fleet's latency for evidence a fleet does not supply.
 //
-// So this stands where the overseer's in-game door stands, and nothing is raised behind it. The desk
+// So this stands where the foreman's in-game door stands, and nothing is raised behind it. The desk
 // runs its whole length: it hears an authenticated chat packet, parses, corrects, gates, and relays
-// through `overseer_door` — the same socket, the same envelope, the same port.
+// through `foreman_door` — the same socket, the same envelope, the same port.
 //
 // ── WHY THE CUT IS HERE AND NOT IN THE FOREMAN ────────────────────────────────────────────────────
 // The alternative was a test mode inside the desk: teach it that one named player is a tester and have
@@ -26,19 +26,19 @@ require('../workshop_paths').registerAliases();
 // is precisely the power V5/V8/V12 exist to prove it does not have. A probe cannot install the
 // capability its own controls are built to disprove.
 //
-// Cutting at the door needs no such branch, because the door is already the seam. `overseer_door`'s own
+// Cutting at the door needs no such branch, because the door is already the seam. `foreman_door`'s own
 // header states the rule this relies on: the origin of a verb is decided by WHICH DOOR IS KNOCKED ON,
 // never by a field the sender spells. A foreman talking to this module is byte-for-byte the foreman
-// talking to the overseer — it cannot tell, and nothing in it needed to be told.
+// talking to the foreman — it cannot tell, and nothing in it needed to be told.
 //
 // ── WHAT IT MAY AUTHOR, AND WHAT IT MUST CALL ─────────────────────────────────────────────────────
 // The playground's governing line, applied one category over: anything MINECRAFT decides must be READ,
-// anything WE decide may be AUTHORED. The overseer is ours, so its answers may be authored — the roster
+// anything WE decide may be AUTHORED. The foreman is ours, so its answers may be authored — the roster
 // it would report, the delivery verdict it would return. What may NOT be authored is a rule the desk is
 // under test against, because authoring the answer deletes the question:
 //
 //   · THE REQUEST RULES ARE CALLED, NEVER RESTATED. `applyPost` / `applyCancel` / `rowsFor` are the
-//     exact functions `overseer_server` calls, from the exact module (Law 16). Whether a repeat replaces
+//     exact functions `foreman_hub` calls, from the exact module (Law 16). Whether a repeat replaces
 //     or accumulates, whether a met row survives, which items may be asked for — every one of those is a
 //     claim the request questions make, so a second implementation here would grade a ledger nobody
 //     runs. This is the bench's own worst failure, already met once: a scenario passed 25/25 before and
@@ -48,11 +48,11 @@ require('../workshop_paths').registerAliases();
 //     unfinished. Deciding which bots a verb reaches is `broadcastCommand`'s, and it is the subject of
 //     its own control questions. Reimplementing it would put a second copy of the isolation rule in the
 //     instrument that grades it — the copy would pass its own questions while the fleet's copy rotted.
-//     So ownership and species isolation are OVERSEER claims and belong to the phase that runs one.
+//     So ownership and species isolation are FOREMAN claims and belong to the phase that runs one.
 //     Phase 1 must not report on them, and says so rather than scoring them green (Law 25).
 //
 // ── WHAT IT REPLIES TO AN OPERATOR VERB, AND WHY THAT IS NOT A LIE ────────────────────────────────
-// `sent: 0, reason: 'no_bots'` — which is what the REAL overseer returns when its registry is empty,
+// `sent: 0, reason: 'no_bots'` — which is what the REAL foreman returns when its registry is empty,
 // reached by the same branch, because the registry really is empty: nothing was raised. The desk then
 // tells the human its verb reached nobody, which is true. Nothing here reports a delivery that did not
 // happen, and no success flag is emitted that was not earned (Law 25).
@@ -64,7 +64,7 @@ require('../workshop_paths').registerAliases();
 // delivery IS observable. The class of fault it catches is the one a live run already produced — a
 // field the desk was supposed to stamp arriving absent, invisible to a bench that authored it by hand.
 
-const { createEnvelope, parseEnvelope, INGAME_DOOR_PORT_OFFSET } = require('@overseer/message_schema');
+const { createEnvelope, parseEnvelope, INGAME_DOOR_PORT_OFFSET } = require('@foreman/message_schema');
 const requestLedger = require('@kernel/request_ledger');
 const { requireFromHomes } = require('@utils/node_module_homes');
 const { guardExternalSync } = require('@utils/external_library_guard');
@@ -75,8 +75,8 @@ const TAG = 'door_standin';
 //
 //   handle.port       the port it is listening on
 //   handle.envelopes  every message that arrived, in order, whole — the phase-1 evidence
-//   handle.rows       the standing request ledger, as the overseer would hold it
-//   handle.setRoster  author who the overseer would say is in the world
+//   handle.rows       the standing request ledger, as the foreman would hold it
+//   handle.setRoster  author who the foreman would say is in the world
 //   handle.close()
 //
 // THE LEDGER IS THIS PROCESS'S, AND IT IS EMPTY AT THE START OF A RUN — deliberately, because a run
@@ -84,12 +84,12 @@ const TAG = 'door_standin';
 // the reason would be invisible. Law 8: what is raised here is taken down with it.
 function start(opts = {}) {
   const WebSocket = requireFromHomes('ws');
-  const base = parseInt(opts.overseerPort || process.env.OVERSEER_PORT || '3001', 10);
+  const base = parseInt(opts.foremanPort || process.env.FOREMAN_PORT || '3001', 10);
   const port = base + INGAME_DOOR_PORT_OFFSET;
   const log = opts.quiet ? () => {} : (m) => console.log(`[${TAG}] ${m}`);
 
   const envelopes = [];
-  // The roster the overseer would report. AUTHORED, and every question that reads it has to say so:
+  // The roster the foreman would report. AUTHORED, and every question that reads it has to say so:
   // "given a roster of two, the desk refuses a third" is a claim about the DESK and is what phase 1 may
   // assert; "the roster is true" is a claim about the world and is not available here at all.
   let roster = Array.isArray(opts.roster) ? opts.roster.slice() : [];
@@ -100,7 +100,7 @@ function start(opts = {}) {
 
   const answer = (ws, type, payload) => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(createEnvelope(type, 'overseer', payload)));
+      ws.send(JSON.stringify(createEnvelope(type, 'foreman', payload)));
     }
   };
 
@@ -113,7 +113,7 @@ function start(opts = {}) {
     ws.on('message', (raw) => {
       const parsed = parseEnvelope(raw.toString());
       // REPORTED, NEVER SILENTLY DROPPED. A malformed message reaching this door is itself a finding —
-      // it means the desk formed something the real overseer would have refused — and a door that
+      // it means the desk formed something the real foreman would have refused — and a door that
       // swallows it is indistinguishable from a deaf one (Law 6).
       if (!parsed.ok) {
         envelopes.push({ at: Date.now(), bad: true, reason: parsed.reason, raw: raw.toString().slice(0, 500) });
@@ -130,7 +130,7 @@ function start(opts = {}) {
 
       if (msg.type === 'request_command') {
         const { action, item, quantity, asker } = msg.payload || {};
-        // The anonymous-request refusal is the overseer's and is reproduced by CALLING the same guard
+        // The anonymous-request refusal is the foreman's and is reproduced by CALLING the same guard
         // shape, not by re-deciding it: an unnamed request is a requirement belonging to nobody.
         if (!asker) { answer(ws, 'request_result', { ok: false, reason: 'no_asker' }); return; }
         if (action === 'post') {
@@ -151,7 +151,7 @@ function start(opts = {}) {
         }
         if (action === 'status') {
           // NO PROGRESS FIGURES, AND THE EMPTY OBJECT IS THE HONEST ANSWER. Progress is measured inside a
-          // body against real chests; with no crew raised, nobody has looked. The overseer reports an
+          // body against real chests; with no crew raised, nobody has looked. The foreman reports an
           // absent measurement as absent rather than as a zero, and so does this — "nothing gathered
           // yet" and "no bot has looked yet" are different facts and only one of them would be a
           // fabrication here (Law 25).
@@ -163,7 +163,7 @@ function start(opts = {}) {
       }
 
       if (msg.type === 'operator_command') {
-        // RECORDED, NOT PERFORMED, AND REPORTED AS SUCH. `no_bots` is the real overseer's own verdict
+        // RECORDED, NOT PERFORMED, AND REPORTED AS SUCH. `no_bots` is the real foreman's own verdict
         // for an empty registry, and the registry really is empty — so this is the true outcome rather
         // than a stand-in's imitation of one. What the verb WOULD have reached is the ownership
         // filter's answer, and that question is not asked in this phase (see the header).
@@ -180,7 +180,7 @@ function start(opts = {}) {
     });
   });
 
-  log(`standing in for the overseer's in-game door on ${port} — nothing is raised behind it.`);
+  log(`standing in for the foreman's in-game door on ${port} — nothing is raised behind it.`);
 
   return {
     port,

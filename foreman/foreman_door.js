@@ -1,5 +1,5 @@
 'use strict';
-// overseer_door.js — the foreman's one way of reaching the fleet with an operator verb.
+// foreman_door.js — the foreman's one way of reaching the fleet with an operator verb.
 //
 // WHY THE FOREMAN DOES NOT SHELL OUT TO fleet_control FOR THESE. It still does for `get`, and the
 // difference between the two cases is the whole reason this file exists. `get` starts an OS PROCESS,
@@ -11,7 +11,7 @@
 //
 // SO THE ORIGIN IS DECIDED BY WHICH DOOR IS KNOCKED ON, NEVER BY A FIELD. This module knows only the
 // in-game door's address. It cannot spell `terminal` because there is nowhere to spell it: the
-// overseer stamps the origin from which of its own listeners accepted the socket, and this one only
+// foreman stamps the origin from which of its own listeners accepted the socket, and this one only
 // ever reaches the second. A foreman that could name its own origin could name the privileged one, and
 // the species isolation would rest on this file's honesty rather than on the fleet's shape (Law 23).
 //
@@ -20,10 +20,10 @@
 // reason about, in a process whose whole job is to relay single sentences (Law 8 — what is raised is
 // taken down, and the cheapest way to honour that is to raise it for one message).
 
-const { createEnvelope, parseEnvelope, INGAME_DOOR_PORT_OFFSET } = require('@overseer/message_schema');
+const { createEnvelope, parseEnvelope, INGAME_DOOR_PORT_OFFSET } = require('@foreman/message_schema');
 const { guardExternalSync } = require('@utils/external_library_guard');
 
-const TAG = 'overseer_door';
+const TAG = 'foreman_door';
 
 // WHERE THE THIRD-PARTY MODULES LIVE HAS EXACTLY ONE ANSWER IN THIS TREE, and this file is not it.
 // The candidate list was written out here a second time and was missing a home the canonical resolver
@@ -39,10 +39,10 @@ const { requireFromHomes } = require('@utils/node_module_homes');
 
 function requireWs() { return requireFromHomes('ws'); }
 
-const OVERSEER_PORT_DEFAULT = 3001;
+const FOREMAN_PORT_DEFAULT = 3001;
 
 function doorPort() {
-  const base = parseInt(process.env.OVERSEER_PORT || String(OVERSEER_PORT_DEFAULT), 10);
+  const base = parseInt(process.env.FOREMAN_PORT || String(FOREMAN_PORT_DEFAULT), 10);
   return base + INGAME_DOOR_PORT_OFFSET;
 }
 
@@ -98,14 +98,45 @@ function _ask(outgoing, wantType, readPayload, timeoutMs) {
 
     ws.on('error', (e) => {
       clearTimeout(timer);
-      finish({ ok: false, error: `no fleet door on port ${port} (${e.message}) — is the overseer up?` });
+      finish({ ok: false, error: `no fleet door on port ${port} (${e.message}) — is the foreman up?` });
     });
   });
 }
 
+// ── WHAT CROSSES FROM THE FLEET'S VOCABULARY INTO THE DESK'S ─────────────────────────────────────────
+// One projection per answer, used by BOTH roads below (the socket and the in-process desk), so the two
+// cannot come to hand the desk different shapes (Law 16).
+//
+// `stopped` IS CARRIED BECAUSE A WIPE IS THE ONE VERB WHOSE OUTCOME IS NOT A DELIVERY COUNT. It is
+// performed by the foreman against the player's own file and reaches zero bots by design, so `sent`
+// cannot describe it; what the person needs to hear is how many of their crew were sent away. The
+// projection is explicit rather than a spread on purpose — this is the boundary where the fleet's
+// vocabulary becomes the desk's, and a field crosses it only when something in here reads it.
+function readCommandResult(p) {
+  return { sent: p.sent || 0, skippedSpecies: p.skippedSpecies || 0, skippedOwner: p.skippedOwner || 0,
+           reason: p.reason || null, stopped: p.stopped || 0 };
+}
+
+// `departed` is bots that REGISTERED AND THEN LEFT, kept out of `bots` on purpose: every caller of
+// that array acts on its members (hire, film, send a verb) and a departed bot among them is a ghost.
+// A caller that only wants the roster reads `bots` and is unaffected by this existing at all.
+// `buildings` is every live base the fleet holds, `<structure>|<owner>` → its site chairs. Read-only; the
+// desk asks it before siting so a crew's existing base is handed back rather than surveyed over.
+function readFleetState(p) {
+  return {
+    bots: Array.isArray(p.bots) ? p.bots : [],
+    departed: Array.isArray(p.departed) ? p.departed : [],
+    buildings: p.buildings && typeof p.buildings === 'object' ? p.buildings : {},
+    // What the world is doing, from the foreman that owns it: { where, state, reason, host, port, ours, ... }.
+    world: p.world && typeof p.world === 'object' ? p.world : null,
+  };
+}
+
+function readRequestResult(p) { return { ...p }; }
+
 // send(verb, args, asker) — an operator verb, on behalf of the player who spoke it.
 //
-// THE ASKER IS NOT OPTIONAL AND IS NOT DEFAULTED. The overseer refuses an in-game verb that names
+// THE ASKER IS NOT OPTIONAL AND IS NOT DEFAULTED. The foreman refuses an in-game verb that names
 // nobody, because the unaddressed form means "all of MY bots" and an anonymous one would mean "all of
 // everybody's" — so a forgotten asker fails loudly here rather than becoming the widest possible
 // command (Law 13).
@@ -113,13 +144,7 @@ function send(verb, args = {}, asker = null, timeoutMs = 5000) {
   return _ask(
     createEnvelope('operator_command', 'foreman', { verb, args, asker }),
     'command_result',
-    // `stopped` IS CARRIED BECAUSE A WIPE IS THE ONE VERB WHOSE OUTCOME IS NOT A DELIVERY COUNT. It is
-    // performed by the overseer against the player's own file and reaches zero bots by design, so `sent`
-    // cannot describe it; what the person needs to hear is how many of their crew were sent away. The
-    // projection is explicit rather than a spread on purpose — this is the boundary where the fleet's
-    // vocabulary becomes the desk's, and a field crosses it only when something in here reads it.
-    (p) => ({ sent: p.sent || 0, skippedSpecies: p.skippedSpecies || 0, skippedOwner: p.skippedOwner || 0,
-              reason: p.reason || null, stopped: p.stopped || 0 }),
+    readCommandResult,
     timeoutMs,
   );
 }
@@ -128,20 +153,14 @@ function send(verb, args = {}, asker = null, timeoutMs = 5000) {
 //
 // ASKED RATHER THAN REMEMBERED. The foreman could tally bots as it hands them out, and that counter would
 // be wrong the first time the operator stops one from the console and every time the foreman itself
-// restarts (Invariant B). The overseer's registry is the live fact, and the fact it holds is CONNECTION,
+// restarts (Invariant B). The foreman's registry is the live fact, and the fact it holds is CONNECTION,
 // not life: a bot that LEFT is not in it, a bot that merely DIED still is — it keeps its owner's slot
 // because it is coming back, which is death_manager's job and not the roster's.
 function query(timeoutMs = 5000) {
   return _ask(
     createEnvelope('fleet_query', 'foreman', {}),
     'fleet_state',
-    // `departed` is bots that REGISTERED AND THEN LEFT, kept out of `bots` on purpose: every caller of
-    // that array acts on its members (hire, film, send a verb) and a departed bot among them is a ghost.
-    // A caller that only wants the roster reads `bots` and is unaffected by this existing at all.
-    (p) => ({
-      bots: Array.isArray(p.bots) ? p.bots : [],
-      departed: Array.isArray(p.departed) ? p.departed : [],
-    }),
+    readFleetState,
     timeoutMs,
   );
 }
@@ -161,9 +180,27 @@ function request(action, args = {}, asker = null, timeoutMs = 5000) {
   return _ask(
     createEnvelope('request_command', 'foreman', { action, ...args, asker }),
     'request_result',
-    (p) => ({ ...p }),
+    readRequestResult,
     timeoutMs,
   );
 }
 
-module.exports = { send, query, request, doorPort };
+// local(desk) — the same three calls, answered by the foreman living in THIS process (2026-09-18).
+//
+// The desk and the hub are one process now, so the desk no longer knocks on a socket to reach a
+// neighbour it shares memory with. Same signatures, same projections and same always-resolving promise as
+// the socket road, so nothing in the desk can tell which road it took. The origin is still not the desk's
+// to name: `desk.operator` stamps in-game inside the foreman. The socket road above stays for the
+// readers that are other processes (run.js, the camera warden).
+function local(desk) {
+  return {
+    send: (verb, args = {}, asker = null) =>
+      Promise.resolve({ ok: true, ...readCommandResult(desk.operator({ verb, args, asker })) }),
+    query: () => Promise.resolve({ ok: true, ...readFleetState(desk.fleetState()) }),
+    request: (action, args = {}, asker = null) =>
+      Promise.resolve({ ok: true, ...readRequestResult(desk.request({ action, ...args, asker })) }),
+    doorPort,
+  };
+}
+
+module.exports = { send, query, request, doorPort, local };

@@ -8,7 +8,7 @@
 // not a guarantee.
 //
 // WHAT IS AUTHORED HERE IS THE PAGE, AND WHAT IS CHECKED IS THAT IT MATCHES THE DOOR. `INGAME_VERBS` —
-// the set the OVERSEER accepts from a human, enforced there rather than here (Law 23: a guarantee resting
+// the set the FOREMAN accepts from a human, enforced there rather than here (Law 23: a guarantee resting
 // on the sender's honesty is not one) — must be fully named on the page, or a verb works that nobody can
 // discover. The assertion at the bottom of the vocabulary section is that check.
 
@@ -22,10 +22,10 @@
 // fleet-wide erasers, and cutting them took the page from fifteen lines to nine — under the ten a vanilla
 // chat window shows, which is the first time the whole help has fit on one screen at once.
 //
-// INGAME_VERBS is the set a human may say, and it is REFUSED BY THE OVERSEER rather than merely unlisted
+// INGAME_VERBS is the set a human may say, and it is REFUSED BY THE FOREMAN rather than merely unlisted
 // here (see runOperatorVerb). An unlisted word the desk still accepts is hidden state (Invariant C), and
 // the two-listener design exists because a guarantee resting on the sender's honesty is not one (Law 23).
-const { INGAME_VERBS } = require('@overseer/message_schema');
+const { INGAME_VERBS } = require('@foreman/message_schema');
 
 // HOW MANY BOTS ARE IN A CREW — the number one `get` hands out, and the only number there is.
 //
@@ -202,12 +202,12 @@ const HELP_CEILING = 4;
       + `~50 characters a client re-wraps at, so each becomes two visual lines: ${long.map(l => `"${l}"`).join(', ')}`);
   }
   // EVERY VERB THE FLEET ACCEPTS IS ON THE PAGE. This is the guarantee the deleted VERB_HELP throws used
-  // to carry, re-aimed at the format that replaced them. INGAME_VERBS is the set the OVERSEER enforces at
+  // to carry, re-aimed at the format that replaced them. INGAME_VERBS is the set the FOREMAN enforces at
   // the door, so a verb there and not here works and is undiscoverable — the silent half.
   const page = lines.join(' ');
   for (const verb of INGAME_VERBS) {
     if (!VERBS.includes(verb)) {
-      throw new Error(`[foreman_vocabulary] CODING VIOLATION (Law 13): the overseer accepts the in-game verb `
+      throw new Error(`[foreman_vocabulary] CODING VIOLATION (Law 13): the foreman accepts the in-game verb `
         + `'${verb}' and the help page does not name it. It would work and nobody could find it.`);
     }
     if (!page.includes(verb)) {
@@ -422,7 +422,6 @@ const SHORT_JOB = Object.freeze({
   ground_salvage: 'salvaging',
   light:          'lighting',
   canopy:         'clearing trees',
-  base_layout:    'surveying',
   wood_preference:'checking wood',
 });
 

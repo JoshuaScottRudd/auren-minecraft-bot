@@ -184,7 +184,7 @@ module.exports = {
   // That is what lets the same `run.js` serve a stranger who started their server by hand and him with a
   // script doing it in the same pass: neither run can tell, because neither run asks.
   //
-  // WHERE THE ADDRESS IS: `Auren_Bot/your_server.js`, not here. Hosting is about this machine's server
+  // WHERE THE ADDRESS IS: `Auren_Bot/foreman_config.js`, not here. Hosting is about this machine's server
   // FOLDER — starting the JVM, restoring a snapshot, minting a console password. The address is about
   // where to dial, which everybody needs and this section's reader is only one of.
   // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -213,6 +213,6 @@ module.exports = {
     // removes the console rather than the password, and the console is how a crew gets placed beside you.
     //
     // A world you do NOT host still needs one from you, because that world is not this script's to
-    // reconfigure: put it in `Auren_Bot/your_server.js`, or set AUREN_RCON_PASSWORD.
+    // reconfigure: put it in `Auren_Bot/foreman_config.js`, or set AUREN_RCON_PASSWORD.
   },
 };

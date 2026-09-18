@@ -321,7 +321,7 @@ function registerStation(pos, type, window, blueprint, stance) {
         // owner: WHOSE SHELF THIS IS — the commons for a homesteader, the human's name for a
         // contractor. Read from this process's own mandate rather than accepted as an argument, so a
         // caller has no way to stamp a shelf for anyone else (Law 27). It is what lets one merged map
-        // serve crews that must not see each other's stock: the overseer keeps one truth, and the
+        // serve crews that must not see each other's stock: the foreman keeps one truth, and the
         // reader below can only ever form its own key.
         owner: key,
         blueprint: blueprint || null,
@@ -330,7 +330,7 @@ function registerStation(pos, type, window, blueprint, stance) {
         stance: stance
           ? { x: Math.floor(stance.x), y: Math.floor(stance.y), z: Math.floor(stance.z) }
           : null,
-        // updated_at: the last-writer-wins key for the Phase 6 overseer merge (a station id
+        // updated_at: the last-writer-wins key for the Phase 6 foreman merge (a station id
         // is a unique voxel, so freshest write wins). Stamped on every mutation below too.
         updated_at: Date.now(),
     };
@@ -345,8 +345,8 @@ function registerStation(pos, type, window, blueprint, stance) {
 // that survives the fleet's merge, and without it the deletion silently could not happen at all:
 //
 //   removeStation deleted the key locally. sendUpdate then shipped the map MINUS that key, and both merges
-//   (overseer_server.mergeStationsInto and corporate_headquarters.mergeBroadcastStations) iterate the
-//   INCOMING entries only — so an absent key is "no news", never "gone". The overseer's merged map kept the
+//   (foreman_hub.mergeStationsInto and corporate_headquarters.mergeBroadcastStations) iterate the
+//   INCOMING entries only — so an absent key is "no news", never "gone". The foreman's merged map kept the
 //   dead station forever and reinstalled it on the next broadcast, on every bot, including the one that had
 //   just struck it. Measured: one furnace voxel struck and restored 89 times on one bot and 53 on its
 //   partner inside a single run, while the world held air at that cell throughout.
@@ -453,8 +453,8 @@ function getStations(viewerBotId) {
 // THE OWNER GATE, AND THE ONLY ONE. Every read of the station map — findChests, findStation,
 // getStationTypes, stationUsable, the material pool — reaches it through getStations, so the filter
 // lands here once and no consumer above can forget it. Placed at the READER rather than the writer:
-// the overseer keeps ONE unified map so accountability for what is true stays in one place, and a bot
-// narrows it to its own shelves using the only key it can form (Law 27, Invariant D — the overseer owns
+// the foreman keeps ONE unified map so accountability for what is true stays in one place, and a bot
+// narrows it to its own shelves using the only key it can form (Law 27, Invariant D — the foreman owns
 // the fact, the bot owns whether it cares).
 //
 // This is not the lock rule and must not be confused with it: a chest locked by a PEER stays visible and

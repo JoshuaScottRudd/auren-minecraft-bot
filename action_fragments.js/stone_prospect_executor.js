@@ -46,7 +46,7 @@
 // A column is a world OBJECT, and two bots digging the same one is the same failure as two bots felling
 // the same tree: the second arrives at a shaft already open, reads a surface that has moved under it,
 // and descends into the first one's hole. So it is claimed the way a tree is — object exclusivity
-// through the overseer, keyed on the column itself rather than on the bot, chosen at EXECUTION time
+// through the foreman, keyed on the column itself rather than on the bot, chosen at EXECUTION time
 // from live perception because a planning token cannot name a column nothing had scanned yet.
 //
 // CLAIM BEFORE THE WALK, and release the moment the walk fails. Claiming after arrival is the race the
@@ -262,7 +262,7 @@ module.exports = {
 
         // The claim is released once the body is out and the haul is counted, on every path below.
         // Law 8: whoever raised the lifecycle ends it. A signal killed mid-descent skips this, which is
-        // what overseer_link's releaseAllClaims exists to sweep — it is not a reason to release early.
+        // what foreman_link's releaseAllClaims exists to sweep — it is not a reason to release early.
         if (!climb.out) {
             releaseTarget(columnKey);
             // Environmental, not a defect: the filler ran out or a placement was refused. Reported as

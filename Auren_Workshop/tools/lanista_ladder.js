@@ -648,8 +648,8 @@ async function main() {
     // Without it a plains at midnight puts its own zombies into the field, and the trial then measures a
     // wave nobody wrote — the tag count would still read clean, because the world's spawns are untagged
     // and so are invisible to the field read but perfectly visible to the bot.
-    await link.rcon.command('gamerule doMobSpawning false');
-    const spawning = ((await link.rcon.command('gamerule doMobSpawning')) || '').trim();
+    await link.rcon.command('gamerule spawn_mobs false');
+    const spawning = ((await link.rcon.command('gamerule spawn_mobs')) || '').trim();
     log('world', `${spawning} — the only mobs in this trial are the ones the ladder summons.`);
 
     // Carried ACROSS trials, which is what makes elevation a control rather than a coincidence — each
