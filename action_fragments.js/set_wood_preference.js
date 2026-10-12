@@ -1,52 +1,41 @@
 // fragment: set_wood_preference (action)
-// purpose: Decide, ONCE for the whole fleet, which log species construction should prefer — by counting
-//          what is actually standing around the base — and publish it where every bot can read it.
+// purpose: Decide, once for the whole fleet, which log species construction should prefer — by counting
+//          what is standing around the base — and publish it where every bot can read it.
 //
-// The job runs behind a magnet so only one bot executes it, and does the same surface scan a log search
-// would do — but purely to fix the preference, not to gather. It is posted at high priority alongside
-// blueprint-location setup, so on a fresh run it resolves before any gathering starts; once set, it never
-// re-posts.
+// Runs behind a magnet so only one bot executes it, using the same surface scan a log search would do,
+// for a census. Posted at high priority alongside blueprint-location setup so it resolves before
+// gathering starts; once set, it never re-posts.
 //
-// THE PROBLEM IT SOLVES, and why a preference is worth a job of its own. `craft_handler.resolveGroupItem`
-// picks the plank species the bot holds the most LOGS of. A pocket split across two species therefore tops
-// out at whichever half is larger, and the larger half is not the total — a craft can starve while the
-// combined pile would have covered it. Converging the log supply on one species is what fixes that, and it
-// can only converge if the choice is made BEFORE the gathering starts — hence a startup one-shot ranked
-// above every tier that touches wood.
+// craft_handler.resolveGroupItem picks the plank species the bot holds the most logs of, so a pocket
+// split across species tops out at whichever half is larger. Converging the log supply on one species
+// before gathering starts is what this job exists to do.
 //
-// IT IS A SORT KEY, NOT A COMMITMENT, and that distinction is the whole reason this is allowed to exist.
-// The fleet already tried a wood commitment once: a `wood_species` boardroom chair that meant "one species
-// until it runs out" and FILTERED the candidate list, so a nearer birch was skipped to reach an oak the
-// fleet had promised itself. Nothing here filters. tree_feller's ranking puts the preferred species ahead
-// of the rest and breaks ties by distance; every other species stays in the list and gets felled the
-// moment the preferred ones are exhausted or unreachable — it prefers and selects, never removes the
-// possibility of harvesting any other type.
+// It is a sort key, not a commitment: tree_feller's ranking puts the preferred species ahead of the rest
+// and breaks ties by distance, and every other species stays in the list and gets felled once the
+// preferred ones are exhausted or unreachable.
 //
-// WHY IT IS DECIDED ONCE AND NEVER RE-SENSED — the one place this system yields to remembered state on
-// purpose (Invariant B). What is remembered is a CHOICE, not a world fact. Re-measuring every scan would
-// flip the preference whenever a bot happened to stand in a different grove, which is precisely the churn
-// a stable ordering exists to prevent; and the world fact underneath it is re-read every single scan
-// anyway, by the candidate list this only re-orders. So the remembered value can never make the bot walk
-// to a tree that is not there.
+// Decided once and never re-sensed (Invariant B): the chair holds a choice, not a world fact, and the
+// candidate list beneath it re-reads the world on every scan, so the remembered value can never send a
+// bot to a tree that is not there.
 //
-// WHY IT RIDES THE BOARDROOM CHAIR. One bot decides for the fleet, so the answer has to cross the foreman.
-// Conference-room flags do not — they are local to each bot's HQ file. The foreman broadcasts exactly
-// three things, and the chair is the right one: it already carries per-bot facts (magnet, claims, body
-// cell, position), every writer read-modify-writes it rather than replacing it, and it has exactly one
-// writer, so a merge conflict cannot arise (Invariant D). See architect_config.WOOD_PREFERENCE_CHAIR_FIELD
-// for why the building conference was the other candidate and was rejected.
+// Travels on the boardroom chair (WOOD_PREFERENCE_CHAIR_FIELD): one bot decides for the whole fleet, so
+// the answer must cross the foreman. The chair already carries per-bot facts (magnet, claims, body cell,
+// position), every writer read-modify-writes it, and it has exactly one writer, so a merge conflict
+// cannot arise (Invariant D).
 //
-// This fragment operates ON the record only — it joins no build or gather pathway, places nothing, and
-// walks nowhere. The scan is the same surface_filter log scan the feller runs, reused rather than
-// re-implemented (Law 16); it is called for its CENSUS, not for a tree to cut.
+// Operates on the record only: joins no build or gather pathway, places nothing, walks nowhere. Reuses
+// surface_filter's log scan for its census (Law 16).
 
 'use strict';
 
 const watcher = require('@kernel/watcher');
 const hq      = require('@kernel/corporate_headquarters');
 const { routeToJudge } = require('@utils/signal_utils');
-const { WOOD_PREFERENCE_CHAIR_FIELD } = require('@thinking/architect_config');
 const { guardExternalSync } = require('@utils/external_library_guard');
+
+// The boardroom-chair field this fleet-wide choice travels in; both the writer and the reader live in
+// this file.
+const WOOD_PREFERENCE_CHAIR_FIELD = 'wood_preference';
 
 const TAG = 'set_wood_preference';
 
@@ -54,14 +43,12 @@ const LOG_NAME = /(.*_)?log$/;
 
 // readWoodPreference — the fleet's decided species, or null before the job has ever run.
 //
-// Scans EVERY chair, not just this bot's: the job is scope:'shared', so the bot that ran it is usually the
-// peer, and a bot reading only its own chair would see null forever and fall back to distance-only order
-// (correct, but it would silently discard the whole feature).
+// Scans every chair, not just this bot's: the job is scope:'shared', so the bot that ran it is usually a
+// peer.
 //
-// Deterministic on the collision that should not happen (Law 19): two bots can only both hold a preference
-// if they wrote one either side of a disconnect, and then a tie must resolve the same way on both machines
-// or their orderings diverge. Earliest decision wins — the same first-writer rule the building conference
-// uses — with the species name as the final tie-break.
+// Deterministic on the collision that should not happen (Law 19): if two bots each hold a preference, a
+// tie must resolve the same way on both machines or their orderings diverge. Earliest decision wins — the
+// same first-writer rule the building conference uses — with the species name as the final tie-break.
 function readWoodPreference() {
   const board = hq.getFullBoardroom({}) || {};
   let best = null;
@@ -76,30 +63,27 @@ function readWoodPreference() {
   return best;
 }
 
-// woodPreferenceSet — the ONE definition of "this job has nothing left to do" (Law 16), exported so
-// job_board's posting gate asks the performer instead of re-deriving the performer's criterion. That is
-// the same rule `lock_all_buildspots.baseLayoutComplete` exists to enforce: a gate that computes its own
-// "done" can demand more than the performer will ever deliver and re-post forever.
+// woodPreferenceSet — the one definition of whether this job has nothing left to do (Law 16), exported so
+// job_board's posting gate asks the performer instead of re-deriving its criterion, the same rule
+// `lock_all_buildspots.baseLayoutComplete` enforces.
 function woodPreferenceSet() {
   return readWoodPreference() !== null;
 }
 
 // run(bot) → { ok, species, census } | { ok:false, reason }
 //
-// A miss is ENVIRONMENTAL, never a throw: a bot standing in a clearing (or with the world still streaming)
-// legitimately sees no trees, and the correct response is to leave the preference unset and let the job
-// re-post next sweep from a different spot. Law 13's test — could this happen in a correctly-written
-// system in a normal world? Yes, so it soft-fails.
+// A miss is environmental, never a throw (Law 13): a bot standing in a clearing, or with the world still
+// streaming, legitimately sees no trees, so it leaves the preference unset and lets the job re-post next
+// sweep from a different spot.
 async function run(bot) {
   if (!bot?.entity?.position) {
     throw new Error(`[${TAG}] CODING VIOLATION: global.bot is not set (no bot.entity.position). The bot must be registered before this fragment runs.`);
   }
 
   const surfaceFilter = require('@perception/surface_filter');
-  const scan = surfaceFilter.scan(bot, { type: 'object_group_or_direct', targets: ['logs'] });
+  const scan = await surfaceFilter.scan(bot, { type: 'object_group_or_direct', targets: ['logs'] });
 
-  // surface_filter collapses a log scan to one entry per TRUNK, so this counts trees, not blocks — trees
-  // are the deciding unit, not logs.
+  // surface_filter collapses a log scan to one entry per trunk, so this counts trees, not blocks.
   const census = {};
   for (const o of (scan?.objectives || [])) {
     if (!o || !LOG_NAME.test(o.name || '')) continue;
@@ -121,9 +105,7 @@ async function run(bot) {
   };
   hq.writeBoardroomChair(botId, chair);
 
-  // Push it to the peers NOW rather than waiting for the next heartbeat. This job exists to run before the
-  // gathering starts, so a preference that reaches the other bot a sweep late has already missed the logs
-  // it was meant to steer.
+  // Pushes the preference to peers immediately, so it reaches them before gathering starts.
   guardExternalSync(TAG, 'foreman sendUpdate', () => require('@kernel/foreman_link').sendUpdate());
 
   const censusStr = ranked.map(([n, c]) => `${n}:${c}`).join(' ');

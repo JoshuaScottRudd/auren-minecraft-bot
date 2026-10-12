@@ -1,27 +1,20 @@
 // js_kernel/foreman_link.js
-// Bot-side WebSocket client for foreman communication.
-//
-// Four capabilities (de-confliction taxonomy lives in foreman_brain.js):
-//   1. sendUpdate() — sends this bot's boardroom chair + shared logistics/
-//      structure state to the foreman for broadcast. Callable from anywhere
-//      (Law 15 API).
+// Bot-side WebSocket client for foreman communication. Four capabilities
+// (de-confliction taxonomy in foreman_brain.js):
+//   1. sendUpdate() — pushes chair + shared logistics/structure state to the
+//      foreman for broadcast (Law 15 API).
 //   2. requestClaim(key) / releaseClaim(key) — arbiter flavor (a): exclusive
-//      hold on a world object ('anchor:…', 'tree:…', 'cell:…' — lock the
-//      object, not the bot). Resolves { granted, reason? }; can be rejected.
+//      hold on a world object ('anchor:…', 'tree:…', 'cell:…'). Resolves
+//      { granted, reason? }; can be rejected.
 //   3. acquirePlanningToken() / releasePlanningToken() — arbiter flavor (b):
-//      the plan-phase mutex. Never rejected; a loser parks until promoted.
-//   4. forwardLog(line) — mirrors this bot's watcher stream to the foreman's
+//      the plan-phase mutex, never rejected; a loser parks until promoted.
+//   4. forwardLog(line) — mirrors the watcher stream to the foreman's
 //      combined console (display only).
-//
-// Every granted claim is mirrored into this bot's boardroom chair
-// (active_claims) so peers — and the Architect — can see what each bot has
-// locked (Law 6: what a bot is working on is inspectable state, not hidden
-// arbiter internals).
-//
-// When no foreman is configured or the connection drops, the bot falls back
-// to local-only mode: requestClaim always grants, sendUpdate is a no-op.
-//
-// Law 16: one pathway. Connected = foreman arbitrates. Disconnected = local.
+// Granted claims mirror into this bot's boardroom chair (active_claims) so
+// peers can see what each bot has locked (Law 6), and a claim's row carries
+// the box it closes to peers (closeClaimedArea). No foreman configured or
+// connection dropped = local-only mode: requestClaim always grants,
+// sendUpdate is a no-op (Law 16).
 
 'use strict';
 
@@ -29,6 +22,8 @@ const WebSocket = require('ws');
 const watcher = require('@kernel/watcher');
 const { createEnvelope, parseEnvelope } = require('@foreman/message_schema');
 const { guardExternalSync } = require('@utils/external_library_guard');
+const timeoutCrash = require('@utils/timeout_crash');
+const memoryWorkspace = require('@utils/memory_workspace');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1 — State
@@ -43,28 +38,21 @@ let _reconnectTimer = null;
 let _pendingClaim = null;
 let _bodyCellTimer = null;
 
-// Planning token (plan-phase mutex — arbiter flavor b, see foreman_brain.js
-// taxonomy). Distinct from _pendingClaim: an object claim can be REJECTED and
-// resolves fast; a planning acquire is never rejected — the bot parks until
-// 'planning_granted' arrives, so there is no timeout on the wait.
-let _pendingPlanning = null;       // resolver parked until planning_granted
-let _planningRenewTimer = null;    // heartbeat while holding the token
+// Planning token (plan-phase mutex — arbiter flavor b, foreman_brain.js
+// taxonomy). Never rejected: the bot parks until 'planning_granted' arrives,
+// so there is no timeout on the wait.
+let _pendingPlanning = null;       // { resolve, answer } parked until planning_granted
+let _planningEntry = null;         // the entry number this body is inside the planning gate on | null
+let _planningPhase = null;
+let _planningRequestId = 0;
 
 const RECONNECT_INTERVAL_MS = 5000;
-const CLAIM_TIMEOUT_MS = 10000;
-// Renew at 4x the foreman's 2s TTL rate so a plan phase that yields the event
-// loop (the 100ms signal-bus hop) keeps its token even if a sweep runs long.
-// Capped: if release never comes (leaked chain), renewal stops and the TTL
-// frees the fleet rather than deadlocking it (Law 13: default = available).
-const PLANNING_RENEW_INTERVAL_MS = 500;
-const PLANNING_RENEW_MAX = 20;
 
-// Body-cell publishing (Phase 4 movement de-confliction): each bot exposes ONLY
-// its body cell — peers avoid it in A* and yield at doorways. 1s cadence, but a
-// write/broadcast happens only when the cell CHANGES, so a parked bot is silent.
+// Each bot publishes only its body cell so peers avoid it in A* and yield at
+// doorways; broadcasts only when the cell changes, so a parked bot is silent.
 const BODY_CELL_INTERVAL_MS = 1000;
-// A cell older than this is a ghost (crashed/stalled peer) — ignore it rather
-// than route around a bot that is no longer there (Law 13: default = free).
+// A cell older than this is treated as a ghost (crashed/stalled peer) and
+// ignored, not routed around (Law 13: default = free).
 const BODY_CELL_FRESH_MS = 15000;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,12 +67,9 @@ function getBotId() {
   return _botId;
 }
 
-// Sends this bot's boardroom chair, its logistics station map, and its fleet structure
-// entries to the foreman for broadcast. The chair carries the magnet + chest locks; the
-// stations carry the shared registry (chests/furnaces + in-flight furnace orders); the
-// building conference carries established buildspots so the fleet converges on ONE home
-// (a peer adopts it instead of finding its own). All pushed together on every update so
-// peers converge on one view (Law 6 transparency across processes).
+// Sends this bot's boardroom chair (magnet + chest locks), logistics station
+// registry (chests/furnaces + in-flight orders), and building conference
+// (established buildspots) to the foreman for broadcast (Law 6).
 function sendUpdate() {
   if (!isConnected()) return;
 
@@ -94,10 +79,8 @@ function sendUpdate() {
 
   const stations = hqModule.readConfRoomFlag('logistics_confrence_room', 'stations', {}) || {};
   const buildings = hqModule.readOffice('building_confrence_room') || {};
-  // NO DEATH PILES ON THIS ENVELOPE any more (2026-08-12). The ledger they came from is deleted: salvage
-  // is a live scan of each bot's own entity table now, and an entity table is not shareable state — a peer
-  // relaying "there is an item at (x,y,z)" would be relaying a claim its recipient cannot verify and that
-  // may already be false (Law 23). Every bot sees its own yard; that is the whole distribution.
+  // Salvage is a live per-bot entity-table scan, not shareable state, so no
+  // death-pile field travels on this envelope (Law 23).
   const envelope = createEnvelope('hq_delta', _botId, {
     boardroom_chair: chair,
     logistics_stations: stations,
@@ -129,13 +112,77 @@ function _dropClaimFromChair(key) {
   }
 }
 
-// Asks the foreman to grant a claim key (category or object). Returns
-// Promise<{ granted, reason? }>. In single-bot mode (no foreman), always
-// grants immediately — claims only arbitrate between bots, and there is one.
+// ── A HELD CLAIM MAY CLOSE THE GROUND IT WORKS ───────────────────────────────
+// closeClaimedArea states the box a held claim closes to every peer's route and dig. The box rides the
+// claim's own row in the chair, so it reaches peers on the ordinary broadcast and ends with the claim
+// (Law 8). `box` is { min:{x,y,z}, max:{x,y,z} }, world cells, both ends included.
+function closeClaimedArea(key, box) {
+  const hqModule = require('@kernel/corporate_headquarters');
+  const botId = _botId || process.env.BOT_ID || 'default';
+  const chair = hqModule.readBoardroomChair(botId, {}) || {};
+  const row = chair.active_claims && chair.active_claims[key];
+  if (!row) {
+    throw new Error(`foreman_link: CODING VIOLATION (Law 13) — closeClaimedArea('${key}') was called by a body `
+      + 'that does not hold that claim. The ground is closed by the claim\'s holder, after the grant.');
+  }
+  const cell = (c) => ({ x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z) });
+  row.box = { min: cell(box.min), max: cell(box.max) };
+  hqModule.writeBoardroomChair(botId, chair);
+  sendUpdate();
+  watcher.summary('foreman_link', `Closed ${key} to peers: (${row.box.min.x},${row.box.min.y},${row.box.min.z}) to (${row.box.max.x},${row.box.max.y},${row.box.max.z}).`);
+}
+
+// Every box a working peer has closed — a perception-style read of merged chair state, the same read
+// as getPeerBodyCells. A chair with no magnet holds no job, so its rows close nothing.
+function getPeerClosedAreas() {
+  const hqModule = require('@kernel/corporate_headquarters');
+  const botId = _botId || process.env.BOT_ID || 'default';
+  const out = [];
+  for (const [id, chair] of Object.entries(hqModule.getFullBoardroom({}))) {
+    if (id === botId || !chair || !chair.magnet) continue;
+    for (const [key, row] of Object.entries(chair.active_claims || {})) {
+      if (row && row.box) out.push({ botId: id, key, min: row.box.min, max: row.box.max });
+    }
+  }
+  return out;
+}
+
+// Every claim key a working peer holds — the same merged chair read as getPeerClosedAreas.
+function peerClaimKeys() {
+  const hqModule = require('@kernel/corporate_headquarters');
+  const botId = _botId || process.env.BOT_ID || 'default';
+  const out = new Set();
+  for (const [id, chair] of Object.entries(hqModule.getFullBoardroom({}))) {
+    if (id === botId || !chair || !chair.magnet) continue;
+    for (const key of Object.keys(chair.active_claims || {})) out.add(key);
+  }
+  return out;
+}
+
+// The peer area holding this cell, or null when the cell is open ground.
+function peerAreaAt(x, y, z) {
+  for (const a of getPeerClosedAreas()) {
+    if (x >= a.min.x && x <= a.max.x && y >= a.min.y && y <= a.max.y && z >= a.min.z && z <= a.max.z) return a;
+  }
+  return null;
+}
+
+// ── THE PREDICATE IS CONFIGURATION, NEVER CONNECTION STATE ────────────────────
+// _foremanUrl (set once at connect(), never changed) distinguishes a bot
+// started alone from one whose foreman is unreachable; isConnected() cannot,
+// so it never decides whether a claim grants. Asks the foreman to grant a
+// claim key (category or object). Returns Promise<{ granted, reason? }>.
 function requestClaim(key) {
-  if (!isConnected()) {
+  if (!_foremanUrl) {
+    // Born alone: no arbiter exists. Still recorded in the chair so this
+    // bot's own sweeps can read its holds back.
     _recordClaimInChair(key);
     return Promise.resolve({ granted: true });
+  }
+  if (!isConnected()) {
+    // Configured with a foreman that is unreachable: the body is stopping
+    // (see the `close` handler), so no new hold is granted (Law 13).
+    return Promise.resolve({ granted: false, reason: 'the foreman is gone — this body is stopping and is taking no new holds' });
   }
 
   if (_pendingClaim) {
@@ -143,85 +190,175 @@ function requestClaim(key) {
   }
 
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      _pendingClaim = null;
-      reject(new Error('foreman_link: claim response timed out'));
-    }, CLAIM_TIMEOUT_MS);
+    // The body's half of the two-way watch: the foreman answers a claim at once, and timeout_crash's one
+    // clock is on that answer.
+    const answer = timeoutCrash.watch('claim', `the foreman has not answered this body's claim on '${key}'`);
 
-    _pendingClaim = { key, resolve, reject, timeout };   // reject is kept: a claimant-side key fault is a throw, not an answer (see 'claim_rejected')
+    _pendingClaim = { key, resolve, reject, answer };   // reject is kept: a claimant-side key fault is a throw, not an answer (see 'claim_rejected')
 
     const envelope = createEnvelope('claim_request', _botId, { key });
     _ws.send(JSON.stringify(envelope));
-    // No log on request/grant/release: the tree-reachability sweep claims-then-releases every
-    // candidate to test peer-ownership, so routine bookkeeping floods the story (Law 5 noise).
-    // Only a DENIAL (claim_rejected) carries diagnostic weight — that one still logs.
+    // No log on request/grant/release — routine bookkeeping would flood the
+    // story (Law 5); only a denial (claim_rejected) logs.
   });
 }
 
-// ── Planning token (plan-phase mutex) ────────────────────────────────────────
-// acquirePlanningToken() resolves ONLY when this bot holds the token — a loser
-// parks in the foreman's FIFO and resolves later, on promotion. Local mode
-// (no foreman) grants instantly: a lone bot cannot race anyone. While held,
-// a renewal heartbeat keeps the foreman's short crash-TTL from freeing a
-// slow-but-alive planner. This is NOT requestClaim (object exclusivity) and
-// NOT the magnet (task identity) — see the taxonomy in foreman_brain.js.
+// ── The planning gate, from the body's side (plan-phase mutex) ───────────────
+// acquirePlanningToken() resolves only once this body is INSIDE the gate, holding the entry number the
+// foreman issued. releasePlanningToken() sends that same number back as the exit token. A body in the
+// line waits its turn with no clock of its own: the foreman watches each body that is inside. Granted
+// instantly in local mode. Distinct from requestClaim/the magnet — taxonomy in foreman_brain.js.
+//
+// The body's one clock is timeout_crash's, on the foreman's ANSWER to a request (granted or queued).
+// A grant this body is not waiting for, a grant while it is already inside, and an exit with no entry
+// in hand are impossible states, and each ends the whole run through timeout_crash.
 
-function _startPlanningRenewal() {
-  _stopPlanningRenewal();
-  let renewals = 0;
-  _planningRenewTimer = setInterval(() => {
-    if (++renewals > PLANNING_RENEW_MAX || !isConnected()) {
-      _stopPlanningRenewal();   // stop feeding a leaked hold — let the TTL free it
-      return;
+const _planningState = () => `this body: ${_pendingPlanning ? 'waiting on a request' : 'not waiting'}, `
+  + `${_planningEntry === null ? 'not inside the gate' : `inside on entry #${_planningEntry}`}, foreman socket ${isConnected() ? 'open' : 'closed'}`;
+
+// How a body ends the whole run: its own record first, then the foreman is told and ends everyone, then
+// this body ends. A foreman that cannot be told sees this body's error and its departure instead.
+function _registerCrashRoad() {
+  timeoutCrash.onCrash((report) => {
+    watcher.error('timeout_crash', report);
+    if (isConnected()) {
+      guardExternalSync('foreman_link', 'send fleet_crash', () => _ws.send(JSON.stringify(createEnvelope('fleet_crash', _botId, { report }))));
     }
-    // The heartbeat only refreshes a hold the foreman's TTL will free anyway, so a send that does not
-    // land costs one interval, not correctness.
-    guardExternalSync('foreman_link', 'send planning_request renewal', () => _ws.send(JSON.stringify(createEnvelope('planning_request', _botId, {}))));
-  }, PLANNING_RENEW_INTERVAL_MS);
-  if (_planningRenewTimer.unref) _planningRenewTimer.unref();
+    require('@utils/body_end').endBody('this body ended the whole run — see its timeout_crash report', { code: 1 });
+  });
 }
 
-function _stopPlanningRenewal() {
-  if (_planningRenewTimer) {
-    clearInterval(_planningRenewTimer);
-    _planningRenewTimer = null;
-  }
+// ── STANDING DOWN: A BODY THAT HAS STOPPED WORKING LEAVES THE GATE BEFORE IT DOES ANYTHING ELSE ──────
+// A body that lost the world, or whose signal died outside the judge, still has a live process and a
+// live foreman socket, so the foreman would wait on it. This is the first act of such a body: one
+// message, sent before any record is flushed to disk, after which this body neither asks to enter nor
+// sends an exit.
+let _stoodDown = false;
+function standDown(reason) {
+  if (_stoodDown || !_foremanUrl) return;
+  _stoodDown = true;
+  if (_pendingPlanning) { _pendingPlanning.answer.done(); _pendingPlanning = null; }
+  _planningEntry = null;
+  _planningPhase = null;
+  memoryWorkspace.leave();
+  if (!isConnected()) return;
+  guardExternalSync('foreman_link', 'send body_stood_down', () => _ws.send(JSON.stringify(createEnvelope('body_stood_down', _botId, { reason }))));
 }
 
-function acquirePlanningToken() {
-  if (!isConnected()) {
+function acquirePlanningToken(phase = 'planning') {
+  // Same _foremanUrl split as requestClaim: alone plans freely; a foreman
+  // that's gone means stopping, so the acquire never resolves (Law 4).
+  if (!_foremanUrl) {
+    if (memoryWorkspace.enabled()) memoryWorkspace.enter(memoryWorkspace.measureGrant());
+    _planningPhase = phase;
     return Promise.resolve();
   }
+  if (!isConnected() || _stoodDown) {
+    return new Promise(() => {});
+  }
 
-  if (_pendingPlanning) {
-    // Law 4 makes two concurrent plan phases impossible in a correct system —
-    // a second acquire is a coding violation, not a wait-your-turn (Law 13).
-    return Promise.reject(new Error('foreman_link: planning token acquire already pending'));
+  if (_pendingPlanning || _planningEntry !== null) {
+    // Law 4 makes two concurrent plan phases impossible in a correct system, so a second acquire is a
+    // coding violation (Law 13).
+    timeoutCrash.crashEverything('planning_gate', 'this body asked to enter the planning gate a second time', _planningState);
+    return new Promise(() => {});
   }
 
   return new Promise((resolve) => {
-    _pendingPlanning = { resolve };
-    _ws.send(JSON.stringify(createEnvelope('planning_request', _botId, {})));
-    watcher.summary('foreman_link', 'Requested planning token.');
+    _pendingPlanning = {
+      resolve, phase, requestId: ++_planningRequestId,
+      answer: timeoutCrash.watch('planning_gate', 'the foreman has not answered this body\'s request to enter (neither granted nor queued)', _planningState),
+    };
+    _ws.send(JSON.stringify(createEnvelope('planning_request', _botId, { phase, requestId: _planningRequestId })));
+    watcher.summary('foreman_link', `Asked to enter the planning gate for ${phase}.`);
   });
 }
 
+// The foreman's "queued" answer: the request was heard, so the watch on its answer closes.
+function _onPlanningQueued(place) {
+  if (_stoodDown) return;
+  if (place.requestId < _planningRequestId) return;
+  if (!Number.isSafeInteger(place.requestId) || place.requestId !== _pendingPlanning?.requestId) {
+    throw new Error('foreman_link: queued requestId differs from the pending request');
+  }
+  if (!_pendingPlanning) {
+    timeoutCrash.crashEverything('planning_gate', 'the foreman put this body in the planning line and it had not asked to enter', _planningState);
+    return;
+  }
+  _pendingPlanning.answer.done();
+  timeoutCrash.note('planning_gate', `in line: ${place.ahead} ahead, '${place.holder}' inside for ${place.held_ms} ms`);
+  watcher.summary('foreman_link', `In line for the planning gate — ${place.ahead} ahead, ${place.holder} inside for ${place.held_ms} ms.`);
+}
+
+function _onPlanningGranted(payload) {
+  // An entry issued while this body's stand-down was on its way: the foreman closes it on that message.
+  if (_stoodDown) return;
+  // A canceled request's grant can already be in flight; its number cannot grant the new chain ownership.
+  if (payload.requestId < _planningRequestId) return;
+  if (!_pendingPlanning || _planningEntry !== null) {
+    timeoutCrash.crashEverything('planning_gate', `the foreman issued entry #${payload && payload.entry} to this body and it was not waiting for one`, _planningState);
+    return;
+  }
+  const { resolve, answer, phase } = _pendingPlanning;
+  if (payload.requestId !== _pendingPlanning.requestId) throw new Error('foreman_link: grant requestId differs from the pending request');
+  if (payload.phase !== phase) throw new Error(`foreman_link: granted phase '${payload.phase}' differs from requested '${phase}'`);
+  if (memoryWorkspace.enabled()) memoryWorkspace.enter(payload.workspace);
+  answer.done();
+  _pendingPlanning = null;
+  _planningEntry = payload.entry;
+  _planningPhase = phase;
+  timeoutCrash.note('planning_gate', `entered on #${_planningEntry}`);
+  watcher.summary('foreman_link', `Entered the planning gate on entry #${_planningEntry} — ${phase} workspace is ours.`);
+  resolve();
+}
+
 function releasePlanningToken() {
-  _stopPlanningRenewal();
-  if (!isConnected()) return;
-  // A release that does not land is freed by the foreman's TTL instead — later, but never lost.
-  if (guardExternalSync('foreman_link', 'send planning_release', () => _ws.send(JSON.stringify(createEnvelope('planning_release', _botId, {})))).ok) {
-    watcher.summary('foreman_link', 'Released planning token.');
+  memoryWorkspace.leave();
+  _planningPhase = null;
+  if (!_foremanUrl || _stoodDown) return;
+  // A closed socket means the foreman has already closed this body's entry itself
+  // (foreman_brain.releaseForBot), so there is no exit left to send.
+  if (!isConnected()) { _planningEntry = null; return; }
+  if (_planningEntry === null) {
+    timeoutCrash.crashEverything('planning_gate', 'this body reached the end of a plan phase with no entry in hand', _planningState);
+    return;
+  }
+  const entry = _planningEntry;
+  _planningEntry = null;
+  timeoutCrash.note('planning_gate', `exited on #${entry}`);
+  if (guardExternalSync('foreman_link', 'send planning_release', () => _ws.send(JSON.stringify(createEnvelope('planning_release', _botId, { entry })))).ok) {
+    watcher.summary('foreman_link', `Left the planning gate, exit token #${entry}.`);
   }
 }
 
-// Publish this bot's body cell (feet voxel) into its boardroom chair on a 1s
-// tick. The chair broadcast is the ONLY sync channel — peers read the cell from
-// their merged boardroom like any other chair state (Law 16: no second route).
+// Planning and execution borrow the same exclusive gate; nested computations use their caller's grant.
+async function withComputationWorkspace(work) {
+  if (!memoryWorkspace.enabled() || _planningPhase !== null) return work();
+  await acquirePlanningToken('workspace');
+  const entry = _planningEntry;
+  return require('@utils/external_library_guard').withCleanup('foreman_link', 'computation workspace', work, () => {
+    if (_planningPhase === 'workspace' && _planningEntry === entry) releasePlanningToken();
+  });
+}
+
+// A Law 15 handover abandons its promise, so release happens before control passes to combat or the judge.
+function abandonComputationWorkspace() {
+  if (_pendingPlanning) {
+    const requestId = _pendingPlanning.requestId;
+    _pendingPlanning.answer.done();
+    _pendingPlanning = null;
+    ++_planningRequestId;
+    guardExternalSync('foreman_link', 'cancel queued computation workspace', () => _ws.send(JSON.stringify(createEnvelope('planning_cancel', _botId, { requestId }))));
+  }
+  if (_planningPhase !== null) releasePlanningToken();
+}
+
+// Publishes this bot's body cell (feet voxel) into its boardroom chair on a
+// 1s tick; peers read it from the merged boardroom (Law 16).
 function startBodyCellPublisher(bot) {
   if (_bodyCellTimer) return;
   let lastCellKey = null;
-  _bodyCellTimer = setInterval(() => {
+  _bodyCellTimer = timeoutCrash.every('foreman_link', 'publish the cell this body stands in to its boardroom chair when it changes', () => {
     const pos = bot?.entity?.position;
     if (!pos) return;
     const cell = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
@@ -256,29 +393,14 @@ function getPeerBodyCells() {
   return out;
 }
 
-// Startup-only situational report: where this bot spawned, its pocket inventory, and (if any other bot
-// is connected) how far the nearest one is. Called once, after a short delay so peer chairs have arrived
-// over the foreman (a peer publishes its body cell within ~1s of its own spawn). Reuses the same peer
-// body cells the navigator avoids — no separate position channel (Law 16).
-//
-// IT GOES TO THE LOG AND NOWHERE ELSE (2026-09-06, and the name changed with it — it used to be
-// `announceStartupPosition` and it used to put both halves in open chat). Its reader is whoever opens
-// the trace after a run, and that reader had it either way: `watcher.summary` is the record. The chat
-// copy was aimed at nobody — a player who has just been handed a crew does not need its inventory
-// itemised, and two bodies × two lines is four messages over four seconds in a window drawn on top of
-// the world. See THE BOT DOES NOT SPEAK in Thinking_fragments/dispatcher.js for the ruling.
+// Startup-only situational report: where this bot spawned and (if any peer
+// is connected) how far the nearest one is.
+// Called once after a delay so peer chairs have arrived; reuses the peer
+// body cells the navigator avoids (Law 16). Logged only (Thinking_fragments/dispatcher.js).
 function recordStartupPosition(bot) {
   const pos = bot?.entity?.position;
   if (!pos) return;
   const here = `(${Math.floor(pos.x)}, ${Math.floor(pos.y)}, ${Math.floor(pos.z)})`;
-
-  // Pocket inventory snapshot at spawn, richest stack first.
-  const counts = {};
-  for (const item of bot.inventory.items()) counts[item.name] = (counts[item.name] || 0) + item.count;
-  const invList = Object.entries(counts)
-    .sort((a, b) => b[1] - a[1])
-    .map(([name, count]) => `${name}:${count}`)
-    .join(', ') || 'empty';
 
   const peers = getPeerBodyCells();
   let where;
@@ -293,27 +415,26 @@ function recordStartupPosition(bot) {
     }
     where = `Online at ${here}. Nearest bot '${nearest.botId}' is ${best.toFixed(1)} blocks away at (${nearest.x}, ${nearest.y}, ${nearest.z}).`;
   }
-  const inv = `Startup inventory: ${invList}.`;
-
-  watcher.summary('foreman_link', `${where} ${inv}`);
+  watcher.summary('foreman_link', where);
 }
 
-// Forward one already-formatted watcher line to the foreman so it can show both bots' streams in
-// one place. Must stay SILENT — no watcher calls, no throws — or a log would recurse into itself.
-// No-op when there's no foreman (single-bot mode just logs to its own console as before).
-// UNGUARDED, AND IT IS THE ONE SEND IN THIS FILE THAT MAY NOT BE. The guard reports by calling the
-// watcher, and this function is called BY the watcher — routing it through the guard would make a
-// failed log line emit a log line, on the socket that just failed. That is the same recursion the
-// watcher's own boundary is exempted for, one hop out. The precondition takes the guard's place:
-// isConnected() proves readyState === OPEN, which is the only thing ws.send refuses on, so a throw
-// escaping here is a defect and not a dropped packet (Law 26 — the interface must not report through
-// the channel it is reporting about).
-// `level` is the watcher's own word for which of its three channels wrote this line ('summary' |
-// 'warn' | 'error' | 'context'). It rides beside the text rather than inside it so the foreman can
-// count faults without reading a sentence — see watcher._forward's note.
+// Forwards one already-formatted watcher line to the foreman's combined
+// console. Must stay silent (no watcher calls, no throws) since the watcher
+// calls this function. No-op with no foreman. Left unguarded: isConnected()
+// already proves readyState OPEN, the only thing ws.send refuses on (Law 26).
+// `level` is the watcher's channel word ('summary'|'warn'|'error'|'context'),
+// carried beside the text so the foreman can count faults without parsing it.
 function forwardLog(line, level) {
   if (!isConnected() || typeof line !== 'string') return;
   _ws.send(JSON.stringify(createEnvelope('log', _botId, { line, level: level || null })));
+}
+
+// Sends a batch of this body's item-book entries (js_kernel/item_book.js). Returns whether it left, so
+// the clerk keeps a batch the socket could not take.
+function sendItemBook(entries) {
+  if (!isConnected()) return false;
+  _ws.send(JSON.stringify(createEnvelope('item_book', _botId, { entries })));
+  return true;
 }
 
 // Tells the foreman this bot is done with a key. Fire-and-forget.
@@ -326,13 +447,11 @@ function releaseClaim(key) {
   // routine bookkeeping — not logged (see requestClaim); only denials are worth a line.
 }
 
-// Release EVERY object claim this bot currently holds (read from its own chair mirror).
-// Used when a task ends abruptly — a killed signal abandons the executor's promise mid-await
-// (Law 15), so the executor's own end-of-run releaseClaim never runs and its anchor claim leaks
-// for the full STALE_CLAIM_MS TTL (5 min) — long enough to starve a peer into an infinite-loop
-// kill (the cascade that killed TessaBot). A cleared magnet means no active task, hence no claim
-// should survive; releasing here returns the task to exactly one LIVE owner (Law 4 / Invariant D).
-// Reuses releaseClaim per key — no new arbitration path (Law 16). Returns the count released.
+// Releases every object claim this bot holds (read from its own chair
+// mirror). Used when a task ends abruptly and the executor's own end-of-run
+// releaseClaim never runs, so a cleared magnet always means no claim
+// survives (Law 4 / Invariant D). Reuses releaseClaim per key (Law 16).
+// Returns the count released.
 function releaseAllClaims() {
   const hqModule = require('@kernel/corporate_headquarters');
   const botId = _botId || process.env.BOT_ID || 'default';
@@ -348,6 +467,15 @@ function releaseAllClaims() {
 
 function connect(foremanUrl, botId) {
   _foremanUrl = foremanUrl;
+  _registerCrashRoad();
+  // The chair is kept between runs and whether the body is dead is a reading of this run: the kept
+  // answer is dropped here, so the foreman hears nothing until this run's first sweep states it.
+  const kept = require('@kernel/corporate_headquarters').readBoardroomChair(botId, null);
+  if (kept && ('dead' in kept || 'dead_at' in kept)) {
+    delete kept.dead;
+    delete kept.dead_at;
+    require('@kernel/corporate_headquarters').writeBoardroomChair(botId, kept);
+  }
   _botId = botId;
 
   if (!_foremanUrl) {
@@ -376,19 +504,16 @@ function _attemptConnect() {
     const stations = hqModule.readConfRoomFlag('logistics_confrence_room', 'stations', {}) || {};
     const buildings = hqModule.readOffice('building_confrence_room') || {};
 
-    // THE SPECIES TRAVELS ON REGISTRATION because the foreman routes on it and cannot read it any
-    // other way — a mandate is an environment fact of THIS process and nothing outside it can see one.
-    // It is the bot's own answer about itself, which is the only kind of claim about a species that
-    // can be made: the foreman is the party that OBSERVES where a command entered the fleet (which
-    // door it arrived at), and the bot is the party that KNOWS what it is. Neither can supply the
-    // other's half, so both are stated at the one moment they meet.
+    // The mandate travels on registration because it is an environment fact
+    // of this process alone — the foreman cannot observe it, only read it
+    // stated here (Law 23).
     const envelope = createEnvelope('register', _botId, {
       boardroom_chair: chair || {},
       logistics_stations: stations,
       building_conference: buildings,
       mode: require('@kernel/bot_mandate').currentMode(),
-      // WHOSE it is, travelling beside WHAT it is, because the foreman routes a human's command on
-      // both and can read neither any other way. Null for a homesteader is the answer, not an omission.
+      // Owner travels beside mode: the foreman routes a human's command on
+      // both and can read neither elsewhere. Null means homesteader.
       owner: require('@kernel/bot_mandate').currentOwner(),
     });
     _ws.send(JSON.stringify(envelope));
@@ -403,29 +528,55 @@ function _attemptConnect() {
     _handleMessage(parsed.msg);
   });
 
+  // ── LOSING THE FOREMAN ENDS THIS BODY ──────────────────────────────────────
+  // This socket closing means the foreman PROCESS is gone (its in-world body
+  // loss is handled separately, by foreman.js). A fleet with no arbiter must
+  // not keep working unarbitrated, so this body stops; restart comes from
+  // start_auren.js, which raises a fresh crew.
   _ws.on('close', () => {
     const wasConnected = _connected;
     _connected = false;
     _ws = null;
+    if (_pendingPlanning) _pendingPlanning.answer.done();
+    _planningEntry = null;
+
+    _planningPhase = null;
+    memoryWorkspace.leave();
+
+    // A claim in flight when the socket dies is refused, with a reason: no
+    // answer is invented for one nobody issued.
+    if (_pendingClaim) {
+      _pendingClaim.answer.done();
+      const resolve = _pendingClaim.resolve;
+      _pendingClaim = null;
+      resolve({ granted: false, reason: 'the foreman went away while this claim was in flight — nothing was granted' });
+    }
+    // The parked planner is deliberately left parked: the process is ending, and resolving it would
+    // start one more plan cycle on a fleet with no arbiter (Law 4).
+    _pendingPlanning = null;
 
     if (wasConnected) {
-      watcher.warn('foreman_link', 'Disconnected from foreman — falling back to local brain.');
-    }
+      watcher.error('foreman_link',
+        '⛔ The foreman is GONE — the socket to the fleet\'s arbiter closed. No body may hold a claim or the '
+        + 'planning token without it, so this body is stopping rather than working unarbitrated. '
+        + 'The whole fleet ends with the foreman; restart through start_auren.js.');
 
-    if (_pendingClaim) {
-      clearTimeout(_pendingClaim.timeout);
-      _recordClaimInChair(_pendingClaim.key);
-      _pendingClaim.resolve({ granted: true });
-      _pendingClaim = null;
-    }
+      // ── AND ONE OF US STAYS UP TO SAY SO ───────────────────────────────────
+      // The foreman cannot report its own death, so one body claims witness
+      // atomically (every body arrives here at once); the rest fall through
+      // and end as normal. BOT_ID (stamped by crew_launch) names the window
+      // the report must land in.
+      const whoAmI = _botId || process.env.BOT_ID || 'default';
+      const foremanGone = require('@utils/foreman_gone');
+      if (foremanGone.standAsWitness(whoAmI)) {
+        foremanGone.announce(whoAmI);
+        require('@utils/body_end').flushRecord('the foreman is gone — this body stayed up to report it');
+        foremanGone.hold();
+        return;
+      }
 
-    // A planner waiting in the foreman's queue must not hang on a dead socket —
-    // disconnected = local mode = a lone bot, which always plans freely.
-    _stopPlanningRenewal();
-    if (_pendingPlanning) {
-      const resolve = _pendingPlanning.resolve;
-      _pendingPlanning = null;
-      resolve();
+      require('@utils/body_end').endBody('the foreman is gone', { code: 1 });
+      return;
     }
 
     _scheduleReconnect();
@@ -464,49 +615,45 @@ function _handleMessage(msg) {
 
     case 'hq_broadcast': {
       const hqModule = require('@kernel/corporate_headquarters');
-      // GHOST HOLDS FIRST. Any magnet on this bot's disk belonging to a bot the foreman does not
-      // currently see is void — and with the magnet goes every chest_lock inside it, which is the
-      // real damage (locked means wait-to-act, so a dead bot's locks stall live work forever).
-      // Runs BEFORE the merge on purpose: a peer that is genuinely connected has its fresh chair in
-      // this very payload and is restored a line later, so a reconnect can never be robbed of a
-      // live magnet — the release only ever wins for a bot that is actually absent.
-      // Warn-level and named: this is a ghost being cleaned up after an unclean shutdown, which the
-      // operator should see (Law 5 — it is a degraded condition, not routine bookkeeping).
+      // Any magnet held by a bot absent from the foreman's roster is void, taking
+      // its chest_locks with it. Runs before the merge, so a genuinely
+      // connected peer's fresh chair (restored below) is never robbed of a
+      // live magnet. An ordinary line: a body's magnet is kept across a stop so a continue start has
+      // it, and a body that leaves a run without being sent home ends that run with its own error.
       const roster = msg.payload.connected_bots;
       if (Array.isArray(roster)) {
         const freed = hqModule.releaseAbsentBotMagnets(roster, _botId);
         if (freed.length) {
-          watcher.warn('foreman_link',
-            `Released stale magnet(s) held by disconnected bot(s): ${freed.join(', ')} — chest locks and job claims freed. `
-            + `A magnet outliving its bot means that bot did not shut down cleanly (a killed window, not a 'down').`);
+          watcher.summary('foreman_link',
+            `Released magnet(s) held by bot(s) not in the world: ${freed.join(', ')} — chest locks and job claims freed.`);
         }
       }
       const chairs = msg.payload.bot_boardroom;
       if (chairs && typeof chairs === 'object') {
         hqModule.mergeBroadcastChairs(chairs);
       }
-      // Phase 6: merge the foreman's relayed station map (LWW per voxel by updated_at).
-      // No log: this fires on every broadcast heartbeat, so a summary here is per-step
-      // noise (Law 5), not a phase of work. The merged map is inspectable in HQ (Law 6).
+      // Merges the foreman's relayed station map (LWW per voxel by updated_at).
+      // No log — this fires every broadcast heartbeat (Law 5); the merged map
+      // is inspectable in HQ (Law 6).
       const stations = msg.payload.logistics_stations;
       if (stations && typeof stations === 'object') {
         hqModule.mergeBroadcastStations(stations);
       }
       // Fleet structures: adopt established buildspots (first-writer-wins) so this
-      // bot's planner sees the fleet's ONE home instead of finding a duplicate.
+      // bot's planner sees the fleet's ONE home, never a duplicate.
       const buildings = msg.payload.building_conference;
       if (buildings && typeof buildings === 'object') {
         hqModule.mergeBroadcastBuildings(buildings);
       }
-      // Standing requests: what each human has asked for. ADOPTED WHOLE rather than merged, because the
-      // foreman is their sole author — a bot contributes nothing here and reconciling would invent a
-      // second writer (Invariant D). A crew narrows the map to its own rows when it reads.
+      // Standing requests (what each human asked for) are adopted whole, not
+      // merged — the foreman is their sole author (Invariant D). A crew
+      // narrows the map to its own rows when it reads.
       const requests = msg.payload.standing_requests;
       if (requests && typeof requests === 'object') {
         require('@kernel/request_ledger').mergeBroadcast(requests);
       }
-      // `death_piles` used to be merged here and is now IGNORED if an older peer still sends it — see the
-      // hq_delta builder above for why the ledger was deleted rather than replaced with a shared scan.
+      // `death_piles`, if an older peer still sends it, is ignored (see the
+      // hq_delta builder above).
       _markFirstBroadcast();
       break;
     }
@@ -514,7 +661,7 @@ function _handleMessage(msg) {
     case 'claim_granted':
       // routine bookkeeping — not logged (see requestClaim); only denials are worth a line.
       if (_pendingClaim) {
-        clearTimeout(_pendingClaim.timeout);
+        _pendingClaim.answer.done();
         _recordClaimInChair(_pendingClaim.key);
         _pendingClaim.resolve({ granted: true });
         _pendingClaim = null;
@@ -524,27 +671,17 @@ function _handleMessage(msg) {
     case 'claim_rejected':
       watcher.summary('foreman_link', `Claim rejected for '${msg.payload.key}': ${msg.payload.reason}.`);
       if (_pendingClaim) {
-        clearTimeout(_pendingClaim.timeout);
-        // TWO KINDS OF REFUSAL ARRIVE ON ONE MESSAGE, and only one of them is an answer about the
-        // world. A peer holding the object is an ordinary environmental outcome the caller handles by
-        // trying the next candidate. `fault: 'claimant'` means the arbiter could not read the key at
-        // all — an unlisted namespace or a malformed coordinate — which no retry and no world change
-        // can resolve, and which the caller cannot tell apart from a busy object once it is folded
-        // into a plain `granted: false` (Law 13: a coding violation throws; Law 25: "held by a peer"
-        // is a false verdict when nobody holds anything). Rejected HERE rather than at each claimant
-        // so every caller inherits it from the one door (Law 16). The cost of the old shape, measured:
-        // an executor read every candidate as peer-held, conceded, was re-dispatched, and the loop's
-        // judge halted the planner — with the actual cause visible only as a rejection line nobody
-        // was reading.
+        _pendingClaim.answer.done();
+        // Two kinds of refusal arrive on one message: a peer holding the
+        // object (ordinary — caller tries the next candidate) and
+        // `fault: 'claimant'` (the arbiter could not read the key at all,
+        // no retry can fix it) — rejected here, at the one door (Law 13/16).
         if (msg.payload.fault === 'claimant') {
           const { key, reason } = msg.payload;
           const pending = _pendingClaim;
           _pendingClaim = null;
-          // REJECT THE CALLER'S PROMISE rather than throwing out of the socket handler. A throw here
-          // would leave the awaiting executor holding a promise nothing will ever settle — a hang, and
-          // the one outcome worse than the loop this replaces (Law 8: whoever raised the lifecycle ends
-          // it). Rejected, it surfaces inside the executor's own await, where watcher.track and
-          // master_core report it as the coding violation it is.
+          // Rejects the caller's promise; throwing out of the socket handler
+          // would leave the executor hanging (Law 8).
           pending.reject(new Error(`foreman_link: CODING VIOLATION (Law 13) — the foreman could not read `
             + `claim key '${key}': ${reason}. A claim key's namespace must be listed in foreman_brain's `
             + `OBJECT_KEY_PREFIXES; until it is, that object can never be claimed by anyone.`));
@@ -556,15 +693,11 @@ function _handleMessage(msg) {
       break;
 
     case 'planning_granted':
-      // No pending acquire = a late/duplicate grant (e.g. after a TTL round
-      // trip) — ignore silently; the renewal heartbeat covers a live hold.
-      if (_pendingPlanning) {
-        watcher.summary('foreman_link', 'Planning token granted — plan phase is ours.');
-        const resolve = _pendingPlanning.resolve;
-        _pendingPlanning = null;
-        _startPlanningRenewal();
-        resolve();
-      }
+      _onPlanningGranted(msg.payload);
+      break;
+
+    case 'planning_queued':
+      _onPlanningQueued(msg.payload);
       break;
 
     case 'command': {
@@ -574,12 +707,8 @@ function _handleMessage(msg) {
       // Forwarded unchanged from the operator; the verb's own case validates it (Law 3: this is
       // transport, it does not inspect the cargo).
       const args = msg.payload.args || {};
-      // WHERE THE COMMAND ENTERED THE FLEET, carried from the foreman and NOT defaulted here.
-      // The foreman is the only party that can know this truthfully — it stamps the origin from
-      // WHICH SOCKET spoke, never from anything the sender claims about itself (Law 23) — so this
-      // side passes the stamp through untouched and lets the mandate judge it. An `|| TERMINAL`
-      // here would be this process inventing the one fact the isolation turns on, and it would
-      // silently re-open the door the moment a stamp went missing upstream.
+      // Origin (where the command entered the fleet) passes through
+      // untouched, never defaulted — only the foreman can state it truthfully (Law 23).
       const origin = msg.payload.origin;
       const operatorCommands = require('@kernel/operator_commands');
       if (!operatorCommands.VERBS.has(verb)) {
@@ -608,10 +737,10 @@ function disconnect() {
     _reconnectTimer = null;
   }
   if (_bodyCellTimer) {
-    clearInterval(_bodyCellTimer);
+    timeoutCrash.stop(_bodyCellTimer);
     _bodyCellTimer = null;
   }
-  _stopPlanningRenewal();
+  if (_pendingPlanning) _pendingPlanning.answer.done();
   if (_ws) {
     _ws.close();
     _ws = null;
@@ -619,11 +748,10 @@ function disconnect() {
   _connected = false;
 }
 
-// ── THE FIRST BROADCAST IS WHERE A BODY LEARNS ITS BASE (Architect 2026-09-18) ────────────────────────
-// *"Bots can't set their own points now"*. The foreman writes every site into its memory before spawning a
-// body, and the hub broadcasts that memory the moment the body registers. So "has this body heard the
-// foreman yet" is the question a start must ask before it reads its base; before the first broadcast, an
-// empty building room means "not heard yet", not "no base".
+// ── THE FIRST BROADCAST IS WHERE A BODY LEARNS ITS BASE ────────────────────────
+// The foreman writes every site into memory before spawning a body and
+// broadcasts it on registration. Before the first broadcast, an empty
+// building room means "not heard yet", not "no base".
 let _firstBroadcastSeen = false;
 const _firstBroadcastWaiters = [];
 function _markFirstBroadcast() {
@@ -657,10 +785,18 @@ module.exports = {
   requestClaim,
   releaseClaim,
   releaseAllClaims,
+  closeClaimedArea,
+  getPeerClosedAreas,
+  peerClaimKeys,
+  peerAreaAt,
   acquirePlanningToken,
+  standDown,
   releasePlanningToken,
+  withComputationWorkspace,
+  abandonComputationWorkspace,
   startBodyCellPublisher,
   getPeerBodyCells,
   recordStartupPosition,
   forwardLog,
+  sendItemBook,
 };

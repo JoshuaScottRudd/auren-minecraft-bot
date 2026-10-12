@@ -1,16 +1,15 @@
 // Auren_Bot/monitoring/motion_classifier.js
-// PROTOTYPE (round 62 follow-on). Splits a run's timeline into MOVING and DOING spans, so footage can
-// be sorted into "the bot travelled" vs "the bot worked" — the Architect's observation that travel is
-// ~half the runtime and is what makes a raw take unwatchable.
+// Splits a run's timeline into MOVING and DOING spans, so footage can be sorted into "the bot
+// travelled" vs "the bot worked" — travel is roughly half the runtime and is what makes a raw take
+// unwatchable.
 //
-// WHY TIME, NOT OWNERSHIP — the split the Architect first reached for was by fragment ownership
-// (locomotion inside an executor = doing; locomotion outside = moving), and he correctly predicted it
-// "won't work" because locomotion lives inside the executors. The trace resolves this: NAVIGATOR and
-// LOCOMOTION_DISPATCHER are their OWN tag stream (the two largest in the whole trace), logged WHILE an
-// executor owns the job. So the question a video editor actually asks — "is the world changing on
-// screen right now, or is the bot just walking?" — is answered by WHICH TAG is emitting at each
-// second, not by who called it. A run of NAVIGATOR lines is the bot visibly walking whoever requested
-// the walk; a run of INVENTORY_SWAPPER/executor lines is the bot visibly acting.
+// WHY TIME, NOT OWNERSHIP: fragment ownership (locomotion inside an executor = doing; locomotion outside
+// = moving) does not work, because locomotion lives inside the executors. The trace resolves this:
+// NAVIGATOR and LOCOMOTION_DISPATCHER are their OWN tag stream (the two largest in the whole trace),
+// logged WHILE an executor owns the job. So the question a video editor actually asks — "is the world
+// changing on screen right now, or is the bot just walking?" — is answered by WHICH TAG is emitting at
+// each second, not by who called it. A run of NAVIGATOR lines is the bot visibly walking whoever
+// requested the walk; a run of INVENTORY_SWAPPER/executor lines is the bot visibly acting.
 //
 // This is READ-ONLY analysis of the trace (Law 6) and reuses trace_read's parse (Law 16). It emits
 // a segment list designed to feed footage_clipper's clip cutting next — this node decides the split,
@@ -31,10 +30,8 @@ const { readTrace, segmentRuns, buildEpisodes, jobToken } = require('./trace_rea
 const out = require('./data_out');
 
 const paths = require('./lens_paths');
-// NO READER SPELLS A RECORD'S PATH — record_homes answers it, and this file was the one place still
-// guessing (found 2026-09-16). It read `js_kernel/watcher_<bot>.jsonl`, which is where traces lived
-// before they moved to `fleet_logs/traces/`; every run since has thrown ENOENT here. The rule exists
-// precisely so a move like that cannot leave a reader behind (Law 16).
+// NO READER SPELLS A RECORD'S PATH — record_homes answers it, so a move of the trace's storage location
+// cannot leave a reader behind (Law 16).
 const TRACE_DIR = require(paths.bot('js_kernel/utils/record_homes')).TRACE_DIR;
 
 const args = process.argv.slice(2);
@@ -48,8 +45,8 @@ const AS_JSON = args.includes('--json');
 // item moving, a tree falling). NEUTRAL: bookkeeping and perception with no on-screen action — job
 // board posts, integrity scans, the judge, managers. Neutral lines never OWN a second; they inherit
 // whatever the bot was last visibly doing, so a burst of 20 integrity lines between two dig segments
-// does not read as a third kind of moment. INVENTORY_SWAPPER is DO on the Architect's own call — an
-// api a main task dips into still counts as doing.
+// does not read as a third kind of moment. INVENTORY_SWAPPER counts as DO: an api a main task dips into
+// still counts as doing.
 const MOVE_TAGS = new Set(['NAVIGATOR', 'LOCOMOTION_DISPATCHER', 'LOCOMOTION_JUDGE']);
 const DO_RE = /EXECUTOR|PRECONSTRUCTION|DROP_COLLECTOR|SEED_PICKER|TREE_FELLER|CRAFT_HANDLER|INVENTORY_SWAPPER|FARM/;
 
@@ -66,12 +63,10 @@ function tagOf(raw) {
 
 // CARVE-OWNER OVERRIDE — the one place ownership beats tag. Mining moves the bot BY digging: the bot
 // paths downward THROUGH the rock it is removing, so NAVIGATOR fires densely during an active carve
-// while MINING_EXECUTOR logs only a summary per completed segment (observed: 59s carving 28 blocks
-// logged as one MINING line + dozens of NAVIGATOR `dig_through`/`PILLAR` lines). Tag alone therefore
-// reads active shaft-digging as travel. So inside a mining arc, locomotion is reclassified DO — the
-// Architect's "locomotion inside [mining] is doing." Preconstruction (digs the build pad) and
-// farming land-prep (tills) are the same case; they are minor in this trace and NOT yet folded in —
-// flagged as the identical follow-up rather than guessed at. Supply/delivery/canopy locomotion is
+// while MINING_EXECUTOR logs only a summary per completed segment. Tag alone therefore reads active
+// shaft-digging as travel, so inside a mining arc, locomotion is reclassified DO: locomotion inside
+// mining counts as doing. Preconstruction (digs the build pad) and farming land-prep (tills) are the
+// same case; they are minor in this trace and not yet folded in. Supply/delivery/canopy locomotion is
 // genuine travel across finished world and stays MOVE.
 const CARVE_ARC = /^mine\//;
 
@@ -87,10 +82,9 @@ function classifyTimeline(seg, inCarve) {
   // above, so any bound derived from a different set can be wrong in two ways at once: a segment whose
   // first or last row carries no relSec makes `end - start` NaN and `new Array(NaN)` throws RangeError,
   // and a segment not ordered by relSec sizes the array shorter than the largest index written into it.
-  // min/max rather than first/last for the same reason — the order of the rows is not this function's to
-  // assume (Law 13: validate the precondition here, where the array is sized, rather than trusting a
-  // caller's ordering). The RangeError this replaces killed the whole run report, so a run too short to
-  // classify lost its capture entirely instead of reporting an empty timeline.
+  // min/max, not first/last: the order of the rows is not this function's to assume (Law 13: validate the
+  // precondition here, where the array is sized). A run too short to classify still reports an empty
+  // timeline and keeps its capture, with no RangeError reaching the whole run report.
   const stamps = lines.map(l => l.relSec);
   const start = Math.min(...stamps), end = Math.max(...stamps);
   const move = new Array(end - start + 1).fill(0);
@@ -184,15 +178,14 @@ function arcBreakdown(spans, segments) {
   return rows;
 }
 
-// The split for one bot's latest run, as data. Extracted so a consumer (the footage clipper)
-// reuses the ONE definition of moving-vs-doing rather than re-deriving it (Law 16). Returns null when
-// the run has no MOVE/DO activity, so a caller iterating bots can skip a bot that never ran.
+// The split for one bot's latest run, as data. Extracted so a consumer (the footage clipper) reuses the
+// ONE definition of moving-vs-doing (Law 16). Returns null when the run has no MOVE/DO activity, so a
+// caller iterating bots can skip a bot that never ran.
 //
-// `traceFile` exists because a FILMED run's records are copied beside its footage and the live file is
-// overwritten by the next fleet run — so an editing surface asking "where did this take travel" is
-// asking about a trace that is no longer the live one. The parameter is the whole of that support: the
-// classification is identical, only the file it reads differs, which is why this is one argument rather
-// than a second entry point (Law 16).
+// `traceFile` exists because a FILMED run's records are copied beside its footage, and the live file is
+// overwritten by the next fleet run — so an editing surface asking where a take's travel happened is
+// asking about a trace that is not the live one. The parameter is the whole of that support: the
+// classification is identical, only the file it reads differs (Law 16).
 function computeSplit(bot, minSeg = MIN_SEG, traceFile = null) {
   const seg = segmentRuns(readTrace(traceFile || path.join(TRACE_DIR, `watcher_${bot}.jsonl`))).pop() || [];
   const spans = arcSpans(seg);
@@ -213,9 +206,8 @@ function main() {
 
   if (AS_JSON) { out.json({ bot: BOT, minSeg: MIN_SEG, segments }); return; }
 
-  // OUTPUT IS DATA (Architect 2026-09-16). MOVE and DO are measured classes, not judgements — a second
-  // is whichever kind of line is in the majority within it. What left: the header sentence and the note
-  // naming footage_clipper as the consumer; who reads a table is not part of the table.
+  // OUTPUT IS DATA. MOVE and DO are measured classes, not judgements — a second is whichever kind of
+  // line is in the majority within it. Who reads a table is not part of the table.
   const tot = totMove + totDo;
   out.kv('lens', 'motion');
   out.kv('bot', BOT);

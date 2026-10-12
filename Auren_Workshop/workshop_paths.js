@@ -1,67 +1,35 @@
 'use strict';
-// workshop_paths — the ONE answer to "where is the bot, and where is the repo, from inside the workshop".
+// workshop_paths — resolves the workshop, the bot and the repo root from one place, and registers the
+// bot's @-aliases so workshop code can load bot fragments (Law 16: one crossing point, not one per file).
 //
-// ── WHY THIS FILE EXISTS ────────────────────────────────────────────────────────────────────────────
-// The workshop and the shipped bot are two sibling directories under one repo root. Every instrument,
-// bench, probe, lens and launcher in here has to reach across that boundary — to load a fragment, to
-// read a run record, to resolve a third-party package — and before this file existed each one answered
-// "where is the bot" for itself, as `path.join(__dirname, '..')`. That sentence was true only while the
-// tools lived INSIDE the bot directory. Fifty-five copies of one assumption, each silently wrong the
-// moment the layout moved, is the exact shape of the defect `js_kernel/utils/node_module_homes` was
-// written to end one layer down: four hand-written answers to "where do the node modules live" that had
-// drifted apart, one of them making the camera rig single-machine for weeks with nothing to say so.
-//
-// So the boundary gets one crossing point. If the layout moves again it is this file, not fifty-five.
-//
-// ── THE BOUNDARY IS DELIBERATELY VISIBLE, NOT ALIASED AWAY ──────────────────────────────────────────
-// A workshop file addressing a bot file writes `require(paths.bot('js_kernel/utils/rcon_link'))` rather
-// than an `@utils/...` alias. The alias would be shorter and it would also make the crossing invisible:
-// the whole point of the split is that "this workshop file depends on shipped bot code" is a fact
-// somebody can grep for in one string. The @-aliases still exist and are still registered here — but
-// for the reason they were invented, which is that the BOT'S OWN code says `require('@utils/x')`
-// internally and cannot load without them (Law 29: two different topics, one list each).
+// ── THE BOUNDARY STAYS VISIBLE ──────────────────────────────────────────────────────────────────────
+// A workshop file addressing a bot file writes `require(paths.bot('js_kernel/utils/rcon_link'))`, so
+// that dependency is a fact anyone can grep for. The @-aliases are still registered here, for the
+// reason they exist: the bot's own code says `require('@utils/x')` internally (Law 29).
 //
 // ── ORDER IS LOAD-BEARING IN registerAliases() ──────────────────────────────────────────────────────
-// `module-alias` is a third-party package and it lives in a node_modules that is in a different place
-// on every machine. Inside the bot directory Node found it by walking up to `Auren_Bot/node_modules`;
-// from the workshop that walk now ends at the repo root and finds nothing. So the module homes go on
-// NODE_PATH FIRST, from the bot's own resolver, and only then is `module-alias` required by name.
+// `module-alias` is a third-party package resolved through the bot's own node_modules, so the module
+// homes go on NODE_PATH first, from the bot's own resolver, and only then is `module-alias` required.
 //
 // ── WHY THE MAP IS REBUILT INSTEAD OF `require('module-alias')(BOT_ROOT)` ───────────────────────────
-// That one-liner is the documented way to load a package.json's `_moduleAliases`, and calling it twice
-// in one process CORRUPTS the map on Windows. It resolves each relative target in place, in the object
-// Node has cached for that package.json, and its "already absolute" test is `value[0] !== '/'` — which
-// is false for `C:\Auren\...`. A second call therefore joins the base onto an already-joined path and
-// every alias points at `C:\Auren\Auren_Bot\C:\Auren\Auren_Bot\js_kernel`. Reading the map and joining
-// into a FRESH object cannot do that, however many callers ask. The idempotence flag below is still
-// kept, because repeating the work is waste even when it is harmless.
+// The alias map is read from the bot's package.json and joined into a fresh object on every call, so
+// calling registerAliases() more than once in a process cannot double-join a path onto itself.
 //
 // ── IT NEVER GUESSES ────────────────────────────────────────────────────────────────────────────────
-// `bot()` and `repo()` are computed from this file's own location and nothing else. There is no
-// environment override and no search: a workshop that cannot find the bot beside it is a broken
-// checkout, and it should fail on the missing file with Node's own message naming the path it wanted
-// (Law 13 — never default a missing field into a plausible wrong answer).
+// `bot()` and `repo()` are computed from this file's own location and nothing else. A checkout that
+// cannot find the bot beside it fails on the missing path Node names (Law 13).
 
 const path = require('path');
 
-// ── THE WORKSHOP LIVES INSIDE THE BOT NOW (Architect 2026-09-10) ────────────────────────────────────
-// *"the tools need to live with the bot to read the bot and i should just ship the whole thing as one
-// piece and hand people scripts to run the thing instead of hiding it from them."*
+// ── THE WORKSHOP IS A SUBDIRECTORY OF THE BOT ───────────────────────────────
+// `bot()`, `repo()`, `workshop()` and `fleetLogs()` each name which side of that boundary a path is on.
 //
-// It was a SIBLING of `Auren_Bot/`, and these three lines are the entire structural cost of the move:
-// `bot()`, `repo()`, `workshop()`, `fleetLogs()` and `registerAliases()` all keep their signatures, so
-// the other 142 files in this folder did not change. That is why the folder moved WHOLE rather than
-// being flattened into `Auren_Bot/tools/` + `Auren_Bot/scripts/` — the flat version reads better and
-// touches every path in the repository.
-//
-// `repo()` NOW POINTS AT SOMEBODY ELSE'S PARENT DIRECTORY ON A STRANGER'S MACHINE, and that is fine
-// because of what it is used for: `Sessions/` (the AI-developer session layer) and the Architect's other
-// private folders. All are absent from a download by design, all are asked for through an existence
-// check, and `preflight`'s shipped-tree pass refuses any `require` that reaches private ground — so a
-// wrong answer from `repo()` can only ever be a missing-directory refusal that names itself, never a
-// silent load-time failure. THE MINECRAFT SERVER FOLDER, JAVA AND THE MODULE HOMES ARE NOT reached
-// through `repo()` (2026-09-11): they are `js_kernel/utils/workstation.js`'s answers, which try the
-// stranger's way first and the Architect's workstation file second.
+// `repo()` reaches folders outside the shipped bot — the session layer and other operator-only data —
+// that a download never has. Every caller checks existence first, and `preflight`'s shipped-tree pass
+// refuses any `require` inside the bot that reaches private ground, so a missing folder there is a
+// named refusal, never a silent failure. The Minecraft server folder, Java and the module homes are not
+// reached through `repo()`: they are answered by `js_kernel/utils/workstation.js`, which tries a
+// download's own layout first and the operator's workstation settings second.
 const WORKSHOP_ROOT = __dirname;
 const BOT_ROOT = path.resolve(__dirname, '..');
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -73,8 +41,7 @@ function bot(...parts) { return path.join(BOT_ROOT, ...parts); }
 // neither the bot nor the workshop, except what `js_kernel/utils/workstation.js` answers.
 function repo(...parts) { return path.join(REPO_ROOT, ...parts); }
 
-// workshop(...parts) — a path inside the workshop itself. Present so a tool spawning a sibling tool
-// states which side of the boundary it means rather than leaning on `__dirname` arithmetic.
+// workshop(...parts) — a path inside the workshop itself, for a tool spawning a sibling tool.
 function workshop(...parts) { return path.join(WORKSHOP_ROOT, ...parts); }
 
 // fleetLogs(...parts) — where a run's records land. THIS IS INSIDE THE BOT, not the workshop, and that

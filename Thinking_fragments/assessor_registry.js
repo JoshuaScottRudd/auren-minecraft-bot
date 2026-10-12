@@ -1,71 +1,62 @@
 // assessor_registry — WHICH ASSESSORS EXIST, AND IN WHICH TWO ORDERS THE SWEEP USES THEM.
 //
-// job_board was one file holding thirteen assessments and the sweep that ran them. The assessments are
-// what grows — the Architect adds jobs — and the sweep is what does not, so they are separated along
-// the axis that actually moves. Every assessor is now its own file under `assessors/`, with its own
-// commentary beside its own code, and this module is the manifest.
+// Each assessor lives in its own file under `assessors/`, with its own commentary beside its own code.
+// Assessments are what grows as job types are added; the sweep that runs them is what does not, so
+// they are separated along the axis that moves, and this module is the manifest.
 //
-// WHY A MANIFEST AND NOT A DIRECTORY SCAN. `fragment_registry`'s header states the rule this follows:
-// requiring every member at load means a missing or broken one crashes at boot, naming itself, instead
-// of failing the first time something routes to it. A `readdirSync` would also make the two orderings
-// below impossible to state, and it would silently enlist a file someone left in the folder.
+// Every assessor is required at load: a missing or broken one crashes at boot, naming itself, before
+// anything routes to it. A directory scan would also make the two orderings below impossible to state,
+// and would silently enlist a stray file.
 //
-// ── THE TWO ORDERS, WHICH ARE GENUINELY TWO (Law 18) ────────────────────────────────────────────────
-// The old sweep carried both as hand-typed lists and nothing checked that they agreed. They run
-// counter-directionally on purpose:
-//
-//   EVALUATE  stable → urgent.  The order assessments are RUN in. It matters because assessments are
-//             not all independent: they read shared world state, and one of them (building) computes
-//             the material shortfall that mining's pull is derived from.
+// ── THE TWO ORDERS (Law 18) ─────────────────────────────────────────────────────────────────────────
+//   EVALUATE  stable → urgent.  The order assessments RUN in. Assessments are not all independent: they
+//             read shared world state, and one of them (building) computes the material shortfall that
+//             mining's pull is derived from.
 //   ASSEMBLE  urgent → stable.  The order jobs are CONCATENATED in, and therefore the order equals are
 //             PRINTED in — it decides nothing about what is claimed. Equals are picked at random by the
-//             dispatcher, so this is where Law 18's phasing is visible to a reader rather than where a
-//             tie is settled. It used to settle one; that tiebreak is deleted.
+//             dispatcher, so this is where Law 18's phasing is visible to a reader.
 //
-// Reordering EVALUATE to "match" ASSEMBLE would silently break the phasing, which is exactly why the
-// old sweep carried a comment begging the reader not to. Now the two are declared apart, named for what
-// each one decides, and checked against each other below.
+// Reordering EVALUATE to match ASSEMBLE would silently break the phasing. The two are declared apart,
+// named for what each one decides, and checked against each other below.
 //
 // ── THE CHECKS, AND WHAT EACH ONE CATCHES ───────────────────────────────────────────────────────────
-// Every fault here produces a board that is quietly missing work rather than one that throws, which is
-// the failure shape this fleet is worst at reading — a job that is never posted looks exactly like a job
-// whose conditions were never met. So the manifest is checked at require time, in every process.
+// A silent fault here produces a board that is quietly missing work, the failure shape this fleet is
+// worst at reading — a job that is never posted looks exactly like a job whose conditions were never
+// met. The manifest is checked at require time, in every process.
 'use strict';
 
 const mining        = require('@thinking/assessors/mining');
 const building      = require('@thinking/assessors/building');
 const supply        = require('@thinking/assessors/supply');
 const furnace       = require('@thinking/assessors/furnace');
+const compost       = require('@thinking/assessors/compost');
+const housekeeping  = require('@thinking/assessors/housekeeping');
 
-// `exploration` IS GONE — DELETED 2026-09-10, not merely unregistered. Its only output was the
-// `seek_biome` job, which marched a homesteader out of an unbuildable biome to found its base
-// elsewhere. Ruled out: *"i dont want the bots to teleport to a player who lives in the desert and the
-// bots just walk off to another loaded chunk to make a base. it should just refuse and crash and tell
-// the human that it cant find a place to build the base."* A crew is brought to where a person stands,
-// and that placement is the instruction — a base sited in another chunk overrules it.
-// BIOME HUNTING FOR MATERIAL SURVIVES and is untouched: `supply_manager` routes to
-// `exploration_executor` directly for that, so it never needed a board job (*"it should only biome hunt
-// if searching for surface items like logs"*).
-//
-// `base_layout` IS GONE TOO — DELETED 2026-09-18. It posted `lock_base_layout`, the job by which a body
-// surveyed and locked its own base. Ruled out: *"double check forman does the site locking and its no longer
-// a job any bots do. its done before bot spawn. so the bots come in and get straight to work."* The foreman
-// sites the base before any body exists and hands it over at birth; `start_injector` records it and refuses
-// to start a body that has none (`lock_all_buildspots.recordHandedSite`).
+// exploration posts no job: a crew is brought to where a person stands, so a base sited in another
+// chunk would overrule that placement. Biome hunting for surface material still runs, through
+// `supply_manager` routing straight to `exploration_executor`, with no board job needed.
+// base_layout posts no job either: the foreman sites and locks the base before any body exists, and
+// hands it over at birth; `start_injector` records it and refuses to start a body that has none
+// (`lock_all_buildspots.recordHandedSite`).
 const woodPreference= require('@thinking/assessors/wood_preference');
 const hunger        = require('@thinking/assessors/hunger');
 const farming       = require('@thinking/assessors/farming');
 const lighting      = require('@thinking/assessors/lighting');
 const canopy        = require('@thinking/assessors/canopy');
+const grounds       = require('@thinking/assessors/grounds');
 const respawn       = require('@thinking/assessors/respawn');
 const groundSalvage = require('@thinking/assessors/ground_salvage');
 const contractorHouse = require('@thinking/assessors/contractor_house');
+// A DOWNLOADED building's whole ladder in one assessor — trees, scrape, columns, seal. It is a STRUCTURE
+// assessor like `building` and `contractorHouse`, and it publishes the same `built` verdict, so it runs
+// where they do: with the other structure assessors, ahead of `supply`, the first reader of a structure's claim.
+const downloadedBuild = require('@thinking/assessors/downloaded_build');
 
-// RESPAWN IS NOT IN EITHER ORDER, and that is what it means rather than an omission. It is a GATE on the
-// whole board: a dead bot posts respawn_recover and nothing else, so it does not compete with the
-// assessors — it decides whether any of them run at all. Listing it among them would make it one
-// assessment of thirteen, which is the reading the sweep's dead-bot short circuit exists to refuse.
-// job_board calls it directly, ahead of the loop.
+// RESPAWN IS NOT IN EITHER ORDER — that is what it means, not an omission. It is a GATE on the whole
+// board: a dead bot posts respawn_recover and nothing else, so it does not compete with the assessors —
+// it decides whether any of them run at all. Listing it among them would read as one assessment of
+// thirteen, which the sweep's dead-bot short circuit exists to refuse. job_board calls it directly,
+// ahead of the loop.
 const GATE = respawn;
 
 // EVALUATE — stable → urgent (Law 18). The order assessments RUN in.
@@ -73,26 +64,26 @@ const GATE = respawn;
 // different structure. Its position among the others decides nothing about what is claimed — the band
 // and the rung do that — so what it must not do is drift AWAY from `building`, where a later reader
 // would stop recognising the two as one kind of work.
-// THE STRUCTURE ASSESSORS RUN IN SETUP_ORDER, AHEAD OF `supply` (Architect 2026-09-15). job_board carries each
-// structure's "built" verdict forward through this loop and drops the claim of any structure still waiting its
-// turn; a structure evaluated before the ones it waits on would see them unreported, read "not built", and
-// withhold a claim it is entitled to. So: building (headframe) → farming (the farm) → contractorHouse, and all
-// three before supply, the first reader of the claim. farming reads no claim, so moving it up changes none of
-// its own answers.
+// THE STRUCTURE ASSESSORS RUN AHEAD OF `supply`, AND THAT IS A DATA-FLOW ORDER. Each structure's build
+// claim is recomputed every sweep and accumulated as the loop runs, so an assessor that SUBTRACTS a claim
+// must run after the one that DECLARES it: building (headframe) → farming (the farm) → contractorHouse,
+// and all three before supply, the first reader of the claim. farming declares no claim of its own, so its
+// position changes none of its answers. Nothing here ranks anything and nothing here withholds anything —
+// which structure a body serves first is STRUCTURE_PRIORITY, read in job_ranking.
 const EVALUATE_ORDER = [
-    hunger, mining, building, farming, contractorHouse, supply, furnace,
-    woodPreference, lighting, canopy, groundSalvage,
+    hunger, mining, building, farming, contractorHouse, downloadedBuild, supply, furnace, compost, housekeeping,
+    woodPreference, lighting, canopy, grounds, groundSalvage,
 ];
 
 // ASSEMBLE — urgent → stable (Law 18). The order jobs are CONCATENATED in, which survives into the
 // printed board because the display sort is stable. It breaks no ties: equals are picked at random.
 const ASSEMBLE_ORDER = [
     hunger, groundSalvage, woodPreference, supply,
-    furnace, building, contractorHouse, mining, farming, lighting, canopy,
+    housekeeping, furnace, compost, building, contractorHouse, downloadedBuild, mining, farming, lighting, canopy, grounds,
 ];
 
 // 1. THE CONTRACT. An assessor that exports the wrong shape would throw deep inside the sweep, on a
-//    line that reads as the sweep's fault rather than the file's — and only when the sweep next ran.
+//    line that reads as the sweep's fault, not the file's — and only when the sweep next ran.
 for (const a of [GATE, ...EVALUATE_ORDER]) {
     if (!a || typeof a.name !== 'string' || !a.name) {
         throw new Error('CODING VIOLATION (Law 13): an assessor in assessor_registry exports no `name`. '
@@ -140,8 +131,8 @@ if (ASSEMBLE_ORDER.length !== EVALUATE_ORDER.length) {
         + 'of them lists an assessor twice.');
 }
 
-// 4. THE GATE IS NOT AN ASSESSOR. If respawn were added to the orders it would post its job alongside
-//    the others instead of instead of them, and a corpse would be handed mining work.
+// 4. THE GATE IS NOT AN ASSESSOR. Respawn runs before the others and replaces them for a dead bot;
+//    listing it among them would let a corpse be handed ordinary work it cannot do.
 if (evalNames.has(GATE.name)) {
     throw new Error(`CODING VIOLATION (Law 13): the board gate '${GATE.name}' is also listed as an ordinary `
         + 'assessor. It runs BEFORE the others and replaces them; listing it among them would let a dead '

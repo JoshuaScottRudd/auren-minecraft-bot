@@ -1,25 +1,16 @@
 // api: exploration_api
-// purpose: WALK the bot toward the biome that normally holds what a caller wants. Law 15 sub-loop
-//          mover — the caller says "I want this and it isn't near me", seek() answers "that's normally
-//          in these biomes, I'll walk you there", drives locomotion, and returns once the bot has
-//          moved. The caller then re-senses (scans) from the new position. Shared by
-//          exploration_executor (the `explore` job) and seed_picker (heading for grass when the local
-//          surface district has none). One implementation, one place (Law 16).
+// purpose: walks the bot toward the biome that normally holds what a caller wants (Law 15 sub-loop
+//          mover). Drives locomotion one step and returns; the caller re-senses from the new position.
+//          Shared by exploration_executor (the `explore` job) and seed_picker (heading for grass when
+//          the local surface district has none). One implementation, one place (Law 16).
 //
-// WHY the mover lives here (reversed from the brief decision-only split, Architect 2026-07-04):
-// "decide + walk toward a biome" is one verb with its own internal Sense-Plan-Act; splitting the walk
-// out to every caller just duplicated the goTo handling. seek() owns the walk; the caller owns only
-// the re-sense afterward.
-//
-// NO retry / NO soft-loop (Law 13): seek() makes ONE move toward the chosen biome and returns. It is
-// the CALLER's job to re-sense and decide — and a caller must NOT sit in a scan→seek→scan loop: if a
-// re-sense after a real move still fails, the expectation is broken (seek keeps re-picking the biome
-// it's already in and barely moves), which can only infinite-loop. That is a coding violation to
-// surface (throw), not an environmental condition to retry.
+// NO retry / NO soft-loop (Law 13): seek() makes ONE move toward the chosen biome and returns. The
+// caller owns re-sensing and deciding; a scan→seek→scan loop after a real move that still fails is a
+// coding violation to surface (throw), not an environmental condition to retry.
 //
 // FAILURE (Law 15): movement is goTo's domain. goTo resolves arrived:false on a normal give-up (seek
-// returns the give-up position) and never resolves only on a hard emergency (seek is abandoned with
-// the chain, intentional). seek() adds no movement retry of its own.
+// returns the give-up position) and only fails to resolve on a hard emergency (seek is abandoned with
+// the chain). seek() adds no movement retry of its own.
 //
 // Returns: { mode, current_biome, current_rank, target_biome?, position?, distance?, for_item?, arrived_at? }.
 //   mode 'none_detected' → nothing usable this cycle (no move made). Other modes → the bot walked.
@@ -67,13 +58,11 @@ function currentBiomeFromBot(bot, refX, refY, refZ) {
 }
 
 // chooseTarget — which detected biome to head toward this cycle.
-//   patches:      biome_scanner's flat, distance-SORTED patch list [{ biome, dist, seed, … }] (nearest first)
+//   patches:      biome_scanner's flat, distance-sorted patch list [{ biome, dist, seed, … }] (nearest first)
 //   targetBiomes: { item: [biomeName, ...] } material-driven candidates (possibly {})
 //   currentBiome: excluded from general_seek so we never "seek" the biome we're already in
-// Returns { mode, biomeName, position, distance, forItem? } or null (nothing usable). The patch list is the
-// biome_scanner upgrade (2026-07-18): the nearest PATCH of a biome is `patches.find(p => p.biome === name)`
-// (already sorted), which is exactly the old "nearest point per biome" this used to read — same behaviour,
-// richer source. `seed` is the patch's nearest cell = the walk target (the old `.position`).
+// Returns { mode, biomeName, position, distance, forItem? } or null (nothing usable). `seed` is the
+// patch's nearest cell — the walk target.
 function chooseTarget(patches, targetBiomes, currentBiome) {
     if (!patches || patches.length === 0) return null;
 
@@ -117,11 +106,9 @@ async function seek(bot, opts = {}) {
     const currentBiome = currentBiomeFromBot(bot, refX, refY, refZ);
     const currentRank  = BIOME_RANK[currentBiome] ?? DEFAULT_RANK;
 
-    // Sense fresh, then plan (Law 11 / Invariant B). This is the ONLY populator of the biome scan on
-    // the seek path — nothing else calls scanBiomes here (only the unrelated water-site overlay did),
-    // so getState() used to read empty and seek always held. Scanning at the top of the one shared
-    // mover brings the scanner online for BOTH callers — exploration_executor's build-site hunt and
-    // seed_picker's grass hunt — in one place (Law 16). One scan per call = one SPA, not a loop.
+    // Sense fresh, then plan (Law 11 / Invariant B). The only populator of the biome scan on this path;
+    // scanning here brings the scanner online for both callers — exploration_executor's build-site hunt
+    // and seed_picker's grass hunt (Law 16). One scan per call = one SPA, not a loop.
     biomeScanner.scanBiomes(bot);
     const patches      = biomeScanner.getState()?.patches || [];
     const targetBiomes = opts.targetBiomes || {};

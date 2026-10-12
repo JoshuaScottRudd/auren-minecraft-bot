@@ -41,14 +41,14 @@ const { isRequestable } = require('@kernel/requestable_catalogue');
 const ROOM = 'requests_confrence_room';
 const CHAIR = 'standing';
 
-// The ledger is one flag holding `{ "<owner>|<item>": row }`. Flat rather than nested per owner because
-// the foreman's merge works on flat id→entry maps and a nested shape would need its own merge (Law 16).
+// The ledger is one flag holding `{ "<owner>|<item>": row }`, flat: the foreman's merge works on flat
+// id→entry maps, and a nested shape would need its own merge (Law 16).
 function rowKey(ownerKey, item) { return `${ownerKey}|${normalizeItemName(item)}`; }
 
 // WHOSE ROWS THESE ARE. A bot derives it from its own mandate and can form no other; the FOREMAN
 // passes it explicitly, because it is not a bot, has no mandate, and is the one process that must write
-// on behalf of whichever human spoke (§8.3 — the foreman owns the fact, the bot owns whether it cares).
-// One implementation with the key as a parameter rather than two copies of the rules (Law 16).
+// on behalf of whichever human spoke — the foreman owns the fact, the bot owns whether it cares.
+// One implementation with the key as a parameter (Law 16).
 function _ownerKey(explicit) {
   if (explicit) return explicit;
   return require('@kernel/bot_mandate').stationOwnerKey();
@@ -60,9 +60,9 @@ function _write(rows) { _hq().writeConfRoomFlag(ROOM, CHAIR, rows); }
 // post(item, quantity, asker) → { ok, row } | { ok:false, reason, blockedBy? }
 //
 // THE CATALOGUE GATES THE WRITE, NOT THE READ. An unrequestable item is refused here, at the moment a
-// person says it, while they are still present to be told why — rather than accepted and discovered
-// later by a crew that cannot act on it. The refusal carries the leaf that stopped the walk, because
-// "no" teaches nothing and "the walk stopped at string" teaches the whole family above it (Law 24).
+// person says it, while they are still present to be told why. The refusal carries the leaf that
+// stopped the walk, since naming the exact family member that failed teaches more than a bare refusal
+// (Law 24).
 // ── THE RULES ARE PURE; THE STORAGE IS A WRAPPER ─────────────────────────────────────────────────
 // applyPost/applyCancel/rowsFor take a rows object and return one. They touch no disk and require no
 // mandate, which is what lets TWO processes of different kinds share one implementation of the rules:
@@ -70,9 +70,8 @@ function _write(rows) { _hq().writeConfRoomFlag(ROOM, CHAIR, rows); }
 // station map — it has no HQ of its own and must not acquire one, because a second HQ writer with no
 // BOT_ID would author a file no bot reads and no name explains (Invariant D, Law 6).
 //
-// The alternative was the foreman restating the rules over its own map, which is the parallel route
-// that drifts (Law 16): the desk would come to disagree with the crews about what "asking twice" means,
-// and nothing would report it.
+// One shared rule set keeps the foreman and every crew agreeing about what counts as asking twice
+// (Law 16).
 function applyPost(rows, item, quantity, asker, ownerKey) {
   const name = normalizeItemName(item);
   if (!Number.isFinite(quantity) || quantity <= 0 || Math.floor(quantity) !== quantity) {
@@ -80,7 +79,7 @@ function applyPost(rows, item, quantity, asker, ownerKey) {
   }
   const legal = isRequestable(name);
   // `askInstead` travels with the refusal for the same reason `blockedBy` does: a caller rendering this
-  // needs to tell "the fleet has no route to it" from "right material, wrong grain — say `logs`".
+  // needs to tell a routing failure from a naming mismatch it can correct.
   if (!legal.ok) {
     return { ok: false, reason: 'not_requestable', blockedBy: legal.blockedBy, askInstead: legal.askInstead };
   }
@@ -88,7 +87,7 @@ function applyPost(rows, item, quantity, asker, ownerKey) {
   const owner = ownerKey;
   const key = rowKey(owner, name);
   // Absolute: the previous target is REPLACED. `first_asked_at` survives so a restated request keeps its
-  // age — the human's want did not begin again just because they said it twice.
+  // age — a repeated request is the same want, not a new one.
   const previous = rows[key];
   rows[key] = {
     item: name,
@@ -143,8 +142,8 @@ function outstanding(ownerKey) { return rowsFor(_all(), _ownerKey(ownerKey)); }
 
 // status(haveOf) → [{ item, asked, have, met }], measured NOW against a caller-supplied count.
 //
-// THE COUNT IS PASSED IN RATHER THAN FETCHED, which is what keeps this file honest about its own
-// category. The ledger knows what was wanted; only a reader of the world knows what is there, and that
+// The count is passed in, not fetched, which keeps this file honest about its own category. The ledger
+// knows what was wanted; only a reader of the world knows what is there, and that
 // read costs a round trip the ledger has no business deciding to spend. The caller that is about to
 // speak to a human pays for it at the moment it speaks (Law 26 — the ledger states, the world is
 // sensed, and the join happens where someone is accountable for the answer).
@@ -166,8 +165,8 @@ function status(haveOf) {
 function allRows() { return _all(); }
 
 // mergeBroadcast(rows) → adopt the foreman's ledger wholesale. Not a merge in the station sense: the
-// foreman is the SOLE author of requests, so a bot's copy is a mirror rather than a contribution, and
-// reconciling it against local state would be inventing a second author (Invariant D). Every broadcast
+// foreman is the SOLE author of requests, so a bot's copy is a mirror, and reconciling it against local
+// state would be inventing a second author (Invariant D). Every broadcast
 // restates the whole truth, so a missed one self-heals on the next.
 function mergeBroadcast(rows) {
   if (!rows || typeof rows !== 'object') return;

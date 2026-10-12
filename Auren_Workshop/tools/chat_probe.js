@@ -1,26 +1,23 @@
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/chat_probe.js');
 // tool: chat_probe — the LIVE observation that settles whether a bot can HEAR a human in 1.21.5,
-// which is the single fact the whole in-game control program rests on. Vol. 52 §18 resolved the
-// doorman's shape on lifecycle grounds and then recorded the hole underneath it plainly:
-// `bot.on('chat')` has NEVER been observed in this fleet. Everything downstream — spawn from chat,
-// the contractor mandate, the order desk's acknowledgements — is paper until this runs.
+// the single fact the whole in-game control program rests on. `bot.on('chat')` has never been
+// observed live in this fleet, so everything downstream — spawn from chat, the contractor mandate,
+// the order desk's acknowledgements — is paper until this runs.
 //
-// WHY A SECOND BOT IS THE HUMAN. The Architect cannot be in the game ("i cant go in game to do
-// anything right now"), and the question is a WORLD-TRANSFORMATION — what does Minecraft DO with a
-// player's chat — which no harness may answer by computing it (READ DON'T SIMULATE,
-// `Auren_Workshop/README.md`; the rule predates the bench that used to carry it and outlived it).
-// But the human is not being
+// WHY A SECOND BOT IS THE HUMAN. The operator cannot always be in the game to test, and the question
+// is a WORLD-TRANSFORMATION — what does Minecraft DO with a player's chat — which no harness may
+// answer by computing it (READ DON'T SIMULATE, `Auren_Workshop/README.md`). The human is not being
 // SIMULATED here: a second mineflayer client is a real connection holding a real player slot, and
 // `bot.chat()` emits the same serverbound chat packet a keyboard does. The server cannot tell them
-// apart, which is exactly why the proxy is legitimate. Nothing about the sender is authored.
+// apart, so the proxy is legitimate; nothing about the sender is authored.
 //
-// THE CONFOUND THIS PROBE EXISTS TO AVOID, stated before the results so it cannot be rationalised
-// afterwards: 1.19 introduced SIGNED chat. On an offline-mode server the signature chain is absent
-// or unverifiable, and libraries differ in whether they surface such a message, drop it, or route it
-// down a different packet. So "the event did not fire" and "the fleet cannot hear humans" are NOT
-// the same finding — the wire is tapped underneath the event for every question and both layers are
-// reported. A negative with no wire trace beneath it would be an uncontrolled negative (Law 26).
+// THE CONFOUND THIS PROBE EXISTS TO AVOID: 1.19 introduced SIGNED chat, and on an offline-mode server
+// the signature chain is absent or unverifiable, so libraries differ in whether they surface such a
+// message, drop it, or route it down a different packet. An event not firing and the fleet being
+// unable to hear humans are not the same finding, so the wire is tapped underneath the event for
+// every question and both layers are reported — a negative with no wire trace beneath it would be an
+// uncontrolled negative (Law 26).
 //
 // EVERY QUESTION CARRIES ITS CONTROL. C4 (console /say) exists so that my own RCON test instrument
 // cannot be mistaken for a human: if a console announcement were indistinguishable from a player's
@@ -47,13 +44,13 @@ const rconLink = require(paths.bot('js_kernel/utils/rcon_link'));
 
 const HOST = process.env.PROBE_HOST || 'localhost';
 const PORT = Number(process.env.PROBE_PORT || 25565);
-// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// Version READ from architect_config, never restated here — one authored answer (Law 16).
 // A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
 const VERSION = process.env.PROBE_VERSION
   || require(paths.bot('Thinking_fragments/architect_config.js')).SERVER_MINECRAFT_VERSION;
 
 const EAR = 'ChatProbe';       // stands for a contractor bot — the LISTENER
-const HUMAN = 'ProxyHuman';    // stands for the Architect at a keyboard — the SPEAKER
+const HUMAN = 'ProxyHuman';    // stands for the operator at a keyboard — the SPEAKER
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -76,7 +73,7 @@ function tapWire(bot, sink) {
 }
 
 // The high-level events mineflayer MIGHT route a message through. Listening to all of them at once
-// is the point: the probe reports which one actually carried the traffic rather than assuming.
+// lets the probe report which one actually carried the traffic, instead of assuming.
 function tapEvents(bot, sink) {
   bot.on('chat', (username, message) => sink.push({ event: 'chat', username, message, at: Date.now() }));
   bot.on('whisper', (username, message) => sink.push({ event: 'whisper', username, message, at: Date.now() }));
@@ -107,17 +104,15 @@ function readFront(bot, v) {
   }
 }
 
-// Q1 settled that ONLY the compound form is faithful — the plain-string and json-string forms are
-// accepted by the parser and then store their own punctuation AS SIGN TEXT. This builder is the one
-// shape allowed to seed a sign anywhere in this fleet.
+// ONLY the compound form is faithful — the plain-string and json-string forms are accepted by the
+// parser and then store their own punctuation AS SIGN TEXT. This builder is the one shape allowed to
+// seed a sign anywhere in this fleet.
 //
-// The distinction is one layer of quoting and it is easy to get wrong in exactly the direction that
-// LOOKS right: `messages:['{"text":"ORDER"}']` is a LIST OF STRINGS that happen to contain JSON —
-// that is Q1's rejected B-json-string, and the sign then literally reads {"text":"ORDER"}. The
-// faithful form is a list of SNBT COMPOUNDS: `messages:[{text:"ORDER"}]`, no surrounding quotes.
-// The first revision of this probe made precisely that mistake and reported the transport as
-// MANGLED — an instrument fault wearing a finding's clothes. Q1 caught it because the read-back is
-// compared to what was written rather than merely being non-empty.
+// The distinction is one layer of quoting, easy to get wrong in the direction that LOOKS right:
+// `messages:['{"text":"ORDER"}']` is a LIST OF STRINGS that happen to contain JSON, and the sign then
+// literally reads {"text":"ORDER"}. The faithful form is a list of SNBT COMPOUNDS:
+// `messages:[{text:"ORDER"}]`, no surrounding quotes — verified by comparing the read-back to what
+// was written, never by checking merely that it is non-empty.
 function compoundSnbt(lines) {
   const four = [0, 1, 2, 3].map(i => `{text:${JSON.stringify(lines[i] || '')}}`);
   return `{front_text:{messages:[${four.join(',')}]}}`;
@@ -208,13 +203,11 @@ async function main() {
         : 'NO — a whisper does not reach the bot on either event. Commands must travel on open chat.');
 
   // ── C6 — is chat global, or must the doorman stand near the human? ─────────────────────────────
-  // CARRIES ITS CONTROL, and the first revision of this probe shows why it must. That revision sent
-  // `tp <human> ~ ~ ~2000`, which RCON resolves against the SERVER CONSOLE's position (world spawn),
-  // not against the human — so the proxy landed somewhere arbitrary, possibly inside rock, and the
-  // silence that followed was reported as "chat is not global". That is an uncontrolled negative:
-  // "the channel is ranged" and "the probe broke its own speaker" are indistinguishable without a
-  // liveness check. So the human's ABSOLUTE position is read first, the move is made from it, and a
-  // control utterance after the return trip proves the speaker still works.
+  // CARRIES ITS CONTROL: a relative `tp <human> ~ ~ ~2000` resolves against RCON's own console
+  // position (world spawn), not the human, so a relative move is never used here. The human's
+  // ABSOLUTE position is read first, the move is made from it, and a control utterance after the
+  // return trip proves the speaker still works — a silence at range and a broken speaker are
+  // otherwise indistinguishable.
   const hp = human.entity.position.floored();
   await cmd(`forceload add ${hp.x + 1984} ${hp.z - 16} ${hp.x + 2016} ${hp.z + 16}`);
   await cmd(`tp ${HUMAN} ${hp.x + 2000} 120 ${hp.z}`);
@@ -284,7 +277,7 @@ async function main() {
         ? "YES — activateBlock re-grants the editor on a sign the bot did not place and the write LANDS. Q9's negative was the WAXING, not the ownership. The order desk can answer a human on their own sign."
         : "NO — the write was dropped on an UNWAXED sign the bot did not place, so the editor grant (not waxing) is what refuses it. The order desk must acknowledge somewhere other than the human's own sign.");
 
-  // ── S2 — the line budget, round-tripped. The Architect's rule: everything fits on ONE line. ─────
+  // ── S2 — the line budget, round-tripped. Everything must fit on ONE line. ────────────────────────
   // The rendered-pixel limit cannot be observed headlessly (Q8) and is NOT being re-attempted here.
   // What IS observable — and is the part that can actually break — is whether the shortened
   // vocabulary survives the transport verbatim. Anything mangled here would never be read correctly.

@@ -3,20 +3,14 @@
 //          a summary chair so building_planner knows the blueprint is confirmed, and
 //          trigger dependent setup (mining_blueprinter for headframe). Routes back to
 //          recursive_judge — building execution is a separate chain.
-// WHY: Confirming the blueprint and triggering dependents is a decision (action).
-//      The actual voxel transposition (relative → world coords) is NOT done here —
-//      that is pure arithmetic and happens on the fly inside building_integrity.scan(),
-//      so no derived voxel file exists to go stale against the blueprint.
-//      Blueprints come from @kernel/blueprint_registry, never from the file directly.
-//      NOT LIVE-EDITABLE, deliberately (reversed 2026-07-20): this comment used to promise
-//      that editing building_blueprints.json took effect on the next integrity scan without a
-//      restart. It did — and that was the defect, in both directions. The re-read crashed every
-//      bot that scanned during the delete half of a delete-then-upload, and a completed swap
-//      silently left the bot checking a half-built world against a different blueprint. The
-//      registry snapshots at boot; an edit applies at the next start. See blueprint_registry.js.
+// Voxel transposition (relative to world coordinates) happens on the fly inside
+// building_integrity.scan(), not here, so no derived voxel file exists to go stale
+// against the blueprint. Blueprints are read through @kernel/blueprint_registry, never
+// from the file directly; the registry snapshots at boot, so an edit to
+// building_blueprints.json takes effect at the next start (blueprint_registry.js).
 // invariants:
 //   - payload.blueprint_name must be set (by building_manager via RECIPES)
-//   - building_confrence_room[blueprintName].set_buildspot.build_center must exist
+//   - building_confrence_room[blueprintName].set_buildspot.transpose_origin must exist
 //   - Idempotent: if blueprint_paster chair already written, skip and route to recursive_judge
 //   - Law 6: writes building_confrence_room[blueprintName].blueprint_paster summary
 //   - Routes to recursive_judge on completion or skip
@@ -26,7 +20,7 @@ const hq      = require('@kernel/corporate_headquarters');
 const blueprintRegistry = require('@kernel/blueprint_registry');
 const { routeToJudge } = require('@utils/signal_utils');
 
-// Collect all voxels from a blueprint — anchors[].voxels + unassigned_voxels, or legacy flat voxels.
+// Collects every voxel of a blueprint: anchors[].voxels plus unassigned_voxels, falling back to a flat voxels list.
 function collectAllVoxels(building) {
   const result = [];
   if (Array.isArray(building.anchors)) {
@@ -50,10 +44,10 @@ module.exports = {
       throw new Error('[blueprint_paster] CODING VIOLATION: payload.blueprint_name is missing. Check building_manager RECIPES.');
     }
 
-    // ── Read build_center from the set_buildspot chair ────────────────────────
+    // ── Read transpose_origin from the set_buildspot chair ────────────────────────
     const setBuildspot = hq.readBuildingChair(blueprintName, 'set_buildspot');
-    if (!setBuildspot?.build_center || typeof setBuildspot.build_center.x !== 'number') {
-      throw new Error(`[blueprint_paster] CODING VIOLATION: No locked build_center in building_confrence_room["${blueprintName}"].set_buildspot. set_buildspot must run before blueprint_paster.`);
+    if (!setBuildspot?.transpose_origin || typeof setBuildspot.transpose_origin.x !== 'number') {
+      throw new Error(`[blueprint_paster] CODING VIOLATION: No locked transpose_origin in building_confrence_room["${blueprintName}"].set_buildspot. set_buildspot must run before blueprint_paster.`);
     }
 
     // ── Idempotency check ─────────────────────────────────────────────────────
@@ -78,9 +72,7 @@ module.exports = {
     const voxelCount = allVoxels.length;
 
     // ── Stamp blueprint_paster summary chair in building_confrence_room (Law 6) ──
-    // Confirms the blueprint is validated and ready. building_planner reads this
-    // to know the blueprint step is complete. No voxel file is written — building_integrity
-    // transposes building_blueprints.json on the fly when it scans.
+    // Tells building_planner the blueprint step is complete; no voxel file is written.
     hq.writeBuildingChair(blueprintName, 'blueprint_paster', {
       building_name: blueprintName,
       confirmed_at:  new Date().toISOString(),
@@ -90,9 +82,8 @@ module.exports = {
 
     watcher.summary(tag, `✅ "${blueprintName}" blueprint validated (${voxelCount} voxels). Integrity will transpose on scan. Handing back to recursive_judge.`);
 
-    // The headframe blueprint locks the shaft site — generate the mining staircase
-    // blueprint immediately so mining_planner/mining_executor have it from the
-    // first planning cycle. Pure computation (attach-point tiled), no bot needed.
+    // The headframe blueprint locks the shaft site: generates the mining staircase
+    // blueprint so mining_planner/mining_executor have it from the first planning cycle.
     if (blueprintName === 'headframe') {
       const miningBluePrinter = require('@perception/mining_blueprinter');
       const miningResult = miningBluePrinter.generateStaircase();

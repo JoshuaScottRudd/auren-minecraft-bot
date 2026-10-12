@@ -1,60 +1,20 @@
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/seed_scanner.js');
-// tool: seed_scanner — roll world seeds until the ground the bots land on is the ground he asked for,
-// and keep a permanent note of what every seed turned out to be.
+// tool: seed_scanner — rolls world seeds until the ground inside the loaded area (the ~160-block radius
+// the server streams around a body) matches the criteria below, and logs every seed tried to a
+// permanent record.
 //
-// ── WHY IT EXISTS, in his words (2026-09-05) ────────────────────────────────────────────────────────
-// *"right now the minecraft world i have now is ideal. landing biome is forest or plains. theres rivers
-// and medium amount of water content and the ground is reletivley flat, no giant mountains or oceans
-// spanning a large portion of the loaded chunk. so i plan the bots to construct within the loaded chunk
-// area normally so i need to be able to reset the seed until its ideal again."*
+// Reuses (Law 16, Law 22 gate 2): world_forge.ACCEPTABLE_BIOMES, the landing-biome list · @perception/
+// biome_scanner, the fleet's own biome reader, so a world is vetted with the same eyes the bots use ·
+// @utils/voxel_reader, block reads for the relief columns · @utils/site_geometry's isGround/isWater/
+// isCanopy, the terrain vocabulary · bench_world, which brings a candidate world up and down with no
+// crew · rcon_link, the seed read-back.
 //
-// The constraint underneath the sentence is the important half: the fleet BUILDS INSIDE THE LOADED AREA.
-// A base is sited within the ~160-block radius the server streams around a body, so a world is not judged
-// by what is somewhere out there — it is judged by what is inside that one circle around the landing
-// point. Every measurement below is taken from the bot's own spawn cell outward, and nothing is measured
-// that the bots could not reach.
+// world_forge.HARD_DENY and the snapshot check in guardCandidate gate which world folders this file may
+// delete — a seed only takes effect on a freshly created folder, so hunting means deleting one.
 //
-// ── WHAT IT REUSES, AND WHY NOTHING HERE IS A SECOND COPY (Law 16, Law 22 gate 2) ───────────────────
-//   world_forge.ACCEPTABLE_BIOMES  the "forest or plains type" list, already his sentence made executable.
-//                                  Imported, never restated — one list, so an edit there moves both tools.
-//   @perception/biome_scanner      the fleet's OWN eyes. The bots read the biome map with this node, so a
-//                                  world vetted with anything else would be vetted with a second opinion
-//                                  the fleet does not hold. It reports patches and decides nothing; the
-//                                  deciding is this file's, which is exactly the split it was built for.
-//   @utils/voxel_reader            the declared-needs block reader, for the relief columns.
-//   @utils/site_geometry           isGround / isWater / isCanopy — the terrain vocabulary, not re-derived.
-//   fleet_control server-start/stop the one route to the JVM. This file never launches java itself.
-//   rcon_link                      the one Source-RCON implementation.
-//
-// WHAT IT DOES NOT REUSE, deliberately: `site_geometry.surfaceY` is the topmost GROUND in a column, and
-// leaves and logs pass its `isGround` test (the canopy rule lives at its caller, by design). In a forest
-// — which is the world he is asking for — that reads the relief of the TREETOPS. So the column walk below
-// applies `!isCanopy` on top of the same exported predicates: composed from that vocabulary, not a rival
-// copy of it, and the difference is the whole measurement.
-//
-// ── WHY THE SERVER AND NOT THE FLEET ────────────────────────────────────────────────────────────────
-// `fleet_control up` would bring the foreman and a working bot online, which is minutes of bring-up and
-// a memory wipe to think about, per seed. The question here is only "what is the ground", and one
-// spectator-weight mineflayer client answers it. So each attempt costs a JVM start and a client join —
-// and a rejected seed costs no fleet at all. Nothing this file starts has autonomy, and nothing it starts
-// is left holding a player slot.
-//
-// ── WHICH WORLDS IT MAY DESTROY, AND HOW THAT IS ENFORCED ───────────────────────────────────────────
-// A seed only takes effect when a world folder is CREATED, so hunting seeds means deleting folders. The
-// guard is world_forge's and it is a property test rather than a name list: ANY world someone bothered to
-// SNAPSHOT is someone's world, and a candidate by definition has no snapshot yet — so having one is the
-// proof it is not a candidate. `sub_agent_01`, the world he has now, is protected by that rule today.
-// The candidate world defaults to its own name (`seed_scan`) so the live world is never even addressed.
-//
-// ── THE PERMANENT RECORD ────────────────────────────────────────────────────────────────────────────
-// *"it should log what was found per seed in the permanent log section so i know what kind of seed to
-// pick from another time."* — one JSONL line per seed tried, appended to
-// `Long_term_memory/seed_scans.jsonl`, never rewritten. It passes that folder's two-part admission rule:
-// LOW FREQUENCY (a handful of lines per hunt, and a hunt happens when a world is being chosen — it is a
-// decision, not a stream) and REVIEW VALUE (the question "what does a good seed look like" cannot be
-// answered from the world you are standing in; it needs the ones you rejected). Read it back with the
-// `log` verb — that is this record's lens, and no other reader should open the file.
+// Logs one JSONL line per seed tried to `Long_term_memory/seed_scans.jsonl`, appended and never
+// rewritten; read back with the `log` verb, the record's only reader.
 //
 // ── USAGE ───────────────────────────────────────────────────────────────────────────────────────────
 //   node Auren_Workshop/tools/seed_scanner.js measure                     measure the RUNNING world. Reads
@@ -72,12 +32,8 @@ const path = require('path');
 const paths = require('../workshop_paths');
 paths.registerAliases();
 
-// mineflayer and its prismarine stack are not installed beside this file, and which directory carries
-// them differs per machine — so an entry point that requires a live client must put the module homes on
-// NODE_PATH before its first such require. Every other client entry point in the tree does this through
-// the same call; this one did not, which made it silently dependent on a package sitting in the bot's own
-// node_modules without being declared there. An install that prunes undeclared packages removes it and
-// the tool stops resolving mineflayer at all (Law 16 — one answer to where the modules live).
+// Puts mineflayer's module homes on NODE_PATH before the first live-client require — the one answer to
+// where those modules live (Law 16).
 paths.bootstrapModules();
 
 const fs = require('fs');
@@ -92,12 +48,10 @@ const { guardExternal, guardExternalSync, withCleanup } = require('@utils/extern
 const { SERVER_ENDPOINT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const rconLink = require(paths.bot('js_kernel/utils/rcon_link'));
 const worldForge = require('./world_forge');
+const benchWorld = require('../bench_world');
 
 const TAG = 'seed_scanner';
 const BOT_DIR = paths.BOT_ROOT;
-// From `paths` rather than `path.resolve(BOT_DIR, '..')`, which computed the same answer to a question
-// `workshop_paths` already answers — the second copy is exactly the defect that file was written to end,
-// and it survived the 2026-09-10 move only because the arithmetic happened to still be right.
 const REPO_ROOT = paths.REPO_ROOT;
 const SERVER_DIR = require(paths.bot('js_kernel/utils/workstation')).needServerDir();
 const SNAPSHOT_DIR = path.join(SERVER_DIR, 'world_snapshots');
@@ -106,64 +60,40 @@ const FLEET = path.join(BOT_DIR, 'fleet_control.js');
 const LEDGER = path.join(REPO_ROOT, 'Long_term_memory', 'seed_scans.jsonl');
 
 // ── THE CRITERIA ────────────────────────────────────────────────────────────────────────────────────
-// Every threshold below says WHOSE number it is, and the verdict block prints that ownership beside each
-// line. He stated four things in words and no numbers; encoding a number and then reporting PASS against
-// it as if it were measured fact is how a tool quietly takes a decision that was never delegated to it
-// (Law 25). The tool's numbers were calibrated against the world he currently calls ideal — see the
-// `measure` verb, which is how anyone re-derives them rather than trusting this comment.
+// Each threshold names whose number it is; the verdict block prints that ownership beside every check
+// (Law 25). Re-derive the tool's numbers by pointing `measure` at a world already called good.
 
 // HIS, via world_forge — one list, imported, never restated.
 const LANDING_BIOMES = new Set(worldForge.ACCEPTABLE_BIOMES.map(b => b.replace('minecraft:', '')));
 
-// Biome families. Named here because these are questions about the biome MAP, and the map is what
-// biome_scanner returns; the surface-water measure below answers a different question and is not this.
+// Biome-map families, from biome_scanner's patches; ground-water is measured separately below.
 const OCEAN_RE = /ocean/;                       // every ocean variant, deep/frozen/lukewarm included
 const RIVER = new Set(['river', 'frozen_river']);
 
-// THE TOOL'S NUMBERS, AND WHERE THEY CAME FROM (measured 2026-09-05, not invented).
-//
-// `sub_agent_01` — the world he pointed at and called ideal — was measured with the `measure` verb
-// before any of these were fixed, and it reads:
-//     landing forest · 12.4% of ground under water · 0% ocean · nearest river 107b
-//     ground y32–y94, median y64, p5–p95 spread 32b
-// So the reference world is the calibration, and any threshold that rejects IT is the threshold being
-// wrong rather than the world. The first draft of the relief number was 30 and it failed sub_agent_01 by
-// two blocks — that is the whole reason this comment names a measurement instead of a preference.
-const DEFAULT_MIN_WATER = 2;    // % of sampled ground columns standing under water — "theres rivers"
-const DEFAULT_MAX_WATER = 22;   // "medium amount of water content"; the reference sits at 12.4%, mid-band
-const DEFAULT_MAX_OCEAN = 8;    // % of biome cells that are an ocean — "no oceans spanning a large portion".
-                                // The reference has none; this is the point where an ocean stops being a
-                                // feature of the coastline and starts being a portion of the build area.
-const DEFAULT_MAX_RELIEF = 40;  // blocks between the 5th and 95th percentile ground height — "relatively
-                                // flat, no giant mountains". The reference measures 32b, so this carries
-                                // 8b of headroom: one world is a calibration, not a distribution, and the
-                                // permanent record's rejection table is what will tighten it honestly.
-// NOT A THRESHOLD OF THE TOOL'S — it is the loaded radius, which is his own frame ("within the loaded
-// chunk area"). "Theres rivers" means a river the bots can actually reach, and the edge of what they can
-// reach is where the server stops streaming. The reference world's river sits at 107b, well inside it.
+// THE TOOL'S NUMBERS — thresholds for criteria given in words, not numbers, calibrated against a world
+// already called good (re-derive with `measure`).
+const DEFAULT_MIN_WATER = 2;    // % of sampled ground columns standing under water, lower bound
+const DEFAULT_MAX_WATER = 22;   // % of sampled ground columns standing under water, upper bound
+const DEFAULT_MAX_OCEAN = 8;    // % of biome cells that are an ocean
+const DEFAULT_MAX_RELIEF = 40;  // blocks between the 5th and 95th percentile ground height
+// The loaded radius, not a tool threshold — the frame the fleet builds within.
 const DEFAULT_MAX_RIVER_DIST = 160;
 
-// How the relief grid is sampled. 16-block spacing across the loaded radius gives 441 columns — enough
-// for a percentile spread and cheap enough to run per seed. Denser sampling measures the same landscape
-// more slowly; this is a statistic about a 320-block square, not a survey of it.
+// Relief grid: 16-block spacing across the loaded radius, 441 columns — a percentile statistic over a
+// 320-block square.
 const RELIEF_RADIUS = 160;
 const RELIEF_STEP = 16;
 const RELIEF_UP = 120;   // ceiling of the column walk, above the bot — a peak inside the loaded area
 const RELIEF_DOWN = 70;  // floor of the walk, below the bot — a ravine or a shore
 
-// Chunk settle. The biome map is read out of mineflayer's own chunk cache, so it can only report ground
-// the server has actually streamed — and on a world being generated for the first time that streaming is
-// slow. A fixed sleep would sometimes measure a half-loaded world and call it a verdict (Law 23), so the
-// wait is a GATE: poll the scan until its point count stops growing.
+// Chunk settle: biome_scanner reads mineflayer's own chunk cache; the scan is polled until its point
+// count stops growing before being judged (Law 23).
 const SETTLE_POLL_MS = 2500;
 const SETTLE_TIMEOUT_MS = 90000;
 const FULL_GRID_POINTS = 81 * 81;          // biome_scanner: radius 160, step 4
-// 100% is not reachable and that is geometry, not a fault: the server streams a SQUARE of 21×21 chunks
-// centred on the body's chunk, and a ±160 sweep from the body's exact position reaches past two of its
-// edges whenever the body is not standing dead centre of its chunk. A fully streamed world measures ~97%.
-// (Those corners used to come back named `badlands` — biome id 0 — which is the defect this hunt found in
-// biome_scanner and which is fixed there; they read as unloaded now, which is what makes this gate real.)
-const DEFAULT_MIN_COVERAGE = 0.90;         // below this the world is UNJUDGED rather than failed
+// The server streams a square of 21x21 chunks centred on the body's chunk; a ±160 sweep from off-centre
+// reaches past two edges of it, so a fully streamed world measures ~97%, not 100%.
+const DEFAULT_MIN_COVERAGE = 0.90;         // below this the world is UNJUDGED, not failed
 
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -177,22 +107,14 @@ const opt = (k, d) => (flags.has(k) && flags.get(k) !== true ? String(flags.get(
 const num = (k, d) => { const v = parseFloat(opt(k, String(d))); return Number.isFinite(v) ? v : d; };
 
 // ── WHICH SERVER IS BEING MEASURED ──────────────────────────────────────────────────────────────────
-// The endpoint a scout dials is already answerable per-deployment through `SERVER_ENDPOINT`'s environment
-// override, so the body can be aimed at any world on this machine without touching tracked code. Two
-// facts about that world are NOT in the endpoint and are read out of a properties file: the world's NAME
-// and the rcon credentials that answer `seed`. Left pointing at the fleet's own dev server while a body
-// measures somebody else's world, the report would carry a true measurement under a false world name and
-// a seed read off a server nobody asked about — a well-formed falsehood, which is the one thing an
-// outcome signal may never be (Law 25). `--props` moves both facts together, so the properties file and
-// the endpoint always describe the same server.
-//
-// It is a PATH ARGUMENT rather than a known location on purpose: this file must not learn the layout of
-// any deployment, or the fleet starts depending on a layer that is supposed to depend on it.
+// `--props` moves the world's name and rcon credentials together with `SERVER_ENDPOINT`, so the
+// properties file and the endpoint always describe the same server — a mismatch would report a true
+// measurement under a false world name and seed, a well-formed falsehood (Law 25). A path argument, not
+// a known location: this file must not learn the layout of any deployment.
 const PROPS = path.resolve(opt('props', DEV_PROPS));
 
-// The identity the scout joins under. Default when nothing else is asked for; a server whose door admits
-// only a fixed set of names has no way to let an unknown one in, so the name has to be authorable by
-// whoever is pointing the tool at that door.
+// The identity the scout joins under, authorable since a door admitting only a fixed set of names has no
+// way to let an unknown one in.
 const SCOUT_NAME = opt('as', 'Seed_Scout');
 
 const t0 = Date.now();
@@ -203,8 +125,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const pct = (a, b) => (b > 0 ? (100 * a / b) : 0);
 
 // ── server.properties ───────────────────────────────────────────────────────────────────────────────
-// Written while the server is STOPPED, always. `level-seed` is a world-GENERATION input read once at JVM
-// start; writing it into a live server is a silent no-op that looks like a control.
+// Written only while the server is stopped: `level-seed` is read once at JVM start, so writing it into a
+// live server is a silent no-op that looks like a control.
 function setProperty(key, value) {
   const text = fs.readFileSync(PROPS, 'utf8');
   const re = new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=.*$`, 'm');
@@ -221,17 +143,16 @@ function fleet(args) {
   return spawnSync(process.execPath, [FLEET, ...args], { cwd: REPO_ROOT, stdio: 'inherit' });
 }
 
-// A 64-bit signed seed, which is exactly what Minecraft's generator takes. Cryptographic randomness is
-// not for secrecy here — it is so two hunts run a minute apart never walk the same seeds.
+// A 64-bit signed seed, Minecraft's generator input; cryptographically random so two hunts run a minute
+// apart never walk the same sequence.
 function randomSeed() {
   return crypto.randomBytes(8).readBigInt64BE().toString();
 }
 
 // ── THE MEASUREMENT ─────────────────────────────────────────────────────────────────────────────────
 
-// biomeCensus — the biome map as counts, from the patch list biome_scanner already built. Its patches
-// carry `size` in sampled CELLS and the sum of them is `pointsScanned`, so these are exact fractions of
-// the ground actually streamed rather than of the ground hoped for.
+// biomeCensus — the biome map as counts, from biome_scanner's patch list. Patch `size` is sampled cells;
+// their sum is `pointsScanned`, so fractions are of ground actually streamed.
 function biomeCensus(scan) {
   const cells = new Map();
   for (const p of scan.patches) cells.set(p.biome, (cells.get(p.biome) || 0) + p.size);
@@ -241,8 +162,8 @@ function biomeCensus(scan) {
     if (OCEAN_RE.test(biome)) ocean += n;
     if (RIVER.has(biome)) river += n;
   }
-  // The patch at distance 0 is the bot's own cell — the ground it landed on, which is the "landing
-  // biome" he named. There is exactly one, because dx=0,dz=0 is on the sample grid.
+  // The patch at distance 0 is the bot's own landing cell — exactly one, since dx=0,dz=0 is on the
+  // sample grid.
   const home = scan.patches.find(p => p.dist === 0);
   const nearestRiver = scan.patches.filter(p => RIVER.has(p.biome)).sort((a, b) => a.dist - b.dist)[0] || null;
   const ranked = [...cells.entries()].sort((a, b) => b[1] - a[1]);
@@ -257,12 +178,9 @@ function biomeCensus(scan) {
   };
 }
 
-// groundColumn — the top of the TERRAIN at (x,z): the highest block that is ground and is not a tree.
-//
-// Not site_geometry.surfaceY, and the header says why: its isGround accepts leaves and logs, so in the
-// forest he is asking for it would return the canopy. Everything else here is that file's vocabulary —
-// isGround decides what terrain is, isCanopy decides what a tree is, isWater decides what is flooded.
-// Returns { y, name, submerged } or null when no terrain sits inside the window.
+// groundColumn — the top of the terrain at (x,z): the highest ground block that is not canopy, using
+// site_geometry's isGround/isCanopy/isWater vocabulary. Returns { y, name, submerged } or null when no
+// terrain sits inside the window.
 function groundColumn(reader, x, z, refY) {
   for (let y = refY + RELIEF_UP; y >= refY - RELIEF_DOWN; y--) {
     const b = reader.blockAt(x, y, z);
@@ -275,12 +193,8 @@ function groundColumn(reader, x, z, refY) {
   return null;
 }
 
-// reliefSurvey — the shape of the land, and how much of it is under water.
-//
-// TWO MEASURES OF WATER EXIST IN THIS FILE AND THEY ANSWER DIFFERENT QUESTIONS. The biome census above
-// says how much of the map is named river or ocean; this says how much of the GROUND is flooded. A pond
-// in the middle of a forest is invisible to the first and counted by the second, and a body of water is
-// what the base anchors on — so "water content" is judged here and "is it an ocean" is judged there.
+// reliefSurvey — the shape of the land and how much of the ground is under water: distinct from
+// biomeCensus's ocean/river fractions of the map — a forest pond counts here and not there.
 function reliefSurvey(bot) {
   const reader = makeVoxelReader(bot, { needs: ['type'] });
   const origin = bot.entity.position.floored();
@@ -312,9 +226,7 @@ function reliefSurvey(bot) {
   };
 }
 
-// settle — wait until the chunk stream has stopped growing, then hand back the final scan. The point
-// count is the honest signal: it is how many cells the client actually holds, and a world still
-// streaming grows it every poll.
+// settle — polls until the chunk stream's point count stops growing, then returns the final scan.
 async function settle(bot) {
   let last = -1, stable = 0, scan = null;
   const deadline = Date.now() + SETTLE_TIMEOUT_MS;
@@ -352,12 +264,9 @@ async function measureWorld() {
 
   const scan = await settle(bot);
   const coverage = scan ? scan.summary.pointsScanned / FULL_GRID_POINTS : 0;
-  // HOW MUCH GROUND HAS TO BE THERE BEFORE A VERDICT IS HONEST. The full grid is the count a server
-  // streaming ten chunks produces, so the default gate is that server's number and no other's. A server
-  // that streams fewer chunks never reaches it, and on such a server the sweep is not half-finished — it
-  // has measured the whole of a smaller circle, which is still the loaded area the bots would build in.
-  // Every verdict prints the coverage it was reached at, so a smaller circle is stated rather than hidden;
-  // what the gate prevents is judging ground that is still arriving (Law 23).
+  // The coverage gate: below it, ground still arriving would be judged as final (Law 23). A server that
+  // streams fewer chunks than the full grid measures the whole of a smaller circle, still inside the
+  // area the bots build in — every verdict prints the coverage it was reached at.
   const minCoverage = num('min-coverage', DEFAULT_MIN_COVERAGE);
   if (coverage < minCoverage) {
     bot.quit();
@@ -470,9 +379,8 @@ function ledgerAppend(row) {
   console.log(`${el()} recorded in Long_term_memory/seed_scans.jsonl`);
 }
 
-// rowFor — what one seed is worth remembering as. Deliberately the MEASUREMENTS and not the verdict
-// alone: the thresholds are the tool's and they will be retuned, and a row holding only PASS/FAIL would
-// be unreadable the moment they change. Every number here can be re-judged years later.
+// rowFor — a seed's measurements, not just its verdict: thresholds are retuned, and every number here
+// can be re-judged later regardless.
 function rowFor(world, seed, seedReadBack, m, v) {
   return {
     at: new Date().toISOString(),
@@ -498,17 +406,16 @@ function rowFor(world, seed, seedReadBack, m, v) {
 
 // ── VERBS ───────────────────────────────────────────────────────────────────────────────────────────
 
-// measure — the RUNNING world, read-only. This is also how the tool's thresholds are re-derived: point it
-// at a world he calls good and read the numbers off it.
+// measure — the RUNNING world, read-only; also how the tool's thresholds are re-derived, by pointing it
+// at a world already called good.
 async function measure() {
   const world = getProperty('level-name');
   banner(`MEASURE the running world '${world}' — nothing is created, nothing is deleted`);
   const m = await measureWorld();
   if (!m.ok) { console.error(`\nseed_scanner: ${m.why}`); return 1; }
   const v = judge(m);
-  // The SERVER's seed, never server.properties'. A standing world was generated from whatever level-seed
-  // held on the day its folder was created, and that property has been rewritten many times since — a
-  // hunt rewrites it once per attempt. Printing it here would attach a stranger's seed to his world.
+  // The SERVER's own seed, not server.properties' — a standing world's folder was generated from
+  // whatever level-seed held at creation, and the property is rewritten on every hunt attempt since.
   const seed = await seedReadBack();
   report(world, seed, m, v);
   if (has('log')) ledgerAppend(rowFor(world, null, seed, m, v));
@@ -517,9 +424,8 @@ async function measure() {
   return v.met ? 0 : 2;
 }
 
-// seedReadBack — the server's own answer to "what seed is this world". Asked rather than assumed: a seed
-// written to server.properties and a seed the world actually generated from are two different facts, and
-// only the second one is worth recording (Law 23).
+// seedReadBack — the server's own answer to what seed a world is; server.properties can name a different
+// seed than the one the world actually generated from (Law 23).
 async function seedReadBack() {
   const r = await guardExternal(TAG, 'rcon `seed`', () => rconLink.once(['seed'], { file: PROPS }));
   if (!r.ok) return null;
@@ -527,8 +433,8 @@ async function seedReadBack() {
   return m ? m[1] : null;
 }
 
-// guardCandidate — may this world folder be destroyed? world_forge's rule, applied here rather than
-// re-decided: a snapshot is the proof somebody meant to keep it.
+// guardCandidate — may this world folder be destroyed, per world_forge's rule: a snapshot is the proof
+// somebody meant to keep it.
 function guardCandidate(world) {
   if (worldForge.HARD_DENY.has(world)) {
     return `'${world}' is on the protected list — it is not a seed candidate.`;
@@ -540,13 +446,10 @@ function guardCandidate(world) {
   return null;
 }
 
-// scan — the hunt. Each attempt: stop the JVM, delete the folder, write the seed, start the JVM, join,
-// measure, judge, record. A MET world is left standing; a MISSED one is rolled over.
-// A hunt rewrites `level-seed` once per attempt, and that property is a LANDMINE left set: it does
-// nothing while a world folder exists, and the moment anybody deletes one and restarts, the world
-// silently regenerates from the last candidate seed instead of a fresh one. So the hunt puts it back on
-// every exit path — a teardown guarantee, which is what withCleanup is for. It is not a guard: a throw
-// inside the hunt still travels, it just travels over a properties file that has been put back.
+// scan — the hunt: per attempt, stop the JVM, delete the folder, write the seed, start the JVM, join,
+// measure, judge, record. A MET world is left standing; a MISSED one rolls to the next seed.
+// `level-seed` stays a landmine while any world folder exists — deleting one and restarting regenerates
+// from the last candidate seed. withCleanup restores it on every exit path, including a throw.
 async function scan() {
   const before = getProperty('level-seed') || '';
   return withCleanup(TAG, 'restoring level-seed after the hunt', () => runHunt(), () => {
@@ -559,11 +462,9 @@ async function scan() {
 }
 
 async function runHunt() {
-  // THE HUNT IS BOUND TO THE SERVER IT CAN DRIVE, and `--props` does not move that binding. Every
-  // destructive step here — the folder it deletes, the JVM it starts — is addressed through the fleet's
-  // own server directory and launcher, so a properties file pointing elsewhere would write seeds into one
-  // server's configuration while deleting another server's world. Measuring is portable because it only
-  // reads; hunting is not, and the refusal is what keeps the difference from being discovered by damage.
+  // The hunt is bound to the server it can drive: every destructive step — the folder it deletes, the
+  // JVM it starts — goes through the fleet's own server directory and launcher, so `--props` cannot move
+  // it. Measuring only reads and is portable; hunting is not, so --props is refused here.
   if (has('props')) {
     console.error(`\nseed_scanner: REFUSING — --props aims the MEASUREMENT at another server's world, and ` +
       `the hunt cannot follow it: it deletes world folders under ${SERVER_DIR} and starts the JVM through ` +
@@ -585,15 +486,18 @@ async function runHunt() {
   console.log(`  the server is currently pointed at '${startedProps.level}' — it will be repointed at ` +
     `'${world}' for the hunt and LEFT there, so put it back when you are done.`);
 
+  // bench_world brings each candidate world up with no crew and shuts it down between seeds; this file
+  // only writes level-name/level-seed while the server is stopped and asks for the next one.
+  let foreman = null;
   const tried = [];
   for (let i = 1; i <= tries; i++) {
     const seed = seedList ? seedList[i - 1] : (i === 1 && has('seed') ? opt('seed', '') : randomSeed());
     banner(`SEED ${i}/${tries}: ${seed}`);
 
-    // Everything up to the JVM start is authored while the server is DOWN. A live server read level-name
-    // and level-seed once, at start, so writing them into a running one changes nothing and says nothing.
+    // Everything up to the JVM start happens while the server is DOWN — level-name and level-seed are
+    // read once, at start, so writing them into a running server is a no-op.
     console.log(`${el()} taking the server down — level-name and level-seed are read at JVM start.`);
-    fleet(['server-stop']);
+    if (foreman) { console.log(`${el()} ${(await benchWorld.down(foreman)).why}`); foreman = null; }
     if (fs.existsSync(worldDir)) {
       console.log(`${el()} deleting the previous candidate world at ${worldDir}.`);
       const rm = guardExternalSync(TAG, `removing the candidate world folder ${world}`, () =>
@@ -608,10 +512,12 @@ async function runHunt() {
     setProperty('level-name', world);
 
     console.log(`${el()} generating the world and starting the server on seed ${seed}…`);
-    const up = fleet(['server-start', `--world=${world}`]);
-    if (up.status !== 0) {
-      console.error(`\nseed_scanner: the server would not come up on seed ${seed}. The hunt stops here — a ` +
+    const up = await benchWorld.up({ start: 'continue' });
+    foreman = up.foreman;
+    if (!up.ok) {
+      console.error(`\nseed_scanner: the world would not come up on seed ${seed} — ${up.why}. The hunt stops here — a ` +
         `world that cannot be served cannot be measured, and rolling past it would hide the reason.`);
+      await benchWorld.down(foreman);
       return 1;
     }
 
@@ -637,9 +543,10 @@ async function runHunt() {
       console.log(`  The server is UP on '${world}' and the ground is the ground you asked for.`);
       console.log(`\n  Keep it (so a rollback can always come back to it):`);
       console.log(`      node Auren_Workshop/tools/seed_scanner.js keep --world=${world}`);
-      console.log(`  Or put the server back on the world it was on before the hunt:`);
-      console.log(`      node Auren_Workshop/fleet_control.js server-stop`);
-      console.log(`      node Auren_Workshop/fleet_control.js server-start --world=${startedProps.level}`);
+      console.log(`  The foreman that started it is still running, in its window 'auren desk'.`);
+      console.log(`  Or put the server back on the world it was on before the hunt: stop it with`);
+      console.log(`      node Auren_Workshop/fleet_control.js verb shutdown`);
+      console.log(`  then set level-name=${startedProps.level} in the server's server.properties.`);
       return 0;
     }
     console.log(`\n${el()} seed ${seed} MISSED (${tried[tried.length - 1].failed.join(', ')}) — rolling to the next one.`);
@@ -652,31 +559,32 @@ async function runHunt() {
   console.log(`  That is not a failure of the hunt. Run it again for more seeds, or loosen one threshold`);
   console.log(`  (--max-relief=, --max-ocean=, --max-water=) once the record shows which one is doing the`);
   console.log(`  rejecting.`);
-  console.log(`\n  The server is UP on the last candidate '${world}'. Put it back with:`);
-  console.log(`      node Auren_Workshop/fleet_control.js server-stop`);
-  console.log(`      node Auren_Workshop/fleet_control.js server-start --world=${startedProps.level}`);
+  console.log(`\n  The server is UP on the last candidate '${world}', run by the foreman in its window 'auren desk'.`);
+  console.log(`  Put it back: stop it with  node Auren_Workshop/fleet_control.js verb shutdown`);
+  console.log(`  then set level-name=${startedProps.level} in the server's server.properties.`);
   return 2;
 }
 
-// keep — snapshot the found world so a rollback can always return to it. Delegates to fleet_control's
-// snapshot, which delegates to rollback.ps1 — the one implementation, and the one that already refuses
-// while the server is up (a snapshot of a live world is a torn copy).
-function keep() {
+// keep — snapshots the found world so a rollback can return to it, via fleet_control's snapshot
+// (rollback.ps1, the one implementation), which refuses while the server is up.
+async function keep() {
   const world = opt('world', 'seed_scan');
   const name = opt('snapshot', `${world}_fresh_start`);
   banner(`KEEP '${world}' as snapshot '${name}'`);
-  console.log(`${el()} the server must be down for a clean copy — stopping it.`);
-  fleet(['server-stop']);
+  console.log(`${el()} the server must be down for a clean copy — asking the foreman that runs it to shut down.`);
+  const stopped = await benchWorld.stopRunning();
+  if (!stopped.ok) { console.error(`\nseed_scanner: ${stopped.why}, so no clean copy can be taken.`); return 1; }
   const r = fleet(['snapshot', `--world=${world}`, `--name=${name}`]);
   if (r.status !== 0) { console.error(`\nseed_scanner: the snapshot did not complete.`); return 1; }
   console.log(`\n  '${world}' is now restorable, and this tool will now REFUSE to overwrite it — having a`);
   console.log(`  snapshot is what makes a world somebody's rather than a candidate.`);
-  console.log(`\n  To run the fleet on it:  node Auren_Workshop/fleet_control.js up --world=${world}`);
+  console.log(`\n  To run the fleet on it: set level-name=${world} in server.properties; a rollback start then`);
+  console.log(`  puts it back to this copy every run (foreman_config: start: 'rollback').`);
   return 0;
 }
 
-// log — the permanent record's lens. Every question about what a seed turned out to be is answered
-// here; nothing else opens the file.
+// log — the permanent record's lens: every question about a seed's measurements is answered from here,
+// and nothing else opens the file.
 function readLedger() {
   if (!fs.existsSync(LEDGER)) return [];
   return fs.readFileSync(LEDGER, 'utf8').split(/\r?\n/).filter(Boolean).map(l => {
@@ -710,8 +618,7 @@ function showLog() {
   }
   console.log(line(118));
 
-  // WHICH CRITERION IS DOING THE REJECTING — the one question the raw rows cannot be skimmed for, and
-  // the one that tells him whether a threshold is wrong or the world generator simply is like that.
+  // Which criterion is doing the rejecting — the one question the raw rows cannot be skimmed for.
   const misses = rows.filter(r => r.verdict === 'MISSED');
   if (misses.length) {
     const why = new Map();

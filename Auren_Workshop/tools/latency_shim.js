@@ -1,35 +1,27 @@
 // latency_shim — puts a measured network delay between the fleet and the Minecraft server, on one machine.
 //
-// WHY IT EXISTS. The whole fleet was written against `localhost`, where a round trip is effectively zero.
-// Point it at a world across a network — a box in another room, a rented host 20-80 ms away, anybody
-// else's server — and tick-counted waits, chat used as synchronisation, physics prediction and multi-bot
-// ordering all lose the timing they were getting for free.
-//
-// The obvious way to find out is to connect to a remote world and try. This is the cheaper way and it
-// comes FIRST: a TCP relay that holds every byte for a set delay before passing it on. Bots connect here
-// instead of to the server; the server never knows. The delay is a DIAL, so the question stops being
-// "does it work remotely" and becomes "at what latency does it stop working", which is a number a
-// deployment decision can be built on.
+// The fleet is written against `localhost`, where a round trip is near zero. Pointed at a remote world,
+// tick-counted waits, chat used as synchronisation, physics prediction and multi-bot ordering all lose
+// the timing they get for free on localhost. This shim relays every byte through a set delay, turning
+// that question into a number a deployment decision can be built on. Bots connect here instead of to the
+// server; the server never knows.
 //
 // ── ORDER IS THE WHOLE CORRECTNESS PROBLEM ───────────────────────────────────────────────────────────
-// Minecraft's protocol is a stream, not messages: a chunk delayed past the chunk behind it does not arrive
-// "late", it arrives CORRUPT, and the client desynchronises in a way that looks exactly like the fleet
-// bug this instrument exists to hunt. Scheduling each chunk with its own `setTimeout(delay + jitter)` does
-// precisely that whenever jitter makes one timer shorter than the one before it.
-// So every direction keeps a queue whose release times are MONOTONIC: a chunk's release is the later of
-// (now + delay ± jitter) and (the previous chunk's release). Jitter therefore adds delay and can never
-// reorder — which is also how a real network behaves, since TCP itself will not deliver out of order.
+// Minecraft's protocol is a stream: a chunk delayed past the chunk behind it arrives CORRUPT, not late,
+// desynchronising the client in a way that looks exactly like the fleet bug this instrument hunts. Each
+// direction keeps a queue whose release times are MONOTONIC — a chunk's release is the later of
+// (now + delay ± jitter) and the previous chunk's release — so jitter adds delay and never reorders,
+// matching how TCP itself behaves.
 //
 // ── WHAT THE DELAY MEANS ─────────────────────────────────────────────────────────────────────────────
-// `--delay-ms` is the ROUND TRIP, matching how latency is quoted everywhere else. Each direction is
-// therefore held for half of it. Asking for 60 means a bot's action reaches the server 30 ms later and the
-// world's answer comes back 30 ms after that, which is what a 60 ms ping to a remote host costs.
+// `--delay-ms` is the ROUND TRIP, matching how latency is quoted everywhere else; each direction holds
+// for half of it. 60 means a bot's action reaches the server 30 ms later and the answer returns 30 ms
+// after that — what a 60 ms ping costs.
 //
 // ── WHAT IT DOES NOT SIMULATE ────────────────────────────────────────────────────────────────────────
-// Packet loss, reordering, bandwidth limits and MTU behaviour. A real link drops packets and TCP recovers
-// by retransmitting, which produces occasional multi-hundred-millisecond stalls that no fixed delay
-// reproduces. So a fleet that survives this shim is not proven to survive the internet — it is proven to
-// survive latency, which is the specific hypothesis under test (Law 25).
+// Packet loss, reordering, bandwidth limits and MTU behaviour — the multi-hundred-millisecond stalls a
+// real link produces on a retransmit. A fleet that survives this shim is proven to survive latency, the
+// specific hypothesis under test (Law 25).
 //
 // Usage:
 //   node Auren_Workshop/tools/latency_shim.js --listen=25567 --target=127.0.0.1:25565 --delay-ms=60 --jitter-ms=15
@@ -62,16 +54,16 @@ function run({ listenPort, targetHost, targetPort, delayMs, jitterMs }) {
     stats.connections += 1; stats.live += 1;
     const upstream = net.connect({ host: targetHost, port: targetPort });
 
-    // Nagle would coalesce small packets and add its own delay on top of the one being measured, which
-    // would make the dial read low. Both ends off, so the shim contributes only what it was asked for.
+    // Nagle coalesces small packets and would add its own delay on top of the one measured. Both ends
+    // off, so the shim contributes only the delay it was asked for.
     client.setNoDelay(true);
     upstream.setNoDelay(true);
 
     delayedPipe(client, upstream, half, jitterMs, stats.up);
     delayedPipe(upstream, client, half, jitterMs, stats.down);
 
-    // A half-closed relay is a hung bot: whichever side ends, the other is torn down with it rather than
-    // left holding a socket nothing will ever write to again (Law 13 — default stopped).
+    // A half-closed relay is a hung bot: whichever side ends, the other is torn down with it (Law 13 —
+    // default stopped).
     const close = () => {
       if (!client.destroyed) client.destroy();
       if (!upstream.destroyed) upstream.destroy();
@@ -121,8 +113,8 @@ if (require.main === module) {
   const delayMs = parseFloat(opt('delay-ms', '60'));
   const jitterMs = parseFloat(opt('jitter-ms', '0'));
 
-  // Refused rather than defaulted: a shim that silently relays to the wrong port would produce a clean run
-  // at zero latency and be read as the fleet passing the test it never took (Law 25).
+  // A bad target is refused, never defaulted: a silent relay to the wrong port would produce a clean
+  // pass at zero latency, read as the fleet passing a test it never took (Law 25).
   if (!Number.isFinite(listenPort) || !Number.isFinite(targetPort) || !targetHost) {
     console.error('latency_shim: --listen and --target=host:port must both be valid.');
     process.exit(1);

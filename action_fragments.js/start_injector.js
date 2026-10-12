@@ -1,121 +1,82 @@
 /**
  * fragment: start_injector
- * purpose: Manual bootstrap lever to flush transient state artifacts and kick the autonomous planning loop (task_delegator).
+ * purpose: Bootstrap lever, for an operator or a newly-spawned body, that kicks the autonomous planning
+ *          loop (task_delegator).
  * invariants:
- *   - watcher.json flushed on start; failure aborts injection (required for clean arc history).
- *   - A body carrying a placement player is STANDING BESIDE THEM, confirmed, before anything is routed.
+ *   - The run record is appended to; a start begins a new segment of the same file.
+ *   - A body carrying a placement player is standing beside them, confirmed, before anything is routed.
  *   - Emits exactly one routed signal (start_command -> task_delegator) per inject() call, and none at
- *     all when either the flush or the placement gate refuses.
- * WHY: Provides an operator / dev entry point to reinitialize planning without restarting the whole process. Explicitly
- *      clearing watcher artifacts avoids the planner reasoning over stale arc history from a previous session.
+ *     all when the placement gate refuses.
  */
-const fs = require('fs');
-const path = require('path');
 const watcher = require('@kernel/watcher');
 const { routeToJudge } = require('@utils/signal_utils');
-const { guardExternalSync } = require('@utils/external_library_guard');
 
-// Config: toggle whether 'start' also triggers a system flush beforehand
+// Whether 'start' also runs a full system flush beforehand.
 const CONFIG = {
-  alsoFlushOnStart: false // set to false to skip calling flush_system before starting
+  alsoFlushOnStart: false
 };
 
-// How long a starting body waits to hear the foreman's memory (its base lives there). The hub broadcasts on
-// every registration, so this is normally met in well under a second; the ceiling only decides how long a
+// How long a starting body waits to hear the foreman's memory (its base lives there). The hub broadcasts
+// on every registration, so this is normally met in well under a second; the ceiling decides how long a
 // body stands still before saying plainly that the foreman never answered.
 const FIRST_BROADCAST_WAIT_MS = 30000;
-
-// watcher files live in js_kernel; hard-reset on start so history doesn't leak across restarts
-const _siBotId = process.env.BOT_ID || '';
-const _siKernelDir = path.dirname(require.resolve('@kernel/watcher.js'));
-const WATCHER_JSON_PATH = require('@utils/record_homes').traceFile(_siBotId);
 
 module.exports = {
   handle: 'start_injector',
 
   inject: async function () {
-    // Reset the runtime clock so all watcher timestamps count from this moment
+    // Resets the runtime clock so all watcher timestamps count from this moment.
     watcher.resetRuntimeClock();
 
-    // Optional: run system flush before starting
     if (CONFIG.alsoFlushOnStart) {
       // Unguarded: flush_system is ours, and starting a run on a flush that failed is how a run inherits
-      // the previous one's state while the log says it was cleaned (Law 13 — default stopped).
+      // the previous one's state while the log says it was cleaned (Law 13, default-stopped).
       const { flush } = require('@kernel/flush_system.js');
       watcher.summary('start_injector', '🧹 Pre-start flush enabled; invoking flush_system...');
       await flush();
       watcher.summary('start_injector', '✅ flush_system complete. Proceeding with start.');
     }
-    // Flush watcher file
-    // A REAL BOUNDARY (fs), and the one place in this fragment where refusing to start is right: the run
-    // record is the only thing that survives the run, so beginning one on top of the last one's trace
-    // makes both unreadable. Truncate to EMPTY, not to an empty object — the story file is JSONL, and a
-    // `{}` written into it is a line the reader cannot parse sitting at the top of the run.
-    const flushed = guardExternalSync('start_injector', `flush watcher file at ${WATCHER_JSON_PATH}`,
-      () => fs.writeFileSync(WATCHER_JSON_PATH, '', 'utf8'));
-    if (!flushed.ok) return { started: false, why: `the run record at ${WATCHER_JSON_PATH} could not be cleared, so no run was begun` };
-    watcher.summary('start_injector', `🧼 Flushed watcher file at ${WATCHER_JSON_PATH}`);
+    // The run record is appended to and never cleared here: a rollback start empties fleet_logs/ before any
+    // body exists (start_auren.js), and that is the one thing that deletes a record.
 
     // Start the global runtimer so uptime is tracked in watcher.json
     const timer = watcher.timer.start('runtimer', { source: 'start_injector' });
     watcher.summary('start_injector', `⏱️ runtimer started (elapsed=${timer.elapsed})`);
 
-    // ── THE PLACEMENT GATE — BE STANDING WITH YOUR PERSON BEFORE YOU PLAN (Architect 2026-09-10) ────
-    // *"the teleport needs to happen before they scan homebase… so teleport is a part of the start
-    // process and the start command should not run until its been confirmed that teleport is completed
-    // fully and the bot is near the player then it gives a start command."*
+    // ── the placement gate: stand beside your person before you plan ─────────
+    // Gates both start routes — a body born started injects its own, and an operator's `start` verb
+    // arrives here too — through this one function, so a start cannot happen without passing it (Law 16).
+    // Placed before the route and after the flush: the flush above is what makes the run's record start
+    // clean, so a refusal lands in the trace a reader will open, and routing is the start itself.
     //
-    // WHY IT IS HERE AND NOT IN master_core. A start happens two ways — a body born started injects its
-    // own, and an operator types `start` at the readline — and both arrive at this one function. Putting
-    // the gate at the birth call site would have left the operator's verb ungated, which is the same
-    // capability reached by two routes with one of them missing the check (Law 16). One place, so a
-    // start cannot happen without passing it.
-    //
-    // WHY IT IS BEFORE THE ROUTE AND AFTER THE FLUSH. The flush above is what makes the run's record
-    // start clean, so a refusal written after it lands in the trace a reader will actually open; a
-    // refusal recorded before the flush would be erased by the next attempt. And it is before the route
-    // because routing IS the start. Measured 2026-09-10: the body's own base survey ran 0.2s before the
-    // desk's teleport landed, three runs in a row, so the base layout was decided at the world spawn while
-    // the person who asked stood 130 blocks away. (The body no longer surveys at all since 2026-09-18 —
-    // see the site record below — but it still must not begin work anywhere but where it was placed.)
-    //
-    // A BODY NOBODY PLACED STARTS WHERE IT STANDS. `startNearPlayer()` returns null only when no person
-    // was named, which is the hand-launched single bot `beginsWorkAtBirth` describes — and inventing a
-    // player to walk it to would be defaulting a missing field (Law 13). Everything the desk raises
-    // carries a person, and a contractor derives one from its owner, so every fetched body is gated.
+    // A body nobody placed starts where it stands. `startNearPlayer()` returns null only when no person
+    // was named, the hand-launched single-bot case `beginsWorkAtBirth` describes, and a body with no
+    // named person is not walked to an invented one (Law 13).
     const placeBeside = require('@kernel/bot_mandate').startNearPlayer();
     if (placeBeside) {
-      const placed = await require('@kernel/body_recovery').arriveAtPlayer(global.bot, placeBeside);
+      const recovery = require('@kernel/body_recovery');
+      const placed = await recovery.arriveAtPlace(global.bot, placeBeside);
+      const where = recovery.isCellPlace(placeBeside) ? `at (${placeBeside})` : `with ${placeBeside}`;
       if (!placed.arrived) {
-        // REFUSED, NOT STARTED-ANYWAY (Law 13, default-stopped). A body that plans from the wrong place
-        // locks a base layout somewhere nobody chose, and a lock is the one act in the startup sequence
-        // that outlives the mistake — it is written to the headquarters and every later job reads it.
-        // Standing still and saying why is recoverable; a base in the wrong world is not.
+        // Refused, not started anyway (Law 13, default-stopped): a base layout lock outlives the run and
+        // is read by every later job, so standing still and saying why is recoverable and a base surveyed
+        // from the wrong place is not.
         watcher.error('start_injector',
-          `⛔ NOT STARTED — this body must be standing with ${placeBeside} before it plans, and it is not: ${placed.error}. `
+          `⛔ NOT STARTED — this body must be standing ${where} before it plans, and it is not: ${placed.error}. `
           + 'Nothing was surveyed and nothing was locked. Place it and start it again.');
-        return { started: false, why: `it is not standing with ${placeBeside}: ${placed.error}` };
+        return { started: false, why: `it is not standing ${where}: ${placed.error}` };
       }
       watcher.summary('start_injector',
-        `📍 Placed beside ${placeBeside} — ${placed.distance.toFixed(1)} blocks away. The base will be surveyed from here.`);
+        `📍 Placed ${where} — ${placed.distance.toFixed(1)} blocks off. The base will be surveyed from here.`);
     }
 
-    // ── AND IF THAT PLACE IS THE WORLD CENTRE, SAY SO LOUDLY (Architect 2026-09-10) ─────────────────
-    // *"also notify loudly that the bots are in the world center."*
+    // ── if that place is the world centre, say so loudly ─────────────────────
+    // The spawn-protected square refuses breaks and placements silently, so this names the condition
+    // once, before the survey, instead of letting it surface as scattered per-cell dig refusals.
     //
-    // WHY HERE AND NOT AT THE FIRST REFUSED DIG. The square refuses breaks and placements SILENTLY, so
-    // the fleet only discovers it one swing at a time — the 2026-09-10 soak logged `dig refused` at
-    // (14,64,8), (5,64,16) and (6,64,16), and TessaBot's stone work returned `0x cobblestone of 8
-    // asked` twice, all of it as scattered per-cell warnings that never added up to the sentence "this
-    // crew is standing in the one place it cannot work". This line is that sentence, said once, BEFORE
-    // the survey — which is the last moment it is still cheap, because the base layout lock is the one
-    // act in this sequence that outlives the mistake.
-    //
-    // WARN AND NOT ERROR, deliberately. An error wakes the watch and ENDS the run, and `standing:
-    // 'spawn'` is a legitimate mode — it samples what a stranger gets, and a stranger gets exactly this
-    // square. Refusing to start would delete the ability to test the thing. So it is told, in every
-    // channel he reads (the bot's own window, the merged trace, the fleet console, the watch digest),
-    // and the decision stays his (Law 25 — name the shortfall, do not act on his behalf).
+    // A warning, not an error: `standing: 'spawn'` is a legitimate mode that samples what a stranger
+    // gets, so refusing to start would delete the ability to test it. Named in every channel the operator
+    // reads, and the decision stays his (Law 25 — name the shortfall, do not act on his behalf).
     const spawnGuard = require('@perception/spawn_protection');
     const here = global.bot && global.bot.entity && global.bot.entity.position;
     if (here && spawnGuard.isSpawnProtectedAt(global.bot, here)) {
@@ -125,21 +86,18 @@ module.exports = {
         + `Inside it the server refuses every break and placement by a non-op and REPORTS NOTHING, so `
         + `every dig this crew attempts near its base will be refused and the jobs that need stone, `
         + `seeds or a cleared site will return nothing. The crew is about to start work from HERE. `
-        + `To move it: set 'standing' to 'biome' in run_config.js, which places the person in the `
-        + `nearest good biome clear of this square and brings the crew to them.`);
+        + `The foreman sites a crew clear of this square; a crew here was placed by hand or by a `
+        + `person who stood here and fetched it.`);
     }
 
-    // ── A BODY WITH NO BASE DOES NOT START, AND IT NEVER SETS ONE (Architect 2026-09-18) ──────────────────
-    // *"Bots can't set their own points now"*. The foreman writes every site into its memory before it spawns
-    // a body, and the hub broadcasts that memory the moment the body registers. So the one thing to wait for
-    // is that first broadcast: before it, an empty building room means "not heard yet", not "no base".
+    // ── a body with no base does not start, and it never sets one ────────────
+    // The foreman writes every site into its memory before it spawns a body, and the hub broadcasts that
+    // memory the moment the body registers, so the one thing to wait for is the first broadcast: before
+    // it, an empty building room means "not heard yet", not "no base".
     //
-    // HERE FOR THE PLACEMENT GATE'S OWN REASON: every start passes this one function, so no route can begin
-    // planning without the base in hand. AFTER PLACEMENT, BEFORE THE ROUTE, so the first sweep sees the base.
-    //
-    // A body with no foreman at all (no FOREMAN_URL: one bot run alone) has nobody to hear from and reads its
-    // own memory as it stands. Either way a body with no base is refused: there is no job by which a bot could
-    // find or set one, which is the ruling itself.
+    // Placed after placement and before the route, so the first sweep sees the base. A body with no
+    // foreman at all (no FOREMAN_URL) has nobody to hear from and reads its own memory as it stands.
+    // Either way a body with no base is refused: a bot has no job by which to find or set one.
     const link = require('@kernel/foreman_link');
     if (process.env.FOREMAN_URL && !(await link.awaitFirstBroadcast(FIRST_BROADCAST_WAIT_MS))) {
       watcher.error('start_injector',
@@ -147,35 +105,66 @@ module.exports = {
         + 'Its base lives there, and a body does not set its own. Is the foreman up and did this body register?');
       return { started: false, why: "the foreman's memory never reached it, and a body does not set its own base" };
     }
+    // ── who was accountable decides the severity ──────────────────────────────
+    // The same missing base means two different things depending on whether anyone was supposed to have
+    // set it, so this reads the same fact and reports it at the severity the situation earns:
+    //
+    //   a foreman raised this body  ->  the foreman proves every structure sited before it spawns
+    //     anything, so a body arriving without one means that step passed on a base it should have
+    //     refused. That is one party's job done wrong, so it crashes and names them (Law 13's one
+    //     permitted second verification).
+    //   nobody did (no FOREMAN_URL: a hand-launched single bot)  ->  nothing upstream ever claimed to
+    //     have sited it, so a plain refusal is right: a bot cannot set its own site.
     const lockLayout = require('@action/lock_all_buildspots');
     if (!lockLayout.baseLayoutComplete()) {
+      if (process.env.FOREMAN_URL) {
+        throw new Error('[start_injector] CODING VIOLATION (Law 13): a foreman raised this body and its memory '
+          + 'holds no base for this crew. The foreman proves every structure is sited before it spawns anything '
+          + '(foreman/utils/startup_steps.js, step "every structure this crew builds is sited"), so reaching this '
+          + 'line means that step passed on a base it should have refused. Fix the foreman step, not this call.');
+      }
       watcher.error('start_injector',
-        '⛔ NOT STARTED — this body has no base. Only the foreman sets a site, before any body is spawned, and the '
-        + "foreman's memory holds none for this crew. Raise the crew through the foreman.");
-      return { started: false, why: 'it has no base: only the foreman sets a site, and none is held for this crew' };
+        '⛔ NOT STARTED — this body has no base, and no foreman raised it. Only a foreman sets a site, before any '
+        + 'body is spawned, and a body never sets its own. Raise the crew through the foreman.');
+      return { started: false, why: 'it has no base and no foreman raised it: only a foreman sets a site' };
+    }
+
+    // ── a builder takes its plan in hand before it plans anything (Law 26) ────
+    // The downloaded building's plan is a file, read once at the stopped -> running boundary, validated,
+    // and trusted for the life of the run, the same contract every other snapshot registry in the fleet
+    // holds. This is the one call site: `assessors/downloaded_build` and the site executors all read the
+    // loaded snapshot and none of them loads it, so no sweep and no dispatch first opens the file.
+    //
+    // The load is not the check: the foreman proves the plan before it spawns anything, so `load` here
+    // only puts it into this body's own process memory. It still throws on a plan it cannot prove, the
+    // one kind of second verification permitted (Law 13) — a throw here says the foreman's step was
+    // wrong.
+    //
+    // Only a builder, because only a builder has a downloaded building; a homesteader has no
+    // `builder.build` it is answerable for.
+    if (require('@kernel/bot_mandate').isBuilder()) {
+      const buildName = require('../foreman_config').builder.build;
+      const plan = require('@kernel/downloaded_plan_registry').load(buildName);
+      watcher.summary('start_injector',
+        `📐 Plan in hand for "${buildName}" — ${plan.dimensions.w}×${plan.dimensions.l}, `
+        + `${plan.columns.length} columns, ${plan.anchors.length} cubes.`);
     }
 
     watcher.summary('start_injector', '🧪 Injected autonomous start signal to recursive_judge');
-    // REQUIRED HERE, NOT AT MODULE SCOPE, and it is a cycle rather than a style choice:
-    //   signal_bus:28 → fragment_registry:56 → start_injector → signal_bus
-    // A module-scope require lands mid-way through signal_bus's own load whenever the bus is the one
-    // pulled in first, so this file captured `{}` and kept it for the life of the process. MEASURED
-    // live 2026-08-07: `verb start` on a sentry-armed bot threw "signalBus.route is not a function"
-    // from signal_utils:44 — an unhandled rejection outside the judge, i.e. the operator's start verb
-    // silently unavailable on exactly the runs that had already loaded the bus. Every other fragment
-    // in the fleet already resolves the bus at call time (recursive_judge:180 is the pattern); this
-    // file was the lone module-scope holdout.
+    // Resolved at call time, not module scope, to break a require cycle (signal_bus -> fragment_registry
+    // -> start_injector -> signal_bus) that would otherwise capture signal_bus mid-load as `{}`.
+    //
+    // Opens the startup span here, at the one line every start route passes through, so the bot-minutes
+    // ledger's worked + idle + startup == life covers everything that ran before it. The span closes at
+    // the first dispatch or idle pass.
+    require('@kernel/bot_minutes').open();
     routeToJudge('start_injector', {
       readable: 'start_injector: starting autonomous planning loop with clean state',
       start_injector: { success: true },
     });
-    // ── THE OUTCOME IS RETURNED, BECAUSE A CALLER THAT ASSUMES IT WILL ANNOUNCE A LIE (Law 25) ──────
-    // Both callers — master_core's birth path and the `start` verb — used to fire this and immediately
-    // print that the start signal had been injected, which was safe only while the single failure here
-    // was a flush that never fails in practice. The placement gate above makes refusal an ordinary
-    // outcome, and the first negative test of it printed *"🚀 Homesteader — launched to work. Autonomous
-    // start signal injected."* to the terminal while the trace recorded that nothing had started. The
-    // console is the half a person actually reads, so the truth has to reach it.
+    // The outcome is returned, not assumed, so a caller reports failure truthfully (Law 25): the
+    // placement gate above makes refusal an ordinary outcome, and the console is the half a person
+    // actually reads.
     return { started: true, why: null };
   }
 };

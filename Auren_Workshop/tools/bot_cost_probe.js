@@ -1,9 +1,7 @@
 // bot_cost_probe — measures what ONE BOT costs this machine, in CPU and memory.
 //
-// WHY IT EXISTS. Sizing a machine for a fleet needs a number nobody had ever taken: if bots grow with the
-// number of people being served, "how much compute does one bot need" is what decides how many fit on one
-// box. Before this, the only answers available were an impression of Task Manager and arithmetic on a
-// whole-machine average.
+// WHY IT EXISTS. Sizing a machine for a fleet: if bots grow with the number of people served, how much
+// compute one bot needs is what decides how many fit on one box.
 //
 // ── WHY PER-PROCESS AND NOT WHOLE-MACHINE (the reason this is not machine_load_sampler) ──────────────
 // `tools/machine_load_sampler.js` answers a different question — *did the box have headroom while a run
@@ -27,19 +25,16 @@
 // several bots burst together the host stutters in a way no mean can show (Law 25 — the verdict states
 // what was measured).
 //
-// ── WHOSE PROCESS IS IT (two traps, both of which have already bitten) ───────────────────────────────
-// The roles come from `fleet_control_runtime.json`, the fleet's own pid map (Law 16 — one source), and it
-// has to be read with two corrections.
+// ── WHOSE PROCESS IS IT ─────────────────────────────────────────────────────────────────────────────
+// The roles come from `fleet_control_runtime.json`, the fleet's own pid map (Law 16 — one source), read
+// with two corrections.
 //
 //   1. PID REUSE. That file keeps entries for processes that died long ago, and Windows reissues pids, so
-//      a pid alone answers "does SOME process hold this number", never "is it mine" — a trap fleet_control
-//      names in its own comments. Every root is confirmed by its START TIME matching what the file
-//      recorded; a mismatch is reported as stale and excluded rather than silently measured as a bot.
-//   2. THE RECORDED PID MAY BE A WRAPPER. Measured 2026-09-03: the server's recorded pid held 9.8 MB and
-//      almost no CPU, because it is a launcher whose CHILD is the 1.2 GB JVM doing all the work. Reading
-//      the recorded pid alone reported the server as costing nothing. So each role is measured as its
-//      whole PROCESS TREE — the recorded process plus every descendant — which is correct for a wrapper
-//      and unchanged for a role that has none.
+//      a pid alone does not confirm ownership. Every root is confirmed by its START TIME matching what
+//      the file recorded; a mismatch is reported as stale and excluded, never measured as a bot.
+//   2. THE RECORDED PID MAY BE A WRAPPER. A launcher's own footprint can be trivial while its CHILD does
+//      the real work, so each role is measured as its whole PROCESS TREE — the recorded process plus
+//      every descendant — which is correct for a wrapper and unchanged for a role that has none.
 //
 // Usage:
 //   node Auren_Workshop/tools/bot_cost_probe.js --seconds=180
@@ -59,9 +54,7 @@ const RUNTIME_FILE = path.join(BOT_DIR, 'fleet_control_runtime.json');
 const START_TIME_TOLERANCE_MS = 120000;
 
 // ── Reading the OS ───────────────────────────────────────────────────────────────────────────────────
-// Pipe-delimited lines rather than JSON: Windows PowerShell 5.1 collapses a one-element array on
-// ConvertTo-Json, which would make a single-process reading parse as an object and a multi-process one as
-// an array. A delimiter has no such shape.
+// Lines are pipe-delimited: pid|name|cpuSeconds|workingSetBytes|startedMs.
 function powershellLines(script) {
   const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script],
                       { encoding: 'utf8', windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
@@ -115,8 +108,8 @@ Get-CimInstance Win32_Process | ForEach-Object { Write-Output "$($_.ProcessId)|$
   return byParent;
 }
 
-// A `seen` set rather than a depth limit: pid reuse can make the parent table describe a cycle, and a walk
-// that trusted it would not return.
+// A `seen` set guards against a cycle: pid reuse can make the parent table describe one, and an
+// unguarded walk would not return.
 function treeOf(rootPid, byParent) {
   const seen = new Set([rootPid]);
   const stack = [rootPid];
@@ -160,9 +153,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function pad(s, n) { s = String(s); return s + ' '.repeat(Math.max(0, n - s.length)); }
 function padLeft(s, n) { s = String(s); return ' '.repeat(Math.max(0, n - s.length)) + s; }
 
-// Sum a tree's counters out of one reading. Absent pids are skipped rather than counted as zero — a child
-// that exited mid-window contributes the CPU it used before it went, and inventing a zero for it would
-// understate the role (Law 25).
+// Sum a tree's counters out of one reading. Absent pids are skipped, not counted as zero, so a child that
+// exited mid-window still contributes the CPU it used before it went (Law 25).
 function sumTree(reading, pids) {
   let cpu = 0, mem = 0, present = 0;
   for (const pid of pids) {

@@ -49,7 +49,7 @@ module.exports = {
     // Withholding here is what made the whole run torchless: a threshold held fuel back, nothing spent
     // it, and a bar one unit from opening was indistinguishable from a broken one (Law 25 — the asker
     // owns the criterion, and this asker's criterion is "whatever we can make now").
-    const result = await craftItems(bot, targetItem, quantity, payload, { allowPartial: true });
+    const result = await craftItems(bot, targetItem, quantity, payload);
 
     // craft_handler returns undefined on caller abandonment — guard just in case
     if (!result) return;

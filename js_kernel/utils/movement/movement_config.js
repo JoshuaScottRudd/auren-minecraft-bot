@@ -1,11 +1,10 @@
-// module: movement/movement_config — the tunable dials for the movement family, in one place.
-// Nothing here decides anything; it holds the numbers the primitives read, so a re-tune is one edit
-// and cannot land in two files at different values (Law 16).
+// The tunable dials for the movement family, in one place. Nothing here decides anything; it holds the
+// numbers the primitives read, so a re-tune is one edit (Law 16).
 //
-// The scaffold/structural inversion is the non-obvious part: pillars and bridges are THROWAWAY and sit
-// on the open path, so they read the scaffold order (cheapest-to-replace first: soil, sediment, then
-// crafted goods); permanent fill reads structural_fill (cobblestone first). Same members, opposite
-// priority, one definition each — re-tune the ORDER in fragment_utils, never here.
+// Scaffold and structural fill invert priority on the same block group: pillars and bridges are
+// throwaway and sit on the open path, so they read the scaffold order (cheapest-to-replace first: soil,
+// sediment, then crafted goods); permanent fill reads structural_fill (cobblestone first). Re-tune the
+// ORDER in fragment_utils, never here.
 
 'use strict';
 
@@ -34,15 +33,15 @@ function setEscalationConfig(partial) { Object.assign(escalationConfig, partial 
 function getMovementConfig() { return movementConfig; }
 function getEscalationConfig() { return escalationConfig; }
 
-// defaultPriority: derived from the canonical throwaway order so there's one source of truth
-// (Law 16) — re-tune the order in fragment_utils, not here.
+// defaultPriority: derived from the canonical throwaway order, one source of truth (Law 16); re-tune the
+// order in fragment_utils, not here.
 //
-// pillar_block, NOT scaffold_block, and NOT structural_fill. Two separations, each load-bearing:
-//   · vs structural_fill — scaffolding is throwaway and on the open path (spend the cheapest first);
-//     fill is permanent (spend the most durable first). Same members, inverted priority.
-//   · vs scaffold_block — gravel and sand are legal PILLAR blocks and illegal BRIDGE blocks, because a
-//     pillar block lands supported and a bridge block lands over air (Law 17). BRIDGE_PREFS below is
-//     the filtered exposure of the same order; the two must not be collapsed back into one read.
+// pillar_block, not scaffold_block and not structural_fill:
+//   · vs structural_fill — scaffolding is throwaway (spend the cheapest first); fill is permanent (spend
+//     the most durable first). Same members, inverted priority.
+//   · vs scaffold_block — gravel and sand are legal PILLAR blocks and illegal BRIDGE blocks: a pillar
+//     block lands supported, a bridge block lands over air (Law 17). BRIDGE_PREFS below is the filtered
+//     exposure of the same order; the two reads stay separate.
 const pillarConfig = {
   jumpHoldMs: 350,
   postJumpSettleMs: 100,
@@ -50,16 +49,13 @@ const pillarConfig = {
   defaultPriority: [...group_to_item.pillar_block]
 };
 
-// Bridging lays the same throwaway material as pillaring in the same order, MINUS the gravity blocks a
-// bridge cannot carry (see pillarConfig above). This was declared as an identical literal inside BOTH
-// tryBridgeStep and stepHorizontal — two copies in one file, either of which could be re-tuned without
-// the other (Law 16).
+// Bridging lays the same throwaway material as pillaring in the same order, minus the gravity blocks a
+// bridge cannot carry (see pillarConfig above). Declared once here so tryBridgeStep and stepHorizontal
+// read the same order (Law 16).
 //
-// NO `|| [fallback]` ON EITHER READ. Both groups are module constants in this repo, so an absent one is
-// a coding violation, not an environmental failure — and the literal that used to stand here silently
-// substituted a DIFFERENT preference order (cobblestone and stone, the two blocks the throwaway order
-// deliberately ranks last) for the real one, on a boot nobody would have been told about (Law 13: never
-// default a missing field; Law 16: no fallback that silently does the primary's job).
+// No `|| [fallback]` on either read: both groups are module constants, so an absent one is a coding
+// violation, not an environmental failure (Law 13: never default a missing field; Law 16: no fallback
+// that silently does the primary's job).
 const BRIDGE_PREFS = [...group_to_item.scaffold_block];
 
 function setPillarConfig(partial) { if (partial && typeof partial === 'object') Object.assign(pillarConfig, partial); }

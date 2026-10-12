@@ -1,29 +1,27 @@
 // Auren_Bot/monitoring/dashboard.js
-// The Architect's LIVE observer state — a single JSON file (fleet_logs/traces/dashboard.json) that is
-// OVERWRITTEN whole every tick with the current fleet picture: per-bot VITALS (📊/⚠️/❌ counts,
+// The fleet's LIVE observer state — a single JSON file (fleet_logs/traces/dashboard.json) OVERWRITTEN
+// whole every tick with the current fleet picture: per-bot VITALS (summary/warning/error counts,
 // liveness, last-activity) merged with HQ PROGRESS (structures done, each bot's current task, queue).
 //
-// WHY a file, not a terminal (Architect, 2026-07-14): a live in-terminal panel needs ANSI cursor
-// control, which renders inconsistently across his environments (the "stacking wall" bug). A plain
-// JSON file has no rendering at all — he keeps it open in the editor, which live-reloads on each
-// overwrite, so the FILE is his visible accountability surface (his "no invisible window" rule, re-
-// tuned at the table: the window is the file). Single writer, no concurrent readers, so a plain whole-
-// file overwrite is safe and simple (Law 9: writes only its own file; Law 6: filename matches unit).
+// Written to a plain file, not an in-terminal panel: no rendering step and no cross-environment
+// rendering inconsistency, and an editor that live-reloads on each overwrite is the visible surface.
+// Single writer, no concurrent readers, so a plain whole-file overwrite is safe and simple (Law 9:
+// writes only its own file; Law 6: filename matches unit).
 //
-// Quiet runs stay quiet: a healthy fleet shows the vitals + `alerts: []`. When a trace signature fires
-// (error, judge-halt, warn-burst, regression…) it is posted into the `alerts` array WITH its context
-// slice — "errors like normal", but in the JSON instead of a scrolling terminal. The per-bot `errors`
-// count and `status:"halted"` are the at-a-glance cue; `alerts` carries the detail. The machine
-// wake-arm (paging the AI dev) is still a separate `trace_monitor --watch --exit-on-flag` — two
-// observers of the trace, one file with one writer (this tool).
+// Quiet runs stay quiet: a healthy fleet shows the vitals with `alerts: []`. When a trace signature
+// fires (error, judge-halt, warn-burst, regression…) it is posted into the `alerts` array with its
+// context slice. The per-bot `errors` count and `status:"halted"` are the at-a-glance cue; `alerts`
+// carries the detail. The machine wake-arm (paging the AI dev) stays a separate
+// `trace_monitor --watch --exit-on-flag` — two observers of the trace, one file with one writer (this
+// tool).
 //
-// It COMPOSES the two read-only observers rather than re-reading their sources (Law 16): trace vitals
-// via trace_monitor.computeBotStats/sigJudgeHalt, HQ progress via progress_tracker.computeSnapshot. It
-// invents no reading and, like both, lives OUTSIDE the construct — touches no bot, no signal bus.
+// Builds its state by composing the two read-only observers (Law 16): trace vitals via
+// trace_monitor.computeBotStats/sigJudgeHalt, HQ progress via progress_tracker.computeSnapshot. It
+// invents no reading and, like both, lives outside the construct — touches no bot, no signal bus.
 //
 // Usage:  node dashboard.js [traceFile] [--interval=2] [--out=<path>] [--once]
-//         .\Auren_Bot\Auren_Workshop\scripts\dashboard.ps1        (from the Architect's repo root)
-//         .\Auren_Workshop\scripts\dashboard.ps1                  (from a download's Auren_Bot root)
+//         .\Auren_Bot\Auren_Workshop\scripts\dashboard.ps1        (repo root)
+//         .\Auren_Workshop\scripts\dashboard.ps1                  (a download's Auren_Bot root)
 // Exit: runs until Ctrl-C (or --once: writes a single snapshot and exits 0).
 
 'use strict';
@@ -46,15 +44,13 @@ const INTERVAL = Math.max(1, parseInt(opt('interval', '2'), 10) || 2);
 const ONCE = args.includes('--once');
 const TRACE_FILE = args.find(a => !a.startsWith('--'))
   || require(paths.bot('js_kernel/utils/record_homes')).traceFile('fleet');
-// Written into the records room, not the kernel: the kernel holds what a bot needs to RUN, and
-// nothing in the fleet reads this — it is an observer's output for a human's editor (Architect
-// 2026-08-31).
+// Written into the records room, not the kernel: the kernel holds what a bot needs to RUN, and nothing
+// in the fleet reads this — it is an observer's output for a human's editor.
 const OUT_FILE = opt('out', path.join(require(paths.bot('js_kernel/utils/record_homes')).TRACE_DIR, 'dashboard.json'));
-const ALERT_CONTEXT = 6;   // raw trace lines kept above each posted anomaly (the "like normal" slice)
+const ALERT_CONTEXT = 6;   // raw trace lines kept above each posted anomaly, for context
 
-// AN ELAPSED SPAN, AND NOTHING ELSE. The word "ago" it used to carry now lives in the FIELD NAME that
-// holds this value (`*_ago`), which is where a unit belongs — a value that explains itself is a value
-// with a sentence stuck to it (Architect 2026-09-16).
+// An elapsed span, and nothing else — the unit lives in the FIELD NAME that holds this value (`*_ago`),
+// not appended to the string.
 function agoShort(ms) {
   if (!ms) return '—';
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -76,20 +72,16 @@ function buildState() {
     const segs = read.segmentRuns(lines);
     const seg = segs[segs.length - 1] || [];
     for (const f of trace.sigJudgeHalt(seg)) halted.add(f.bot);
-    // Post every anomaly the trace signatures fire in the LATEST run — "errors like normal", but into
-    // the JSON instead of a terminal. The dashboard stays the SINGLE writer of dashboard.json and
-    // REUSES trace_monitor's detect() (Law 16) rather than letting trace_monitor write the file too —
-    // one file, one owner (Law 6/9, Invariant D). A clean run → []; the whole set is re-snapshotted
-    // each tick (no stream/dedup — the file always shows the current outstanding anomalies).
-    // ── A FLAG CARRIES FIELDS, NOT A `reason` SENTENCE (2026-09-16) ────────────────────────────────
-    // `reason: f.reason` until this date. trace_monitor's signatures stopped composing prose about
-    // their own measurements, so the field is gone at the source — and a JSON key that reads `reason:
-    // undefined` on every alert would be this file quietly losing the detail rather than carrying it.
-    // Each signature's own fields are spread in beside sig/bot instead: `count`/`text` for an error,
+    // Posts every anomaly the trace signatures fire in the LATEST run into the JSON. The dashboard stays
+    // the SINGLE writer of dashboard.json and reuses trace_monitor's detect() (Law 16) — one file, one
+    // owner (Law 6/9, Invariant D). A clean run → []; the whole set is re-snapshotted each tick (no
+    // stream/dedup — the file always shows the current outstanding anomalies).
+    // ── A FLAG CARRIES FIELDS, NOT A `reason` SENTENCE ────────────────────────────────
+    // Each signature's own fields are spread in beside sig/bot: `count`/`text` for an error,
     // `gap_sec`/`threshold_sec` for a silence, `from`/`to`/`drop`/`tolerance` for a regression. The
-    // shape is the flag's, which means a signature that learns a new field posts it here with nobody
-    // editing this file (Law 16 — trace_monitor owns what a flag says, this file only places it).
-    // `idx` stays out: it is an offset into a trace parse this JSON's reader does not have.
+    // shape is the flag's, so a signature that learns a new field posts it here with no edit to this
+    // file (Law 16 — trace_monitor owns what a flag says, this file only places it). `idx` stays out: it
+    // is an offset into a trace parse this JSON's reader does not have.
     alerts = trace.detect(seg).map(({ idx, ...f }) => ({
       ...f,
       context: lines.slice(Math.max(0, idx - ALERT_CONTEXT), idx + 1).map(l => l.raw),
@@ -111,10 +103,9 @@ function buildState() {
   const bots = roster.map(id => {
     const s = stats.get(id) || { s: 0, w: 0, e: 0, lastRel: 0 };
     const isHalted = halted.has(id);
-    // `doing` is now null when a bot holds no magnet — progress_tracker stopped substituting the word
-    // 'idle' for an absent task (2026-09-16), so the check for that literal went with it.
+    // `doing` is null when a bot holds no magnet.
     const doing = doingById[id] || null;
-    // status = the Architect's "active or not" cue: a judge-killed bot is inert; a bot with an HQ task
+    // status = the operator's "active or not" cue: a judge-killed bot is inert; a bot with an HQ task
     // is working; otherwise alive but idle. No error TEXT — `errors` is the only error signal, a number.
     const status = isHalted ? 'halted' : (doing ? 'active' : 'idle');
     return {
@@ -159,7 +150,7 @@ function write() {
 // ── Run ─────────────────────────────────────────────────────────────────────────
 if (ONCE) {
   write();
-  // OPERATIONAL CHATTER GOES TO stderr (Architect 2026-09-16). This daemon's ANSWER is dashboard.json,
+  // OPERATIONAL CHATTER GOES TO stderr. This daemon's ANSWER is dashboard.json,
   // which is already pure data; these three lines are the process telling you it is alive, and stdout is
   // reserved for the answer so nothing can smuggle a sentence onto that channel.
   console.error(`dashboard: wrote one snapshot → ${OUT_FILE}`);

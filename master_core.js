@@ -1,4 +1,5 @@
-// master_core.js — Unified Core
+// master_core.js — the bot process's entry point: wires identity, world connection, the tick seats, and
+// the shutdown/crash paths into one process.
 const moduleAlias = require('module-alias');
 moduleAlias.addAliases({
   '@perception': __dirname + '/perception_nodes.js',
@@ -12,13 +13,13 @@ moduleAlias.addAliases({
   '@foreman': __dirname + '/foreman'
 });
 
-// THE MANDATE IS READ FIRST — before the banner, before mineflayer, before anything can act.
-//
-// This is the birth the Architect described: a bot is a species from its first instruction, and a
-// process that cannot say which species it is does not become a bot. readMandate() THROWS on an
-// absent or unknown BOT_MODE rather than assuming one, so a launcher that forgets to stamp the mode
-// dies here — loudly, naming itself — instead of connecting and behaving like the wrong species for
-// the rest of the run. Placed at the very top so there is no window in which a half-born bot exists.
+// A body's console is a pipe to the foreman, and a pipe write on Windows waits on this process's own loop
+// for its reader; the lane hands each line to the thread pool so a paused reader never holds the body
+// (js_kernel/utils/console_lane). Installed before the first line is printed.
+require('@utils/console_lane').install();
+
+// Read before anything else can act: readMandate() throws on an absent or unknown BOT_MODE, never
+// assumes one, so a process that cannot say which species it is never starts behaving like one (Law 13).
 const botMandate = require('@kernel/bot_mandate');
 const MANDATE = botMandate.readMandate();
 
@@ -27,9 +28,8 @@ const readline = require('readline');
 const { pathfinder } = require('mineflayer-pathfinder');
 const { inject: runPerceptionFragmentTester } = require('@perception/perception_fragment_tester.js');
 const foremanLink = require('@kernel/foreman_link.js');
-// The protocol version is authored in the config, not here: the virtual playground reads the SAME value to
-// pull block facts (material, harvestTools) out of the registry, and a bench on a different Minecraft than
-// the body would grade this fleet against a game it is not playing (Law 16 — one authored answer).
+// Same protocol version the virtual playground reads out of the block registry (Law 16 — one authored
+// answer).
 const { SERVER_MINECRAFT_VERSION, SERVER_ENDPOINT } = require('@thinking/architect_config');
 
 
@@ -41,14 +41,9 @@ function delayedChat(bot, message, delay = 1) {
 }
 global.delayedChat = delayedChat;
 
-// Startup banner (bright cyan, bold) — a bot window's own story is silenced (it streams to the
-// foreman), so this banner is nearly all a bot terminal ever prints. It exists purely to make a bot
-// window instantly distinguishable from the foreman's live log stream. Cyan, deliberately NOT
-// warning-yellow or error-red so those stay meaningful.
-//
-// The SPECIES is on the banner because the two are indistinguishable at a glance otherwise, and the
-// difference decides whether the bot in that window will answer a human at all. A recording session
-// that discovers the wrong species by talking to a bot that cannot hear has already lost the take.
+// Marks a bot window as itself: its own log stream is silenced to the foreman, so this banner is nearly
+// all it ever prints. Cyan is reserved so warning/error colors elsewhere stay meaningful. Carries the
+// species because that decides whether the bot in this window answers a human at all.
 (function botBanner() {
   const C = '\x1b[96m\x1b[1m', R = '\x1b[0m';
   const bar = '═'.repeat(50);
@@ -63,28 +58,9 @@ global.delayedChat = delayedChat;
 console.log('🧐 Launching unified master core...');
 
 // ── RESPAWN IS A COMMAND, NOT A REFLEX ────────────────────────────────────────────────────────────
-// `respawn: false` is mineflayer's own switch (lib/plugins/health.js): on death it emits `death` and then
-// STOPS — the click is `bot.respawn()`, ours to make. Default true would send it the instant the health
-// packet lands.
-//
-// WHY THE DEFAULT IS WRONG FOR THIS FLEET, and it is a Law 4 problem, not a preference. A death does not
-// end the chain that was running: an executor parked in a walk to a tree a thousand blocks away is still
-// parked there. Auto-respawn hands that line a LIVE body at the world spawn point, so it resumes intent
-// built for a position, an inventory and a body that no longer exist (Invariant B) — while the death
-// handler originates a fresh chain beside it. Two live signals, and the bus does not stop it: route()
-// refuses only an immediate repeat of the same source→target pair, so there is no live-signal lock to
-// catch this. The only thing that ends the old line is Law 15 abandonment, which needs the line to come
-// back through the battle_stations gate first.
-//
-// Gating the respawn makes DEAD the serialization point. A corpse cannot walk, mine or place, so the
-// stale line is inert by physics rather than by a check that has to arrive in time — Law 13's
-// default-stopped, held by the world instead of by code.
-//
-// NOTHING IN THIS FILE CLICKS THE BUTTON. The battle_stations gate only CHECKS and routes to the judge;
-// job_board's respawn planner then posts the one job a corpse can be given, and respawn_executor sends the
-// packet. That fragment is the only place `bot.respawn()` appears in the fleet (Law 16) — and this one
-// line is what makes it the only place that CAN matter. Flip `respawn` back to true and mineflayer starts
-// clicking underneath all of it, silently, at the one moment the design depends on the body staying down.
+// `respawn: false` overrides mineflayer's default so a death does not hand a stale chain a fresh live
+// body at world spawn (Invariant B) — DEAD is the serialization point, since a corpse cannot act.
+// respawn_executor is the only caller of `bot.respawn()` in the fleet (Law 16).
 const bot = mineflayer.createBot({
   host: SERVER_ENDPOINT.host,
   port: SERVER_ENDPOINT.port,
@@ -96,50 +72,26 @@ const bot = mineflayer.createBot({
 bot.loadPlugin(pathfinder);
 
 // ── THE SPAWN-PROTECTED SQUARE IS LATCHED BEFORE LOGIN FINISHES, NOT AT SPAWN ────────────────────
-// `spawn_position` is a LOGIN packet: the server sends it while the body is still being brought into
-// the world, so it has already come and gone by the time the `spawn` handler below runs. A listener
-// registered there would be registered after the only packet it exists to catch, the world spawn would
-// read as never-received for the whole session, and every dig and placement would be refused with a
-// perfectly accurate message about a state that only the registration order created.
-//
-// Here, immediately after createBot and before anything can await, is the first moment a listener can
-// exist at all — and it is the last moment before the packet can arrive.
-//
-// WHY THE FLEET LATCHES THIS ITSELF INSTEAD OF READING mineflayer's `bot.spawnPoint`: that field is
-// initialised to (0,0,0) and overwritten when the packet lands, so a read before it arrives returns a
-// well-formed falsehood — and worlds this fleet generates spawn at x=0,z=0, the one value that would
-// make the gap invisible. The full argument lives on the module (Law 13, Law 26).
+// `spawn_position` is a login packet sent before `spawn` fires, so the listener must exist here,
+// immediately after createBot, to catch it. `bot.spawnPoint` starts at (0,0,0), which this fleet's
+// worlds also spawn at, so reading it before the packet lands would be a well-formed falsehood (Law 26).
 require('@perception/spawn_protection').armSpawnProtection(bot);
 
-// ── BOUNDARY TRANSLATOR: on 26.1 the difficulty packet carries a NAME and upstream indexes with it ──
-// The same seam and the same legal form as the explosion translator in the spawn handler below, for a
-// fault found the day the fleet moved from 1.21.5 to 26.1 (2026-09-17). It sits HERE, beside the spawn
-// square's latch and for that latch's exact reason: the `difficulty` packet arrives during LOGIN — it was
-// observed on the wire immediately after the login packet and before `spawn` — so a listener registered
-// in the spawn handler would be registered after the only packet it exists to catch.
-//
-// mineflayer/lib/plugins/game.js:134-135 does:
-//     bot._client.on('difficulty', (packet) => {
-//       bot.game.difficulty = ['peaceful','easy','normal','hard'][packet.difficulty]
-//     })
-// Through 1.21.x `packet.difficulty` was the ORDINAL (0..3) and that index was correct. 26.1 declares
-// the field as an enum and the server sends the NAME — observed on the wire as
-// `{"difficulty":"peaceful","difficultyLocked":false}` — so the array is indexed by a string, which is
-// `undefined`, and `bot.game.difficulty` is never set for the whole life of the process.
-//
-// WHAT IT COSTS, WHICH IS WHY IT IS NOT COSMETIC. `architect_config.isPeacefulWorld()` reads exactly
-// this field, and its stated rule is UNKNOWN IS NOT PEACEFUL (Law 13, default-stopped). So a permanently
-// undefined field reads as a hostile world forever: the night gate closes at dusk on a world where
-// nothing can spawn, and a homesteader hands back half of every day it is given. Nothing errors, nothing
-// warns — this is Law 26's well-formed falsehood, and the only reason it is visible at all is that the
-// field's value can be checked against what the server said.
-//
-// THE TRANSLATION IS A PREPENDED REWRITE, exactly like the explosion one: the name is turned back into
-// the ordinal upstream's own line already handles, so upstream still does the assigning and there is one
-// author of `bot.game.difficulty`. A packet already carrying an ordinal is passed through untouched, so
-// this is inert on 1.21.x and on any server that goes back to numbers. Delete it the day upstream reads
-// its own schema. A name that is not one of the four is left alone rather than guessed at — upstream
-// then writes `undefined`, which is the honest answer and the one isPeacefulWorld already refuses on.
+// Every change to this body's pocket, sent to the foreman's item book (item_book says how it is read).
+require('@kernel/item_book').arm(bot);
+// Every position the server sets for this body, said as it happens (server_account says how it is read).
+require('@kernel/server_account').arm(bot);
+// A body flush against a block face is kept on the open side of it (block_face_seat says why).
+require('@kernel/block_face_seat').arm(bot);
+// The server's tick, heard once a second; a frozen server ends the body (server_pulse says why).
+require('@kernel/server_pulse').arm(bot);
+
+// ── BOUNDARY TRANSLATOR: difficulty packet carries a NAME on 26.1, upstream still indexes by ordinal ──
+// Sits here, beside the spawn latch, since `difficulty` also arrives during login before `spawn` fires.
+// mineflayer indexes `packet.difficulty` by ordinal; 26.1 sends a name instead, so the index is
+// `undefined` and `isPeacefulWorld()` (Law 13, unknown-is-hostile) reads that as hostile forever (Law 26).
+// Rewrites the difficulty back to the ordinal upstream's own line handles (Law 16); an ordinal already
+// present, or an unknown name, passes through untouched.
 const DIFFICULTY_NAMES = ['peaceful', 'easy', 'normal', 'hard'];
 bot._client.prependListener('difficulty', (packet) => {
   if (typeof packet.difficulty !== 'string') return;      // already an ordinal — upstream is correct
@@ -149,26 +101,10 @@ bot._client.prependListener('difficulty', (packet) => {
 
 
 // ── A CORPSE CANNOT ANNOUNCE ITSELF ───────────────────────────────────────────────────────────────
-// A body that died and was stopped is saved to playerdata dead, and on the next login mineflayer's
-// health plugin consumes its one-shot spawn gate WITHOUT firing it — the gate only emits `spawn` for a
-// living body. So every handler below hangs off an event that never arrives: the process joins the
-// world, holds a socket, and never registers, never perceives, never takes a command. It looks like a
-// hung bot and it is a bot waiting for an event that cannot come.
-//
-// THE CLICK MUST LAND ON `health`, NOT ON `spawn` OR ON `start`. `spawn` is the event this repairs, so
-// hanging the repair there is circular; `start` is an operator verb that arrives through machinery this
-// same registration installs, so nothing is listening for it yet. `health` is the first packet the
-// server sends about the body either way, which makes it the only edge that fires for a corpse.
-//
-// Clicking respawn makes the server send a fresh body, and the health plugin's OTHER branch emits
-// `spawn` for it — so this hands off to the normal path rather than duplicating it. Nothing here
-// teleports: where a revived body belongs is already decided downstream (a contractor is carried to its
-// owner by report_to_owner, a homesteader stays where vanilla put it), and deciding it twice would be
-// two routes to one destination (Law 16).
-//
-// Gated on `global.bot` being unset, which is what makes this the LOGIN edge specifically: after the
-// spawn handler runs, a death is the death signal's to own, and a second reviver racing it would be two
-// occupants of one decision (Law 4).
+// A body that reconnects dead consumes mineflayer's one-shot spawn gate without firing `spawn`, so every
+// handler below would hang off an event that never arrives. `health` is the first packet sent about the
+// body either way, so the revive clicks respawn here and lets health's own branch emit `spawn` (Law 16).
+// Gated on `global.bot` unset so this owns login only; after spawn runs, death owns the signal (Law 4).
 bot.on('health', () => {
   if (global.bot || bot.health > 0) return;
   require('@action/death_manager.js').reviveBody(bot).then(r => {
@@ -184,25 +120,14 @@ bot.once('spawn', () => {
 
   global.bot = bot;
 
-  // AND THE SQUARE IS MADE INVISIBLE, BEFORE ANY PERCEPTION RUNS (Architect 2026-09-15). Arming latches
-  // WHERE it is; masking is what keeps its cells out of every scan, route and plan without a single
-  // fragment asking.
-  //
-  // HERE AND NOT BESIDE THE ARM, for a reason that cost a run: `maskWorldReads` wraps `bot.blockAt`, and
-  // mineflayer has not attached that yet at the moment `createBot` returns — the wrap threw
-  // `maskWorldReads called with no body to mask` at module load and the process died before it joined.
-  // Spawn is the first moment the body is whole, and it is still early enough to leave no window: every
-  // read in this construct happens under a handler registered below this line, so no candidate can be
-  // chosen off unmasked ground and outlive the wrap.
+  // Masks the spawn square out of every scan, route and plan without a fragment asking. Done here rather
+  // than beside the arm because `maskWorldReads` wraps `bot.blockAt`, which mineflayer has not attached
+  // until the body is whole at spawn.
   require('@perception/spawn_protection').maskWorldReads(bot);
 
-  // STATE THE SQUARE ONCE PER RUN, whatever it says. A gate that only speaks when it refuses something
-  // is indistinguishable from a gate that is dead, and this one refuses work — so a run needs the line
-  // that says which ground was off-limits in order to read a "nothing to mine" as a keep-out rather
-  // than as an empty world (Law 6). It also reports the not-known case at the one moment it is still
-  // actionable: by spawn the login packets are all in, so an unknown world spawn here means every dig
-  // and placement this session will be refused, and that is worth seeing at the top of the trace
-  // instead of inferring it from a hundred refusals further down.
+  // Logs the spawn square once per run regardless of outcome, so a later "nothing to mine" reads as a
+  // keep-out, never an empty world (Law 6). An unknown square is reported here, while it is still
+  // actionable, since every dig and placement this session will be refused otherwise.
   {
     const spawnProtection = require('@perception/spawn_protection');
     const line = spawnProtection.describeSpawnProtection(bot);
@@ -218,64 +143,18 @@ bot.once('spawn', () => {
   bot._client.write('client_command', { payload: 0 });
 
   // ── BOUNDARY TRANSLATOR: mineflayer's explosion handler crashes the process on 1.21.3 and later ────
-  // Law 16's one legal catch — a third-party fault converted into a Law 13 outcome at the seam, logged,
-  // never silently swallowed. This is not a workaround for our code; it is upstream reading a field it
-  // just proved absent.
+  // Law 16's one legal catch — a third-party fault turned into a Law 13 outcome at the seam, logged, not
+  // swallowed. On 1.21.3+ the server sends playerKnockback in place of the playerMotion* fields
+  // mineflayer/lib/plugins/physics.js still reads, feeding `undefined`s into Vec3.add and crashing the
+  // process on every detonation; a prepended listener spreads playerKnockback into those fields and
+  // deletes it, so upstream's own correct branch runs unchanged (inert on the old packet shape).
   //
-  // mineflayer/lib/plugins/physics.js:298-300 does:
-  //     if (explosion.playerKnockback) {                     // the 1.21.3+ shape
-  //       bot.entity.velocity.add(explosion.playerMotionX, …) // …then reads the PRE-1.21.3 fields
-  //     }
-  // On 1.21.3+ the per-axis playerMotion* fields no longer exist — playerKnockback replaced them — so
-  // those are three `undefined`s into Vec3.add, which does `undefined.x` and throws INSIDE the packet
-  // emitter. There is no call site of ours to wrap: it fires on a server packet, so the throw lands in
-  // process.on('uncaughtException') and kills the bot.
-  //
-  // Every creeper detonation costs the PROCESS, not just the health, which makes any detonation-driven
-  // counter unmeasurable: a counter whose failure mode deletes the instrument cannot be characterised.
-  //
-  // THE FIX REWRITES THE PACKET, IT DOES NOT REPLACE THE HANDLER. A prepended listener normalises the
-  // 1.21.3+ shape into the pre-1.21.3 shape upstream's SECOND branch already handles correctly:
-  // playerKnockback is spread into playerMotionX/Y/Z and then DELETED, so the broken branch is skipped
-  // by its own guard. Knockback is still applied, by upstream, from the numbers the server actually sent.
-  //
-  // TWO WRONG TURNS, BOTH TAKEN, both recorded so a successor spends its round elsewhere:
-  //   1. Installed beside bot.loadPlugin() — mineflayer had not injected physics yet, so there was
-  //      nothing to find and the guard returned silently. Moving it to spawn was necessary, not enough.
-  //   2. Then it removed `listeners('explosion')[0]` and installed a corrected copy. blocks.js:395
-  //      registers an explosion listener BEFORE physics.js:295, so index 0 is BLOCKS — the crash was
-  //      untouched and explosion block-updates were silently disabled instead. Never index a third-party
-  //      listener array by position; there is no contract on the order.
-  // Repairing the fields WITHOUT deleting playerKnockback is a third wrong turn: the broken branch would
-  // then run `velocity.add(number, …)`, and Vec3.add reads `.x` off its argument — NaN velocity, silent.
-  //
-  // Prepending is also why this needs no "did I find it" guard at all: the translation is unconditional
-  // and depends on no upstream listener existing, so there is no silent-decline path to warn about.
-  // Delete this the day upstream fixes it.
-  //
-  // ─── AND IT MUST CATCH THE FALSEHOOD, NOT ONLY THE GARBLE (Law 26) ───
-  // Stopping the throw is only half a translator. An extreme-but-finite velocity value (no throw,
-  // Number.isFinite passes) can still stall prismarine-physics's swept-AABB scan (getSurroundingBBs ←
-  // moveEntity), which walks the box a block at a time — a large enough sweep never returns, keep-alives
-  // stop, and the server eventually kicks the bot while the match keeps reporting normally in the
-  // meantime. Nothing throws; every value stays finite.
-  //
-  // That is the exact failure Law 26 names: a well-formed falsehood crossing into a machine that
-  // faithfully acted on it. A form check (Number.isFinite) cannot see it — only a check against
-  // physical reality can, so the bound below is the truth-catch this boundary was missing. The cap is
-  // ~2.5× terminal velocity (3.92 b/tick), which is far above any real blast and far below anything
-  // that can stall a swept-AABB scan. On a reject the knockback is DROPPED WHOLE rather than clamped:
-  // a clamped vector is an invented physics event, and there is no honest number to substitute here.
-  // The raw vector is logged because it is also the open question — whether the server sends f64 where
-  // minecraft-data's schema declares `["option","vec3f64"]` is unverified, and these numbers are
-  // the evidence that would settle it.
+  // Also bounded against physical reality, not just shape (Law 26): a finite-but-extreme value can stall
+  // prismarine-physics's swept-AABB scan and get the bot silently kicked. The cap is ~2.5× terminal
+  // velocity; a reject drops the knockback whole — never clamped into an invented physics event.
   const EXPLOSION_KNOCKBACK_MAX_BPT = 10;
-  // UNGUARDED, and the two `try` blocks that used to be here were deleted 2026-09-10 when preflight's
-  // catch-shape gate was first allowed to see this file. VALIDATION is the correct form and it is already
-  // here: `if (!kb) return`, `Number.isFinite`, and the physical bound. Nothing left inside can throw
-  // except our own arithmetic, and our own code throwing is a defect that must travel to reportCrash
-  // (Law 13: default stopped). The old comment said losing the process was worse than losing knockback —
-  // but a clamping bug that keeps the bot alive and silently wrong is the expensive shape, not the crash.
+  // Unguarded on purpose: validation is the correct form here, and a throw from our own arithmetic must
+  // reach reportCrash (Law 13: default stopped).
   bot._client.prependListener('explosion', (explosion) => {
     const kb = explosion.playerKnockback;
     if (!kb) return;
@@ -295,79 +174,45 @@ bot.once('spawn', () => {
     }
   });
 
-  // two lines of open chat for a crew of two, plus two more from announceStartupPosition, before either
-  // bot had done a thing. It told the world something the world could see. A person's crew is announced
-  // once, by the foreman, in the reply to the `get` that asked for it (Law 16: one arrival, one voice).
-  // See THE BOT DOES NOT SPEAK in Thinking_fragments/dispatcher.js.
+  // A person's crew is announced once, by the foreman, in the reply to the `get` that asked for it — not
+  // here (Law 16: one arrival, one voice). See THE BOT DOES NOT SPEAK in Thinking_fragments/dispatcher.js.
 
-  // A CONTRACTOR ARRIVES WHERE ITS OWNER IS STANDING. Fired here rather than posted as a job because
-  // birth happens once and the process is its own lifecycle (Law 8); a job would re-post every time the
-  // two bodies drifted apart and heel the bot to its owner forever. It is deliberately not awaited — the
-  // seats below are process-lifetime listeners with no dependency on where the body is, and holding the
-  // spawn handler on an RCON round-trip would delay every one of them for a teleport that is allowed to
-  // fail. See report_to_owner for why the owner's exact cell needs no safety scan.
+  // A contractor arrives where its owner is standing, fired once at birth, never posted as a job (Law 8)
+  // — a job would re-post every time the two bodies drifted apart. Not awaited: the seats below are
+  // process-lifetime listeners independent of body position, and a teleport here is allowed to fail.
   require('@action/report_to_owner.js').announce(bot);
 
   const survivalInstincts = require('@locomotion/survival_instincts');
   survivalInstincts.start(bot);
 
-  // ── THE CREW'S TWO TICK SEATS, IN THE ORDER THEY MUST RUN ────────────────────────────────────────
-  // The COMMANDER first, and unconditionally. It is the fleet's only scanner of monsters, and it sweeps
-  // whether or not a fight is open — deliberately with no engage switch, because a gunner that could be
-  // starved by a commander waiting for an engagement would lose the one thing a tick-level upper body is
-  // for: hitting the mob that wandered up mid-job instead of either ignoring it or abandoning the job.
+  // ── THE CREW'S TICK SEATS, IN THE ORDER THEY MUST RUN ────────────────────────────────────────────
+  // Commander first and unconditionally: the fleet's only monster scanner, sweeping whether or not a
+  // fight is open so the gunner is never starved waiting on an engagement.
   require('@api/commander').start(bot);
 
-  // The gunner ATTACHES for the process and ENGAGES per wave, and the split is deliberate: attaching and
-  // detaching a physicsTick listener at every engagement boundary is a lifecycle with an obvious leak
-  // (Law 8), so the handler goes up once here beside the other tick-level reflexes and battle_stations
-  // flips one boolean. Silent and inert until something arms it — the tick returns on its first line.
-  //
-  // REGISTERED AFTER THE COMMANDER, AND THAT ORDER IS LOAD-BEARING. mineflayer fires physicsTick handlers
-  // in registration order, so the gunner reads a board the commander wrote THIS tick rather than one tick
-  // stale. Two lines in one file is what makes the order visible and reviewable; two modules each
-  // attaching their own listener wherever they happened to be required would leave the order to whichever
-  // `require` ran first, which is exactly the hidden state Invariant C forbids.
+  // The gunner attaches once for the process and engages per wave via one boolean (Law 8), never by
+  // attaching/detaching a physicsTick listener per engagement. Registered after the commander so it reads
+  // the board the commander wrote this same tick (Invariant C).
   require('@api/gunner').start(bot);
 
-  // THE DRIVER IS THIRD, AND THIS IS THE LAST LINK IN THE SAME CHAIN. The rotation is
-  // commander → gunner → driver, and each seat consumes what the one before it wrote THIS tick: the
-  // gunner reads the commander's board, and the driver reads BOTH the board and `bot.entity.yaw` — the
-  // facing the gunner just wrote. Registered last so the keys it presses are computed against the
-  // facing the body actually holds this tick, not the one it held last tick.
-  //
-  // A successor moving these three lines is not reordering log statements. Put the driver first and it
-  // strafes relative to a facing one tick stale, which at a sprinting mob's 0.28 b/tick is a heading
-  // error that looks exactly like a pathing bug.
+  // Driver last in the same chain: it reads both the commander's board and `bot.entity.yaw`, the facing
+  // the gunner just wrote, so its keys are computed against the facing the body holds this same tick.
   require('@api/driver').start(bot);
 
-  // The death edge. Installed here beside the other process-lifetime listeners because that is what it
-  // is (Law 8), but the DECISION it feeds lives at the battle_stations gate — see armDeathWatch's header
-  // for why an edge-triggered latch and a health poll are not the same instrument.
+  // The death edge, installed beside the other process-lifetime listeners (Law 8). The decision it feeds
+  // lives at the battle_stations gate — see armDeathWatch's header on why an edge latch and a health
+  // poll differ.
   require('@api/battle_stations').armDeathWatch(bot);
-
-  // WHAT USED TO BE THE SECOND LISTENER ON THIS EDGE, and why nothing replaced it: death_pile_recorder
-  // captured where a body's things fell, because the retrieval system worked off a RECORD of the death.
-  // Salvage now works off a live scan of the entity table (perception/ground_drop_scanner), so there is
-  // nothing to capture at the moment of dying — the drops announce themselves for as long as they exist,
-  // and a record of them could only outlive them. Deleted with the whole death-pile chain.
 
   // Connect to foreman if URL is configured (env var FOREMAN_URL).
   // If not set, the bot runs in local-brain mode — no change to behavior.
   const foremanUrl = process.env.FOREMAN_URL || null;
   const botId = process.env.BOT_ID || bot.username || 'AurenBot';
 
-  // A BOOTING BOT HOLDS NOTHING — say so before registering (Law 8: a lifecycle terminates with the
-  // owner that raised it). The magnet is written to disk, so a claim made by the PREVIOUS process
-  // under this same id is read back as gospel by the new one and by every peer that merges the chair.
-  // The exit paths already clear it ('end' handler, reportCrash), but a hard kill runs neither — and
-  // that is the normal case, because relaunching the fleet kills the bots outright.
-  //
-  // releaseAbsentBotMagnets does NOT cover this: it is keyed on the holder being absent from the
-  // foreman's roster, and a relaunched bot re-registers under the same id, so it is present and its
-  // own ghost claim is skipped by both the connected-check and the self-check. Absent-holder and
-  // reborn-holder are two different failures; that one owns the first, this owns the second.
-  // Not a second release pathway (Law 16) — same clearMagnet(), a boundary it did not reach.
+  // Clears any magnet claim left by a previous process under this id before registering (Law 8) — a hard
+  // kill skips both exit paths that would clear it, and a relaunch under the same id survives
+  // `releaseAbsentBotMagnets` (catches only an absent holder). Same clearMagnet(), not a second pathway
+  // (Law 16).
   require('@thinking/dispatcher.js').clearMagnet(botId);
 
   foremanLink.connect(foremanUrl, botId);
@@ -377,39 +222,17 @@ bot.once('spawn', () => {
   // our spawn position and the distance to the nearest other bot (if one is connected).
   setTimeout(() => foremanLink.recordStartupPosition(bot), 4000);
 
-  // ── A CONTRACTOR IS BORN STARTED (Architect 2026-09-01) ──────────────────────────────────────────
-  // *"getting the bots also starts them. theres no reason why they should be seperate commands."*
-  //
-  // A CONSTITUTION, NOT A SEQUENCE, and that is why it is here rather than in the foreman (Law 27). The
-  // obvious build was to have the desk launch the crew, WAIT for both bodies to register, then send
-  // `start` through the door — which needs a poll, a ceiling, a judge for the wait, and an honest report
-  // for the case where the wait expires. All of that machinery exists only to police a gap between two
-  // acts. Defining a contractor as a body that is already working closes the gap instead: there is no
-  // un-started contractor to wait for because none can be constructed.
-  //
-  // A HOMESTEADER IS STARTED WHEN THE OPERATOR DECIDES THE FLEET IS READY, and the two species differ
-  // by WHO decides rather than by what happens: a contractor exists BECAUSE a person asked for one, so
-  // being fetched is what starting means for it and there is no moment in its life when standing idle
-  // is the right state.
-  //
-  // Which of those a body is, is a question for the mandate and not for this file — `beginsWorkAtBirth`
-  // owns it, and its header carries the 2026-09-09 live finding that a crew launcher must stamp the
-  // decision at birth because the shipped layer has no second sender for the verb.
-  //
-  // AFTER THE SEATS AND THE FOREMAN LINK, deliberately. The planning recursion reads the job board and
-  // claims through the foreman, so injecting before `connect` would run the first plan cycle against a
-  // bot with no peer arbitration — every claim granted locally, which is exactly the split-brain the
-  // planning token exists to prevent (Law 4).
-  // ── ANNOUNCED FROM THE OUTCOME, NOT FROM THE CALL (2026-09-10) ──────────────────────────────────
-  // `inject()` is async and now carries a gate that can legitimately refuse — a body must be standing
-  // with the person who raised it before it plans. This line used to print beside the call rather than
-  // after it, so a refused start still announced itself as launched. Chained rather than awaited because
-  // this handler is `spawn`'s synchronous listener: making it async would turn every synchronous throw in
-  // the rest of the sequence into an unhandled rejection, which is a wider change than the report needs.
+  // ── A CONTRACTOR IS BORN STARTED ──────────────────────────────────────────
+  // A contractor is defined as a body already working, so there is no un-started contractor to poll or
+  // wait on (Law 27); `beginsWorkAtBirth` on the mandate owns which species starts here. Placed after the
+  // seats and the foreman link so the first plan cycle claims through peer arbitration (Law 4). Reported
+  // from `inject()`'s outcome, since it can refuse; chained, not awaited, since this is `spawn`'s
+  // synchronous listener.
   if (botMandate.beginsWorkAtBirth()) {
-    require('@action/start_injector.js').inject().then((r) => {
+    // The first plan waits for the world round the body to arrive (world_ready).
+    require('@kernel/world_ready').awaitWorld(bot).then(() => require('@action/start_injector.js').inject()).then((r) => {
       if (r && r.started) {
-        console.log(`🚀 ${botMandate.isContractor() ? 'Contractor — born started' : 'Homesteader — launched to work'}.`
+        console.log(`🚀 ${botMandate.isContractor() ? 'Contractor — born started' : botMandate.isBuilder() ? 'Builder — launched to work' : 'Homesteader — launched to work'}.`
           + ' Autonomous start signal injected.');
       } else {
         console.log(`⛔ ${botMandate.currentMode()} did not start — ${(r && r.why) || 'the start injector refused and said nothing'}.`
@@ -439,12 +262,9 @@ bot.once('spawn', () => {
         testInjector.inject();
         break;
       case 'test_locklayout': {
-        // test_locklayout — run the base-layout survey from where this body stands and REPORT it (no
-        // autonomous loop, nothing written). The full survey lands on watcher_<BotId>.json under
-        // 'lock_all_buildspots'.
-        // IT ONLY LOOKS. A `lock` option used to commit the result, and it was the last route by which a
-        // body could site its own base; siting is the foreman's alone, before any body spawns (Architect
-        // 2026-09-18), so a body may see what a survey would say and never act on it.
+        // Runs the base-layout survey from where this body stands and reports it only — nothing is
+        // written. The full survey lands on watcher_<BotId>.json under 'lock_all_buildspots'. Siting a
+        // base is the foreman's alone, before any body spawns, so this never commits the result.
         require('@action/lock_all_buildspots').run(global.bot, { dryRun: true })
           .then(r => console.log(`🧪 lock_all_buildspots (dry run): ok=${r.ok} transient=${!!r.transient} would lock=[${(r.site || []).map(s => s.roomKey).join(', ')}]`))
           .catch(e => console.log(`🧪 lock_all_buildspots threw (expected on a bad layout): ${e.message.split('\n')[0]}`));
@@ -468,11 +288,8 @@ bot.once('spawn', () => {
         console.log('🛡️ Sentry mode armed — threat scan only, isolated from the planning recursion.');
         break;
       case 'see':
-        // UNGUARDED ON PURPOSE. perception_fragment_tester already answers every human-input case with a
-        // correction (Law 13) — no argument, `list`, an unknown function name — and its header says the
-        // call itself is deliberately unguarded because *"a catch here reduced a real stack to one message
-        // line — it hid the answer the operator ran the verb to get"*. The catch that used to be here did
-        // exactly that to it from one caller out.
+        // Unguarded on purpose: perception_fragment_tester already answers every bad-input case with a
+        // correction (Law 13), and a catch here would reduce a real stack to one message line.
         runPerceptionFragmentTester(args[1]);
         break;
       case 'teleport': {
@@ -500,77 +317,37 @@ bot.on('error', (err) => {
   console.error('❌ Bot Error:', err);
 });
 
-// ── shutdownFlush — THE THREE THINGS A DYING PROCESS OWES THE DISK, IN ONE PLACE ─────────────────
-// Called from `end` (the world connection dropped) and from reportCrash (a signal died outside the
-// judge). Both paths used to carry their own copy of these three calls, each line wrapped in its own
-// `try { … } catch (_) {}` — six silent swallows across two sites, which is Law 16's duplication and
-// Law 13's silence in the same six lines.
-//
-// UNGUARDED, and the ordering cost is accepted deliberately: if `clearMagnet` throws, the two flushes
-// below it do not run. That is the correct trade. A throw here is a defect in our own shutdown path, and
-// the alternative — swallow it and keep going — is a process that appears to have flushed cleanly and
-// did not, which is the failure nobody ever discovers. `durable_write` is what makes a half-finished
-// flush survivable; a `catch (_) {}` is what makes a broken one invisible.
-function shutdownFlush() {
-  require('@thinking/dispatcher.js').clearMagnet();
-  require('@kernel/watcher').flushNow();
-  require('@kernel/corporate_headquarters').flushNow();
-}
+// ── HOW THIS BODY ENDS: `@utils/body_end` OWNS IT ─────────────────────────────────────────────────
+// The disk flush a dying process owes lives in a kernel module, not here, since `foreman_link` needs the
+// same sequence and cannot reach a function defined inside master_core (Law 16). `endBody` flushes and
+// exits; `flushRecord` flushes only, which is what `reportCrash` below wants.
 
 bot.on('end', (reason) => {
-  // Emit a LOUD error first: a disconnect halts the signal loop mid-flight (any in-progress
-  // fragment just stops), which is exactly as serious as a judge-kill and must be as visible.
-  // The foreman websocket is separate from the Minecraft connection, so this still forwards to
-  // the aggregated trace even when the game connection is what dropped — no more silent death
-  // where the last navigator loop appears to run forever with no ❌ (the 'Timed out' case).
-  // The watcher cannot throw out of itself — every catch inside it reports through `_selfFault()` or
-  // rethrows, and preflight proves that separately — so the console fallback that used to sit on this
-  // call was guarding against a case the watcher's own gate already forbids.
+  // A disconnect halts the signal loop mid-flight, as serious as a judge-kill, so it is reported through
+  // watcher.error, not console alone — the foreman websocket is separate from the game connection, so
+  // this still reaches the aggregated trace when the game connection is what dropped.
   require('@kernel/watcher').error('master_core',
     `⛔ Bot disconnected${reason ? ` (${reason})` : ''} — signal loop halted, world connection lost.`);
   console.log(`⚠️ Bot disconnected${reason ? ` (${reason})` : ''}.`);
-  shutdownFlush();
 
-  // ── AND THEN IT ENDS. MEASURED 2026-09-03, and this is the most expensive bug found on the public
-  // server so far (architect_bugsquashing.md round 225).
-  //
-  // Before this, `end` logged, flushed, and RETURNED — leaving the process alive with no world
-  // connection. "Signal loop halted" was true of the loop and false of the process: every in-flight
-  // async continuation kept running, and a disconnected bot was measured burning **33-82% of a CPU
-  // core, indefinitely, doing nothing**. Ten bots were dropped from an eleven-bot fleet and the nine
-  // corpses were consuming more of the machine than the nine living bots ever had.
-  //
-  // THAT IS A CASCADE, not an inconvenience. Bots are dropped because the box is too busy for them to
-  // answer a keep-alive within 30s. A dropped bot that keeps burning a core makes the box BUSIER, which
-  // drops the next one, which burns another core. The failure is self-feeding, and no amount of pacing
-  // the STARTS can win against it — which is exactly what the first-movement scheduler proved when it
-  // paced perfectly and still lost ten of eleven.
-  //
-  // It also closes a second gap (round 223 §5): `bot-start` refuses a bot whose process is alive, so a
-  // disconnected bot could not be relaunched without finding and killing its pid by hand. A bot that
-  // exits is a bot the launcher can simply start again.
-  //
-  // Exit is DEFERRED by a beat so the flushes above actually reach disk - they are the record of how the
-  // bot died, and losing them to a faster exit would trade one invisible failure for another.
-  setTimeout(() => {
-    console.log('⚠️ No world connection — this body is finished. Exiting so it stops costing the machine.');
-    process.exit(0);
-  }, 2000).unref();
+  // A process that only logs and returns on disconnect keeps every async continuation running with no
+  // world connection — a self-feeding cascade, since a dropped bot's idle CPU load helps drop the next
+  // one. Exiting lets the launcher restart it; deferred by a beat so the flushes above reach disk first.
+  require('@utils/body_end').endBody(`no world connection${reason ? ` (${reason})` : ''}`);
 });
 
-// A throw that reaches these process handlers is ALWAYS a coding violation (Law 13):
-// environmental failures soft-fail to recursive_judge and never surface as an uncaught
-// throw. This is the ONLY way a signal ends outside a judge — so it must be as LOUD as a
-// judge-kill. The old handlers logged via console.error (raw local stderr), which the
-// watcher does NOT forward to the foreman — so in the aggregated fleet trace the signal
-// just vanished (only the magnet-clear summary showed) and the bot sat idle looking alive.
-// Route through watcher.error instead: it forwards to the foreman AND dumps the buffered
-// context, so a signal death is always visible and inspectable (Law 5, Law 13).
+// A throw reaching these process handlers is always a coding violation (Law 13): environmental failures
+// soft-fail to recursive_judge and never surface as an uncaught throw. Routed through watcher.error so it
+// forwards to the foreman and dumps buffered context, keeping a signal death visible (Law 5).
 function reportCrash(kind, err) {
   const detail = (err && (err.stack || err.message)) || String(err);
   require('@kernel/watcher').error('master_core',
     `⛔ ${kind} — signal died OUTSIDE the judge (coding violation): ${detail}`);
-  shutdownFlush();
+  // Out of the foreman's gate before the flush: this process stays alive and would otherwise keep its place.
+  require('@kernel/foreman_link').standDown(`${kind.toLowerCase()} outside the judge`);
+  // Flushes without exiting — see `flushRecord`'s header. Registering this handler keeps node alive;
+  // whether the process should end is not decided here.
+  require('@utils/body_end').flushRecord(`${kind.toLowerCase()} outside the judge`);
 }
 
 process.on('uncaughtException', (err)   => reportCrash('Uncaught exception', err));

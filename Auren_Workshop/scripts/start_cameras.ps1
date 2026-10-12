@@ -179,6 +179,19 @@ $node = Get-AurenNode
 # The server folder whose latest.log is read below - the workstation resolver's answer (Law 16).
 $serverDir = & $node (Join-Path $botRoot 'js_kernel\utils\workstation.js') server
 
+# The major version of a java.exe, read from the `release` file the runtime ships beside its bin folder:
+# a file read, so it costs nothing per camera and answers for a runtime this script will not run.
+# Returns $null when the file is absent, and every caller treats that as "do not judge this runtime".
+function Get-JavaMajor([string]$javaExe) {
+    if (-not $javaExe) { return $null }
+    $rel = Join-Path (Split-Path -Parent (Split-Path -Parent $javaExe)) 'release'
+    if (-not (Test-Path -LiteralPath $rel)) { return $null }
+    $line = Get-Content -LiteralPath $rel | Where-Object { $_ -match '^JAVA_VERSION=' } | Select-Object -First 1
+    if (-not $line) { return $null }
+    if ($line -match '(\d+)') { return [int]$Matches[1] }
+    return $null
+}
+
 # Roster in seniority order — Cam_<Bot> windows map 1:1 onto these names.
 $Roster = @(((& $node $fleetControl roster) | Select-Object -Last 1).Trim() -split ',')
 if (-Not $Roster -or $Roster.Count -lt 1 -or $Roster[0] -eq '') {
@@ -463,6 +476,33 @@ foreach ($cam in $CamList) {
                     Write-Host "  $cam : JavaPath stale and no runtime at $reanchored - leaving for Prism to re-detect"
                 }
             }
+        }
+    }
+
+    # ---- JavaPath: NEVER OLDER THAN THE JAVA THE SERVER RUNS ON --------------------------------
+    # This script already pins the camera to the version the SERVER reports, and a Minecraft version
+    # names a minimum Java. Prism's own auto-detected runtime answers a different question - what was
+    # on the machine when the launcher first started - so an instance re-pinned to a newer Minecraft
+    # keeps a runtime that version refuses to start under, and the launch stalls with the game never
+    # reaching its own log - a silent failure, because a camera that never starts writes nothing to read.
+    # The fleet already owns "which java on this machine" (js_kernel/utils/workstation.js, Law 16), and
+    # that is the java the server itself starts under, so it is the floor the client is held to. The
+    # block above stays what it is: it re-roots a moved path and never judges a version.
+    $fleetJava = "$(& $node $workstation java 2>$null)".Trim()
+    if ($fleetJava -and (Test-Path -LiteralPath $fleetJava)) {
+        $instJava = (Get-Content $cfgFile | Where-Object { $_ -match '^JavaPath=' } | Select-Object -First 1) -replace '^JavaPath=', ''
+        $instMajor  = Get-JavaMajor $instJava
+        $fleetMajor = Get-JavaMajor $fleetJava
+        if ($fleetMajor -and $instMajor -and $instMajor -lt $fleetMajor) {
+            $fleetW = Join-Path (Split-Path -Parent $fleetJava) 'javaw.exe'
+            $useJava = if (Test-Path -LiteralPath $fleetW) { $fleetW } else { $fleetJava }
+            Set-InstanceCfgLine $cfgFile 'JavaPath'    ($useJava -replace '\\', '/')
+            Set-InstanceCfgLine $cfgFile 'JavaVersion' "$fleetMajor"
+            # AutomaticJava is the other half of pinning: left on, Prism picks a runtime for itself and
+            # hunts the bundled one the version asks for, so a JavaPath it never reads looks like a fix
+            # that did nothing. Off is what makes the line above the answer.
+            Set-InstanceCfgLine $cfgFile 'AutomaticJava' 'false'
+            Write-Host "  $cam : Java $instMajor is older than the server's Java $fleetMajor - pointed at $useJava"
         }
     }
 

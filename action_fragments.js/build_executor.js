@@ -1,38 +1,25 @@
 // fragment: build_executor
-// purpose: Stationary fractal build system. Preconstruction (separate fragment)
-//          prepares materials before this fragment runs. Per anchor the bot stands
-//          ONCE at anchor.y+1 and digs ALL Y (top-down) then places ALL Y
-//          (bottom-up) from that spot — every voxel of a 5×5×5 cell is within the
-//          4.5 reach radius, so no pillaring/vantage movement is needed. High
-//          corners place via the non-raycast findAttachable path (a "cheat place"),
-//          the same model the mining cell executor uses. Valid on a vanilla server
-//          with no anti-cheat / no LOS enforcement.
-// invariants:
-//  - job_board gates building until ALL materials are available. By the time
-//    this fragment runs, every material needed is in bot inventory.
-//  - Reads building state via building_integrity.scan(bot) (memory-primary, no file).
-//  - All digs complete at an anchor before any placing starts. No interleaving.
-//  - Zero vertical movement at an anchor — stand at anchor.y+1, reach the whole cell.
-//  - Planner/manager makes all decisions. Executor is dumb — just executes the plan.
-//  - portable_judge (strict) routes to recursive_judge on stall — executor exits, recursive_judge kills the signal.
-//  - On exit: cleanup/judge descends, collects drops, dumps excess
-//    inventory (INVENTORY_WHITELIST from job_board), composes capsule.
-//
-// NOTE (Law 19, Machine-Species Authenticity): the bot runs on a self-hosted server
-// that accepts it as a deterministic construct, so it does not pillar to "earn" a
-// human-style vantage point — it stands at the anchor and reaches the whole cell. The
-// only vertical move left is pillaring the bot's OWN footing block (placeOne under-feet),
-// because the anchor/floor must be the correct blueprint block. The old pillaring/vantage
-// machinery for anti-cheat servers was removed (recoverable from git history).
+// purpose: Stationary fractal build system. Preconstruction (separate fragment) prepares
+//          materials before this fragment runs. Per anchor the bot stands ONCE at
+//          anchor.y+1, digs ALL Y (top-down) then places ALL Y (bottom-up) from that spot —
+//          every voxel of a 5×5×5 cell is within the 4.5 reach radius. High corners place
+//          via the non-raycast findAttachable path (a "cheat place"), the same model the
+//          mining cell executor uses. Valid on a vanilla server with no anti-cheat/LOS.
+// invariants: job_board gates building until all materials are staged in inventory; all
+//   digs at an anchor complete before any placing starts; zero vertical movement at an
+//   anchor beyond placeOne under-feet; planner/manager decides, this executor only
+//   executes; portable_judge (strict) routes a stall to recursive_judge; on exit,
+//   cleanup/judge descends, collects drops, dumps excess inventory (INVENTORY_WHITELIST
+//   from job_board) and composes the capsule. (Law 19): stands at the anchor and reaches
+//   the whole cell without pillaring for a vantage point — the one vertical move left
+//   is pillaring its own footing block.
 const Vec3 = require('vec3');
 const watcher = require('@kernel/watcher');
 const locomotion = require('@locomotion/locomotion_dispatcher');
 
 const { group_to_item, groupToReference, normalizeBlockName, BLOCK_REACH, STATION_TYPES, WINDOWLESS_STATIONS } = require('@utils/fragment_utils');
-// Entered through combatCheckpoint, never battleStations directly (Architect 2026-08-08: "remove it
-// from the callers"). One process-wide 500 ms clock, shared with the dig and drive primitives that now
-// carry the same gate, plus the engaging/escaping bypass so combat's own arms cannot re-enter it. The
-// whole reasoning is in its header; a call a primitive already paid for costs nothing here.
+// Entered through combatCheckpoint, never battleStations directly — one process-wide
+// 500ms clock shared with dig/drive, with an engaging/escaping bypass for combat's own arms.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { ensureNoOpenWindow, performDig } = require('@utils/movement/dig_authority');
 const { performPlace } = require('@utils/movement/place_authority');
@@ -44,69 +31,106 @@ const buildingIntegrity = require('@perception/building_integrity');
 const { collectNearby } = require('@api/drop_collector.js');
 const stationRegistry = require('@perception/station_registry');
 const inventorySwapper = require('@api/inventory_swapper');
-const { OPTIONAL_BUILD_MATERIALS } = require('@thinking/architect_config');
+const jobExclusions = require('@thinking/job_exclusions');
 const hq = require('@kernel/corporate_headquarters');
 const portableJudge = require('@kernel/portable_judge');
 const foremanLink = require('@kernel/foreman_link');
-// The stationary dig-all/place-all routine is shared with mining_executor (Law 16 / D3 —
-// one repair primitive under two separate executors). build_executor supplies the
-// build-domain mechanics (group resolution, station registration, pillarStep footing) as
-// callbacks; the primitive owns the anchor control flow (reach gate, corner cheat, retry).
+const blueprintRegistry = require('@kernel/blueprint_registry');
+// The stationary dig-all/place-all routine is shared with mining_executor (Law 16); this
+// file supplies build-domain mechanics as callbacks, the primitive owns anchor control flow.
 const anchoredRepair = require('@api/anchored_repair');
 const { routeToJudge } = require('@utils/signal_utils');
 const { guardExternalSync, withCleanup } = require('@utils/external_library_guard');
 
-const STEP_WAIT_MS = 200;
-// PLACE_MAX_ATTEMPTS — how many times a single place step is retried before it defers/fails.
-// Two failure modes self-heal on retry (Architect): (1) a footing whose FIRST attempt went the
-// normal-place route and timed out — by the next attempt the bot has fallen into the cell, the
-// under-feet re-check fires, and it pillarSteps instead; (2) out_of_range because the bot drifted
-// one block off the anchor — re-anchoring at the top of the retry restores reach. 3 attempts.
+// PLACE_MAX_ATTEMPTS — retries a place step before it defers/fails: covers a footing whose
+// first attempt timed out, and an out-of-range drift that re-anchoring fixes.
 const PLACE_MAX_ATTEMPTS = 3;
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 
-// "IS THIS BLOCK INTERACTABLE" LIVED HERE AND IN anchored_repair AS BYTE-IDENTICAL TWINS, and this copy
-// is gone rather than kept. It had exactly one reader — the sneak decision at the place step — and that
-// decision now belongs to movement/place_authority, which asks anchored_repair's copy. Two identical
-// definitions of one predicate is the Law 16 delete-test failing in the direction nobody checks: both
-// were live, both were right, and a block added to one list would have silently not been in the other.
+// ── WHAT THE BODY CAN SEE AT A CELL THE SERVER JUST REFUSED ──────────────────
+// refusalSurvey and occupantsOf read the world at the moment of a refusal (Invariant B,
+// Law 26): whether the cell is actually empty, an entity's hitbox occupies it, or the
+// support face is wrong. occupantsOf lists every entity whose AABB overlaps the target
+// cell (Law 16). A player AABB is 0.6 wide, 1.8 tall, feet-anchored, so an entity occupies
+// its own cell and the one above; overlap is measured per axis. Returns [] on an
+// unreadable entity list.
+const ENTITY_HALF_WIDTH = 0.3;
+const ENTITY_HEIGHT = 1.8;
+// The entity kinds that stand in a cell and must be waited out. mineflayer names the kind on
+// `entity.type`, and it has changed spelling across versions, so every living spelling is listed
+// and the set is the whole permission — an unknown kind is not waited for.
+const BLOCKING_KINDS = new Set(['player', 'mob', 'hostile', 'animal', 'creature', 'living', 'npc']);
+function occupantsOf(bot, pos) {
+  // bot.entities is this body's own live view; the boardroom's relayed body cells can be
+  // up to a second stale.
+  const ents = guardExternalSync('build_executor', 'cell occupants', () => Object.values(bot.entities || {}));
+  if (!ents.ok) return [];
+  const out = [];
+  for (const e of ents.value) {
+    const p = e?.position;
+    if (!p) continue;
+    // An occupant is something a placement has to wait for, and that is a BODY — a player or a
+    // living mob standing where the next block goes. A dropped item, an arrow or an orb is named
+    // here by omission: the server places the block and pops the item out, so nothing is in the
+    // way, and a thing that cannot walk off never satisfies a wait for it to move.
+    if (!BLOCKING_KINDS.has(String(e.type || '').toLowerCase())) continue;
+    // Cell AABB is [x, x+1) × [y, y+1) × [z, z+1); entity AABB is feet-anchored and half-width wide.
+    if (p.x + ENTITY_HALF_WIDTH <= pos.x || p.x - ENTITY_HALF_WIDTH >= pos.x + 1) continue;
+    if (p.z + ENTITY_HALF_WIDTH <= pos.z || p.z - ENTITY_HALF_WIDTH >= pos.z + 1) continue;
+    if (p.y + ENTITY_HEIGHT <= pos.y || p.y >= pos.y + 1) continue;
+    // Named SELF, not counted as a peer: a body standing in its own target is a footing
+    // fault, not contention.
+    const self = (e.id === bot.entity?.id);
+    out.push({ self, who: self ? 'SELF' : (e.username || e.name || e.displayName || `#${e.id}`), p });
+  }
+  return out;
+}
 
-// THE STATION-WINDOW PROOF MOVED TO station_registry (`openProofWindow`) when craft_handler became a
-// second caller of it. It is the registry that DEMANDS an open window before it will write a row, so the
-// routine that obtains one belongs beside that demand — and one definition means a fix reaches both
-// callers (Law 16). Its whole reasoning, including the two defects it was built from, travelled with it.
-//
-// WHAT STAYS THIS FILE'S: what a FAILURE means here. Preconstruction crafts EXACTLY the required chest
-// count, so wasting one starves the next chest slot — which is why a failed proof throws through
-// registrationCrash below rather than digging and retrying.
+// ── WAIT THE CELL OUT; DO NOT NEGOTIATE FOR IT ───────────────────────────────
+// A refused placement is often a peer standing on the course it just laid, in the cell the
+// next course goes into — usually clear within a second, so this polls for it. Returns the
+// instant the cell is clear, so a queue of crossing bodies resolves as soon as any poll
+// finds it empty. SELF is never waited out — that is a footing fault, not contention.
+const CELL_WAIT_MS = 10000;
+const CELL_POLL_MS = 50;         // one tick
+async function waitForCellClear(bot, pos) {
+  const first = occupantsOf(bot, pos);
+  if (!first.length) return { clear: true, waitedMs: 0 };
+  if (first.some(o => o.self)) return { clear: false, waitedMs: 0, reason: 'self' };
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < CELL_WAIT_MS) {
+    await sleep(CELL_POLL_MS);
+    const now = occupantsOf(bot, pos);
+    if (!now.length) {
+      const waitedMs = Date.now() - startedAt;
+      watcher.summary('build_executor', `cell (${pos.x},${pos.y},${pos.z}) cleared after ${(waitedMs / 1000).toFixed(1)}s `
+        + `— placing; it was held by ${first.map(o => o.who).join(',')}.`);
+      return { clear: true, waitedMs };
+    }
+    if (now.some(o => o.self)) return { clear: false, waitedMs: Date.now() - startedAt, reason: 'self' };
+  }
+  return { clear: false, waitedMs: Date.now() - startedAt, reason: 'timeout' };
+}
 
-// registrationCrash — the Law 13 coding-violation message for a station that placed and confirmed and then
-// could not be registered.
-//
-// A FAILED REGISTRATION IS A CRASH, NOT A RETRY (Architect 2026-08-31): *"upgrade a failed registration as
-// a law 13 coding crash. the bot should immediatley crash and say that it cannot place a chest instead of
-// digging and placing multiple times. it should crash and say as much information as possible."*
-//
-// WHY IT PASSES LAW 13's OWN TEST — "could this happen in a correctly-written system in a normal world?"
-// No. The block is already proven present and correct: it was placed and then re-sensed. Everything
-// registration adds is a fact about the BUILD rather than about the world's mood — the blueprint's
-// geometry, the bot's own stand, the window contract. A world does not intermittently refuse to open a
-// correctly placed container the way it destroys a path or empties a vein. So this is a coding or
-// blueprint-authoring fault, and Law 13's answer to those is to throw at once and name the cause.
-//
-// WHAT IT REPLACES, and why both softer versions were worse. The ORIGINAL dug the block up so the next pass
-// could place it again — an unbounded loop that destroyed correct work, which is what the Architect watched
-// happen to his furnace. The version between them left the station standing and retried registration on a
-// later pass: better, because nothing is destroyed, but it converts a structural fault into a permanent
-// quiet degradation — a furnace standing in a finished build that the fleet reports as not existing,
-// forever, behind one warning line. Default-stopped beats both.
-//
-// THE ONE CONFIRMED CAUSE IS CHECKED BEFORE THE CRASH, on his instruction. In vanilla the only thing that
-// blocks a chest lid is a full solid block in the voxel directly above it, and a correctly authored
-// blueprint never puts one there. The check is scoped to chest and trapped_chest because that is where the
-// rule is VERIFIED — a barrel opens with a block above it and a furnace has no lid at all, so claiming the
-// rule for those would be inventing a cause, which is the exact failure this thread has been about. Every
-// other case reports its facts and says plainly that the cause is not yet known.
+function refusalSurvey(bot, pos) {
+  const parts = [];
+  const here = guardExternalSync('build_executor', 'refusal survey blockAt', () => bot.blockAt(new Vec3(pos.x, pos.y, pos.z)));
+  const below = guardExternalSync('build_executor', 'refusal survey blockAt below', () => bot.blockAt(new Vec3(pos.x, pos.y - 1, pos.z)));
+  parts.push(`cell=${here.ok ? (here.value?.name ?? 'unloaded') : `unreadable:${here.reason}`}`);
+  parts.push(`below=${below.ok ? (below.value?.name ?? 'unloaded') : `unreadable:${below.reason}`}`);
+
+  const overlaps = occupantsOf(bot, pos)
+    .map(o => `${o.who}@(${o.p.x.toFixed(1)},${o.p.y.toFixed(1)},${o.p.z.toFixed(1)})`);
+  parts.push(overlaps.length ? `blocked_by=${overlaps.join(',')}` : 'blocked_by=none');
+  return parts.join(' ');
+}
+
+// registrationCrash — formats the Law 13 crash message for a block placed and re-sensed
+// correct but that could not be registered as a station. Proven present, so the failure is
+// a coding/blueprint fault, not a world condition: stops and names the cause. Preconstruction
+// crafts exactly the needed chest count, so a wasted one starves the next slot. Only the
+// confirmed lid-blocked cause (a solid block above a chest) is checked before the crash;
+// every other case reports measured facts.
 function registrationCrash(bot, pos, block, roomKey, reason, diag) {
   const p = bot?.entity?.position;
   const eye = p ? Math.hypot(pos.x + 0.5 - p.x, pos.y + 0.5 - (p.y + 1.62), pos.z + 0.5 - p.z) : null;
@@ -189,20 +213,11 @@ function resolveDesiredItemName(bot, token) {
   return null;
 }
 
-// resolveAnchorStand — WHERE the bot stands to build one anchor's cell. Default is ON the anchor
-// column (anchor.y+1), reaching the whole 5×5×5 cell. But when that stand cell has no DURABLE footing
-// — the block at (a.x,a.y,a.z) is air, OR a dig step THIS pass removes it (the blueprint wants that
-// cell empty) — standing there makes the bot pillar onto the void and then drop the instant its floor
-// is dug, so goTo-exact re-fires the same target and the portable judge strict-kills it (observed:
-// headframe A2 stall at 204/285, BOTH bots). Per the Architect's directive ("move off the spot to
-// place blocks at the anchor, where it stands so it doesn't drop") — the same principle sidestepFooting
-// already uses for the footing-REPLACE case, now extended to the no-footing anchor case: stand on a
-// solid cardinal NEIGHBOR instead. But only one from which EVERY step is still within reach — the reach
-// envelope shrinks off the anchor (Architect's own note: the 4.5 radius is a circle that narrows a Y
-// level down), so an unchecked sidestep would push a far voxel past BLOCK_REACH and trip the Law-13
-// reach gate. No reach-valid neighbor → keep the on-anchor cell (behavior unchanged; a genuinely
-// unstandable anchor then surfaces as a real stall, not a silently-wrong stance). Reuses the ONE reach
-// metric (anchored_repair.reachFromStand) so this agrees with the primitive's gate and never throws.
+// resolveAnchorStand — where the bot stands to build one anchor's cell. Default is the
+// anchor column (anchor.y+1). When that column has no durable footing (air, or dug this
+// pass), it steps to a solid cardinal neighbor from which every step is still within reach
+// (reuses anchored_repair.reachFromStand). No reach-valid neighbor leaves it on the anchor
+// cell, so an unstandable anchor surfaces as a stall.
 function resolveAnchorStand(bot, a, steps) {
   const onAnchor = { x: a.x, y: a.y + 1, z: a.z };
   const footing = bot.blockAt(new Vec3(a.x, a.y, a.z));
@@ -226,9 +241,8 @@ function resolveAnchorStand(bot, a, steps) {
 }
 
 // Placement geometry (evaluatePlacement / findAttachable / botOccupiesCell) and the
-// enclosed-corner test now live in the shared anchored_repair primitive — one definition
-// used by both executors (Law 16). build_executor keeps only the build-domain place
-// mechanics (placeOne below), which consume the ev the primitive hands them.
+// enclosed-corner test live in the shared anchored_repair primitive (Law 16).
+// build_executor keeps only build-domain place mechanics (placeOne below).
 
 module.exports = {
   receive: watcher.track('build_executor', async (signalType, payload) => {
@@ -237,10 +251,21 @@ module.exports = {
     const bot = global.bot;
     const blueprintName = payload?.blueprint_name || 'headframe';
     const roomKey = payload?.conference_room_key || blueprintName;
+    // ── WHAT THE BOARD SAID THE FLEET CANNOT GET, READ OFF THE JOB ────────────
+    // Reads job_board's excluded-materials list via job_exclusions; decides nothing about it.
+    // Absent means exclude nothing — a job with no field places every voxel.
+    const excluded = payload?.excluded || null;
+    const isExcluded = (type) => jobExclusions.excludes(excluded, type);
+    // Announces only what it actually skips, one line per skipped cell (below).
 
     // ── One-time setup (outside the loops) ──────────────────────────────
 
-    // Mutable — updated each setup iteration, read by helpers via closure
+    // ── IS THIS A PLAN EVERY BODY MAY BUILD AT ONCE? ────────────────────────
+    // Read off the blueprint's own label (Law 16). False leaves one-builder-per-anchor
+    // unchanged.
+    const pledgedPlan = blueprintRegistry.isPledgeApproved(blueprintName);
+
+    // Mutable, read by helpers via closure.
     let allSteps = [];
 
     // ── Helper functions ────────────────────────────────────────────────
@@ -252,68 +277,34 @@ module.exports = {
       return performDig(bot, pos, block, 'build_executor');
     }
 
-    // registerStandingStation — open a station that is STANDING in its blueprint cell and write it to the
-    // registry. **Returns only on success. A failure THROWS** (Law 13, and see registrationCrash for why a
-    // registration failure is a coding violation rather than a world condition). Nothing is ever broken to
-    // recover from one.
-    //
-    // ONE REGISTRATION ROUTE, TWO MOMENTS. It used to run only in the tail of a successful placement, so
-    // registration had exactly one chance: the pass that put the block down. Every later pass sees the
-    // correct block and returns 'already' before reaching any registration code, so a station that missed
-    // its one chance was never registered again — a furnace standing in a finished build while the fleet
-    // reported `NO furnace stands`. It is called from both moments now.
-    //
-    // THE SECOND MOMENT STILL EARNS ITS PLACE even though a failure now stops the run instead of waiting
-    // for a retry: a station can stand UNREGISTERED with nothing wrong at all — a continue run whose HQ was
-    // flushed meets a world full of correct stations and an empty registry. That is the case this path
-    // serves. It is not a retry of a failure; a failure no longer survives to be retried.
-    //
-    // GATED ON "NOT ALREADY REGISTERED" so the already-correct path does not open every station on every
-    // pass: an open/close is seconds of a build pass, and the registry answering yes is the whole question.
+    // registerStandingStation — opens a station standing in its blueprint cell and writes it
+    // to the registry. Returns only on success; a failure THROWS (Law 13 — registrationCrash).
+    // Also called on an already-correct-but-unregistered block; gated on "not registered".
     async function registerStandingStation(pos, block) {
-      // A windowless station (composter) is placed and then LEFT ALONE. It is a station in every
-      // other sense — never dug by movement, PROTECTED_VOXEL_DETOUR_BUDGET to path through — but it has no
-      // lid, so the registration path below would poll for a window, find none, read that as a
-      // mis-placement and dig up a correct block. It needs no registry entry either: its state is a public
-      // blockstate its executor reads off the world (fragment_utils' WINDOWLESS_STATIONS carries it).
+      // A windowless station (composter) is placed and left alone — no lid to poll for, so
+      // its state is a public blockstate read off the world (WINDOWLESS_STATIONS) instead.
       if (WINDOWLESS_STATIONS.has(block.name)) {
         watcher.buffer.record('build_executor', `Windowless station: ${block.name} at (${pos.x},${pos.y},${pos.z}) — no registration (its blockstate is its record).`);
         return true;
       }
       if (stationRegistry.getStations()[stationRegistry.stationKey(pos)]) return true;
 
-      // NO GUARD ON THE REGISTRATION. Every call below is ours — openProofWindow guards its own
-      // boundary, and the registry reports its verdict in `result.ok` — so the catch that stood here
-      // could only fire on a defect, and it dug up a correctly-placed station on one. That is the
-      // expensive direction: preconstruction crafts exactly the required chest count, so a wrongly
-      // dug chest starves the next slot (Law 13; Law 25 — result.ok is the measurement, a throw is not).
-      //
-      // Re-sense the window (Invariant B) instead of trusting one 250ms read — a lagging
-      // lid must not be mistaken for no_window and cost a correctly-placed, scarce chest.
+      // Unguarded: openProofWindow guards its own boundary and result.ok is the verdict, so a
+      // catch here could only mask a defect (Law 13; Law 25). Re-sensed to catch a lagging
+      // lid that a single 250ms read would misreport as no_window.
       const diag = {};
       const win = await stationRegistry.openProofWindow(bot, block, diag);
       if (win) diag.window_type = win.type || 'unknown';
 
-      // THE SEPARATE CHEST-LID THROW THAT STOOD HERE IS GONE, folded into the one crash below. It fired
-      // only for a chest with a solid block above it and every other failure fell through to a dig; now
-      // every failure throws and that check is the crash's leading DIAGNOSIS rather than a second exit.
-      // One failure, one exit, one message — the lid case simply arrives with its cause already named.
-
-      // NO ROLE IS ASSIGNED, because a chest has none. The `determineChestRole` call that stood
-      // here stamped each chest 'requester' or 'buffer' from a table of chest numbers; both the
-      // call and the table are deleted. A request is a fleet-wide figure filled from any chest and
-      // surplus is dumped into any chest, so what a chest is FOR is decided by what is asked of the
-      // pool, never by a tag written at the moment a block went down.
+      // No role is assigned to a chest — what it's for is decided by pool demand (any
+      // request fills from any chest), never a tag written at placement time.
       const result = stationRegistry.registerStation(pos, block.name, win, roomKey);
       watcher.buffer.record('build_executor', `Station registered: ${block.name} at (${pos.x},${pos.y},${pos.z}) → ${result.ok ? 'ok' : result.reason} id=${result.id || 'n/a'}`);
       if (win) { guardExternalSync('build_executor', 'closeWindow after registration', () => bot.closeWindow(win)); await sleep(100); }
       if (bot.currentWindow) await ensureNoOpenWindow(bot, 'post-register');
 
-      // THE ONLY EXIT FOR A FAILURE IS A THROW. The block is proven present and correct — placed, then
-      // re-sensed by the caller — so a registration that still fails is a fault in the build rather than a
-      // mood of the world, and Law 13 answers those by stopping and naming the cause. registrationCrash
-      // carries the whole argument and the measurements; the window is closed above so the body is not
-      // left holding one open on the way out.
+      // A registration failure only ever throws (Law 13) — the block is proven present, so
+      // the fault is in the build, not the world. The window is already closed above.
       if (!result.ok) throw new Error(registrationCrash(bot, pos, block, roomKey, result.reason, diag));
       return true;
     }
@@ -323,19 +314,16 @@ module.exports = {
       const desiredToken = normalizeBlockName(step.type);
       const current = bot.blockAt(pos);
 
-      // A CORRECT CELL IS STILL ASKED WHETHER ITS STATION IS ON THE BOOKS. Both 'already' returns below
-      // are the retry moment described on registerStandingStation: the block is right, and the only thing
-      // that may still be missing is the registry entry a previous pass could not reach.
+      // A correct cell is still asked whether its station is registered — the block is
+      // right, only the registry entry might still be missing.
       if (group_to_item && group_to_item[desiredToken] && current && expandGroup(desiredToken).includes(current.name)) {
         if (STATION_TYPES.has(current.name)) await registerStandingStation(pos, current);
         return 'already';
       }
 
-      // Under-feet placement: the blueprint block IS the bot's own footing, so the
-      // bot must place it under itself by pillaring up onto the correct block (the
-      // anchor/floor must be the right block, not whatever it happened to stand on).
-      // pillarStep takes candidateItemNames so it places the BLUEPRINT block, not a
-      // generic filler. This is the one place stationary build still moves vertically.
+      // Under-feet placement: the blueprint block is the bot's own footing, so it places
+      // itself by pillaring onto the correct block (pillarStep, via candidateItemNames) — the
+      // one place stationary build still moves vertically.
       if (ev.underFeet) {
         if (STATION_TYPES.has(desiredToken)) {
           watcher.warn('build_executor', `Station type ${desiredToken} at anchor X,Z — cannot pillarStep onto a station. Skipping.`);
@@ -366,7 +354,13 @@ module.exports = {
 
       const desiredName = resolveDesiredItemName(bot, desiredToken);
       if (!desiredName) {
-        if (OPTIONAL_BUILD_MATERIALS.has(desiredToken)) return 'skipped';
+        // Names the specific skipped cell (dispatch names only the set). Warn, not summary —
+        // nothing failed; the fleet returns once the board stops excluding the material.
+        if (isExcluded(desiredToken)) {
+          watcher.buffer.record('build_executor',
+            `⤳ skipped ${desiredToken} at (${pos.x},${pos.y},${pos.z}) — ${jobExclusions.why(excluded, desiredToken)}`);
+          return 'skipped';
+        }
         watcher.warn('build_executor', `Missing '${desiredToken}' at (${pos.x},${pos.y},${pos.z}) — not in inventory (materials gate should have prevented this)`);
         return false;
       }
@@ -383,32 +377,33 @@ module.exports = {
         if (!cleared) watcher.warn('build_executor', `Pre-clear dig failed at (${pos.x},${pos.y},${pos.z})`);
       }
 
-      // Equip (window-close included), the spawn-protection gate, the combat checkpoint, the sneak
-      // decision and its guaranteed release, the face-centre aim, the click and the settle all live in
-      // the one place route (Law 16). The sneak rule this file ORIGINATED — sneak when the anchor is
-      // interactable, so a click on a chest places against it instead of opening it — is the authority's
-      // 'auto' default, so nothing is passed for it here.
-      // A voxel that names its block state is placed by the facing route, which picks its own clicked face,
-      // cursor and reported rotation from where the body stands (place_authority, opts.state).
+      // Equip, the spawn-protection gate, combat checkpoint, sneak decision and release,
+      // face-centre aim, click and settle all live in the one place route (Law 16),
+      // including the sneak-when-interactable rule (that authority's 'auto' default). The
+      // cell is waited out before the click, not diagnosed after refusal — a peer's
+      // one-second occupancy is indistinguishable from a real fault otherwise (Law 25).
+      const held = await waitForCellClear(bot, pos);
+      if (!held.clear) {
+        watcher.warn('build_executor', `cell (${pos.x},${pos.y},${pos.z}) still occupied after `
+          + `${(held.waitedMs / 1000).toFixed(1)}s (${held.reason}) — ${refusalSurvey(bot, pos)}`);
+        return false;
+      }
       const place = await performPlace(bot, pos, ev.anchor, ev.face, desiredName, 'build_executor', step.state ? { state: step.state } : {});
       if (place.state && place.ok && !place.state.ok) {
         watcher.warn('build_executor', `wrong state at (${pos.x},${pos.y},${pos.z}) ${desiredName}: wanted ${JSON.stringify(place.state.wanted)} got ${JSON.stringify(place.state.got)} [${place.aim}]`);
       }
       if (!place.ok) {
         const bp = bot.entity.position;
-        watcher.warn('build_executor', `place refused at (${pos.x},${pos.y},${pos.z}) — ${place.reason} | bot at (${bp.x.toFixed(1)},${bp.y.toFixed(1)},${bp.z.toFixed(1)}) dist=${dist3({x:pos.x+0.5,y:pos.y+0.5,z:pos.z+0.5},{x:bp.x,y:bp.y,z:bp.z}).toFixed(1)} anchor=${ev.anchor.name}@(${ev.anchor.position.x},${ev.anchor.position.y},${ev.anchor.position.z})`);
+        watcher.warn('build_executor', `place refused at (${pos.x},${pos.y},${pos.z}) — ${place.reason} | bot at (${bp.x.toFixed(1)},${bp.y.toFixed(1)},${bp.z.toFixed(1)}) dist=${dist3({x:pos.x+0.5,y:pos.y+0.5,z:pos.z+0.5},{x:bp.x,y:bp.y,z:bp.z}).toFixed(1)} anchor=${ev.anchor.name}@(${ev.anchor.position.x},${ev.anchor.position.y},${ev.anchor.position.z}) | ${refusalSurvey(bot, pos)}`);
         return false;
       }
 
-      // A PLACEMENT MAY LEAVE A WINDOW OPEN, and the NEXT verb's equip is what pays for it. Kept in this
-      // executor rather than pushed into the authority because it is a property of what THIS one places:
-      // it is the only caller that lays chests, furnaces and barrels, whose click can still open a UI.
+      // A placement may leave a window open (chests/furnaces/barrels open a UI on click);
+      // closed here, specific to what this places, not in the shared authority.
       if (bot.currentWindow) await ensureNoOpenWindow(bot, 'post-place');
 
-      // The registry entry is the same question asked of an already-correct cell, at the other moment,
-      // so it goes through the one route that answers it (Law 16). It either registers or THROWS — there
-      // is no false verdict to branch on any more, and nothing is dug up over one. The dig that used to
-      // stand on this branch is what destroyed a correct furnace over and over.
+      // Same registration question as an already-correct cell (Law 16) — registers or
+      // throws; nothing is ever dug up on a registration failure.
       if (STATION_TYPES.has(place.after.name)) {
         await registerStandingStation(pos, place.after);
       }
@@ -425,32 +420,100 @@ module.exports = {
     let lastAnchorIndex = -1;
     let prevCorrect = -1;
 
-    // Per-anchor stuck tracker. An anchor whose whole-cell pass
-    // (dig-all + place-all) makes zero progress is genuinely blocked this run
-    // (missing reference, occupied position) — skip it so the selector moves on
-    // and the build exits cleanly to cleanup + fresh dispatch (Law 12).
+    // Per-anchor stuck tracker: zero progress on a whole-cell pass means it's genuinely
+    // blocked this run — skip it so the build exits cleanly to cleanup (Law 12).
     const anchorStuck = new Set();
 
-    // Object lock currently held on an anchor (multi-bot). One at a time —
-    // the executor works one anchor at a time; released on switch and on exit.
+    // Object lock on the anchor being worked; one at a time, released on switch/exit.
     let heldAnchorClaimKey = null;
 
+    // ── THE CELLS THIS BODY HOLDS RIGHT NOW, ON A PLEDGE-APPROVED PLAN ──────────────────────────────
+    // The anchor lock's replacement, one level down — cleared and re-taken each pass.
+    let heldCellKeys = [];
+    const releaseHeldCells = () => {
+      for (const k of heldCellKeys) foremanLink.releaseClaim(k);
+      heldCellKeys = [];
+    };
+
+    // ── ONE PLEDGE IS ONE CELL, A FLOOR NOT A CEILING ──────
+    // Claims as many cells as the pocket can pay for, in order (buildingIntegrity.placeableNow:
+    // lowest course first, plan order within a course); two bodies arriving together reach
+    // for adjacent cells, and the loser moves one down the list. Digs are claimed with their
+    // cell. A body that can pay for nothing claims nothing (Law 25 — pool and pocket differ).
+    //
+    // The cell under the stand is swapped from a neighbour on the same level (anchored_repair's
+    // sidestep), so it is claimable only while one stands: the pocket's blocks go to the cells beside
+    // it first, and the swap follows on a later pass.
+    async function claimCellsInOrder(steps, stand) {
+      const footingKey = `${stand.x},${stand.y - 1},${stand.z}`;
+      const sidestep = anchoredRepair.findStandableNeighbor(bot, stand);
+      const footingSwappable = !!sidestep && sidestep.dy === 0;
+      const digs   = steps.filter(s => s.action === 'dig');
+      const places = buildingIntegrity.placeableNow(steps);
+      const byCell = new Map();          // 'x,y,z' → every step at that position
+      for (const s of steps) {
+        const k = `${s.place.x},${s.place.y},${s.place.z}`;
+        if (!byCell.has(k)) byCell.set(k, []);
+        byCell.get(k).push(s);
+      }
+      const order = [];
+      const seen = new Set();
+      for (const s of [...digs, ...places]) {
+        const k = `${s.place.x},${s.place.y},${s.place.z}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        order.push(k);
+      }
+
+      // What the pocket can pay for, spent down as cells are allocated. A dig costs nothing.
+      const spent = {};
+      const affordable = (cellSteps) => cellSteps.every(s => {
+        if (s.action !== 'place') return true;
+        const held = resolveDesiredItemName(bot, s.type);
+        if (!held) return false;
+        const have = bot.inventory.items().filter(i => i.name === held).reduce((n, i) => n + i.count, 0);
+        return have - (spent[held] || 0) > 0;
+      });
+      const charge = (cellSteps) => {
+        for (const s of cellSteps) {
+          if (s.action !== 'place') continue;
+          const held = resolveDesiredItemName(bot, s.type);
+          if (held) spent[held] = (spent[held] || 0) + 1;
+        }
+      };
+
+      const taken = [];
+      let peerHeld = 0, unpayable = 0, digCells = 0, footingWaits = 0;
+      for (const key of order) {
+        const cellSteps = byCell.get(key);
+        if (key === footingKey && !footingSwappable) { footingWaits++; continue; }
+        // One dig per pass: the board seats one body per dig, so a body pledging every free dig would
+        // empty the seats its peers were sent for.
+        const isDig = cellSteps.some(s => s.action === 'dig');
+        if (isDig && digCells >= 1) continue;
+        if (!affordable(cellSteps)) { unpayable++; continue; }   // never claim what this pocket cannot place
+        // Unguarded, exactly as the anchor claim below is: the claim is ours and answers in `granted`.
+        const claim = await foremanLink.requestClaim(`cell:${blueprintName}@${key}`);
+        if (!claim.granted) { peerHeld++; continue; }
+        heldCellKeys.push(`cell:${blueprintName}@${key}`);
+        taken.push(...cellSteps);
+        charge(cellSteps);
+        if (isDig) digCells++;
+      }
+      return { steps: taken, cells: heldCellKeys.length, peerHeld, unpayable, footingWaits, offered: order.length };
+    }
+
     // ═══════════════════════════════════════════════════════════════════
-    // LOOP 3: CLEANUP/JUDGE
-    // Runs after the planner/executor loop exits. Three phases:
+    // LOOP 3: CLEANUP/JUDGE — runs after the planner/executor loop exits.
     //   1. Descend to anchor stand level
     //   2. Collect nearby drops
-    //   3. Clearing pass — re-scan integrity, dig ANY incorrect block
-    //      within reach regardless of scaffold classification. Catches
-    //      Y-adjust pillar debris AND navigator pillar blocks placed
-    //      during drop collection. No movement, no drop collection —
-    //      just clear and exit.
+    //   3. Clearing pass — re-scan integrity, dig any incorrect block within reach regardless
+    //      of scaffold classification, no movement or further drop collection.
     // ═══════════════════════════════════════════════════════════════════
     async function cleanup() {
-      // Phase 1: descend to anchor stand level. Locomotion owns HOW — an exact-goTo lands the feet on
-      // the stand, digging straight down (hardened dig_down, no fall) if the bot is above it. One
-      // descent authority every caller inherits (Law 16; Architect 2026-07-14 — replaced the build-local
-      // tryControlledDescent hack so strengthening locomotion strengthens this too).
+      // Phase 1: descend to anchor stand level. Locomotion owns how — an exact-goTo lands
+      // the feet on the stand, digging straight down (hardened dig_down, no fall) if above
+      // it. One descent authority every caller inherits (Law 16).
       if (lastAnchorIndex >= 0) {
         const worldAnchors = buildingIntegrity.getWorldAnchors(blueprintName, roomKey);
         if (worldAnchors[lastAnchorIndex]) {
@@ -469,11 +532,10 @@ module.exports = {
       // collection. Just clear from current position within reach.
       let clearCount = 0;
       let clearSkipped = 0;
-      // NO GUARD ON AN INTEGRITY SCAN, HERE OR ANYWHERE BELOW IN THIS FILE. The node is ours and absorbs
-      // its own environmental failure, so a throw escaping it is a defect. Catching it left clearCount at
-      // its declared 0 and the pass reported "nothing to clear" — a measurement nobody took, with the
-      // blueprint's air voxels still full of blocks (Law 13; Law 25 — a default is not a measurement).
-      const integrity = buildingIntegrity.scan(bot, blueprintName, roomKey);
+      // Unguarded, here and everywhere below: the integrity scan absorbs its own
+      // environmental failure, so a throw escaping it is a defect, not a condition to catch
+      // and default around (Law 13; Law 25 — a default is not a measurement).
+      const integrity = await buildingIntegrity.scan(bot, blueprintName, roomKey);
       if (integrity && Array.isArray(integrity.steps) && integrity.steps.length > 0) {
         const digSteps = integrity.steps.filter(s => s.action === 'dig');
         for (const step of digSteps) {
@@ -499,19 +561,15 @@ module.exports = {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STATIONARY BUILD — planner + executor for the no-pillar model. Per anchor:
-    // stand once at anchor.y+1, dig ALL Y (top-down), then place ALL Y (bottom-up)
-    // — every voxel is within the 4.5 reach radius of a 5×5×5 cell, and placement
-    // uses the non-raycast findAttachable path, so high corners place from the
-    // ground. No pillaring, no scaffold, no Y-adjust.
+    // STATIONARY BUILD — planner + executor for the no-pillar model (see file header).
     // ═══════════════════════════════════════════════════════════════════
 
     async function setupStationary() {
       const worldAnchors = buildingIntegrity.getWorldAnchors(blueprintName, roomKey);
 
-      // Unguarded (see the clearing pass above). This one answered `done: true` on a throw — the build
-      // declared FINISHED because the instrument that measures finishedness broke (Law 25).
-      const integrity = buildingIntegrity.scan(bot, blueprintName, roomKey);
+      // Unguarded (see the clearing pass above) — a caught throw here would read as `done:
+      // true`, declaring the build finished because the measuring instrument broke (Law 25).
+      const integrity = await buildingIntegrity.scan(bot, blueprintName, roomKey);
 
       lastBuildingName = integrity?.building_name || lastBuildingName;
       if (integrity?.all_complete || !Array.isArray(integrity?.steps) || integrity.steps.length === 0) {
@@ -534,20 +592,14 @@ module.exports = {
         if (ai < 0 || ai >= worldAnchors.length) continue;
         anchorSteps[ai].push(step);
       }
-      // Stand ON the anchor by default, but step OFF to a reach-valid neighbor when the anchor
-      // column has no durable footing (see resolveAnchorStand) — needs anchorSteps to know which
-      // cells get dug this pass, so it is computed here, not before the grouping.
+      // Stand on the anchor by default, stepping off to a reach-valid neighbor when the
+      // column has no durable footing (see resolveAnchorStand); needs anchorSteps to know
+      // what's dug this pass, so it is computed here, after the grouping.
       const standPositions = worldAnchors.map((a, i) => resolveAnchorStand(bot, a, anchorSteps[i]));
-      // An anchor owes REQUIRED structural work (anything not an optional decoration) or only
-      // OPTIONAL steps (torches). Required work always keeps an anchor selectable. Optional-only
-      // anchors are DEFERRED — but not forever: a torch's support may be a wall a DIFFERENT anchor
-      // still has to place, so it can only be lit once the whole shell stands. So "fix/build first,
-      // decorate last" — an optional-only anchor becomes actionable again the moment NO anchor
-      // anywhere still owes a required block, and its deferred torches get placed then (Architect,
-      // 2026-07-04: earlier sections were never lit because an optional-only anchor was treated as
-      // permanently done). A torch still unplaceable after the shell is up defers → identical pass →
-      // portable_judge escalates (bounded, surfaced), never a silent forever-skip.
-      const anchorHasRequired = (ai) => anchorSteps[ai].some(s => !OPTIONAL_BUILD_MATERIALS.has(normalizeBlockName(s.type)));
+      // An anchor owing only optional steps (torches) is deferred, not done — its support
+      // may be a wall a different anchor still owes, so it lights only once no anchor
+      // anywhere still owes required work: structure completes before decoration.
+      const anchorHasRequired = (ai) => anchorSteps[ai].some(s => !isExcluded(normalizeBlockName(s.type)));
       const anchorHasDig = (ai) => anchorSteps[ai].some(s => s.action === 'dig');
       const anyRequiredStructureLeft = () => worldAnchors.some((_, i) => !anchorStuck.has(i) && anchorHasRequired(i));
       const anchorActionable = (ai) => {
@@ -555,21 +607,17 @@ module.exports = {
         if (anchorHasRequired(ai)) return true;          // structural work — always selectable
         return !anyRequiredStructureLeft();              // optional-only (torches) — only once the shell is done
       };
-      // Fix-first (Architect, 2026-07-04): among actionable anchors, one carrying a DIG (a repair/
-      // mismatch clear) outranks a place-only one — repairs go before fresh placement. Used on a
-      // fresh selection only; an in-progress anchor still finishes before the next is picked (no
-      // mid-anchor thrashing).
+      // Fix-first: among actionable anchors, one carrying a dig (repair/mismatch clear)
+      // outranks a place-only one. Used only on a fresh selection — an in-progress anchor
+      // finishes before the next is picked.
       const findActionable = () => {
         const withDig = worldAnchors.findIndex((_, i) => anchorActionable(i) && anchorHasDig(i));
         return withDig >= 0 ? withDig : worldAnchors.findIndex((_, i) => anchorActionable(i));
       };
 
-      // Anchor selection. When the job claimed a specific anchor (per-anchor gating),
-      // build ONLY that one — the gate/preconstruction staged just its materials, so
-      // running ahead into an unprepped anchor would stall. When the claimed anchor is
-      // done this pass exits to cleanup and recursive_judge re-dispatches the next
-      // anchor (separately gated). No claim (legacy/whole-build) → stay on the current
-      // anchor while it has work, else the first actionable one.
+      // Anchor selection: a claimed anchor (per-anchor gating) builds only that one, since
+      // only its materials were staged. No claim → stay on the current anchor while it has
+      // work, else pick the first actionable one.
       const claimedAnchor = (payload && payload.anchor_index != null) ? payload.anchor_index : null;
       let chosen = -1;
       if (claimedAnchor != null) {
@@ -580,21 +628,16 @@ module.exports = {
         chosen = findActionable();
       }
 
-      // Object lock (arbiter flavor a — physical exclusivity, taxonomy in
-      // foreman_brain.js): the anchor is the claimed object — no other bot may
-      // build it while held (lock the object, not the bot). Chosen at execution
-      // time, so the planning token can't cover it. A peer-held anchor is treated
-      // like a stuck one: skip it and select another. In per-anchor-gated mode
-      // there is no "another" (materials were staged for exactly this anchor),
-      // so a peer hold exits to cleanup for a fresh dispatch instead.
-      while (chosen >= 0) {
+      // Object lock (arbiter flavor a — physical exclusivity, foreman_brain.js): a peer-held
+      // anchor is skipped like a stuck one. A pledge-approved plan takes no anchor lock —
+      // exclusivity moves to the cell instead (claimCellsInOrder).
+      while (!pledgedPlan && chosen >= 0) {
         const a = worldAnchors[chosen];
         const claimKey = `anchor:${blueprintName}:${chosen}@${a.x},${a.y},${a.z}`;
         if (heldAnchorClaimKey === claimKey) break;
 
-        // Unguarded: the claim is ours and answers in `granted`. The catch that stood here turned a
-        // defect into `granted: false`, which reads as "a peer holds this anchor" — so the bot walked
-        // away from an anchor nobody held, marked it stuck, and did that for every anchor in turn.
+        // Unguarded: the claim answers in `granted`. A catch here would turn a defect into
+        // `granted: false`, misread as "a peer holds this anchor".
         const claim = await foremanLink.requestClaim(claimKey);
         if (claim.granted) {
           if (heldAnchorClaimKey) foremanLink.releaseClaim(heldAnchorClaimKey);
@@ -610,11 +653,8 @@ module.exports = {
       if (chosen < 0) {
         const totalRemaining = anchorSteps.reduce((sum, s) => sum + s.length, 0);
         if (totalRemaining > 0) {
-          // Diagnostic (Law 6): blocked_remainder loops when job_board keeps dispatching an anchor
-          // build_executor treats as done. Dump per-anchor why: claimed anchor, and for each anchor
-          // with steps left — dig/place counts, sample positions+reason, whether it has a REQUIRED
-          // (non-optional) step, and if it's stuck/peer-held. Shows exactly which anchor's residual
-          // keeps the build incomplete and why this pass won't touch it.
+          // Diagnostic (Law 6): per-anchor breakdown of why nothing is actionable — counts,
+          // sample positions+reasons, required-step and stuck/peer-held state.
           const breakdown = anchorSteps.map((steps, ai) => {
             if (!steps.length) return null;
             const digs = steps.filter(s => s.action === 'dig');
@@ -629,24 +669,20 @@ module.exports = {
         return { done: true, reason: 'all_complete', remaining: 0 };
       }
 
-      // Move to the anchor stand position. goTo handles horizontal travel and
-      // descent between cells; there is no pillar-up — the bot never leaves
-      // ground/stand level.
+      // Move to the anchor stand position — goTo handles horizontal travel and descent
+      // between cells; there is no pillar-up.
       const stand = standPositions[chosen];
       let feet = bot.entity.position.floored();
       const hDist = Math.sqrt((feet.x - stand.x) ** 2 + (feet.z - stand.z) ** 2);
       if (hDist > 1.5 || Math.abs(feet.y - stand.y) > 1) {
-        await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z });
+        await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z, leg: 'work' });
         feet = bot.entity.position.floored();
       }
-      // Stranded ABOVE the stand (feet directly over it): a self-excavated floor (a build that digs its
-      // own sunken floor) leaves the anchor approach as a pit, so the horizontal goTo above finds no walkable edge DOWN.
-      // Locomotion owns the descent — an exact-goTo digs straight down onto the stand (hardened
-      // dig_down, no fall), landing feet === stand so repairAtAnchor's exact-goTo is a no-op. One
-      // authority, no build-local descent primitive (Architect 2026-07-14). Fires only when directly
-      // above the stand column; normal flat builds (feet already at stand.y) are untouched.
+      // Stranded above the stand (feet directly over it): a self-excavated sunken floor
+      // leaves no walkable edge down, so Locomotion's exact-goTo digs straight down onto the
+      // stand instead (hardened dig_down, no fall). Only fires directly above the stand column.
       if (feet.x === stand.x && feet.z === stand.z && feet.y > stand.y) {
-        await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z, exact: true });
+        await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z, exact: true, leg: 'work' });
         if (Math.floor(bot.entity.position.y) > stand.y) {
           watcher.warn('build_executor', `A${chosen} stand (${stand.x},${stand.y},${stand.z}) still unreached from above — bot at y=${Math.floor(bot.entity.position.y)}; anchor will surface as a real stall if it cannot build from here.`);
         }
@@ -654,19 +690,46 @@ module.exports = {
       await microCenter(bot);
       lastAnchorIndex = chosen;
 
-      const digCount = anchorSteps[chosen].filter(s => s.action === 'dig').length;
-      const placeCount = anchorSteps[chosen].filter(s => s.action === 'place').length;
-      watcher.summary('build_executor', `📥 ${integrity.building_name} ${integrity.stats?.correct || '?'}/${integrity.stats?.expected || '?'} | A${chosen} stationary (dig ${digCount}, place ${placeCount})`);
+      // The pledge is taken after the walk: claiming a cell from across the site would deny
+      // it to a peer standing beside it for however long this body takes to arrive.
+      let mySteps = anchorSteps[chosen];
+      if (pledgedPlan) {
+        releaseHeldCells();
+        const pledge = await claimCellsInOrder(anchorSteps[chosen], stand);
+        mySteps = pledge.steps;
+        if (mySteps.length === 0) {
+          // Nothing here for this body, and not a fault: every cell held means the structure
+          // is fully crewed; nothing payable means the material is what to go get. Either way
+          // this exits clean — recursive_judge replans, no strike recorded. The reason string
+          // carries a census (placeable/peer/unpaid) so repeated empty passes on a moving
+          // site don't read as an identical stall (Law 25).
+          const why = pledge.unpayable > 0 && pledge.peerHeld === 0 ? 'no_payable_cell'
+            : pledge.peerHeld > 0 ? 'cells_held_by_peers' : 'footing_waits_for_a_neighbour';
+          const census = `${why}(placeable=${pledge.offered},peer=${pledge.peerHeld},unpaid=${pledge.unpayable},footing_waits=${pledge.footingWaits})`;
+          watcher.summary('build_executor', `A${chosen} pledged: 0 of ${pledge.offered} cell(s) — `
+            + `${pledge.peerHeld} held by peers, ${pledge.unpayable} unaffordable, ${pledge.footingWaits} footing waiting for a neighbour → ${why}`);
+          return { done: true, reason: census, remaining: anchorSteps[chosen].length };
+        }
+        watcher.summary('build_executor', `A${chosen} pledged ${pledge.cells} cell(s) of ${pledge.offered} placeable (${pledge.peerHeld} held by peers)`);
+      }
 
-      return { done: false, job: { anchorIndex: chosen, anchor: worldAnchors[chosen], stand, steps: anchorSteps[chosen] }, integrity };
+      const digCount = mySteps.filter(s => s.action === 'dig').length;
+      const placeCount = mySteps.filter(s => s.action === 'place').length;
+      // ── PROGRESS IS WHAT THE FLEET STOOD UP, NOT WHAT THE GROUND ALREADY GAVE ────────────────────
+      // stats.correct/expected counts a no-action-needed voxel as correct, so it counts open
+      // air and untouched soil as built. integrity.progress is building_integrity's own split
+      // and is the only figure here that moves when a bot actually places something.
+      const p = integrity.progress;
+      const placedOf = p ? `${p.structPlaced}/${p.structTotal} placed (${p.noWorkCells} no-work)` : '?/?';
+      watcher.summary('build_executor', `📥 ${integrity.building_name} ${placedOf} | A${chosen} stationary (dig ${digCount}, place ${placeCount})`);
+
+      return { done: false, job: { anchorIndex: chosen, anchor: worldAnchors[chosen], stand, steps: mySteps }, integrity };
     }
 
-    // innerBuildStationary — one anchor's whole-cell pass, delegated to the SHARED anchored
-    // repair primitive (Law 16 / D3). The primitive owns the control flow (stand, dig-all
-    // top-down, place-all bottom-up, reach gate, corner cheat, per-step retry, tally). This
-    // wrapper injects build_executor's domain mechanics: digOne (plain performDig), placeOne
-    // (group resolution + station registration + pillarStep footing), item resolution via
-    // resolveDesiredItemName, and the OPTIONAL_BUILD_MATERIALS defer policy.
+    // innerBuildStationary — one anchor's whole-cell pass, delegated to the shared
+    // anchored_repair primitive (Law 16), which owns control flow (stand, dig-all top-down,
+    // place-all bottom-up, reach gate, corner cheat, retry, tally). This wrapper injects
+    // build_executor's domain mechanics — digOne, placeOne, item resolution, exclusion defer.
     async function innerBuildStationary(job) {
       const outcome = await anchoredRepair.repairAtAnchor(bot, {
         stand: job.stand,
@@ -676,13 +739,12 @@ module.exports = {
         digOne,
         placeOne,
         resolveItem: (type) => resolveDesiredItemName(bot, type),
-        isOptional: (type) => OPTIONAL_BUILD_MATERIALS.has(type),
-        stationTypes: STATION_TYPES,
+        isOptional: (type) => isExcluded(type),
         tag: 'build_executor',
         maxPlaceAttempts: PLACE_MAX_ATTEMPTS,
-        // Replace the block the bot stands on by sidestepping (dig+place from the side, step back)
-        // instead of digging its own footing and falling into the cell. Build-only; mining keeps its
-        // own descent model (no footingSidestep), so this leaves mining untouched (Law 16 per-domain op).
+        // Replaces the block the bot stands on by sidestepping: dig+place from the side, step
+        // back, so it never digs its own footing and falls in. Build-only — mining keeps its
+        // own descent model (Law 16 per-domain op).
         footingSidestep: true,
       });
       return { anchorIndex: job.anchorIndex, ...outcome };
@@ -703,28 +765,18 @@ module.exports = {
       totalAlreadyOk += outcome.already_ok;
       iterations++;
 
-      // Stay on an anchor while it still owes real work. Deferred blocks (a course whose
-      // support was not placed this pass — including the footing, which pillarStep now
-      // retries) get a fresh attempt next pass, so deferral is NOT a reason to abandon the
-      // anchor. Only give up when a whole pass made zero progress AND nothing is waiting on
-      // a support (deferred==0) — i.e. the remaining work genuinely failed rather than being
-      // "not yet placeable". A repeated true stall (footing actually unplaceable) is caught
-      // by portable_judge below, which owns stall detection (one detector, Law 16).
+      // Stay on an anchor while it owes real work — a deferred block gets a fresh attempt
+      // next pass, so deferral alone never abandons it. Give up only when a whole pass made
+      // zero progress and nothing is deferred (portable_judge catches a repeated true stall).
       const madeProgress = (outcome.dig_ok + outcome.place_ok) > 0;
 
-      // Required material ran short mid-pass (a block the bot doesn't hold — e.g. dual-role dirt burned
-      // pillaring between tasks). Distinct from a defer (waiting on a support a later pass places): a fresh
-      // block won't appear by retrying, so RELEASE to recursive_judge — that routes into the existing
-      // shortfall → supply → re-stage → re-dispatch loop (job_board re-derives the need and posts the supply
-      // job; building_manager re-gates staging on the next dispatch). Only release once a whole pass placed
-      // NOTHING — a pass that used up what it had (madeProgress) keeps going; the next pass, finding the same
-      // block still absent, hits this with zero progress and releases. This is the halt cure: before the
-      // separate material_short bucket, a required-short folded into `deferred` and the executor spun the same
-      // doomed pass until portable_judge strict-killed it (Architect 2026-07-13).
-      if (outcome.material_short > 0 && !madeProgress) {
+      // A required material ran short mid-pass — distinct from a defer, since retrying won't
+      // make a held block reappear, so this releases to recursive_judge's shortfall→supply
+      // loop, once a whole pass placed nothing.
+      if (outcome.pocket_short > 0 && !madeProgress) {
         const shortList = Object.entries(outcome.short_materials || {}).map(([m, c]) => `${c}×${m}`).join(', ');
         watcher.warn('build_executor', `A${outcome.anchorIndex} material-short (${shortList}), zero progress — releasing to recursive_judge for resupply`);
-        exitReason = 'material_short';
+        exitReason = 'pocket_short';
         break;
       }
 
@@ -733,15 +785,10 @@ module.exports = {
         watcher.warn('build_executor', `Marking A${outcome.anchorIndex} blocked — zero progress, nothing deferred (fail=${outcome.dig_fail + outcome.place_fail}); skipping it for the rest of this run`);
       }
 
-      // Optional-only residual: the anchor's remaining work is all optional steps whose material is not
-      // held — placeOne returns 'skipped', so nothing failed, nothing is deferred, and there is genuinely
-      // no work this run can do here. Mark it done for the run so the build completes at the shell instead
-      // of re-selecting a zero-progress pass into a portable_judge strict-kill; 'skipped' was an uncounted
-      // no-op that could neither complete nor block the anchor. The step is re-derived on a future
-      // dispatch once its material arrives.
-      // UNREACHABLE while OPTIONAL_BUILD_MATERIALS is empty. Do not read this branch as licence to refill
-      // that set: an anchor left open by an optional step is what held a shell "unfinished" long enough to
-      // keep its night-gather exemption alive and send a bot outdoors after dusk.
+      // Optional-only residual: remaining work is all optional steps whose material is
+      // absent — nothing failed, nothing deferred. Marked done for the run so the build
+      // completes at the shell; re-derived once the material arrives (bounded by the
+      // exclusion set being measured each sweep, job_exclusions).
       if (!madeProgress && outcome.deferred === 0 && (outcome.dig_fail + outcome.place_fail) === 0 && outcome.skipped > 0) {
         anchorStuck.add(outcome.anchorIndex);
         watcher.summary('build_executor', `A${outcome.anchorIndex} optional-only (${outcome.skipped} skipped, material absent) — done for this run; build proceeds without decoration`);
@@ -752,8 +799,8 @@ module.exports = {
 
       const pjOk = await portableJudge.checkpoint('build_executor', iterSummary, 'strict');
       if (pjOk === false) {
-        // Stall — dump the buffered per-block trace (every dig/place decision, ref,
-        // reach, outcome) so the Architect sees exactly what the bot was attempting.
+        // Stall — dumps the buffered per-block trace (every dig/place decision, ref,
+        // reach, outcome) so the trace reader sees exactly what the bot was attempting.
         watcher.error('build_executor', `portable_judge escalated on A${outcome.anchorIndex}: ${iterSummary}`);
         exitReason = 'portable_judge_escalated';
         break;
@@ -768,6 +815,9 @@ module.exports = {
       foremanLink.releaseClaim(heldAnchorClaimKey);
       heldAnchorClaimKey = null;
     }
+    // Same act, one level down: a body leaving a pledge-approved plan hands its cells back
+    // so peers can take them (Law 8). The foreman's magnet-clear sweep is the backstop.
+    releaseHeldCells();
 
     // ── CLEANUP/JUDGE ────────────────────────────────────────────────
     // If portable_judge escalated, it already routed to recursive_judge.
@@ -792,21 +842,10 @@ module.exports = {
     capsule.iterations = iterations;
     capsule.metrics = { dig_ok: totalDigOk, dig_fail: totalDigFail, place_ok: totalPlaceOk, place_fail: totalPlaceFail, already_ok: totalAlreadyOk, cleared: clearCount };
     // ── THE READABLE IS WHAT THE JUDGE COMPARES, SO IT CARRIES THE REMAINDER ────────────────────────
-    //   "if theres any variable in the report then judge can look at it. so it could be placed '3' blocks
-    //    at anchor 1. and identify the blocks. or the voxels." (Architect 2026-08-12)
-    //
-    // job_board now dispatches PARTIAL anchors — a pass that places three of twelve blocks is the normal,
-    // desired outcome and will happen several times in a row on one anchor. `place_ok` alone cannot carry
-    // that: two passes that each place three read IDENTICALLY, three of those is a contiguous streak, and
-    // recursive_judge kills a build that was working. The per-anchor voxel remainder is the variable that
-    // separates them — 12, then 9, then 6 — so a build making progress never looks like a repeat, and one
-    // that is genuinely stuck still reports the same number twice and is still caught.
-    //
-    // `@lastscan` is in the name and is not hedging: the count comes from the integrity scan at the top of
-    // the final iteration, so on an exit that placed blocks after that scan it lags by one pass. Naming
-    // the instant is what keeps the number honest instead of implying a post-pass measurement it is not
-    // (Law 25). Every exit that matters here — `material_short`, `blocked_remainder` — is reached only
-    // after a pass that placed nothing, where the scan and the truth agree exactly.
+    // job_board dispatches partial anchors, so two passes that each place three blocks would
+    // read identically on place_ok alone. The per-anchor voxel remainder separates them — it
+    // falls on real progress and repeats only on a genuine stall. @lastscan names the instant
+    // the count is taken, since a later exit's placements lag the scan by one pass.
     const remainderByAnchor = allSteps.reduce((acc, s) => {
       const ai = s.anchor_index ?? -1;
       acc[ai] = (acc[ai] || 0) + 1;

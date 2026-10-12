@@ -1,20 +1,20 @@
 // perception node: torch_integrity
-// purpose: The base-lighting counterpart to building_integrity / mining_integrity / farming_integrity —
-//          ONE node that reads how well-lit the headframe base is and hands job_board a single verdict
-//          it gates a `light_base` job on. The auto-torch reflex lights the ground bots WALK; it cannot
-//          guarantee the headframe safe zone is dark-free, because bots roam and corners go unstepped
-//          (combat refurbish §1b). This node closes that gap: a deliberate sweep of the guarded square
-//          that finds the surface cells still dark enough to spawn a hostile.
+// The base-lighting counterpart to building_integrity / mining_integrity / farming_integrity — the one
+// node that reads how well-lit the headframe base is and hands job_board a single verdict it gates a
+// `light_base` job on. The auto-torch reflex lights the ground bots walk; it cannot guarantee the
+// headframe safe zone is dark-free, because bots roam and corners go unstepped. This node closes that
+// gap: a deliberate sweep of the guarded square that finds the surface cells still dark enough to spawn a
+// hostile.
 //
-// DETECTION (Architect, 2026-07-08): sample REAL block light, don't model torch geometry. The light
-//   probe proved live reads work, and reading light is the same one pathway the reflex uses (Law 16) —
-//   no coverage model to drift from the world. A surface cell is "dark" when its block light is at/under
-//   TORCH_LIGHT_FLOOR (the shared lighting trigger).
-// SCOPE (Architect): one sample per (x,z) COLUMN at its top standable surface — where hostiles actually
-//   spawn outdoors — across a SQUARE of half-extent HEADFRAME_SAFE_RADIUS around the headframe
-//   build_center. Not a 3D volume (roofed interiors are a separate concern); the vertical search is
-//   bounded to base_y ± SURFACE_WINDOW so a near-level base stays cheap. Water surfaces are skipped
-//   (isWalkableSurface rejects them — Architect A2: don't torch across a river).
+// Samples real block light directly, through the same one pathway the reflex uses (Law 16), so there is
+// no coverage model to drift from the world. A surface cell is dark when its block light is at or under
+// TORCH_LIGHT_FLOOR (the shared lighting trigger).
+//
+// One sample per (x,z) column at its top standable surface, where hostiles spawn outdoors, across a
+// square of half-extent HEADFRAME_SAFE_RADIUS around the headframe transpose_origin. Not a 3D volume
+// (roofed interiors are a separate concern); the vertical search is bounded to base_y ± SURFACE_WINDOW so
+// a near-level base stays cheap. Water surfaces are skipped (isWalkableSurface rejects them): lighting
+// never crosses or enters water.
 //
 // Pure observation (Law 1 perception exception — action fragments may call this directly). Guards on a
 // locked headframe center before scanning, so it never throws pre-home: a light_base job dispatched
@@ -34,23 +34,20 @@ const { HEADFRAME_SAFE_RADIUS, TORCH_LIGHT_FLOOR } = require('@thinking/architec
 const { guardExternalSync } = require('@utils/external_library_guard');
 
 const TAG = 'torch_integrity';
-const R = HEADFRAME_SAFE_RADIUS;   // square half-extent (Architect: "32 block square")
+const R = HEADFRAME_SAFE_RADIUS;   // square half-extent of the guarded square
 // Every blueprint that owns world voxels the torch grid overlaps. A torch may never occupy a cell
 // any of these claim (interior air included) — a blueprint ALWAYS overrides torch placement, so
-// lighting yields (Architect 2026-07-10). The headframe comes from getFootprintCells (building_integrity);
+// lighting yields. The headframe comes from getFootprintCells (building_integrity);
 // the shaft from mining_integrity. The union is rebuilt every scan, so a newly-placed building is honored
 // the next pass with no torch-side bookkeeping (Invariant B: re-sense, never remember).
-//   NOTE (2026-07-18): the phase-1 wheat field (wheat_plot_pair instances, sited by the wheat_plot_scanner)
-//   is NOT yet folded into this union — the retired farmland blueprint was the only farm reference here and
-//   it is gone. Wheat plots are therefore torch-unprotected for now; closing that is part of the deferred
-//   farming_integrity work (dynamic-water capture + plot protection), not this cleanup.
+//   Farmland plots are not part of this union, so torches do not yield to them.
 const SURFACE_WINDOW = 12;         // vertical search bound around base_y — keeps a level base cheap
 const MAX_REPORT = 64;             // cap the returned dark-cell list; overflow is LOGGED, never silent
 const AIR_NAMES = new Set(['air', 'cave_air', 'void_air']);   // a TRUE-air spawn cell — not water/lava (both boundingBox 'empty')
 
 // isOpenAir: the cell a mob/torch would occupy must be genuine air, not a liquid. Water and lava both
-// report boundingBox 'empty', so a boundingBox test alone would light a submerged floor (Architect A2:
-// never torch across/into water). Name-gate to real air.
+// report boundingBox 'empty', so a boundingBox test alone would light a submerged floor. Name-gate to
+// real air.
 function isOpenAir(block) {
   return !!block && block.boundingBox === 'empty' && AIR_NAMES.has(block.name);
 }
@@ -60,14 +57,13 @@ let _lastLoggedKey = null;
 
 function headframeCenter() {
   const site = hq.readBuildingChair('headframe', 'set_buildspot');
-  return (site && site.build_center) || null;
+  return (site && site.transpose_origin) || null;
 }
 
 // The union of every live blueprint footprint (headframe, shaft) as world "x,y,z" keys. A
 // candidate torch cell in this set is inside a blueprint and must be dropped — lighting yields.
-// Each accessor returns null before its blueprint is placed, and neither throws for that state — an
-// unplaced blueprint is normal, not a fault (Law 13). The two guards that used to stand here were
-// therefore unreachable on the case they named, and reachable only on a real defect in either node.
+// Each accessor returns null before its blueprint is placed, and neither throws for that state: an
+// unplaced blueprint is normal, not a fault (Law 13).
 function blueprintFootprintUnion() {
   const union = new Set();
   const merge = (s) => { if (s) for (const k of s) union.add(k); };
@@ -87,9 +83,9 @@ function topDarkCell(bot, x, z, baseY) {
     const stand = new Vec3(x, y + 1, z);
     if (!isOpenAir(bot.blockAt(stand))) return null;
     if (!getClearance(bot, floor, 2)) return null;
-    // Refusal returns null = "not a dark cell", the same direction an unreadable column already answers.
-    // It never fabricates darkness, so the executor is never sent to light a cell nobody measured; the
-    // square is re-swept every pass, so a column that loads later is counted then (Invariant B).
+    // A null return means "not a dark cell," the same verdict an unreadable column gives. It never
+    // fabricates darkness, so the executor is never sent to light a cell nobody measured; the square is
+    // re-swept every pass, so a column that loads later is counted then (Invariant B).
     const light = guardExternalSync(TAG, `getBlockLight at (${stand.x},${stand.y},${stand.z})`, () => bot.world.getBlockLight(stand));
     if (!light.ok || typeof light.value !== 'number') return null;
     return light.value <= TORCH_LIGHT_FLOOR ? stand : null;
@@ -98,7 +94,7 @@ function topDarkCell(bot, x, z, baseY) {
 }
 
 // scan(bot) → the lighting verdict. Fields job_board reads:
-//   located          headframe build_center exists (no base ⇒ nothing to guard)
+//   located          headframe transpose_origin exists (no base ⇒ nothing to guard)
 //   dark_count       number of dark surface cells in the square
 //   dark_cells       up to MAX_REPORT of them, nearest-to-center first (inspectability + a start point)
 //   torches_have     torches in the bot's pocket

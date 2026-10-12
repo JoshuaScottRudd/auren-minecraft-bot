@@ -24,7 +24,6 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/voxe
 // Exit: 0 every area saved · 2 some area was refused (overlap / no person spot) · 1 could not capture.
 
 const net = require('net');
-const { spawnSync } = require('child_process');
 const paths = require('../workshop_paths');
 paths.registerAliases();
 process.env.BOT_ID = process.env.BOT_ID || 'voxel_snapshot';
@@ -40,11 +39,11 @@ const { makeVoxelReader } = require('@utils/voxel_reader');
 const { ringScan, formatRejections } = require('@utils/site_geometry');
 const { getBiomeName } = require('@perception/biome_scanner');
 const { SPAWN_PROTECTION_RADIUS, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
-const { personSpotTest, landingFloor } = require('./person_spot');
+const { personSpotTest, landingFloor } = require('@utils/person_spot');
 const store = require('./voxel_snapshot_store');
-const { hosting: HOSTING } = require('../run_config');
+// The world a rollback start puts back, named by the foreman's one rule (foreman_plan.freshWorld).
+const HOSTING = require(paths.bot('foreman', 'foreman_plan.js')).freshWorld(require(paths.bot('js_kernel', 'utils', 'workstation.js')).needServerDir());
 
-const FLEET = paths.workshop('fleet_control.js');
 const args = process.argv.slice(2);
 const verb = args[0];
 const has = k => args.includes(`--${k}`);
@@ -53,10 +52,9 @@ const PORT = 25565;
 const NAME = 'SnapProbe';
 const SETTLE_ROUNDS = 3;              // loadedAreaSettled caps each wait at 120 s; fresh ground can need more than one
 const PLACE_WAIT_MS = 20000;
-const SERVER_EXIT_WAIT_MS = 180000;
 const say = m => console.log(`voxel_snapshot: ${m}`);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const fleet = verbArgs => spawnSync(process.execPath, [FLEET, ...verbArgs], { stdio: 'inherit' }).status === 0;
+const benchWorld = require('../bench_world');
 
 function portOpen(port) {
   return new Promise(resolve => {
@@ -145,9 +143,11 @@ async function capture() {
   }
   const mineflayer = moduleHomes.requireFromHomes('mineflayer');
   let failures = 0;
+  // THE FOREMAN BRINGS THE WORLD (bench_world): a rollback start puts it back to its clean copy
+  // (HOSTING names the same copy), --continue uses it as it is. No crew; the foreman's body is a spectator.
+  const world = await benchWorld.up({ start: has('continue') ? 'continue' : 'rollback', say });
   try {
-    if (!has('continue') && !fleet(['snapshot-restore', `--world=${HOSTING.worldName}`, `--snapshot=${HOSTING.snapshot}`])) return 1;
-    if (!fleet(['server-start'])) { say('the server did not come up; nothing captured.'); return 1; }
+    if (!world.ok) { say(`the world did not come up; nothing captured — ${world.why}`); return 1; }
     const bot = mineflayer.createBot({ host: 'localhost', port: PORT, username: NAME, version: SERVER_MINECRAFT_VERSION, auth: 'offline' });
     bot.on('error', e => say(`socket error: ${e.message}`));
     if (!await new Promise(r => { bot.once('spawn', () => r(true)); bot.once('end', () => r(false)); })) return 1;
@@ -159,8 +159,8 @@ async function capture() {
     }
     bot.quit();
   } finally {
-    fleet(['server-stop']);
-    await until(() => !openWindows().some(e => e.label === 'server'), SERVER_EXIT_WAIT_MS, 2000);
+    const down = await benchWorld.down(world.foreman, { say });
+    say(down.why);
     say(`${describeWindows(closeWindows().stillOpen)}.`);
   }
   return failures ? 2 : 0;

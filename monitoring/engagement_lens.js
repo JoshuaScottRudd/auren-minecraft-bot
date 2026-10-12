@@ -1,72 +1,43 @@
 // Auren_Bot/monitoring/engagement_lens.js
 // THE FIGHT, TOLD BACK AS A STORY — one mob at a time, joined out of the three seats' event streams.
 //
-// ── THE RULING THAT BUILT THIS (Architect 2026-08-12) ────────────────────────────────────────────────
-// He began by asking the COMMANDER to build the narrative live:
-//
-//   "commander has a special job to gather engagement data. so commander tracks where the aggroed
-//    monsters are and builds a post mortiem report. so an example would be 'zombie ID# engaged AurenBot
-//    12 blocks away. Auren locked on and engaged, zombie was attacked 2 seconds later once auren came
-//    within range of 2.9 blocks. it captures every strike.... wait... hold on... lets do this instead.
-//    well just add a lens that captures that data from the reports and builds it. therefore the commander
-//    does have to build it real time it can be build after with a program that combines trace data"
-//
-// He withdrew it mid-sentence, and the withdrawal is the design. A commander assembling a narrative
-// while it fights would be holding a growing per-mob history in a seat whose whole job is one sweep of
-// the current world (Invariant B), and it would be paying for that history on every tick of every fight
-// including the ones nobody ever reads. The story is a QUESTION ASKED AFTERWARD, so it is answered
-// afterward, by a reducer that costs nothing until someone asks.
-//
-// ── WHY A LENS CAN SAY THINGS NO SEAT CAN ───────────────────────────────────────────────────────────
 // Each seat owns one fact and may not speak for another (Invariant D), so nothing in the running fleet
-// is allowed to JOIN them — and every interesting question about a fight is a join:
-//   - aggro → first strike is the commander's fact and the gunner's fact, and the gap between them is
-//     the number that says whether the feet got there.
-//   - `notch state=on` with no `shield state=up` before it goes off is an arrow the guard never
-//     answered. The commander knows about the arrow, the gunner knows about the guard, and NEITHER can
-//     see the miss.
-//   - `swell state=on` → the driver's `mode=swell_flee` is the fuse's reaction latency, and it is the
-//     one number that says whether the creeper rule is actually protecting the body.
-// A seat that computed any of these would be a second owner of somebody else's data. A lens computing
-// them after the run is not — it owns nothing, changes nothing, and is read only when asked.
+// may JOIN them — and every interesting question about a fight is a join: aggro → first strike is the
+// commander's fact and the gunner's fact, and the gap between them says whether the feet got there; a
+// `notch state=on` with no `shield state=up` before it goes off is an arrow the guard never answered, and
+// only a join sees both halves; `swell state=on` → the driver's `mode=swell_flee` is the fuse's reaction
+// latency, the number that says whether the creeper rule is protecting the body. A seat that computed
+// any of these would be a second owner of somebody else's data. This reducer owns nothing, changes
+// nothing, and runs only when asked.
 //
-// ── THE RECORD IT READS AND THE ONE WAY IT MAY READ IT ──────────────────────────────────────────────
-// It takes the trace's already-parsed lines from trace_monitor (the CLI is the only thing that touches
-// process.argv or a filename) and decodes each one through `crew_log.parseAll` — the SAME module the seats
-// emit through. It must never carry regexes of its own for these lines: that would be a second copy of
-// the grammar, and the two would drift the first time a field was added (Law 26 — one interface, both
-// ends importing it; Law 16 — one pathway).
+// Reads the trace's already-parsed lines from trace_monitor (the CLI is the only thing that touches
+// process.argv or a filename) and decodes each one through `crew_log.parseAll` — the SAME module the
+// seats emit through. Carries no regexes of its own for these lines (Law 26 — one interface, both ends
+// importing it; Law 16 — one pathway).
 //
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --engagement [--bot=AurenBot] [--all]
 
 'use strict';
 
 // The SAME grammar module the seats emit through.
-// THE ALIAS MAP IS ASKED OF THE WORKSHOP'S ONE ANSWER (Law 16). It reads the bot's own package.json
-// and is idempotent, so it is safe whether or not a caller registered first — which is what the block
-// that stood here was hand-rolling with `addAliases` and a comment explaining why
-// `require('module-alias')(base)` could not be used. The reason that form is unsafe has not changed and
-// is now recorded once, in monitoring/lens_paths.js, instead of in five lenses.
+// Registers @-aliased require paths through the workshop's one answer (Law 16); idempotent, so safe
+// whether or not a caller already registered them.
 require('./lens_paths').registerAliases();
 const crewLog = require('@api/crew_log');
 const { stat, oneDecimal, twoDecimals } = require('./report_formatting');
-// The one writer to stdout. `padRight` and `ABSENT` are no longer imported here: this lens no longer owns
-// a column width, and an absent value is data_out's own em-dash rather than one this file pastes in.
+// The one writer to stdout. Owns no column width itself; an absent value is data_out's own em-dash.
 const out = require('./data_out');
 
-// `report_formatting.relativeTime` is not used here and the difference is the whole reason this lens has
-// its own two: that one renders WHOLE seconds because it exists to match the trace's own eye-index stamp
-// exactly. These render tenths, because a fight is decided in tenths and rounding a 0.4s reaction to
-// "0s" is the measurement being deleted by its own formatter.
+// Render tenths, not whole seconds: a fight is decided in tenths, and rounding a 0.4s reaction to "0s"
+// deletes the measurement.
 const stamp = (t) => `${Math.floor(t / 60)}m ${(t % 60).toFixed(1)}s`;
 const seconds = (t) => `${t.toFixed(1)}s`;
 
 // ── reduceEngagements({ seg, bot }) → the machine-facing half ────────────────────────────────────────
 //
 // RETURNS, never renders and never exits — a deterministic consumer (a conductor deciding whether a
-// ladder tier passed) is as legitimate a reader as a human, and it must not have to scrape a rendering
-// to get here (Architect 2026-08-07: "if you can read what the trace monitor says then why cant a
-// deterministic system like a javascript file").
+// ladder tier passed) is as legitimate a reader as a human, and never has to scrape a rendering to get
+// here.
 //
 // Shape: { bots: Map<botName, { fights: [fight], modes: [...], stalls: [...], unanswered: [...] }> }
 // where a `fight` is one mob from the tick it aggroed to the tick it left the entity table.
@@ -97,20 +68,14 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
   // would silently weld two fights into one and report a first-strike delay measured across a wave gap.
   const keyOf = (ev) => (ev.subject ? `${ev.subject.name}#${ev.subject.id}` : null);
 
-  // ── THE CLOCK IS THE ISO STAMP, NOT THE RELATIVE ONE, AND THAT IS NOT A PREFERENCE ─────────────────
-  // MEASURED 2026-08-12 (kiters): every crew line in that run carried the relative tag `[0m 0s]` — a
-  // whole three-wave ladder collapsed onto one second — and the first rendering of this lens duly
-  // reported "first struck 0s later" for every mob. That is a true-looking falsehood of exactly the
-  // shape Law 25 names: the reader would have concluded the bot struck instantly.
+  // ── THE CLOCK IS THE ISO STAMP, NOT THE RELATIVE ONE ────────────────────────────────────────────────
+  // The relative tag is coarse to the second by design (a human's eye-index into the trace), and a fight
+  // is decided in tenths. The ISO prefix `watcher._record` puts on every persisted line is the same
+  // instant at millisecond resolution, so durations here are measured from it and rendered as seconds.
+  // `relSec` survives as the RETURN ADDRESS — the stamp that finds the line in the trace by eye.
   //
-  // The relative tag is coarse to the second BY DESIGN (it is a human's eye-index into the trace), and a
-  // fight is decided in tenths. The ISO prefix `watcher._record` puts on every persisted line is the same
-  // instant at millisecond resolution, so the durations here are measured from it and rendered as
-  // seconds. `relSec` survives as the RETURN ADDRESS — the stamp that finds the line in the trace by eye,
-  // which is the one thing the ISO is bad at.
-  //
-  // WHICH clock was used is REPORTED, not assumed. The merged foreman trace drops the ISO prefix when
-  // it forwards a bot's line, so reading this lens against the fleet file gives whole seconds while the
+  // WHICH clock was used is REPORTED, not assumed. The merged foreman trace drops the ISO prefix when it
+  // forwards a bot's line, so reading this lens against the fleet file gives whole seconds while the
   // per-bot file gives milliseconds — the same rendering, `0.0s`, meaning two different things. A reader
   // must be told which one they are holding (Law 25: a number carries its confidence).
   let firstMs = null;
@@ -118,9 +83,9 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
   for (const l of seg) {
     if (l.relSec == null) continue;
     if (botFilter && l.bot !== botFilter) continue;
-    // ONE LINE, SEVERAL EVENTS since the crew log started coalescing a whole combat pass onto one line
-    // per seat (crew_log's header, Architect 2026-08-12). `parseAll` is the only decoder for that reason —
-    // taking the first event of a coalesced line would drop the rest and understate every fight.
+    // ONE LINE, SEVERAL EVENTS: a combat pass coalesces onto one line per seat (crew_log's header).
+    // `parseAll` is the only decoder for that reason — taking the first event of a coalesced line would
+    // drop the rest and understate every fight.
     const events = crewLog.parseAll(l.raw);
     if (!events.length) continue;
     const b = B(l.bot);
@@ -128,16 +93,14 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
     if (ms !== null) msLines++;
     if (firstMs === null && ms !== null) firstMs = ms;
     // `t` is seconds since the first crew event of the run, as a real number. A line with no parseable
-    // ISO falls back to the relative tag rather than being dropped — a missing stamp must not delete the
-    // event, only coarsen it. Every event coalesced onto one line shares that line's stamp, which is true
-    // rather than approximate: they were raised inside one pass, and the pass is the resolution the seats
-    // decide at.
+    // ISO falls back to the relative tag: a missing stamp coarsens the event, it is never dropped for
+    // lacking one. Every event coalesced onto one line shares that line's stamp — they were raised inside
+    // one pass, and the pass is the resolution the seats decide at.
     const t = ms === null || firstMs === null ? l.relSec : (ms - firstMs) / 1000;
 
     for (const ev of events) {
-    // Counted per EVENT and not per line, because this field is rendered as "N crew event(s)" and is
-    // described above as the honest denominator. Leaving it on the line count would have quietly divided
-    // it by however many events a pass happened to raise (Law 25).
+    // Counted per EVENT: this field renders as "N crew event(s)", the honest denominator described above
+    // (Law 25).
     b.lines++;
     const key = keyOf(ev);
 
@@ -167,10 +130,9 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
       }
       case 'strike': {
         const s = { at: t, d: crewLog.num(ev.fields, 'd'), with: ev.fields.with || null, hp: crewLog.num(ev.fields, 'hp'), tag: ev.tag };
-        // A strike on a mob with no open fight is not dropped — it is the finding. It means the swing
-        // route fired at something the commander never announced (a hunt's quarry, legitimately; or a
-        // combat target that slipped the sweep, which is a defect). Filing it under a synthetic fight
-        // would hide exactly that, so it is kept where a reader will see the missing `aggro`.
+        // A strike on a mob with no open fight is not dropped — it is the finding: the swing route fired
+        // at something the commander never announced (a hunt's quarry, legitimately, or a combat target
+        // that slipped the sweep). Kept where a reader will see the missing `aggro`.
         const f = key && b.open.get(key);
         if (f) {
           if (f.firstStrikeAt === null) { f.firstStrikeAt = t; f.firstStrikeDistance = s.d; }
@@ -202,8 +164,8 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
           const f = key && b.open.get(key);
           if (f) {
             f.guardsAgainst.push(b.openGuard);
-            // The threat window this guard answered — matched by KIND, because a mob can only be
-            // notching or swelling and the raise names which one it was raised against.
+            // The threat window this guard answered — matched by KIND, since a mob can only be notching
+            // or swelling and the raise names which one it was raised against.
             const kind = ev.fields.why === 'swell' ? 'swell' : 'notch';
             const open = [...f.threats].reverse().find((x) => x.kind === kind && x.to === null);
             if (open) open.answered = true;
@@ -245,16 +207,11 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
     }
   }
 
-  // ── THE ENCIRCLEMENT PASS — the question the per-mob bearings were added to answer ─────────────────
-  //   "i want cardinal direction from bot each entity id so i can determine if i need to add logic to make
-  //    sure all kiters face the same way or not. so the bot would circle around the archer if one is in
-  //    front and one behind."
-  //
-  // A LIST OF BEARINGS DOES NOT ANSWER THAT and printing one would be the lens declining the job: the
-  // question is about mobs held AT THE SAME TIME, so the reduction has to re-walk the compass changes with
-  // the open/closed window of every fight and ask what the widest angle between two live mobs ever was.
-  // Spread is `360 - the largest empty arc`, which is the diameter of the set on a circle — the only form
-  // that behaves for three or more mobs (a max of pairwise gaps reads 90° for mobs at N, E and S).
+  // ── THE ENCIRCLEMENT PASS — whether two live mobs were ever on opposite sides of the bot ────────────
+  // Re-walks the compass changes against the open/closed window of every fight, asking the widest angle
+  // between two live mobs at any instant. Spread is `360 - the largest empty arc`, the diameter of the
+  // set on a circle — the only form that behaves for three or more mobs (a max of pairwise gaps reads
+  // 90° for mobs at N, E and S).
   const DEG = { N: 0, NE: 45, E: 90, SE: 135, S: 180, SW: 225, W: 270, NW: 315 };
   for (const b of bots.values()) {
     const current = new Map();
@@ -288,8 +245,8 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
   return { bots, clock: total && msLines === total ? 'ms' : (msLines ? 'mixed' : 'seconds') };
 }
 
-// The encirclement criterion, as a number rather than a word. It is DECLARED here and printed beside the
-// measurement as its own field, so the reader checks the comparison instead of being handed its result.
+// The encirclement criterion, DECLARED here and printed beside the measurement as its own field, so the
+// reader checks the comparison instead of being handed its result.
 const ENCIRCLE_THRESHOLD_DEG = 135;
 
 // A stamp only when there is something to stamp. `stamp(null)` renders `0m 0.0s`, which is a real-looking
@@ -298,29 +255,19 @@ const at = (t) => (t == null ? null : stamp(t));
 const after = (t, from) => (t == null || from == null ? null : seconds(t - from));
 
 // ── runEngagement(...) — the human-facing half ──────────────────────────────────────────────────────
-// Renders and RETURNS the same object `reduceEngagements` produced, so a caller that wanted both gets
-// both from one pass. It does not exit; the CLI owns the exit (the trap every extracted lens here was
-// built to avoid).
+// Renders and RETURNS the same object `reduceEngagements` produced, so a caller that wants both gets
+// both from one pass. Does not exit; the CLI owns the exit.
 //
-// ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ────────────────────────────────────────────────
-// `narrate(f)` STOOD HERE AND IS DELETED — the whole point of it was to compose his example sentence
-// ("zombie ID# engaged AurenBot 12 blocks away… attacked 2 seconds later once auren came within 2.9
-// blocks"), and a sentence is the one thing this instrument may no longer form. Every measurement it
-// carried is a column of `fights` below, in the same order it used to read: mob, opened_at,
-// opened_distance, via, faced_after, first_strike_after, first_strike_distance, strikes, hp, closed_at.
-// WHAT WAS DELETED RATHER THAN TRANSLATED:
-//   · `NEVER STRUCK` → `struck` = false. · `still on the board when the run ended` →
-//     `on_board_at_run_end` = true. · `with no aggro line for it` → `unannounced` = true.
-//   · `— NO GUARD went up against it` → the `answered` column on every threat window, false.
-//   · `held past the end of the run` → an absent `held_ms`.
-//   · the CLOCK paragraph telling the reader to re-read the per-bot file for tenths. `clock` survives as
-//     a field; where to go next is the reader's move, not the instrument's.
-//   · `0 crew events parsed in this run.` → `crew_events` = 0.
-//   · `Bearings: none posted` / `0 instants with two or more mobs engaged at once` → `bearing_changes`
-//     and `encirclement_samples`, which are 0 in exactly those two cases.
-//   · `declared threshold 135°, OVER` → `widest_spread_deg`, `threshold_deg` and `over_threshold` as
-//     three fields, so the verdict and the number it was measured against are both on the page.
-//   · `(--all for every strike and every change of tactic)`.
+// ── EACH FIELD IS A FACT ─────────────────────────────────────────────────────
+// Every measurement is a column of `fights` below: mob, opened_at, opened_distance, via, faced_after,
+// first_strike_after, first_strike_distance, strikes, hp, closed_at. `struck` (bool) states whether a
+// mob was ever struck; `on_board_at_run_end` states whether it was still on the board when the run
+// ended; `unannounced` states whether the fight carries no aggro line. The `answered` column on every
+// threat window states whether a guard went up against it; an absent `held_ms` covers a guard held past
+// the end of the run. `crew_events`, `bearing_changes` and `encirclement_samples` are each 0 when there
+// is nothing to report. `widest_spread_deg`, `threshold_deg` and `over_threshold` place the verdict and
+// the number it was measured against on the page together. `clock` travels with the data as its own
+// field.
 function runEngagement({ seg = [], traceName = '?', bot: botFilter = null, verbose = false } = {}) {
   const reduced = reduceEngagements({ seg, bot: botFilter });
 
@@ -328,8 +275,8 @@ function runEngagement({ seg = [], traceName = '?', bot: botFilter = null, verbo
   out.kv('record', traceName);
   if (botFilter) out.kv('bot_filter', botFilter);
   out.kv('bots', reduced.bots.size);
-  // WHICH clock the durations were measured on, reported rather than assumed: `ms` from the ISO prefix,
-  // `seconds` from the coarse relative tag, `mixed` when the segment carries both.
+  // WHICH clock the durations were measured on: `ms` from the ISO prefix, `seconds` from the coarse
+  // relative tag, `mixed` when the segment carries both.
   out.kv('clock', reduced.clock);
 
   if (!reduced.bots.size) {
@@ -371,9 +318,8 @@ function runEngagement({ seg = [], traceName = '?', bot: botFilter = null, verbo
     out.kv('guard_waited_ms_min', waited && waited.min);
     out.kv('guard_waited_ms_max', waited && waited.max);
     out.kv('guard_waited_ms_median', waited && waited.med);
-    // ENCIRCLEMENT IS REPORTED EVEN WHEN IT NEVER HAPPENED, because "the mobs were never on opposite
-    // sides" is the answer to his question just as much as "they were" — an omitted field reads as "no
-    // data" and would leave the kiter-facing decision unmade (Law 25).
+    // ENCIRCLEMENT IS REPORTED EVEN WHEN IT NEVER HAPPENED: an omitted field reads as "no data" and would
+    // leave the kiter-facing decision unmade (Law 25).
     out.kv('bearing_changes', b.bearings.length);
     out.kv('encirclement_samples', enc.samples);
     out.kv('widest_spread_deg', enc.worst ? enc.worst.spread : null);
@@ -402,9 +348,8 @@ function runEngagement({ seg = [], traceName = '?', bot: botFilter = null, verbo
         return [
           f.mob, f.unannounced === true, at(f.openedAt), f.openedRel, oneDecimal(f.openedAtDistance),
           f.via, after(f.firstFacedAt, f.openedAt), f.firstFaceWhy,
-          // ABSOLUTE and RELATIVE both, because an unannounced fight has no aggro to measure from and the
-          // instant it was struck is the only time it has. `narrate` printed that instant and dropping it
-          // would delete a measurement (rule: nothing lost but the grammar).
+          // ABSOLUTE and RELATIVE both: an unannounced fight has no aggro to measure from, and the
+          // instant it was struck is the only time it has.
           f.firstStrikeAt !== null, at(f.firstStrikeAt), after(f.firstStrikeAt, f.openedAt),
           twoDecimals(f.firstStrikeDistance), f.strikes.length,
           hp.length ? oneDecimal(hp[0]) : null, hp.length ? oneDecimal(hp[hp.length - 1]) : null,
@@ -414,19 +359,17 @@ function runEngagement({ seg = [], traceName = '?', bot: botFilter = null, verbo
       }),
     );
 
-    // Every guard raise the gunner made, including one raised with no fight open against it — the
-    // superset of the per-fight list this used to print, and the `mob` column says which fight each
-    // belongs to.
+    // Every guard raise the gunner made, including one raised with no fight open against it. The `mob`
+    // column says which fight each belongs to.
     out.section('guards');
     out.table(['mob', 'at', 'why', 'waited_ms', 'held_ms', 'lowered_by'],
       b.guards.map((g) => [g.mob, at(g.from), g.why, g.waitedMs, g.heldMs, g.by]));
 
     // ── THE JOIN THAT NO SEAT CAN MAKE ──────────────────────────────────────────────────────────────
-    // A threat window and whether a guard was raised against it. The commander saw the draw and the
-    // gunner either answered it or did not: `answered` false is the arrow nobody blocked — the timer
-    // never reached its raise point (the mob loosed early, or fled) or the shield was not in the pack.
-    // This is the whole reason the two threat edges are on/off. ALL windows are listed now, not only the
-    // unanswered ones, so the reader has the denominator as well as the finding.
+    // A threat window and whether a guard was raised against it. `answered` false is the arrow nobody
+    // blocked — the timer never reached its raise point (the mob loosed early, or fled), or the shield
+    // was not in the pack. All windows are listed, not only the unanswered ones, so the reader has the
+    // denominator as well as the finding.
     out.section('threats');
     out.table(['mob', 'kind', 'from', 'to', 'span', 'answered', 'open_at_run_end'],
       b.fights.flatMap((f) => f.threats.map((th) => [

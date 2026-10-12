@@ -2,10 +2,7 @@
 // bill of materials. Pure: bytes in, an object out. It reads no world and writes no file; the workshop CLI
 // (Auren_Workshop/tools/import_blueprint.js) owns the file on either side.
 //
-// ── WHY DOWNLOADED BLUEPRINTS NEVER SHARE A FILE WITH HAND-AUTHORED ONES (Architect 2026-09-16) ─────────
-// *"hand authored blueprints and downloaded ones dont mix. it needs a seperate json or a seperate field in
-// the json so i can easily tell the difference.... the difference being i know exactly whats in a hand
-// crafted one and a downloaded one, it needs to be posted so i can see how many of what is needed clearly."*
+// ── WHY DOWNLOADED BLUEPRINTS NEVER SHARE A FILE WITH HAND-AUTHORED ONES ─────────
 // A hand-authored blueprint (building_blueprints.json) is written voxel by voxel by someone who knows every
 // block in it, uses the fleet's group tokens ("planks"), and carries anchors. A downloaded one is exact
 // blocks somebody else chose, so what it asks for has to be COUNTED and POSTED before anything else is
@@ -13,8 +10,8 @@
 // every entry carries its own `bill_of_materials`.
 //
 // ── WHAT IS KEPT, WHAT IS CHANGED, AND WHERE THAT IS STATED ───────────────────────────────────────────
-// The downloaded FILE is never modified (ratified 2026-09-16: "the blueprint itself is unchanged"). The
-// entry built from it changes only what must change to be built on this server, and names every change:
+// The downloaded FILE is never modified. The entry built from it changes only what must change to be built
+// on this server, and names every change:
 //   - a block renamed since the server's version is written under its server name (RENAMES), counted;
 //   - a block the server's version does not have at all is left out of the voxels, counted, and listed;
 //   - state keys the game sets by itself (a stair's corner, a fence's links — facing_aim.DERIVED) are left
@@ -37,9 +34,9 @@ const { familyOf, DERIVED } = require('@utils/movement/facing_aim');
 // download meets an older one through the same table. Each entry is a rename measured in a real download, never a
 // guess at a substitution: a substitution (a different block standing in) is a design choice and is reported, not made.
 const RENAMES = {
-  iron_chain: 'chain',          // 1.21.9 name on an older server; seen in "Normal survival house -from-abfielder"
-  chain: 'iron_chain',          // pre-1.21.9 name on a newer server; seen in "Finished Castle-from-abfielder"
-  grass: 'short_grass',         // renamed in 1.20.3; seen in "Finished Castle-from-abfielder" (data version 3105)
+  iron_chain: 'chain',          // 1.21.9 name on an older server
+  chain: 'iron_chain',          // pre-1.21.9 name on a newer server
+  grass: 'short_grass',         // renamed in 1.20.3
 };
 
 // Blocks whose ITEM is not their own name, and how many items one block costs. Everything else is placed
@@ -226,7 +223,7 @@ function importBlueprint(bytes, fileName, serverVersion) {
       regions: file.regions.map(r => ({ name: r.name, size: r.size, palette_size: r.palette_size })),
     },
     dimensions: { w: max.x - min.x + 1, h: max.y - min.y + 1, l: max.z - min.z + 1 },
-    build_center: { x: Math.floor((max.x - min.x + 1) / 2), y: 0, z: Math.floor((max.z - min.z + 1) / 2) },
+    transpose_origin: { x: Math.floor((max.x - min.x + 1) / 2), y: 0, z: Math.floor((max.z - min.z + 1) / 2) },
     bill_of_materials: {
       totals: {
         volume,
@@ -261,4 +258,4 @@ function importBlueprint(bytes, fileName, serverVersion) {
   return { ok: true, entry };
 }
 
-module.exports = { importBlueprint, RENAMES };
+module.exports = { importBlueprint, itemsFor, RENAMES };

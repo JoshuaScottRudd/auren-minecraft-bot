@@ -1,8 +1,8 @@
-// assessors/respawn — lifted verbatim out of job_board 2026-08-26. See assessor_registry.
+// assessors/respawn — the board's gate for a dead bot. See assessor_registry.
 
 'use strict';
 
-// Architect-owned tables, imported never restated (Law 16 — one source).
+// Tunables imported from architect_config, never restated (Law 16 — one source).
 const {
     JOB_TYPE,
 } = require('@thinking/architect_config');
@@ -18,7 +18,7 @@ const {
 //
 // `where` is null because death_manager owns the recovery point: its tiers need an async site scan and read
 // world state that only means anything once there IS a body, and this sweep is synchronous over a corpse
-// (Invariant B). The definition of "dead" is IMPORTED from that manager rather than restated, so the planner
+// (Invariant B). The definition of "dead" is IMPORTED from that manager, not restated, so the planner
 // and the thing it dispatches can never disagree about it (Law 16). scope:'local' because no peer can
 // respawn this bot's body — the one inherently un-shareable job on the board.
 function assess() {

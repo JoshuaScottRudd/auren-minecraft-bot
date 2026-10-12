@@ -1,31 +1,23 @@
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/wheat_site_probe.js');
-// tool: wheat_site_probe — one body joins, the wheat field is sited exactly the way a crew sites it, the
-// report is printed, and everything leaves. The siting answer without a soak.
+// tool: wheat_site_probe — joins one body, sites the wheat field the way a crew sites it, prints the
+// report, and leaves. Answers a siting question without a soak; siting_scan_bench answers the same
+// question for the headframe's box sweep.
 //
-// Architect 2026-09-11: *"i think theres a tool for testing already, if not make a tool that loads in a bot,
-// then runs the scan and gives you the report and stops so we dont have to do soaks."* There was not one:
-// siting_scan_bench times the headframe's box sweep, and the wheat field is sited by a different module.
+// Runs the fleet's own siting code and authors nothing but where the body stands (--at): loadedAreaSettled,
+// scanWheatPlots, and describeScan, in lock_all_buildspots' own order, against a real server — so the
+// printed lines match what a crew's survey would carry (Auren_Workshop/README.md: read, don't simulate).
 //
-// IT RUNS THE FLEET'S OWN CODE AND AUTHORS ONE THING (the workshop README: READ, DON'T SIMULATE). The three
-// calls are lock_all_buildspots' own, in its order — wheat_plot_scanner.loadedAreaSettled, scanWheatPlots
-// from where the body stands, then describeScan, the formatter the crew's survey prints through — so the
-// lines this prints are the lines that crew's trace would carry. The world is a real server's. The one
-// authored choice is where the body stands (--at), which is an operator's choice.
+// Scope: the headframe and the house are sited by find_buildingspot against a conference room this body
+// does not have, and nothing here builds anything. The printed field is what a crew standing on the same
+// cell would lock; whether a crew then builds it is a separate question.
 //
-// WHAT IT DOES NOT ANSWER. The headframe and the house are sited by find_buildingspot against a conference
-// room this body does not have, and nothing is built. A field printed here is the field a crew standing on
-// the same cell would lock; whether that crew then builds it is a live run's question.
+// Starts its own server, rolled back to the hosting snapshot unless --continue, and stops it on exit.
+// Refuses to start while any terminal is already open or a world already answers (console_window's
+// ledger), and closes every terminal it opened before exiting, reporting what remains.
 //
-// THE SERVER AND THE TERMINALS. This starts its own server through fleet_control — first rolled back to
-// run_config's hosting snapshot, the world every comparable run starts from, unless --continue — and stops
-// it on the way out. It refuses to start at all while any terminal a run opened is still open or a world
-// already answers (console_window's LEDGER, Architect 2026-09-11: *"before every run, before starting
-// anything… verify all terminals are closed fully"*), and it ends by closing every terminal it opened and
-// saying what, if anything, is left.
-//
-// A line the fleet's modules log lands in watcher_wheat_site_probe.jsonl and is swept with every other record
-// at the next bring-up (proxy_human's arrangement). The scan itself logs nothing.
+// Log lines the fleet's modules emit land in watcher_wheat_site_probe.jsonl and are swept at the next
+// bring-up (proxy_human's arrangement). The scan itself logs nothing.
 //
 // Usage (developer mode):
 //   node Auren_Workshop/tools/wheat_site_probe.js [--at=X,Z] [--continue]
@@ -35,13 +27,12 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/whea
 // Exit: 0 at least one plot · 2 the scan ran and no sea-level water bank in view holds one · 1 it could not scan.
 
 const net = require('net');
-const { spawnSync } = require('child_process');
 
 const paths = require('../workshop_paths');
 paths.registerAliases();
 process.env.BOT_ID = process.env.BOT_ID || 'wheat_site_probe';
 
-// Where mineflayer lives is asked, never assumed (proxy_human carries the full note).
+// Where mineflayer lives is asked, never assumed (proxy_human).
 const moduleHomes = require('@utils/node_module_homes');
 const MODULE_DIRS = moduleHomes.bootstrapModulePath();
 if (MODULE_DIRS.length === 0) {
@@ -56,9 +47,9 @@ const rcon = require('@utils/rcon_link');
 const { openWindows, closeWindows, describeWindows } = require('@utils/console_window');
 const { loadedAreaSettled, settleLine, scanWheatPlots, describeScan } = require('@utils/wheat_plot_scanner');
 const { FARM_PLOT_COUNT, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
-const { hosting: HOSTING } = require('../run_config');
+// The world a rollback start puts back, named by the foreman's one rule (foreman_plan.freshWorld).
+const HOSTING = require(paths.bot('foreman', 'foreman_plan.js')).freshWorld(require(paths.bot('js_kernel', 'utils', 'workstation.js')).needServerDir());
 
-const FLEET = paths.workshop('fleet_control.js');
 const args = process.argv.slice(2);
 const has = k => args.includes(`--${k}`);
 const opt = (k, fallback) => {
@@ -69,7 +60,6 @@ const HOST = 'localhost';
 const PORT = Number(opt('port', '25565'));
 const NAME = 'SiteProbe';
 const PLACE_WAIT_MS = 15000;
-const SERVER_EXIT_WAIT_MS = 180000;   // fleet_control's own shutdown allowance: saving chunks is the slow part
 
 const say = m => console.log(`wheat_site_probe: ${m}`);
 const where = bot => { const p = bot.entity.position; return `(${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)})`; };
@@ -84,10 +74,8 @@ function portOpen(port) {
   });
 }
 
-// fleet_control is the one owner of the server's lifecycle and of the world restore (Law 16); this asks it.
-function fleet(verbArgs) {
-  return spawnSync(process.execPath, [FLEET, ...verbArgs], { stdio: 'inherit' }).status === 0;
-}
+// The foreman is the one owner of the world's lifecycle and of the world restore (Law 16); this asks it.
+const benchWorld = require('../bench_world');
 
 async function until(test, ms, every = 250) {
   for (const end = Date.now() + ms; Date.now() < end;) {
@@ -107,12 +95,11 @@ async function probe(at) {
   });
   if (!joined) return 1;
 
-  // CREATIVE, so nothing kills the body mid-scan: a death respawns it at world spawn, and the scan would read
+  // Creative, so nothing kills the body mid-scan: a death respawns it at world spawn, and the scan would read
   // a different place from the one it reports standing on. The bench reads the dev world's own console
-  // credentials rather than the environment's (rcon_link's note on benches).
+  // credentials (rcon_link's note on benches).
   const cmds = [`gamemode creative ${NAME}`];
-  // DROPPED IN FROM ABOVE, not /spreadplayers: with a spread distance of 0 the server answers "too many
-  // entities for space" and moves nobody. A /tp above the column lets the body fall to whatever surface is there.
+  // Drops the body in from above so it falls to whatever surface the column holds.
   if (at) cmds.push(`tp ${NAME} ${at.x + 0.5} 120 ${at.z + 0.5}`);
   for (const { cmd, body } of await rcon.once(cmds, { creds: rcon.readServerProperties() })) say(`> ${cmd} — ${body || '(ok)'}`);
   if (at) {
@@ -151,8 +138,8 @@ async function main() {
     at = { x, z };
   }
 
-  // EVERY TERMINAL CLOSED BEFORE ANYTHING STARTS — checked, never closed here. A world already answering
-  // counts: this starts its own, and a second one beside it is the hang being prevented.
+  // Every terminal must be closed before anything starts here — checked, never closed by this step. A
+  // world already answering counts, since this starts its own and a second one beside it would hang.
   const open = openWindows();
   const worldUp = await portOpen(PORT);
   if (open.length || worldUp) {
@@ -162,19 +149,15 @@ async function main() {
   }
   say('no terminals open, and no world answering.');
 
+  if (!has('continue')) say(`a rollback start: the foreman puts '${HOSTING.worldName}' back to '${HOSTING.snapshot}' first (--continue skips this).`);
+  const world = await benchWorld.up({ start: has('continue') ? 'continue' : 'rollback', say });
   try {
-    if (!has('continue')) {
-      say(`rolling '${HOSTING.worldName}' back to '${HOSTING.snapshot}' before starting it (--continue skips this).`);
-      if (!fleet(['snapshot-restore', `--world=${HOSTING.worldName}`, `--snapshot=${HOSTING.snapshot}`])) return 1;
-    }
-    if (!fleet(['server-start'])) { say('the server did not come up; nothing was scanned.'); return 1; }
+    if (!world.ok) { say(`the world did not come up; nothing was scanned — ${world.why}`); return 1; }
     return await probe(at);
   } finally {
-    // THE END OF THE RUN CHECKS AND CLOSES EVERY TERMINAL. The server goes through its console and its
-    // terminal closes when it has finished saving, which is waited for; then everything else this opened is
-    // closed and the ledger is read again, so the last line is what is actually still open.
-    fleet(['server-stop']);
-    await until(() => !openWindows().some(e => e.label === 'server'), SERVER_EXIT_WAIT_MS, 2000);
+    // The end of the run checks and closes every terminal. The foreman stops and saves the world it started,
+    // and is waited for; then everything else this opened is closed and the ledger is read again.
+    say((await benchWorld.down(world.foreman, { say })).why);
     say(`${describeWindows(closeWindows().stillOpen)}.`);
   }
 }

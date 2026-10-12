@@ -81,8 +81,8 @@ button, one permanent instrument, and a discipline about where a guarantee lives
 > be stopped fixed and restarted to continue a run as if it didnt stop, then why do we do all of these
 > idempotent tests?"*
 
-**The restart-is-cheap premise is verified, not assumed** — a run with `world: 'continue'` on
-`Auren_Workshop/run_config.js` stops, takes a code edit, and resumes on the same world with the
+**The restart-is-cheap premise is verified, not assumed** — a run with `start: 'continue'` on
+`foreman_config.js` stops, takes a code edit, and resumes on the same world with the
 in-progress HQ intact (`fleet_runbook.md` §3). And the exception argues the same way: a *death* is expensive (a corpse's playerdata bricks the login
 and needs a full rollback), but **a throw stops the body before it can die.** The throw path is the cheap
 path. The un-caught bug is the one that costs a rollback.
@@ -262,11 +262,10 @@ violation against correct code — so the claim that *cannot go stale* can go **
 expensive failure. An instrument may only encode what a law makes permanent. The pass that survived this
 same question is the catch shape, and it survives precisely because Law 13 is not revisable by a refactor.
 
-**It is also the first step of every run** (Architect 2026-08-10). `Auren_Workshop/run.js` runs it as its
-own phase 1 — before the world is touched and before any process is launched, so a refusal costs nothing
-— and `lanista_conductor.js` runs it in its preflight, before `raised` flips, so a refusal reaps nothing.
-Both stop on a non-zero exit. Nothing else needs to remember it: an ordinary run and a lanista bench each
-press the button on their own. It sits there rather than inside the sequence because a load
+**It was also the first step of every run** (Architect 2026-08-10) until `run.js` was deleted on
+2026-09-18: the foreman does not reach the workshop, so a run started with `start_auren.js` is not gated
+on it — run it after a code change, as CLAUDE.md says. `lanista_conductor.js` still runs it in its preflight, before `raised` flips, so a refusal reaps nothing.
+and stops on a non-zero exit. It sat there rather than inside the sequence because a load
 fault discovered by the LIVE route surfaces ~40 s in, after a rollback, a JVM start and a bot login, and it
 surfaces wearing the costume of a bot that will not come online — which is the corpse-login brick's
 signature and sends the operator down the wrong repair entirely.
@@ -288,7 +287,7 @@ if (_TACTIC_OF[n])           throw new Error(`... "${n}" is under both ${_TACTIC
 |---|---|
 | Data is malformed (bad key, duplicate, missing field, inverted range) | **A load-time throw** in the module that owns the data. |
 | A rule between constants (X must outrank Y; the ramp must not reverse) | **A load-time throw**, because the invariant is derivable from the data alone. |
-| Code that must **not** exist (no second combat arm, no swing refusal) | **Nowhere — and that is the answer, not a gap.** A design ruling is not a law and may be reversed; an instrument encoding one emits a false verdict the day it is. Its home is the header of the file it was deleted from (Law 14: name the wrong turn). |
+| Code that must **not** exist (no second combat arm, no swing refusal) | **Nowhere — and that is the answer, not a gap.** A design ruling is not a law and may be reversed; an instrument encoding one emits a false verdict the day it is. Its home is the record — the commit message and the bug-diagnosis report (Law 14). |
 | One construction must be the only pathway (a supply job carries `need`) | **A Law 13 throw at the boundary that CONSUMES it.** Worked example: `dispatcher._readJobs`. |
 | An identifier is read where nothing binds it | **`preflight` pass 3.** Neither a throw nor a load can reach it — see below. |
 | Behaviour needing a world (does the shove hold, does the bot reach the mob) | **A live run** — `tools/lanista.js` makes combat on demand. |
@@ -584,7 +583,7 @@ two claims now have no enforcement at all** — recorded plainly below rather th
 
 | deleted bench | the claim | status |
 |---|---|---|
-| `station_band_test` §7 | no retreat planner, no deleted creeper calculator, no second arm, no species check routing into one, no per-fuse hit cap, no phase machine | **nothing enforces it.** Each is a design ruling, not a law, and that is precisely why pass 3 could not hold it — the ruling is reversible and the scan was not. Its home is the header of the file each thing was deleted from (Law 14). |
+| `station_band_test` §7 | no retreat planner, no deleted creeper calculator, no second arm, no species check routing into one, no per-fuse hit cap, no phase machine | **nothing enforces it.** Each is a design ruling, not a law, and that is precisely why pass 3 could not hold it — the ruling is reversible and the scan was not. Its home is the record — the commit message and the bug-diagnosis report (Law 14). |
 | `swing_never_withheld_test` | no swing withheld by a calculation | **nothing enforces it** — and of the two this is the one worth watching, because it is the closest of the nineteen to a standing rule rather than a design choice. `combat_utils`' own header names `bot.attack` on a combat path as the regression to watch. |
 
 **Claims that DIED WITH THEIR BENCH, owed nothing.** These were pinned to numbers or shapes the code owns

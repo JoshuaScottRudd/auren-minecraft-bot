@@ -7,15 +7,14 @@ is a CLOCK: everything else answers from inventory or geometry.
 
 'use strict';
 
-const { SMELT_COOK_MS } = require('@thinking/architect_config');
+// Per-item cook duration, in milliseconds. Vanilla is 10s for every recipe this fleet smelts; the map
+// lets a future recipe with a different duration be added as one row.
+const SMELT_COOK_MS = { default: 10000 };
 
-// The furnace runs "load and leave" (Phase 3): the bot loads a batch, records a
-// start timestamp on the furnace's HQ station entry, and walks away. These pure
-// functions turn that timestamp into a done-time so a later job_board sweep knows
-// when to send the bot back to collect — WITHOUT a live timer that a crash would
-// lose. A date in, a verdict out; the furnace WINDOW is still ground truth on
-// arrival (Law 13), this only decides WHEN to arrive. Per-item cook duration is
-// architect-owned config (SMELT_COOK_MS), so tuning cook times never touches logic.
+// The furnace runs load-and-leave: a start timestamp is recorded on the furnace's HQ station entry, and
+// these pure functions turn it into a done-time for a later job_board sweep to poll, without a live
+// timer that a crash would lose. The furnace WINDOW is still ground truth on arrival (Law 13); this only
+// decides when to arrive.
 
 function smeltCookMsPerItem(item) {
   return (SMELT_COOK_MS && SMELT_COOK_MS[item]) || (SMELT_COOK_MS && SMELT_COOK_MS.default) || 10000;

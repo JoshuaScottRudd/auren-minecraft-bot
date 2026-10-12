@@ -1,45 +1,29 @@
 // api: tree_feller
-// purpose: Fell a single tree in place. Handles approach via locomotion, climb-and-fell
-//          (clear every log connected to the base, pillaring up as reach requires so the
-//          whole tree comes down and nothing is left hanging), descent cleanup, vegetation
-//          clip, and drop collection. It does NOT replant — felling is canopy-clearing
-//          (wild trees near base must not regrow, for camera shots); replanting is the
-//          tree-farm system's job, at fixed farm spots away from base (Architect 2026-07-11).
+// purpose: Fells a single tree in place — approach, climb-and-fell (clears every connected log),
+//   descent cleanup, vegetation clip, drop collection. Does not replant.
 //
 // Two calling modes (Law 15 sub-loop):
 //   await tree_feller.fell(bot)                  — scan for closest tree, approach, fell
 //   await tree_feller.fell(bot, trunkPos)         — approach this trunk and fell it
 //   await tree_feller.fell(bot, trunkPos, opts)   — approach, fell, with options
 //
-// opts.excludeTrees: string[] of "tree:x,y,z" keys to skip in self-scan mode — trees a
-//   previous attempt in THIS signal chain reached but couldn't fell (harvest_executor
-//   carries the list). Stops the bot re-selecting the same nearest trunk and stalling on it.
-// opts.canopyZone: { mode:'inside'|'outside', center:{x,z}, radius } — scopes self-scan wild felling
-//   to the base camera zone ('inside', clear the canopy) or beyond it ('outside', log supply that
-//   never re-touches the cleared base). Omitted = no scoping (see applyCanopyZone).
-// opts.preferNear: {x,y,z} — self-scan RANKING origin. Candidates are worked nearest-FIRST to this
-//   coordinate instead of nearest-to-the-bot, so base clearing radiates outward from the blueprint
-//   center (Architect 2026-07-12: "clear from closest to headframe"). Omitted = rank by bot position
-//   (efficiency), the right default for far-off log supply. Only reorders selection; reach/approach
-//   are unchanged.
+// opts.excludeTrees: string[] of "tree:x,y,z" to skip in self-scan mode (reached-but-unfellable
+//   trees this signal chain already tried; harvest_executor carries the list).
+// opts.canopyZone: { mode:'inside'|'outside', center:{x,z}, radius } — scopes self-scan felling to
+//   the base camera zone or beyond it. Omitted = no scoping.
+// opts.preferNear: {x,y,z} — self-scan ranking origin, nearest-first. Omitted = rank from the bot.
 //
-// Returns: { success, minedCount, species, position }
-// If locomotion cannot reach the tree, goTo abandons to recursive_judge (Law 15)
-// and this invocation dies — the caller's promise never resolves.
+// Returns: { success, minedCount, species, position }. If locomotion cannot reach the tree, goTo
+// abandons to recursive_judge (Law 15) and this invocation dies unresolved.
 //
-// WHY climb-and-fell lives here (not in locomotion):
-//   Locomotion's pillar-up moves are bounded single-cell corrections WHILE walking toward a
-//   destination. Climbing a tree is an unbounded ascend-while-mining loop with NO destination —
-//   it stops only when the trunk runs out. That is a harvesting technique, not a navigation
-//   correction.
+// Climb-and-fell lives here, not in locomotion: locomotion's pillar-up is a bounded correction
+// while walking; climbing a tree is an unbounded ascend-while-mining loop with no destination.
 
 const watcher = require('@kernel/watcher');
 const Vec3 = require('vec3');
 
-// Entered through combatCheckpoint, never battleStations directly (Architect 2026-08-08: "remove it
-// from the callers"). One process-wide 500 ms clock, shared with the dig and drive primitives that now
-// carry the same gate, plus the engaging/escaping bypass so combat's own arms cannot re-enter it. The
-// whole reasoning is in its header; a call a primitive already paid for costs nothing here.
+// Entered through combatCheckpoint, never battleStations directly — one process-wide 500 ms clock
+// shared with the dig and drive primitives, with an engaging/escaping bypass for combat's own arms.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { performDig } = require('@utils/movement/dig_authority');
 const { microCenter } = require('@utils/movement/motion_primitives');
@@ -48,6 +32,8 @@ const { collectNearby } = require('@api/drop_collector.js');
 const { HEADFRAME_SAFE_RADIUS } = require('@thinking/architect_config');
 const { guardExternal } = require('@utils/external_library_guard');
 const { claimFirst, releaseTarget } = require('@utils/target_claims');
+// The fleet's one answer to "can a body stand on this" (Law 16).
+const { classifyFloor } = require('@utils/movement/terrain_predicates');
 
 const TAG = 'tree_feller';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -60,34 +46,12 @@ const CONFIG = {
   vegetationClipRadius: 2
 };
 
-// Reachability sweep depth. The candidate list is sorted nearest-first, so a bot boxed into a
-// pocket (dense forest, or a pit it felled itself into) finds its NEAREST trees unreachable while
-// dozens further out stay reachable. A tight cap of 3 killed bots that had 50+ trees in range —
-// it conceded after the 3 closest failed and never tried the rest (observed live 2026-07-03). Sweep
-// deep before conceding; it's cheap now that a deterministic dead-end abandons after ONE locomotion
-// attempt (locomotion_judge only retries on forward progress), so a boxed approach no longer burns a
-// 4-attempt budget. A concede is a stable "no_reachable_free_tree"; before returning it, fell() makes
-// ONE physical reposition to open ground and rescans (repositionToOpenGround) — a fresh A* from a
-// clear cell reaches trees the boxed stance could not. Only a genuinely entombed/depleted bot
-// exhausts both, and THEN the stable readable lets recursive_judge's identical-outcome counter kill
-// the loop (Law 13). The varying "mined N" readables used to hide such a stall.
-const MAX_UNREACHABLE_APPROACHES = 12;
+const REPOSITION_CLUSTER = 12;       // the nearest trunks whose middle a stuck body steps away from
 const MAX_REPOSITION_ATTEMPTS = 6;   // goTo tries spent stepping out of a stuck pocket before conceding
 const REPOSITION_RADII = [5, 7, 3];  // how far (cells) to step when repositioning
 
-// A fell runs 8-30s (measured across a real run) with no natural summary between "Begin felling" and
-// "Felled" — the bot stands at the base swinging, emitting nothing (per-block digs are unlogged by
-// Law 5). That silent gap has TWO readers it misleads, which is why the cadence is now the navigator's,
-// not a coarse anti-hang minimum:
-//   1. a HUMAN reading the raw trace (Law 6/14) — a 25s gap is ambiguous: felling, or hung?
-//   2. the footage motion classifier (monitoring/motion_classifier.js) — it splits moving-vs-doing by which
-//      tag emits each second; a silent chop is only DOING by forward-filling the "Begin felling" vote
-//      across the gap, i.e. by INFERENCE. A heartbeat every few seconds makes the chop STATE itself as
-//      work instead (Law 23 — read it, don't infer it), and hardens the split if a MOVE line ever
-//      intrudes mid-chop. This is the "reuse the debug trace for footage" dual-use, made legible here.
-// The navigator narrates a long walk at PROGRESS_INTERVAL=3000; a chop is shorter and more localized,
-// so 6s narrates it without doubling trace volume. Still one AGGREGATE line per interval (N down, M
-// remaining), never per-log (Law 5). Well under the silence monitor's 120s — no regression there.
+// Aggregate progress line during a fell, since per-block digs are unlogged (Law 5) and a silent chop
+// reads as a hang to a human or the footage motion classifier.
 const FELL_PROGRESS_HEARTBEAT_MS = 6000;
 
 const LOG_REGEX = /(.*_)?log$/;
@@ -97,9 +61,7 @@ const CLIPPABLE_VEG_REGEX = /^(tall_grass|short_grass|fern)$/;
 function isClippableVegetation(name) { return CLIPPABLE_VEG_REGEX.test(name); }
 
 // ── Dig a single log or leaf block ─────────────────────────────────────────
-// Unguarded, and the RETURN VALUE is now read. performDig REPORTS (false = cell not cleared), so the
-// catch that stood here could only fire on a defect — while the actual refusal was discarded and this
-// function answered `true` for a log still standing (Law 25).
+// Unguarded; performDig's return value reports whether the cell actually cleared (Law 25).
 async function digBlock(bot, block) {
   if (!block) return false;
   const isLeaf = LEAF_REGEX.test(block.name);
@@ -112,11 +74,8 @@ async function digBlock(bot, block) {
 }
 
 // ── Reach + connected-tree model (Law 16: one definition of "the tree") ─────
-// A fell removes EVERY log connected to the base, pillaring up as needed — a log left
-// hanging in the air (with leaves clinging to it) is the immersion-breaker this exists
-// to kill. Leaves are NOT stripped: once a tree's last log is gone its leaves decay on
-// their own (vanilla), so mining the canopy is pure waste (~50 blocks/tree). We touch a
-// leaf only when it blocks the line of sight to a log we are trying to dig.
+// Removes every log connected to the base, pillaring up as needed. Leaves are not stripped (they
+// decay once the last connected log is gone) except when one blocks line of sight to a log.
 const REACH = 4.5;                        // survival dig reach, measured from the eyes
 const SIX = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 
@@ -127,10 +86,8 @@ function eyeDist2(bot, p) {
 }
 function withinReach(bot, p) { return eyeDist2(bot, p) <= REACH * REACH; }
 
-// Flood-fill every log connected to the base through 26-neighbour adjacency: THIS is the
-// tree. Branches connect log-to-log to the trunk so they're included; a neighbouring tree
-// (not log-connected) is not, so felling never eats into the tree next door. Bounded so a
-// pathological mega-canopy can't exhaust memory.
+// Flood-fills every log connected to the base through 26-neighbour adjacency — this is what defines
+// "the tree", so a neighbouring unconnected tree is never touched. Bounded against a mega-canopy.
 const MAX_TREE_LOGS = 512;
 function collectTreeLogs(bot, base, inObjective) {
   const seen = new Set();
@@ -184,40 +141,14 @@ async function clipGroundVegetation(bot) {
 }
 
 // ── Core fell loop: clear the WHOLE connected tree ─────────────────────────
-// Flood-fill the tree's logs from the base, then repeat { mine everything in reach → if
-// logs remain out of reach, pillar up one } until no log of the set survives. Pillaring
-// raises the reach envelope, so a log 7 up is reached even though standing reach is ~4;
-// the loop ends only when the connected set is empty (the whole-tree guarantee) or the
-// bot can neither reach nor climb to the residual (rare awkward canopy — logged once, not
-// spun on forever). Dirt pillars are removed on the way down. Returns { minedCount }.
-// ── THE FELLER STANDS IN THE TRUNK, NOT BESIDE IT ────────────────────────────────────────────────
+// Repeats { mine everything in reach → pillar up one if logs remain out of reach } until the
+// connected set is empty or nothing residual can be reached or climbed to. Returns { minedCount }.
 //
-// Architect 2026-08-31: *"upgrade tree harvester to step into the trunk of the tree instead of to the
-// side, it doesent collect efficently. if it mines directly above itself then drops land directly into
-// its inventory. right now it stands off to the side and pillars sometimes. it should dig into center of
-// tree and dig right above it and pill as much as it needs. to mine the tree."*
-//
-// WHAT THE BESIDE-STANCE COSTS, and it is collection rather than digging. A log broken from the side
-// drops an item at the log's own cell, which then falls to the ground somewhere in the canopy's footprint
-// — off a branch, into leaves, down a slope — and every one of them has to be walked to afterwards by
-// drop_collector, which is the slowest verb the fleet owns. Broken from DIRECTLY OVERHEAD, the item falls
-// down the shaft the bot is standing in and is picked up where it lands, for free, with no walk and no
-// search. Same digs, same tool, the collection deleted.
-//
-// The stance also removes the pillar's worst case. From beside the trunk the bot pillars in open air
-// next to the canopy and its reach envelope leans away from the logs; from inside, every pillar block
-// goes into the column it has just emptied and the next log is always straight up.
-//
-// TWO CELLS ARE DUG TO GET IN — the base log and the one above it — because a body is two blocks tall and
-// the trunk is solid. Both are objective logs and both are counted; this is the fell starting, not a
-// clearing cost. The approach BEFORE this is unchanged and still lands the bot on a skirt cell beside the
-// trunk (standAtTreeBase): a goTo aimed into solid logs is the search that exhausts its budget and stops
-// short, which is the failure that stance exists to avoid. The bot walks up to the tree, then cuts in.
-//
-// FAILS SOFT, ON PURPOSE. If the two cells will not clear, or the step in does not land, the fell carries
-// on from wherever the body is — the loop below works from reach and does not require the trunk stance,
-// so a tree on a slope or against a cliff still comes down the old way rather than being conceded over a
-// stance. Nothing here is allowed to turn an efficiency into a refusal.
+// The feller stands IN the trunk, not beside it: a log broken from directly overhead drops its item
+// down the shaft, picked up on the spot.
+// The two entry cells (base log and the one above) are dug to let the two-block-tall body in, and
+// both count as mined. Fails soft — if entry does not clear or land, the loop still works from reach
+// without the trunk stance.
 async function enterTrunkColumn(bot, base, inObjective) {
   const feet0 = bot.entity.position.floored();
   if (feet0.x === base.x && feet0.z === base.z && feet0.y === base.y) return { entered: true, mined: 0 };
@@ -243,10 +174,9 @@ async function enterTrunkColumn(bot, base, inObjective) {
     return { entered: false, mined };
   }
 
-  // exact:true — the feet must land IN the column, not within tolerance of it. A one-cell miss puts the
-  // bot back beside the trunk with the entry already dug, which is the old stance minus two logs.
+  // exact:true — feet must land IN the column, not merely within tolerance of it.
   const dispatcher = require('@locomotion/locomotion_dispatcher');
-  const res = await dispatcher.goTo({ x: base.x, y: base.y, z: base.z, exact: true });
+  const res = await dispatcher.goTo({ x: base.x, y: base.y, z: base.z, exact: true, leg: 'work' });
   const feet = bot.entity.position.floored();
   const entered = !!(res && res.arrived) && feet.x === base.x && feet.z === base.z;
   watcher.summary(TAG, entered
@@ -258,10 +188,8 @@ async function enterTrunkColumn(bot, base, inObjective) {
 async function climbAndFell(bot, base, objectiveList, protectedSet) {
   const inObjective = (name) => LOG_REGEX.test(name) && (!objectiveList.length || objectiveList.includes(name));
   const placedPillar = [];
-  // Cells THIS climb pillared into are the bot's own scaffold, never the tree — exclude them from the
-  // log-set so a scaffold block is never mined as a trunk (Invariant D: the tree's voxels have one
-  // owner). Load-bearing rather than a belt: the throwaway pillar order is timber-first, so the
-  // scaffold normally IS a log, standing 26-adjacent to the trunk it was placed beside.
+  // Cells this climb pillared into are the bot's own scaffold, excluded from the log-set so a
+  // scaffold block is never mined as a trunk (Invariant D: the tree's voxels have one owner).
   const placedKeys = new Set();
   let minedCount = 0;
 
@@ -297,23 +225,13 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
       lastProgress = Date.now();
     }
 
-    // Anti-oscillation (Architect, 2026-07-03: bot bouncing at a treetop, digging underfoot then
-    // re-pillaring forever). A log in the bot's OWN feet-column below its feet is its support —
-    // digging it drops the bot into the hole, which then re-pillars back up onto a block placed in
-    // that same cell: dig-underfoot ↔ pillar, net zero, forever. In an UPWARD fell the support is
-    // never a trunk log the climb must clear (the bot approached at the base and rises BESIDE the
-    // trunk), so excluding the support column costs nothing on a normal tree and removes the bounce
-    // at its source (Law 16 — delete the bad pathway, don't detect-and-recover). Same-level and
-    // higher logs are still dug; a residual that only ever sits under the feet is conceded below.
+    // A log below the bot's own feet is its support; digging it would drop the bot and trigger a
+    // dig-underfoot/re-pillar bounce, so the support column is excluded (Law 16).
     const feet = bot.entity.position.floored();
     const isSupportColumn = (p) => p.x === feet.x && p.z === feet.z && p.y < feet.y;
 
-    // OVERHEAD FIRST, LOWEST FIRST — the ordering is what makes the trunk stance pay. A log broken
-    // directly above the body drops an item that falls down the emptied column and is picked up where the
-    // bot stands; one broken off to the side drops into the canopy and becomes a walk for drop_collector.
-    // Lowest-first within the column matters too: it opens the shaft from the bottom up, so every later
-    // drop has a clear fall. Everything not overhead keeps the old nearest-first order, which is still
-    // right for branches — and when the trunk stance was not taken, this reduces to exactly the old sort.
+    // Overhead logs are mined lowest-first, so the shaft opens from the bottom and every drop has a
+    // clear fall to the bot. Non-overhead logs are ordered nearest-first for branches.
     const overhead = (p) => p.x === feet.x && p.z === feet.z && p.y > feet.y;
     const reachable = rem.filter(p => !isSupportColumn(p) && withinReach(bot, p)).sort((a, b) => {
       const oa = overhead(a), ob = overhead(b);
@@ -323,26 +241,8 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
     });
     let minedThisCycle = 0;
     for (const p of reachable) {
-      // ── THE GATE BELONGS ON THE LOG, NOT ON THE CYCLE (Architect soak 2026-08-06) ─────────────────
-      // It used to sit only at the top of the outer `while`, which made a whole inner pass one
-      // uninterruptible block of digging. A pass over 5-8 reachable logs runs 8-15 s, and the run of
-      // 2026-08-06 spent exactly that inside one: felling began at [17m 18s], a spider opened at
-      // [17m 26s], and the bot died at [17m 33s] having taken SEVEN blows from 1.2-2.4 b with aggro
-      // confirmed on every one — and the gate was never reached, so no counter ever ran.
-      //
-      // Perception was never the fault and tuning the scanner cannot reach this: the hurt rows printed
-      // `spider#4277 1.4b (aggro✓)` throughout, because that handler runs on a packet listener while
-      // the gate runs only where a fragment awaits it. The bot could SEE it the whole time. What it
-      // could not do was stop chopping — the preemption point Law 4 requires simply was not in the loop.
-      //
-      // Per-log is the same granularity farm_executor and torch_executor already use for their cells
-      // (Law 16 — the pattern is reused, not re-invented). The abandonment path is unchanged:
-      // battleStations owns Law 15, so a fight discards this whole fell rather than returning into it.
-      //
-      // The COST claim this comment used to carry ("one scan per log") is no longer true and was the
-      // reason a per-block gate looked expensive: since 2026-08-08 the call is paced by one process-wide
-      // clock and a log felled inside 500 ms of the last poll costs nothing at all. The dig underneath it
-      // now polls on the same clock too, so this line is a floor, not the only cover.
+      // Combat preemption checkpoint per log, not only at the outer loop's top, so a multi-log pass is
+      // never one uninterruptible block (Law 4). battleStations discards this fell on a fight (Law 15).
       await combatCheckpoint(bot, 'fell');
       let b = bot.blockAt(p);
       if (!b || !inObjective(b.name)) continue;
@@ -357,25 +257,17 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
     }
     if (minedThisCycle > 0) { stuckPillars = 0; continue; }   // clearing may bring more into reach
 
-    // Nothing reachable. Pillaring only raises the reach envelope UPWARD, so it can bring HIGHER logs
-    // into range but never one at or below the feet. If every residual log is at/below feet level,
-    // climbing further just moves away from them (runaway-up, the other half of the oscillation) —
-    // concede instead. Leaves decay on their own once the connected trunk above is gone.
+    // Pillaring raises the reach envelope upward only; if every residual log is at/below feet level,
+    // climbing further only moves away from them, so this concedes instead.
     const anyAbove = rem.some(p => p.y > feet.y);
     if (!anyAbove) {
       watcher.warn(TAG, `fell_incomplete residual_logs=${rem.length} all at/below feet (y=${feet.y}) — pillaring cannot reach them, conceding (leaves decay).`);
       break;
     }
 
-    // Logs remain ABOVE but out of reach → pillar up to raise the reach envelope, from the canonical
-    // throwaway order (pillarConfig.defaultPriority). That order is timber-first, so the block placed
-    // here is normally a LOG: 26-adjacent to the trunk and matching inObjective, i.e. indistinguishable
-    // from the tree to this loop's own flood-fill. placedKeys (above) is what stops the feller mining
-    // its own scaffold and re-erecting it next dispatch — an endless same-coord fell.
-    // That guard is per-climb and LOCAL, so it cannot cover a peer: a placed log column resting on
-    // solid ground reads as a ground-supported trunk base to any other bot's scan. The peer half is
-    // closed one level up, by the arbiter's 5x5 tree column (foreman_brain.js), not here — a
-    // scaffold-block swap would only move that hole, since any pillar sits beside a trunk regardless.
+    // Logs remain above but out of reach → pillar up. The placed block is normally a log, so
+    // placedKeys guards this climb's own flood-fill from re-mining it; the peer case (another bot's
+    // scan reading the scaffold as a trunk) is closed one level up by foreman_brain.js.
     await microCenter(bot);
     const res = await pillarStep(bot, { debug: true });
     if (res.success && res.placedPosition) {
@@ -391,62 +283,66 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
     }
   }
 
-  // Descent: remove the dirt pillar we placed, top-down.
-  //
-  // DELIBERATELY NOT GATED, unlike the felling loop above — and this is the wrong turn to know about
-  // before making it. The obvious symmetry ("the fell loop needed a gate, so this does too") trades a
-  // known failure for a worse one: the bot is standing ON the pillar it is removing, so a counter that
-  // opened here would move a body that is nine blocks up with nothing under it but the column it is
-  // mid-way through deleting. That is predictable self-injury, which Law 17 forbids at the planning
-  // layer, and it is not what killed anything — the 2026-08-06 death happened during FELLING, which
-  // runs 8-15 s, where this runs ~5 s of throwaway dirt and ends with the body on the ground.
-  //
-  // The gate at the top of the next cycle catches the fight one descent later, at ground level, where a
-  // counter can actually move. If this window ever does prove fatal, the fix is to ABANDON the pillar
-  // and gate at the bottom — never to fight from the top of it.
+  // Descent: removes the placed pillar top-down, ungated — a combat preemption here would leave the
+  // body standing mid-air on a column it is deleting, which Law 17 forbids. Each block is the one the
+  // body stands on, so the dig lowers the body one block (lowerSelf). The descent ends at the first block
+  // that stays, leaving the column beneath it whole for the body to stand on.
+  let cleaned = 0;
   for (let i = placedPillar.length - 1; i >= 0; i--) {
     const b = bot.blockAt(placedPillar[i]);
-    if (b && b.name !== 'air') { await digBlock(bot, b); await sleep(CONFIG.cleanupPause); }
+    if (!b || b.name === 'air') continue;
+    if (!await performDig(bot, b.position, b, TAG, { lowerSelf: true })) {
+      watcher.warn(TAG, `pillar descent stopped at (${b.position.x},${b.position.y},${b.position.z}) — ${b.name} would not clear; `
+        + `${i + 1} pillar block(s) left standing under the body.`);
+      break;
+    }
+    cleaned++;
+    await sleep(CONFIG.cleanupPause);
   }
-  if (placedPillar.length) watcher.summary(TAG, `Cleaned pillar blocks count=${placedPillar.length}`);
+  if (placedPillar.length) watcher.summary(TAG, `Cleaned pillar blocks count=${cleaned} of ${placedPillar.length}`);
 
   return { minedCount, pillarCount: placedPillar.length };
 }
 
 // ── Trunk approach: walk to a walkable skirt cell beside the trunk ──────────
-// A cell the bot's body can occupy: air / non-colliding vegetation. Null (unloaded
-// chunk) counts as BLOCKED — never plan a stance into a cell we can't see (Law 17).
-const OCCUPIABLE_RE = /^(air|cave_air|void_air|tall_grass|short_grass|fern|large_fern|dead_bush|dandelion|poppy|blue_orchid|allium|azure_bluet|oxeye_daisy|cornflower|snow|.*_sapling)$/;
-function cellOccupiable(bot, x, y, z) {
-  const b = bot.blockAt(new Vec3(x, y, z));
-  return !!(b && b.name && OCCUPIABLE_RE.test(b.name));
-}
-// Solid walkable support: a real block, not occupiable, not a liquid/hazard to stand over.
-function cellSupport(bot, x, y, z) {
-  const b = bot.blockAt(new Vec3(x, y, z));
-  return !!(b && b.name && b.name !== 'air' && !OCCUPIABLE_RE.test(b.name) && !/water|lava/.test(b.name));
-}
-// A stance = feet clear, head clear, solid ground one below.
+// A cell the bot's body can occupy: feet clear, head clear, solid ground one below. Asked through
+// `classifyFloor` (Law 16), not a hardcoded block-name list (Invariant B); null counts as
+// blocked (Law 17).
 function isStandCell(bot, x, y, z) {
-  return cellOccupiable(bot, x, y, z) && cellOccupiable(bot, x, y + 1, z) && cellSupport(bot, x, y - 1, z);
+  return classifyFloor(bot, bot.blockAt(new Vec3(x, y - 1, z))) !== null;
 }
 
-// The trunk base is a SOLID log — a goTo aimed at it hunts a goal A* can never stand in,
-// so in dense forest the search exhausts its node budget and stops blocks short (observed
-// live: 1500/1500 nodes, 2.8 short → astar_no_path, 2026-07-03). Instead pick a real
-// standable cell next to the base — one of the 8 horizontal neighbours, at the base level
-// or a step up/down for gentle slopes — nearest the bot, cardinal preferred so it faces the
-// trunk squarely and climbAndFell's reach clears it. Null = trunk fully boxed in.
-function findSkirtCell(bot, base) {
+// Picks a real standable cell beside the solid trunk base (8 horizontal neighbours, base level or a
+// step up/down) on open ground, nearest the bot and cardinal-preferred. Null = no such cell.
+// groundUnder — where a log's stand is looked for: the log's own level when it rests on the ground, else the
+// first cell over solid ground straight below it, so a log hanging in the air is cut from the ground beneath it
+// (and from a pillar raised there when it hangs out of reach).
+const HANG_SCAN_DOWN = 32;
+function groundUnder(bot, base) {
+  for (let y = base.y - 1; y >= base.y - HANG_SCAN_DOWN; y--) {
+    const b = bot.blockAt(new Vec3(base.x, y, base.z));
+    if (!b) return base;
+    if (b.boundingBox === 'block' && !LEAF_REGEX.test(b.name) && !LOG_REGEX.test(b.name)) return { x: base.x, y: y + 1, z: base.z };
+  }
+  return base;
+}
+
+function findSkirtCell(bot, log) {
+  const { closedBy } = require('@locomotion/navigator');
   const feet = bot.entity.position.floored();
+  const base = groundUnder(bot, log);
+  const hangs = base.y !== log.y;
   let best = null;
   for (let dx = -1; dx <= 1; dx++) {
     for (let dz = -1; dz <= 1; dz++) {
-      if (dx === 0 && dz === 0) continue;
+      if (dx === 0 && dz === 0 && !hangs) continue;   // under a hanging log the cell straight below is a stand
       const x = base.x + dx, z = base.z + dz;
       for (const dy of [0, -1, 1]) {   // level first, then step down/up
         const y = base.y + dy;
         if (!isStandCell(bot, x, y, z)) continue;
+        // The stand is chosen from open ground: a cell inside closed ground (the building's box, the
+        // waste pit, a lane, a peer's work) is one the route planner ends no walk on.
+        if (closedBy({ x, y, z })) continue;
         const d2 = (x - feet.x) ** 2 + (y - feet.y) ** 2 + (z - feet.z) ** 2;
         const penalty = (dx !== 0 && dz !== 0 ? 1 : 0) + Math.abs(dy) * 3;   // bias: near, cardinal, level
         const score = d2 + penalty;
@@ -458,50 +354,53 @@ function findSkirtCell(bot, base) {
   return best ? { x: best.x, y: best.y, z: best.z } : null;
 }
 
-// Give the navigator a reachable goal (the skirt cell), not the solid trunk. The bot lands
-// within mining reach of the trunk — exactly the stance climbAndFell needs. Returns { arrived };
-// a boxed-in trunk (no skirt) reports not-arrived so the caller moves to the next tree rather
-// than burning a full locomotion retry budget on an unreachable stance.
+// Gives the navigator the skirt cell as goal, not the solid trunk. Returns { arrived }; a boxed-in
+// trunk (no skirt) reports not-arrived so the caller moves on.
 async function standAtTreeBase(bot, dispatcher, base) {
   const skirt = findSkirtCell(bot, base);
-  // reason distinguishes the two unlike ways an approach fails, so the caller's tally is not a
-  // black box (Law 5/6): 'no_skirt' = geometry (no standable cell adjacent to the trunk — a boxed
-  // pillar/dense pocket); 'nav_failed' = a stance EXISTS but A* couldn't reach it (a locomotion
-  // problem — e.g. leaf-cost detours, stranding). Different diagnosis, different fix.
+  // reason distinguishes the two ways an approach fails (Law 5/6): 'no_skirt' = geometry; 'nav_failed'
+  // = a stance exists but A* couldn't reach it.
   if (!skirt) return { arrived: false, reason: 'no_skirt' };
   const feet = bot.entity.position.floored();
 
-  // THE ALREADY-CLOSE SHORTCUT MAY NOT FIRE FROM THE TRUNK'S OWN COLUMN, and that exception is the
-  // whole reason this branch is not a bare distance test. Standing ON the base log puts the bot one
-  // block above it and one block horizontally from a skirt cell, which passes both tolerances — so
-  // the shortcut answers `arrived: true` for the one stance from which the tree cannot be felled at
-  // all: climbAndFell excludes the bot's own feet-column log as its support, and on a trunk with
-  // nothing above that log it is the ONLY objective, so the fell mines zero and reports
-  // no_blocks_mined. Nothing recovers from it either — the stance is re-derived identically on the
-  // next chain, so the same trunk is re-picked and re-conceded for as long as it ranks nearest.
-  // `arrived` is consumed as settled fact by a caller that does not re-check it (Law 16 forbids the
-  // redundant pathway), so a stance this function knows is unworkable may not be certified reachable
-  // (Law 25). Skirt cells are always horizontally offset (findSkirtCell skips dx=dz=0), so failing
-  // the shortcut here costs one short walk off the trunk and restores an ordinary beside-stance.
-  //
-  // THE WRONG TURN: fixing this in climbAndFell instead, by letting the support column be dug when
-  // no log is above it. That trades a stalled fell for an unbounded drop — the bot mines the block
-  // holding it up at whatever height it stands — and re-opens the dig-underfoot ↔ re-pillar
-  // oscillation the support exclusion exists to close. The stance is the fault; fix the stance.
+  // Excluded from the trunk's own column: standing ON the base log would pass both tolerances, but
+  // that is the one stance climbAndFell can never fell from (its own feet-column log is excluded as
+  // support), so the shortcut is forced onto a genuine, horizontally-offset skirt cell (Law 25).
   const onTrunkColumn = feet.x === base.x && feet.z === base.z;
   const hDist = Math.hypot(feet.x - skirt.x, feet.z - skirt.z);
   if (!onTrunkColumn && hDist <= 1.5 && Math.abs(feet.y - skirt.y) <= 1) return { arrived: true };
+  const startedAt = Date.now();
   const res = await dispatcher.goTo({ x: skirt.x, y: skirt.y, z: skirt.z });
-  return (res && res.arrived) ? { arrived: true } : { arrived: false, reason: 'nav_failed' };
+  if (res && res.arrived) return { arrived: true };
+  ledgerUnreached(bot, base, skirt, feet, res, Date.now() - startedAt);
+  return { arrived: false, reason: 'nav_failed' };
 }
 
-// Object lock (arbiter flavor a — physical exclusivity, see foreman_brain.js taxonomy):
-// a felled tree is one object, claimed by its base block. Chosen at EXECUTION time from
-// live perception, so the planning token can't cover it — this claim is what stops two
-// bots working the same trunk. Taken through target_claims, the one claim-reach-release walk
-// trees, stone columns and grass share (Law 16). In single-bot mode every claim is granted.
+// ── A TREE THE WALK DID NOT REACH: ONE LINE, WITH WHAT IS NEEDED TO SAY WHY ────────────────────────
+// Written beside the tree-search ledger and read by the same lens (`--trees`).
+//   tree / stand / from   the trunk base, the cell the body was sent to stand in, where it set off
+//   reason                locomotion's own verdict for the walk, verbatim
+//   stand_closed_by       building | waste_pit | lane | peer when that stand cell lies in closed ground
+//                         (a route search refuses such a goal before it starts), else open
+//   ended                 where the body stood when the walk ended; moved is how far that is from `from`
+//   under / at / above    the blocks at the stand cell's floor, feet and head as the body reads them now
+function ledgerUnreached(bot, base, skirt, from, res, heldMs) {
+  const name = (x, y, z) => { const b = bot.blockAt(new Vec3(x, y, z)); return b ? b.name : 'unloaded'; };
+  const end = bot.entity.position.floored();
+  const reason = String((res && res.reason) || 'no_reason_stated').replace(/\s+/g, '_');
+  watcher.summary('tree_search',
+    `unreached tree=(${base.x},${base.y},${base.z}) stand=(${skirt.x},${skirt.y},${skirt.z}) from=(${from.x},${from.y},${from.z})`
+    + ` flat=${Math.round(Math.hypot(skirt.x - from.x, skirt.z - from.z))} rise=${skirt.y - from.y}`
+    + ` reason=${reason} attempts=${(res && res.attempts) || '-'}`
+    + ` stand_closed_by=${require('@locomotion/navigator').closedBy(skirt) || 'open'}`
+    + ` ended=(${end.x},${end.y},${end.z}) moved=${Math.round(Math.hypot(end.x - from.x, end.z - from.z))} held_ms=${heldMs}`
+    + ` under=${name(skirt.x, skirt.y - 1, skirt.z)} at=${name(skirt.x, skirt.y, skirt.z)} above=${name(skirt.x, skirt.y + 1, skirt.z)}`);
+}
+
+// Object lock (arbiter flavor a — physical exclusivity, foreman_brain.js taxonomy): claimed by base
+// block, through target_claims, the one claim-reach-release walk trees/stone/grass share (Law 16).
 const treeKeyOf = (pos) => `tree:${pos.x},${pos.y},${pos.z}`;
-// standAtTreeBase answered in its own shape; the walk reads { ok, reason }.
+// standAtTreeBase answers in its own shape; the walk reads { ok, reason }.
 const approachTree = (bot, dispatcher) => async (pos) => {
   const approach = await standAtTreeBase(bot, dispatcher, pos);
   return { ok: !!(approach && approach.arrived), reason: approach && approach.reason === 'no_skirt' ? 'no_skirt' : 'path_failed' };
@@ -510,38 +409,36 @@ const approachTree = (bot, dispatcher) => async (pos) => {
 // ── Candidate selection + unstick (self-scan mode) ───────────────────────────
 const DIRS8 = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
 
-// preferSpecies (optional) sorts the preferred wood AHEAD of everything else, distance breaking ties
-// within each half — a two-key sort, never a filter. Every non-preferred tree is still in the list and
-// still gets felled once the preferred ones are exhausted or unreachable, which is the whole difference
-// from the fleet-wide species LOCK removed on 2026-07-16 (see scanAllLogs). Pass nothing and the ranking
-// is pure distance, unchanged — that is what canopy clearing gets, and why the two never mix.
-function rankByProximity(candidates, origin, preferSpecies = null) {
+// Ranks by distance only — species is decided elsewhere (`set_wood_preference`,
+// `downloaded_plan_registry.siteWood`), not by which trunk a body walks to.
+function rankByProximity(candidates, origin) {
   return candidates
     .map(c => ({ c, d2: (c.position.x - origin.x) ** 2 + (c.position.y - origin.y) ** 2 + (c.position.z - origin.z) ** 2 }))
-    .sort((a, b) => {
-      if (preferSpecies) {
-        const ap = a.c.name === preferSpecies ? 0 : 1;
-        const bp = b.c.name === preferSpecies ? 0 : 1;
-        if (ap !== bp) return ap - bp;
-      }
-      return a.d2 - b.d2;
-    });
+    .sort((a, b) => a.d2 - b.d2);
 }
 
-// Walk the ranked trees nearest-first: claim each, try to reach its skirt, stop at the first one
-// the bot can stand beside. Claim-BEFORE-walk stops two bots converging on one tree; a claimed but
-// unreachable tree is released and the sweep continues. Bounded by MAX_UNREACHABLE_APPROACHES so a
-// truly boxed bot doesn't churn the whole list. Returns { pick|null, peerHeld, unreachable, spent }.
+// isWetStump — a log with water beside or above it and no log on top of it. performDig refuses such a log
+// (dig_authority: a dig never opens a face onto water), and with nothing above it there is no trunk to take
+// either, so it is no tree to any body: a search passes over it.
+function isWetStump(bot, p) {
+  const above = bot.blockAt(new Vec3(p.x, p.y + 1, p.z));
+  if (above && LOG_REGEX.test(above.name)) return false;
+  return require('@utils/pathfinding_utils').opensOntoWater(bot, p.x, p.y, p.z);
+}
+
+// Walks the ranked trees nearest-first: claim each, try its skirt, stop at the first one reached. The
+// walk ends on that tree or on the end of the list, whichever comes first.
+// Claim-before-walk stops two bots converging on one tree. Returns { pick|null, peerHeld, spent, ... }.
 async function selectReachableTree(bot, dispatcher, ranked, excludeTrees) {
   const approach = approachTree(bot, dispatcher);
   const walk = await claimFirst(ranked.map(r => r.c), {
     keyOf: c => treeKeyOf(c.position),
-    skip: (c, key) => !!(excludeTrees && excludeTrees.has(key)),
+    skip: (c, key) => !!(excludeTrees && excludeTrees.has(key)) || isWetStump(bot, c.position),
     approach: c => approach(c.position),
-    maxUnreachable: MAX_UNREACHABLE_APPROACHES,
   });
   const boxed = walk.failures.no_skirt || 0;
-  const tally = { peerHeld: walk.peerHeld, boxed, pathFailed: walk.unreachable - boxed, spent: walk.skipped };
+  const tally = { peerHeld: walk.peerHeld, boxed, pathFailed: walk.unreachable - boxed, spent: walk.skipped,
+    examined: walk.examined };
   return walk.pick
     ? { pick: { chosenPos: walk.pick.position, chosenName: walk.pick.name, treeKey: walk.key }, ...tally }
     : { pick: null, ...tally };
@@ -554,14 +451,11 @@ function openStanceColumn(bot, x, z, yGuess) {
   return null;
 }
 
-// Last resort before conceding no_reachable_free_tree: the nearest trees are all blocked, which
-// usually means WHERE the bot stands is the problem (boxed by dense trunks, or a pit it felled
-// itself into), not that the trees are gone. Step to open ground AWAY from that pocket so the next
-// rescan's A* starts from a clear cell. Picks a standable cell along the 8 compass steps, the one
-// best aligned with the away-from-pocket vector first. Returns true only if the bot actually moved.
+// Last resort before conceding no_reachable_free_tree: steps to open ground away from the tree
+// cluster's centroid so the next rescan's A* starts from a clear cell. Returns true iff it moved.
 async function repositionToOpenGround(bot, dispatcher, ranked) {
   const feet = bot.entity.position.floored();
-  const cluster = ranked.slice(0, Math.min(ranked.length, MAX_UNREACHABLE_APPROACHES));
+  const cluster = ranked.slice(0, REPOSITION_CLUSTER);
   if (!cluster.length) return false;
   let cx = 0, cz = 0;
   for (const { c } of cluster) { cx += c.position.x; cz += c.position.z; }
@@ -587,118 +481,139 @@ async function repositionToOpenGround(bot, dispatcher, ranked) {
   return false;
 }
 
-// Blueprint self-protection: never fell the build. A blueprint can contain LOG voxels stacked
-// like a trunk (Architect's design), so surface_filter sees them as a ground-supported tree and
-// the feller would mine the structure. Load the locked-blueprint voxel set the navigator protects
-// (Law 16) and drop any tree candidate sitting on it; the set is also handed to climbAndFell so a
-// connected branch that dips into blueprint space is spared. null = nothing locked.
-// No catch (r33/D9): getProtectedBlocks CANNOT throw for "no headframe locked yet" — worldVoxelKeys
-// returns null for that by design (blueprint_survey.js:298). So the old swallow could only ever fire
-// on a genuine bug (bad require, HQ read throwing) and it converted that bug into null → "nothing is
-// protected" → dropProtectedCandidates filters nothing → THE FELLER MINES THE BASE. A coding
-// violation must reach a human, not disarm self-protection silently (Law 13).
+// Blueprint self-protection: a blueprint can contain LOG voxels stacked like a trunk, which
+// surface_filter would otherwise see as fellable. Loads every locked blueprint's solid voxels into
+// one Set (Law 16); null = nothing locked. Unguarded — a swallowed throw would read as "nothing
+// protected" and let the feller mine the base (Law 13).
 function loadBlueprintProtected() {
-  const buildingIntegrity = require('@perception/building_integrity');
-  return buildingIntegrity.getProtectedBlocks('headframe');
+  return require('@perception/blueprint_survey').getAllProtectedBlocks();
 }
 
-function dropProtectedCandidates(objectives, protectedSet) {
-  if (!protectedSet || !protectedSet.size) return objectives;
-  return objectives.filter(o => !protectedSet.has(`${o.position.x},${o.position.y},${o.position.z}`));
+// buildWoodTest — (position) => true for a log that is the fleet's own wood and never a tree: a cell in
+// the downloaded building's box (no route enters the box), or a locked blueprint's block. Handed to the
+// scan as its `exclude`, so the scan's count of usable trees is a count of trees (Law 25).
+function buildWoodTest(protectedSet) {
+  const box = require('@kernel/downloaded_plan_registry').closedBox();
+  return (p) => (!!box && p.x >= box.min.x && p.x <= box.max.x && p.y >= box.min.y && p.y <= box.max.y && p.z >= box.min.z && p.z <= box.max.z)
+    || (!!protectedSet && protectedSet.has(`${p.x},${p.y},${p.z}`));
 }
 
-// Base-canopy scoping (Architect 2026-07-11). Wild felling clears the base's camera zone — the
-// square of half-extent HEADFRAME_SAFE_RADIUS around the headframe's build_center, the SAME "inside
-// base" boundary torch_integrity lights and threat_scanner guards (Law 16 — one base-zone definition,
-// every subsystem agrees where "base" ends). zone.mode:
-//   'inside'  → keep only trees within the zone (clear the canopy so cameras see the base).
+// Scopes wild felling to the base's camera zone — the same "inside base" boundary torch_integrity and
+// threat_scanner use (Law 16). zone.mode:
+//   'inside'  → keep only trees within the zone (clear the canopy).
 //   'outside' → keep only trees beyond it (log supply that never re-touches the cleared base).
-// The caller (job board) picks the mode: 'inside' while the base still holds trees, 'outside' once
-// it is clear. No zone / no locked base center → no scoping (unchanged wild-fell behavior).
+// No zone / no locked base center → no scoping.
 function applyCanopyZone(objectives, zone) {
   if (!zone || (zone.mode !== 'inside' && zone.mode !== 'outside')) return objectives;
   const c = zone.center;
   if (!c || typeof c.x !== 'number') return objectives;
-  const r = typeof zone.radius === 'number' ? zone.radius : HEADFRAME_SAFE_RADIUS;
-  return objectives.filter(o => {
-    const within = Math.max(Math.abs(o.position.x - c.x), Math.abs(o.position.z - c.z)) <= r;
-    return zone.mode === 'inside' ? within : !within;
-  });
+  // Two shapes: `box` states the region as offsets from the transpose origin (a building site's own
+  // footprint); `radius` is a Chebyshev ring (the camera zone). Box is checked first when present.
+  const b = zone.box;
+  const within = b
+    ? (p) => (p.x - c.x) >= b.min_dx && (p.x - c.x) <= b.max_dx
+          && (p.z - c.z) >= b.min_dz && (p.z - c.z) <= b.max_dz
+    : (() => {
+        const r = typeof zone.radius === 'number' ? zone.radius : HEADFRAME_SAFE_RADIUS;
+        return (p) => Math.max(Math.abs(p.x - c.x), Math.abs(p.z - c.z)) <= r;
+      })();
+  return objectives.filter(o => (zone.mode === 'inside' ? within(o.position) : !within(o.position)));
 }
 
-// Tree census (Architect 2026-07-16). The scan ALWAYS runs; this replaces the old repetitive
-// "No fellable trees within scan range" warn with a one-line census so a clearing area reads its own
-// progress — how many fellable trees stand inside the caller's clear ring vs. the total in scan range
-// (outside = total - inside falls out). Emitted on every self-scan, whether trees remain or the ring is
-// clear, so the count is visible as the fleet draws it down (the Architect wants the SCAN kept loud, not
-// quieted). No ring active (pre-base wild fell, canopyZone null) → just the scan-range total. Reuses
-// applyCanopyZone's Chebyshev test so "inside" here means exactly what the fell filter means (Law 16).
-function emitTreeCensus(fellable, zone) {
-  const total = fellable.length;
-  const c = zone && zone.center;
-  if (!c || typeof c.x !== 'number') {
-    watcher.summary(TAG, `Tree census: ${total} fellable tree(s) in scan range (no clear ring active).`);
-    return;
-  }
+// How far from `origin` an 'inside' zone can hold a tree, in flat blocks — the rings stop there, since
+// a bounded region gains no tree from a wider horizon. Every other zone has no such bound.
+function zoneReach(zone, origin) {
+  if (!zone || zone.mode !== 'inside') return Infinity;
+  const c = zone.center;
+  if (!c || typeof c.x !== 'number') return Infinity;
+  const b = zone.box;
   const r = typeof zone.radius === 'number' ? zone.radius : HEADFRAME_SAFE_RADIUS;
-  const inside = applyCanopyZone(fellable, { mode: 'inside', center: c, radius: r }).length;
-  watcher.summary(TAG, `Tree census: ${inside} inside clear ring (r=${r}), ${total} total, ${total - inside} outside.`);
+  const xs = b ? [c.x + b.min_dx, c.x + b.max_dx] : [c.x - r, c.x + r];
+  const zs = b ? [c.z + b.min_dz, c.z + b.max_dz] : [c.z - r, c.z + r];
+  let far = 0;
+  for (const x of xs) for (const z of zs) far = Math.max(far, Math.hypot(x - origin.x, z - origin.z));
+  return Math.ceil(far) + 1;
+}
+
+const zoneLabel = (zone) => {
+  if (!zone || (zone.mode !== 'inside' && zone.mode !== 'outside')) return 'none';
+  return `${zone.mode}:${zone.box ? 'box' : `r${typeof zone.radius === 'number' ? zone.radius : HEADFRAME_SAFE_RADIUS}`}`;
+};
+
+// ── THE TREE SEARCH: ONE RING, CHECK IT, THEN THE NEXT ─────────────────────────────────────────────
+// Rings 16 blocks wide open outward from `origin`. Each ring's trees are tried nearest-first — claim,
+// walk, stand beside — and the search ends on the first tree stood beside or on the last ring the body
+// has loaded. A ring is read only when every ring inside it gave no tree, so a body beside a forest
+// reads one ring and a body in a clearing reads as far as the clearing goes.
+// Returns the pick (or null) and the tally the ledger line and the caller's verdict are read from.
+async function searchRings(bot, dispatcher, o) {
+  const { protectedSet, zone, origin, excludeTrees } = o;
+  const surfaceFilter = require('@perception/surface_filter');
+  // Unguarded: a swallowed throw here would read as "no trees" and not "cannot see" (Law 13).
+  const rings = surfaceFilter.openRings(bot, {
+    type: 'object_group_or_direct',
+    targets: ['logs'],
+    exclude: buildWoodTest(protectedSet),
+    center: origin,
+    reach: zoneReach(zone, origin),
+  });
+  const t = { pick: null, ring: null, seen: 0, inZone: 0, examined: 0, peerHeld: 0, boxed: 0, pathFailed: 0, spent: 0, nearest: [] };
+  for (let ring = await rings.next(); ring; ring = await rings.next()) {
+    const trees = ring.objectives.filter(
+      c => c && c.position && ['x', 'y', 'z'].every(k => typeof c.position[k] === 'number'));
+    t.seen += trees.length;
+    const candidates = applyCanopyZone(trees, zone);
+    t.inZone += candidates.length;
+    if (!candidates.length) continue;
+    const ranked = rankByProximity(candidates, origin);
+    if (t.nearest.length < REPOSITION_CLUSTER) t.nearest.push(...ranked.slice(0, REPOSITION_CLUSTER - t.nearest.length));
+    const sel = await selectReachableTree(bot, dispatcher, ranked, excludeTrees);
+    t.examined += sel.examined; t.peerHeld += sel.peerHeld; t.boxed += sel.boxed;
+    t.pathFailed += sel.pathFailed; t.spent += sel.spent;
+    if (sel.pick) { t.pick = sel.pick; t.ring = ring; break; }
+  }
+  t.cost = rings.cost();
+  return t;
+}
+
+// ── THE TREE-SEARCH LEDGER: ONE LINE PER SEARCH ────────────────────────────────────────────────────
+// What one search read, what it found and how it ended, as fields a lens tallies (`--trees`).
+//   outcome   picked | none_seen | none_in_zone | all_claimed | none_reached
+//   ring      the ring the picked tree was in; dist is the flat distance from the body to that tree
+//   rings / sections / scan_ms   what was read to get there
+//   seen / in_zone / examined    trees read, trees the zone admits, trees put the claim-and-walk question
+//   search_ms includes the walks to trees that were tried
+function ledgerSearch(t, zone, from, startedAt) {
+  const outcome = t.pick ? 'picked'
+    : t.seen === 0 ? 'none_seen'
+    : t.inZone === 0 ? 'none_in_zone'
+    : (t.peerHeld > 0 && t.boxed + t.pathFailed === 0) ? 'all_claimed' : 'none_reached';
+  const p = t.pick && t.pick.chosenPos;
+  watcher.summary('tree_search',
+    `search outcome=${outcome} zone=${zoneLabel(zone)} ring=${t.ring ? t.ring.index : '-'}`
+    + ` dist=${p ? Math.round(Math.hypot(p.x - from.x, p.z - from.z)) : '-'}`
+    + ` rings=${t.cost.rings} sections=${t.cost.read} scan_ms=${t.cost.ms}`
+    + ` seen=${t.seen} in_zone=${t.inZone} examined=${t.examined} peer_held=${t.peerHeld} boxed=${t.boxed}`
+    + ` path_failed=${t.pathFailed} spent=${t.spent} search_ms=${Date.now() - startedAt}`
+    + ` tree=${p ? `(${p.x},${p.y},${p.z})` : '-'} species=${t.pick ? t.pick.chosenName : '-'}`);
 }
 
 // ── Main API ───────────────────────────────────────────────────────────────
-// fell(bot)              — scan for closest tree, approach, fell
+// fell(bot)              — search for the closest tree, approach, fell
 // fell(bot, target)      — approach this trunk position and fell
-// scanAllLogs — every tree is a CANDIDATE, always, whatever its species. That much is unchanged since
-// 2026-07-16 ("remove the tree preference; harvest any and all trees equally from closest to furthest"),
-// and it is the half that must never come back: the removed design rode a fleet-wide `wood_species`
-// boardroom chair meaning "one species until it runs out", which FILTERED — a nearer birch was skipped
-// to reach a committed oak. Nothing below filters. The scan still returns every species collapsed to
-// trunk bases; what 2026-08-13 adds is a SORT KEY on top of distance, opt-in per caller.
 //
-// It does NOT decide the preference. That is `action_fragments.js/set_wood_preference`, a dispatched job
-// with its own rank and its own magnet (Architect 2026-08-13: *"lets make the tree preverence a whole job
-// and uses a magnet so only one bot can do it"*). The first draft of this feature set the preference here,
-// as a side effect of the first scan that happened to see a tree — which meant a decision for the whole
-// fleet was made by whichever bot's felling loop ran first, at whatever moment it ran, with no owner and no
-// claim. Two bots could decide it simultaneously and differently. A fleet-wide choice needs one owner
-// (Invariant D) and one occupant (Invariant A), and a job is what this system already has for both.
-function scanAllLogs(bot, surfaceFilter) {
-  // ENOUGH: the felling loop's scan is the HOTTEST caller in the fleet — it re-scans every ~12s while
-  // it is looking for something to cut — so what it declines to pay for matters more here than
-  // anywhere else. Measured on the live server 2026-09-04, one scan's rings cost 48:~200ms,
-  // 112:~1.5s, 256:~10.5s, and the full horizon bought exactly ONE more tree (5 -> 6). Ten seconds
-  // for a sixth candidate is never the right trade for THIS caller, because everything below filters
-  // the set down hard anyway (blueprint logs excluded, peer-held trees skipped, unreachable ones
-  // dropped) — in the run that produced those numbers, 5 found became 1 usable, and a 6th would have
-  // changed nothing except when the bot got to try it.
-  //
-  // WHY 3 AND NOT 1: the filtering is exactly why it cannot ask for one. A single candidate that turns
-  // out to be peer-held or stanceless sends the whole loop around again at full price; three gives the
-  // filters something to survive. And it is a floor, not a cap — a ring that holds more still returns
-  // all of them, so the common case of standing in a forest is unaffected.
-  //
-  // IT IS SET HERE RATHER THAN IN THE SCAN NODE because the same node serves set_wood_preference,
-  // which wants a CENSUS of every trunk to pick a species and would be corrupted by an early stop
-  // (Law 25 — the asker owns the criterion).
-  return surfaceFilter.scan(bot, { type: 'object_group_or_direct', targets: ['logs'], enough: 3 });
-}
+// Every tree is a candidate whatever its species; species is a sort key a caller could opt into on top
+// of distance, never a filter here (owned by `set_wood_preference`).
 
-// The reader. Returns null until the wood_preference_lock job has run, which every caller treats as "no
-// preference" — the pure nearest-first ordering this fleet ran on until now. The fragment owns both the
-// storage location and the read, so there is exactly one definition of where this value lives (Law 16);
-// this is a thin pass-through so callers do not have to know which fragment holds it. Lazy require — the
-// fragment pulls in the config and HQ, and this API is loaded early by several action fragments.
+// Thin pass-through to the wood-preference fragment, which owns storage and read (Law 16). Returns
+// null until wood_preference_lock has run ("no preference"). Lazy require.
 function getPreferredWoodSpecies() {
   const pref = require('@action/set_wood_preference').readWoodPreference();
   return pref ? pref.species : null;
 }
 
 // fell(bot, target, opts) — approach, fell, with options
-//
-// De-confliction is claim-BEFORE-walk: the tree is locked at selection, not on arrival.
-// Claiming only after the walk let two bots pick the same closest trunk and both travel to
-// it before either discovered the conflict — the loser wasted the whole trip. Now a peer-held
-// tree is skipped before we move, so the bots diverge onto different trees from the start.
+// De-confliction is claim-before-walk: the tree is locked at selection, not on arrival.
 async function fell(bot, target, opts = {}) {
   const protectedSet = opts.protectedBlocks || loadBlueprintProtected();
   const excludeTrees = (Array.isArray(opts.excludeTrees) && opts.excludeTrees.length)
@@ -732,71 +647,38 @@ async function fell(bot, target, opts = {}) {
 
   } else {
     // ── Self-scan mode: claim the closest FREE tree, then approach it ───
-    const surfaceFilter = require('@perception/surface_filter');
-    // NO GUARD ON A SCAN, HERE OR BELOW. The surface filter is ours; a throw escaping it is a defect,
-    // and answering `scan_error` sends the judge a felling that found no trees rather than a fleet that
-    // cannot see (Law 13).
-    const scanResult = scanAllLogs(bot, surfaceFilter);
-    const scanned = (scanResult?.objectives || []).filter(
-      o => o && o.position && ['x', 'y', 'z'].every(k => typeof o.position[k] === 'number')
-    );
-    const unprotected = dropProtectedCandidates(scanned, protectedSet);
-    if (protectedSet && unprotected.length < scanned.length) {
-      watcher.summary(TAG, `Excluded ${scanned.length - unprotected.length} blueprint log(s) from tree candidates.`);
-    }
-    // Canopy zone scopes wild felling to the base's camera ring or beyond it (Architect 2026-07-11).
-    const candidates = applyCanopyZone(unprotected, opts.canopyZone);
-    // Report the census BEFORE the empty-return so a clear ring still prints "0 inside, N total"
-    // (the informative signal that the base is clear but wild trees remain), not silence.
-    emitTreeCensus(unprotected, opts.canopyZone);
-    if (!candidates.length) {
-      return { success: false, reason: 'no_trees_found' };
-    }
-    const candidatesKind = scanResult?.summary?.target || candidates[0].name;
-
     // Ranking origin: prefer the caller's coordinate (opts.preferNear — e.g. the headframe center) so
-    // clearing works outward from the build; fall back to the bot for efficient log supply (Architect 2026-07-12).
+    // clearing works outward from the build; fall back to the bot for efficient log supply. The rings
+    // open from the same point, so "the nearest ring" and "the nearest tree" mean one thing.
     const rankOrigin = (opts.preferNear && typeof opts.preferNear.x === 'number') ? opts.preferNear : bot.entity.position;
 
-    // opts.preferWood is the CALLER's declaration that this felling is for a material supply, not for
-    // clearing ground. Gathering logs to build with wants one species; canopy clearing wants whatever
-    // stands in the camera ring, and asking it to prefer would leave the wrong-species trees standing in
-    // a "cleared" zone forever. The two verbs are told apart HERE, by the caller, exactly as the base
-    // keep-out is owned by the harvest verb rather than built into the scan (Architect 2026-08-13: "make
-    // sure you dont mix the two").
-    const preferSpecies = opts.preferWood ? getPreferredWoodSpecies() : null;
+    // No species term here — a body walks to the nearest trunk. Species is a placement rule owned by
+    // `set_wood_preference` / `downloaded_plan_registry.siteWood`, which reads `getPreferredWoodSpecies`.
+    const ask = { protectedSet, zone: opts.canopyZone, origin: rankOrigin, excludeTrees };
+    let from = bot.entity.position.floored();
+    let startedAt = Date.now();
+    let found = await searchRings(bot, dispatcher, ask);
+    ledgerSearch(found, opts.canopyZone, from, startedAt);
 
-    // Sweep the candidates nearest-first for the closest one we can actually stand beside
-    // (claim-before-walk; see selectReachableTree). Skip trees this chain already reached-but-
-    // couldn't-fell (opts.excludeTrees).
-    let ranked = rankByProximity(candidates, rankOrigin, preferSpecies);
-    let sel = await selectReachableTree(bot, dispatcher, ranked, excludeTrees);
-
-    // Nearest trees all blocked → we're probably boxed where we stand, not out of trees. Step to
-    // open ground and rescan ONCE before conceding: a fresh A* from a clear cell reaches trees the
-    // pocket could not. Still nothing after that = genuinely entombed/depleted, and the stable
-    // no_reachable_free_tree readable lets recursive_judge kill the loop (Law 13).
-    if (!sel.pick) {
-      const moved = await repositionToOpenGround(bot, dispatcher, ranked);
+    // Trees stood in the zone and every walk to one failed → likely boxed where the body stands. Steps
+    // to open ground and searches once more before conceding (Law 13).
+    if (!found.pick && found.boxed + found.pathFailed > 0) {
+      const moved = await repositionToOpenGround(bot, dispatcher, found.nearest);
       if (moved) {
-        const rescan = scanAllLogs(bot, surfaceFilter);
-        const freshUnprotected = dropProtectedCandidates((rescan?.objectives || []).filter(
-          o => o && o.position && ['x', 'y', 'z'].every(k => typeof o.position[k] === 'number')
-        ), protectedSet);
-        const fresh = applyCanopyZone(freshUnprotected, opts.canopyZone);
-        if (fresh.length) {
-          ranked = rankByProximity(fresh, rankOrigin, preferSpecies);
-          sel = await selectReachableTree(bot, dispatcher, ranked, excludeTrees);
-        }
+        from = bot.entity.position.floored();
+        startedAt = Date.now();
+        found = await searchRings(bot, dispatcher, ask);
+        ledgerSearch(found, opts.canopyZone, from, startedAt);
       }
     }
 
-    if (!sel.pick) {
-      watcher.summary(TAG, `No claimable, reachable tree among ${candidates.length} (${sel.peerHeld} peer-held, ${sel.boxed} boxed-no-stance, ${sel.pathFailed} path-failed, ${sel.spent} spent) — replanning.`);
-      return { success: false, reason: 'no_reachable_free_tree' };
+    if (!found.pick) {
+      if (found.inZone === 0) return { success: false, reason: 'no_trees_found' };
+      // Contention is not failure: a peer-held tree means this body is surplus to the work available;
+      // an entombed/depleted forest is a different event for the loop detector (Law 13).
+      return { success: false, reason: found.peerHeld > 0 ? 'all_trees_claimed' : 'no_reachable_free_tree' };
     }
-    chosenPos = sel.pick.chosenPos; chosenName = sel.pick.chosenName; treeKey = sel.pick.treeKey;
-    watcher.summary(TAG, `Claimed ${candidatesKind} at (${chosenPos.x},${chosenPos.y},${chosenPos.z}) of ${candidates.length} (skipped ${sel.peerHeld} peer-held, ${sel.boxed} boxed-no-stance, ${sel.pathFailed} path-failed, ${sel.spent} spent).`);
+    chosenPos = found.pick.chosenPos; chosenName = found.pick.chosenName; treeKey = found.pick.treeKey;
   }
 
   // ── Settle on trunk center and fell (tree already claimed above) ─────

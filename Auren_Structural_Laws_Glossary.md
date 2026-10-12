@@ -10,7 +10,7 @@
 > **This file is NOT injected** with the laws (only `Auren_Structural_Laws_LLM.md` is). Keeping
 > the names here keeps the injected law text a pure, agnostic surface.
 >
-> **This is a WHAT, so it rots (Law 14).** A role phrase in a law cannot go stale — if the role
+> **This table maps names, so it goes stale on a rename.** A role phrase in a law cannot go stale — if the role
 > disappears the law that names it is edited in the same pass. A name in *this* table can: rename
 > or move a fragment and this row silently goes false. **Update this table on any rename/move.**
 > The laws are authoritative; where this table disagrees with the code, the code wins and the row

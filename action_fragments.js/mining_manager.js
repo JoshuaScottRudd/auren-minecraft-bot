@@ -1,23 +1,6 @@
 // mining_manager.js
-// Manager. Reads the mine job from the bot's magnet, dispatches to mining_executor one integrity
-// pass at a time, and OWNS the batch loop: it runs the executor MINING_PASSES_PER_DISPATCH times
-// back-to-back — repair-or-dig one staircase segment, or one cell pass, each time — then returns the
-// bot to the headframe, dumps excess, and releases to recursive_judge so job_board can replan.
-//
-// WHY the manager owns the loop: the executor used to batch shaft segments
-// itself while cells replanned through job_board every pass — two mechanisms for the same "do it a
-// few times before surfacing" need (Law 16 smell). Now the manager plays job_board's dispatch role N
-// times locally for BOTH shaft and cell: after each executor pass it either RE-DISPATCHES the same
-// executor (no replan) or, when the work is done / stuck / the batch cap is hit, ENDS the batch by
-// surfacing + dumping + releasing. A cell re-passes the SAME cell (holding its claim) until its diff
-// is clean or it stops shrinking; the shaft advances one segment per pass.
-//
-// WHY surface on every batch end: each hand-back is a fork where the brain may pick a SURFACE job
-// (wheat farm, build). A bot handing back deep in the shaft makes the next task's pathfinder carve a
-// fresh diagonal toward its target (cheaper than climbing the staircase), scarring the ground. So the
-// manager climbs back to the shaft head before releasing; the storage chests live there, so dumping
-// excess rides free on a trip already being made (return FIRST, dump SECOND — the walk stands on its
-// own because a pass may have nothing over-keep to dump yet still be deep).
+// Reads the mine job from the bot's magnet and dispatches to mining_executor, cell after cell on one
+// descent while the body holds more than MINING_LAST_PICKAXE, then surfaces, dumps and releases.
 
 'use strict';
 
@@ -27,35 +10,18 @@ const miningIntegrity = require('@perception/mining_integrity');
 const blueprintSurvey = require('@perception/blueprint_survey');
 const miningCellGraph = require('@perception/mining_cell_graph');
 const locomotion      = require('@locomotion/locomotion_dispatcher');
-const { dumpExcess }  = require('@api/inventory_swapper');
-const { MINING_PASSES_PER_DISPATCH } = require('@thinking/architect_config');
+const { dumpExcess, retrieveItems } = require('@api/inventory_swapper');
+const { MINING_PASSES_PER_DISPATCH, MINING_LAST_PICKAXE } = require('@thinking/architect_config');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
 
 const TAG = 'mining_manager';
 
-// Executor stop codes that END THE BATCH WITHOUT COMPLETING IT. A third category beside "done" and
-// "keep going": the pass is unfinished and says why, and the reason is one no further pass can change —
-// the bot is short a REQUIRED block, so descending again runs the identical pass against the identical
-// empty pocket. Batching past it is how an honest shortfall still becomes a loop: the executor reports
-// material_short, the manager re-passes to the cap, the job releases, the board re-derives the same
-// segment, and the judge is once again the only party that notices. Ending here surfaces the bot so
-// job_board can post the supply that unblocks it (Law 25 — the outcome is carried, not retried past).
-const BATCH_BLOCKED_EXITS = new Set(['material_short']);
+// Executor exit codes that end the batch without completing it — a required-block shortfall no
+// further pass can fix. Surfacing lets job_board post the supply that unblocks it (Law 25).
+const BATCH_BLOCKED_EXITS = new Set(['pocket_short']);
 
-// Tool gate is COUNT-based, not durability-based: the bot
-// maintains 2 pickaxes per tier (job_board crafting targets) and consumes the most-
-// worn one first (fragment_utils tool selection). Mining is allowed as long as at
-// least ONE pickaxe is in inventory — when down to its last it finishes on that one
-// while job_board crafts a replacement back up to 2. Only a count of ZERO blocks
-// dispatch, so the bot never strip-mines with bare hands. No durability math needed.
-//
-// EXPORTED because job_board must gate the mining POST on it. The board and the manager have to agree on
-// "may this bot mine" or the disagreement becomes a loop: the board posts, the dispatcher claims, this
-// manager releases on the gate, the board posts the same job again — five identical outcomes and
-// recursive_judge kills the bot. Whether that loop is REACHABLE depends on the shaft's rank relative to
-// crafting_tool (6): under it a pickaxe-less bot always crafts one first and the two cannot disagree
-// in practice; over it they can. One predicate, one answer (Law 16) — held on both sides so the next
-// renumber is merely wrong rather than fatal. Same pairing the staircase-lock gate already uses.
+// Tool gate is count-based: mining is allowed as long as at least one pickaxe is in inventory.
+// Exported so job_board's toolGate reads the same predicate (Law 16).
 function hasPickaxe(bot) {
     if (!bot || !bot.inventory) return { ok: false, reason: 'bot/inventory not ready' };
     const count = bot.inventory.items().filter(i => i && i.name && i.name.endsWith('_pickaxe')).length;
@@ -63,56 +29,173 @@ function hasPickaxe(bot) {
     return { ok: true, count };
 }
 
-// LIGHT GATE — the twin of the tool gate above, and it guards the fleet's oldest recorded death spiral
-// rather than a slow dig. An unlit shaft spawns hostiles at depth; a bot that dies underground drops its
-// whole pocket at the bottom, so the material the descent was FOR never surfaces, and the next descent
-// starts poorer than the last. That loop cannot be broken from inside the mine.
-//
-// THE NUMBER IS READ FROM THE STOCK ROW, NEVER TYPED HERE. The supply system already defends a torch
-// floor; a second constant would let the gate and the row disagree, and the failure that produces is
-// silent in both directions — a gate above the row's floor holds the bot out of the mine forever while
-// supply reports the pocket satisfied, and a gate below it authorises a descent supply never intended.
-// One number, one owner (Law 16).
-//
-// EXPORTED for the same reason hasPickaxe is: assessors/mining posts the job and this releases it, and
-// a board that posts what the manager refuses is a claim/release loop the judge ends in five sweeps.
-//
-// COVERS EVERY MINING JOB, not dig_shaft alone (Architect 2026-08-27: "we are law 16 the whole mining
-// system"). The dispatch path below is the single door for shaft, cell and material alike, so the gate
-// belongs on the door and not on one of the jobs coming through it — a per-job gate is the same rule
-// written twice, and the second copy is the one that gets forgotten when a third mining verb arrives.
+// The trip's bound. A body below ground takes the next cell (or segment) only while it holds MORE than
+// MINING_LAST_PICKAXE, so the last pickaxe is always in hand for finishing the piece it is on; at the
+// last one it surfaces with its cell closed instead of leaving a half-dug room for a peer.
+// The pickaxes are the trip's only bound of its own: a tunnel uncovers ore a block at a time, so the body stays on
+// its line and brings up whatever the line gave.
+function keepsDigging(bot) {
+    const held = hasPickaxe(bot);
+    if (!held.ok) return held;
+    if (held.count > MINING_LAST_PICKAXE) return { ok: true, count: held.count };
+    return { ok: false, count: held.count, reason: `down to the last pickaxe (${held.count}) — surfacing to restock` };
+}
+
+// A body enters the mine carrying the pocket's full pickaxe set — the `pickaxe` bot row's deficit_below of
+// any tier, or its stone_level of stone-or-better — then digs on while hasPickaxe holds, down to the last
+// one. Stone pickaxes on the shelf count, since the body takes them at dispatch (takeMiningPicks).
+// Read by job_gates.toolGate for mining jobs.
+function _pickaxeRow() {
+    const { STOCK_THRESHOLDS } = require('@thinking/architect_config');
+    return STOCK_THRESHOLDS.find(r => r.item === 'pickaxe' && r.holder === 'bot') || { deficit_below: 1 };
+}
+function _stonePicks(bot) {
+    const { stoneOrBetter } = require('@thinking/assessors/shared');
+    const inv = {};
+    for (const it of bot.inventory.items()) inv[it.name] = (inv[it.name] || 0) + it.count;
+    return stoneOrBetter('pickaxe', inv);
+}
+function canEnterMine(bot) {
+    const row = _pickaxeRow();
+    const count = hasPickaxe(bot).count || 0;
+    const stone = _stonePicks(bot);
+    const shelf = SHELF_PICKS.reduce((n, pick) => n + require('@kernel/inventory_lens').inChests(pick), 0);
+    if (count >= row.deficit_below) return { ok: true, count };
+    if (row.stone_level && stone + shelf >= row.stone_level) return { ok: true, count };
+    return { ok: false, count, reason: `${count} pickaxe(s) carried (${stone} stone, ${shelf} on the shelf) — `
+        + `the mine takes ${row.deficit_below}${row.stone_level ? ` or ${row.stone_level} stone` : ''}` };
+}
+
+// The shelf's mining pickaxes, best first.
+const SHELF_PICKS = ['copper_pickaxe', 'stone_pickaxe'];
+
+// takeMiningPicks — the trip's stone pickaxes, withdrawn from the shelf by the body about to descend, up to
+// the row's stone_level. Returns true, or null when the withdrawal already abandoned to the judge (Law 15).
+async function takeMiningPicks(bot) {
+    const row = _pickaxeRow();
+    if (!row.stone_level) return true;
+    let took = 0;
+    for (const pick of SHELF_PICKS) {
+        const onShelf = require('@kernel/inventory_lens').inChests(pick);
+        const short = row.stone_level - _stonePicks(bot);
+        if (short > 0 && pick === 'stone_pickaxe') require('@thinking/assessors/shared').noteShelfShort(pick, onShelf, short, 'mining_trip');
+        const want = Math.min(onShelf, short);
+        if (want <= 0) continue;
+        const got = await retrieveItems(bot, pick, want);
+        if (got === undefined) return null;
+        took += want;
+    }
+    if (took === 0) return true;
+    // The exchange: with the stone set in hand, the wooden pickaxes it replaces go to the waste pit.
+    await require('@api/waste_pit').discardTrash(bot);
+    return true;
+}
+
+// The torches one trip carries to place in passing: the shaft's torch cells that hold no torch now
+// (mining_integrity.shaftTorchNeed), up to what a pocket keeps (the `torch` bot row). A lit shaft asks for
+// none. Light is optional — a trip goes with whatever the body could craft, including none.
+function miningTorchNeed(bot) {
+    const { STOCK_THRESHOLDS } = require('@thinking/architect_config');
+    const pocket = STOCK_THRESHOLDS.find(r => r.item === 'torch' && r.holder === 'bot').dump_threshold;
+    return Math.min(pocket, miningIntegrity.shaftTorchNeed(bot));
+}
+
 function hasMiningLight(bot) {
     if (!bot || !bot.inventory) return { ok: false, reason: 'bot/inventory not ready' };
-    const { STOCK_THRESHOLDS } = require('@thinking/architect_config');
-    const row = STOCK_THRESHOLDS.find(r => r.item === 'torch' && r.holder === 'bot');
-    // Law 13 coding violation: the gate is meaningless without the row it reads, and defaulting to a
-    // number here would be this file quietly authoring the floor the config owns.
-    if (!row || typeof row.deficit_below !== 'number') {
-        throw new Error('mining_manager: no bot torch row in STOCK_THRESHOLDS — the light gate has no floor to read');
-    }
+    const need = miningTorchNeed(bot);
     const count = bot.inventory.items()
         .filter(i => i && i.name === 'torch')
         .reduce((n, i) => n + (i.count || 0), 0);
-    if (count < row.deficit_below) return { ok: false, reason: `${count} torches, need ${row.deficit_below}`, count, need: row.deficit_below };
+    if (count < need) {
+        return { ok: false, reason: `${count} torches, need ${need}`, count, need };
+    }
     return { ok: true, count };
+}
+
+// takeMiningLight — the trip's torches, crafted by the body about to descend: coal first, then charcoal, from
+// its pocket and then the chests, over a stick it holds or makes from its planks. It crafts the trip's need
+// and no more; what a craft makes over that stays in the pocket (the `torch` bot row). Light is optional, so a
+// body with no fuel or no wood goes without and the trip is never refused.
+// Returns true, or null when a withdrawal or the craft already abandoned to the judge (Law 15).
+const TORCH_FUELS = ['coal', 'charcoal'];
+const TORCHES_PER_CRAFT = 4;
+async function takeMiningLight(bot) {
+    const light = hasMiningLight(bot);
+    if (light.ok) return true;
+    const held = (test) => bot.inventory.items().filter(i => i && test(i.name)).reduce((n, i) => n + (i.count || 0), 0);
+    const crafts = Math.ceil((light.need - light.count) / TORCHES_PER_CRAFT);
+    let fuel = held(n => TORCH_FUELS.includes(n));
+    for (const source of TORCH_FUELS) {
+        const want = Math.min(require('@kernel/inventory_lens').inChests(source), crafts - fuel);
+        if (want <= 0) continue;
+        if (await retrieveItems(bot, source, want) === undefined) return null;
+        fuel = held(n => TORCH_FUELS.includes(n));
+    }
+    // A stick is two planks.
+    const sticks = held(n => n === 'stick'), planks = held(n => n.endsWith('_planks'));
+    if (fuel < 1 || (sticks < 1 && planks < 2)) {
+        watcher.summary(TAG, `mining light: ${light.count}/${light.need} torches held and none crafted — ${fuel} coal or charcoal, ${sticks} stick(s), ${planks} planks in hand; descending without.`);
+        return true;
+    }
+    const made = await require('@api/craft_handler').craftItems(bot, 'torch', light.need);
+    return made === undefined ? null : true;
+}
+
+// takeShaftFill — the shaft's wall fill, withdrawn as cobblestone before the body descends: every fill block
+// the staircase needs (mining_integrity.shaftFillNeed) less the fill already in the pocket, so a shaft beside a
+// cave seals it in one trip. Takes what the shelf holds and never refuses the trip.
+// Returns true, or null when the withdrawal already abandoned to the judge (Law 15).
+async function takeShaftFill(bot) {
+    const { group_to_item } = require('@utils/fragment_utils');
+    const fill = new Set(group_to_item.structural_fill);
+    const need = miningIntegrity.shaftFillNeed(bot);
+    const held = bot.inventory.items().filter(i => i && fill.has(i.name)).reduce((n, i) => n + (i.count || 0), 0);
+    const onShelf = require('@kernel/inventory_lens').inChests('cobblestone');
+    const want = Math.min(onShelf, need - held);
+    if (want <= 0) return true;
+    watcher.summary(TAG, `shaft: ${need} wall cell(s) to fill, ${held} fill held — taking ${want} cobblestone`);
+    const got = await retrieveItems(bot, 'cobblestone', want);
+    return got === undefined ? null : true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Release back to recursive_judge (as a manager → the judge routes to job_board for a replan). This
-// is the plain release used for pre-dispatch gate failures, where the bot has not descended. The
-// batch-END release (after real mining) goes through _exitMine, which surfaces and dumps first.
+// Releases to recursive_judge for pre-dispatch gate failures, before the bot has descended.
+// Post-mining releases go through _exitMine instead, which surfaces and dumps first.
+// The strip tunnel this body holds for its trip (foreman 'line:' key), released when the trip ends.
+// ── A BODY WALKS THE MINE BY ITS TUNNELS ─────────────────────────────────────────────────────────────
+// The tunnel a body works is entered and left by named points (mining_cell_graph.wayOut): the foot of the
+// shaft's stairs where its trunk begins, then the mouth of its branch on that trunk. Each is its own walk, so
+// the route between two of them is the tunnel that joins them. `_way` is the way out of the tunnel this body
+// is in, nearest point first; empty on the surface.
+let _way = [];
+async function _walkWay(bot, points, direction) {
+    for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        const nav = await locomotion.goToStand(p, { exact: false, purpose: `mine:${direction}` });
+        const arrived = !(!nav || nav.arrived === false);
+        watcher.summary(TAG, `MINE WAY ${direction} leg=${i + 1} of=${points.length} to=(${p.x},${p.y + 1},${p.z}) arrived=${arrived}`);
+        if (!arrived) return false;
+    }
+    return true;
+}
+
+let _heldLine = null;
+function _releaseLine() {
+    if (!_heldLine) return;
+    require('@kernel/foreman_link').releaseClaim(_heldLine);
+    _heldLine = null;
+}
+
 function _release(reason) {
+    _releaseLine();
     watcher.summary(TAG, `Releasing: ${reason}`);
     routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
 }
 
-// Re-dispatch the executor for the NEXT pass of the SAME batch: the manager
-// plays job_board's dispatch role locally, so no replan happens between passes. The payload already
-// carries the job-specific fields (dig_cell / mining_objective) from the first dispatch — they rode
-// the round trip through recursive_judge — so this only bumps the pass counter and re-stamps the
-// manager. NOT called on the first dispatch (that path routes to the shaft head first); mid-batch the
-// bot is already deep and must stay there.
+// Re-dispatches the executor for the next pass of the same batch, without a replan. Bumps the pass
+// counter and re-stamps the manager on the payload's existing job fields. Not used for the first
+// dispatch, which routes to the shaft head first.
 function _redispatch(payload, passesCompleted, readable) {
     routeSignal(TAG, 'mining_executor', {
         ...payload,
@@ -122,37 +205,35 @@ function _redispatch(payload, passesCompleted, readable) {
     });
 }
 
-// Select → hazard-gate → claim → dispatch ONE buildable cell.
-//
-// EXTRACTED so a batch can run several DIFFERENT cells per descent, matching the shaft: without this a
-// cell batch means three passes at the SAME cell, so a cell that comes out clean on pass one ends the
-// trip — the shaft gets three segments per descent while cells get one, from the same cap. The
-// completion branch now calls this again instead of exiting, which is also what makes the batch-end dump
-// frequent enough to be the fleet's whole offload story — the trip ends at the chests every N cells, not
-// every N passes at one cell.
-//
-// RETURNS a verdict instead of releasing itself, because the caller owns which release is correct and the
-// two differ: on a fresh claim the bot has not descended (plain _release), mid-batch it is deep and must
-// surface and dump first (_exitMine). Releasing in here would have picked one and been wrong half the
-// time. Side effects of a failed selection (markCellBlocked) stay here — they belong to the selection.
+// Selects, hazard-gates, claims, and dispatches one buildable cell. Returns a verdict since the
+// caller decides which release applies (fresh claim releases plainly; mid-batch surfaces first via
+// _exitMine). Failed-selection side effects (markCellBlocked) live here with the selection.
 async function _selectAndDispatchCell(payload, bot, miningPass) {
     const N = MINING_PASSES_PER_DISPATCH;
-    // Selection loop with object locking: a peer-held cell is neither complete nor blocked — it is
-    // someone else's object right now (lock the object, not the bot). Skip it and take the next nearest;
-    // never wait on a peer (Law 13: replan, not a retry loop).
+    // A peer-held cell is skipped, not waited on — replan instead of retry (Law 13).
     const heldByPeer = new Set();
     while (true) {
         const candidate = miningCellGraph.selectNextCell(bot, heldByPeer);
         if (!candidate) {
-            return { dispatched: false, reason: heldByPeer.size > 0
+            return { dispatched: false, allHeld: heldByPeer.size > 0, reason: heldByPeer.size > 0
                 ? `dig_cell: all ${heldByPeer.size} candidate cell(s) held by peers — replanning`
                 : 'dig_cell: no buildable cell' };
         }
 
-        // The cell was registered buildable on a PAST scan; re-scan before committing the bot. Unloaded
-        // → defer (Law 13 environmental, not a reject). A real hazard → mark it blocked so selection
-        // skips it from now on, then release to re-select.
-        const scan = miningCellGraph.scanCell(bot, candidate.anchor);
+        const go = await _dispatchCandidate(payload, bot, candidate, miningPass);
+        if (go.held) { heldByPeer.add(candidate.id); continue; }
+        return go;
+    }
+}
+
+// Hazard-gates, claims and dispatches ONE named cell. Returns { dispatched, cell } or { dispatched:false, reason },
+// with held:true when a peer holds its claim (the fan selection above then tries the next one).
+async function _dispatchCandidate(payload, bot, candidate, miningPass) {
+    const N = MINING_PASSES_PER_DISPATCH;
+    {
+        // Re-scans before committing since the cell was registered buildable on a past scan. Unloaded
+        // chunk defers (Law 13, environmental); a real hazard is blocked so selection skips it from now on.
+        const scan = miningCellGraph.scanCell(bot, candidate.anchor, candidate);
         if (!scan.safe) {
             if (scan.halt_reason === 'unloaded') {
                 return { dispatched: false, reason: `dig_cell: cell ${candidate.id} chunk unloaded — deferring` };
@@ -161,88 +242,91 @@ async function _selectAndDispatchCell(payload, bot, miningPass) {
             return { dispatched: false, reason: `dig_cell: cell ${candidate.id} blocked (${scan.halt_reason}) — skipping` };
         }
 
-        // Arbiter flavor (a) — physical exclusivity on the cell, chosen at execution time from live
-        // perception (the planning token can't cover it; taxonomy in foreman_brain.js).
-        // Lazily required here as well as in `receive` — the two are separate functions, and this helper
-        // had been reading `receive`'s binding, which it never had. Every claim threw a ReferenceError, and
-        // the guard that used to stand here reported it as an errored claim and returned undispatched, so no
-        // cell was mined for a day while the log read like ordinary contention (Law 13, Law 16). Kept lazy to
-        // match `receive`: require's cache makes the repeat free.
+        // Physical exclusivity on the cell, claimed at execution time from live perception (taxonomy
+        // in foreman_brain.js). Required lazily, matching `receive` — require's cache makes the repeat free.
         const foremanLink = require('@kernel/foreman_link');
+        // ONE BODY, ONE TUNNEL: a strip segment is worked only under its line's claim, taken (or renewed) here and held
+        // until the trip ends, so no peer is handed the segment beyond a body still working the line. A repair of a
+        // segment already dug takes the same claim: the stand for segment N is the far end of segment N-1, which the
+        // line's holder closes to peers while it works there (cellWorkBox), so a second body has nowhere to stand.
+        let freshLine = null;
+        if (miningCellGraph.isStrip(candidate)) {
+            const key = miningCellGraph.lineKey(candidate);
+            const line = await foremanLink.requestClaim(key);
+            if (!line.granted) return { dispatched: false, held: true, reason: `dig_cell: line ${key} worked by a peer` };
+            if (_heldLine !== key) { _releaseLine(); _heldLine = key; freshLine = key; }
+        }
         const claim = await foremanLink.requestClaim(`cell:${candidate.id}`);
-        if (!claim.granted) { heldByPeer.add(candidate.id); continue; }
+        if (!claim.granted) {
+            if (freshLine) _releaseLine();
+            return { dispatched: false, held: true, reason: `dig_cell: cell ${candidate.id} held by a peer` };
+        }
+
+        // A tunnel this body is not already in is entered by the shaft and then by its way in.
+        const way = miningCellGraph.wayOut(candidate);
+        if (freshLine && way.length) {
+            await _routeToShaftHead(bot);
+            await _walkWay(bot, [...way].reverse(), 'in');
+        }
+        _way = way;
 
         const cell = candidate;
-        watcher.summary(TAG, `Dispatching mining_executor for cell ${cell.id} @ (${cell.anchor.x},${cell.anchor.y},${cell.anchor.z}) — cell ${miningPass + 1}/${N} of this trip.`);
+        watcher.summary(TAG, `Dispatching mining_executor for cell ${cell.id} @ (${cell.anchor.x},${cell.anchor.y},${cell.anchor.z}) — pass ${miningPass + 1}/${N} on this cell, ${hasPickaxe(bot).count} pickaxes in hand.`);
         routeSignal(TAG, 'mining_executor', {
             ...payload,
             manager: TAG,
             mining_pass: miningPass,
-            dig_cell: { id: cell.id, anchor: cell.anchor, fan: cell.fan, maintenance: !!cell.maintenance },
+            dig_cell: { id: cell.id, anchor: cell.anchor, fan: cell.fan, maintenance: !!cell.maintenance, kind: cell.kind, dir: cell.dir, k0: cell.k0 },
             readable: `${TAG}: dig_cell ${cell.id}${cell.maintenance ? ' (maintain)' : ''} → mining_executor`,
         });
         return { dispatched: true, cell };
     }
 }
 
-// End the batch: climb back to the shaft head, dump excess into the headframe chests, then release
-// to recursive_judge. Return FIRST so the bot is standing at the chests (making the dump a reachable,
-// zero-extra-travel offload) and so whatever job runs next starts from the surface, never from deep in
-// the shaft. dumpExcess is a no-op when nothing is over-keep, so the surface walk is the load-bearing
-// step; the dump rides along. Reuses the ONE dump primitive (Law 16), the same call dump_executor makes.
+// Ends the batch: returns to the shaft head, dumps excess into the headframe chests, then releases
+// to recursive_judge. Returning first puts the bot at the chests and starts the next job from the
+// surface. Reuses the one dump primitive dump_executor calls (Law 16).
 async function _exitMine(bot, site, reason) {
+    _releaseLine();
+    const way = _way; _way = [];
+    await _walkWay(bot, way, 'out');
     const back = await _returnToHeadframe(bot);
     if (!back.skipped && !back.arrived) {
-        // Caved/blocked access out is environmental (Law 13): log and release from where we are rather
-        // than strand the bot underground. The next task degrades to whatever path it can find.
+        // A blocked exit is environmental (Law 13): logs and releases from the current position, so the
+        // bot stays reachable by the next job.
         watcher.warn(TAG, 'could not surface to the headframe on batch exit — releasing from current position');
     }
-    // The batch exit carries the same latent double-route as the executors: a dump that abandons has
-    // ALREADY routed to the judge, so releasing after it would put two live signals in one scope
-    // (Law 4). It rarely fires here because mining is the only caller and the chests are rarely contested
-    // at surfacing time — but an abandoned line is dead, and the release is what would revive it, so the
-    // same guard applies: skip the release when the dump abandons.
+    // An abandoned dump has already routed to the judge, so releasing after it would put two live
+    // signals in one scope (Law 4). Skip the release when the dump abandons.
     const dumped = await dumpExcess(bot);
     if (dumped?.abandoned) return;
     _release(reason);
 }
 
-// Enter the mine THROUGH the headframe, never by digging straight down. Before the executor takes
-// over, walk the bot to the shaft head (the headframe's ANCHOR 0 — see the warning below) so descent
-// follows the existing staircase access instead of a fresh vertical hole from wherever a prior
-// surface task left it. The shaft-wall A* penalty
-// (mining_integrity.getProtectedBlocks) already nudges door-entry, but a long straight-down
-// shortcut out-competes that soft cost when the bot is far — routing to the head first makes
-// entry-via-access a hard step, and it is a surface walk (head and bot both at surface), so it
-// never itself digs down. SKIPPED when the bot is already below the entry (mid-descent, or working
-// a cell underground) so underground work is never dragged back to the surface. locomotion.goTo is
-// a Law 15 sub-loop API — a direct call that owns its own movement retries.
-const SHAFT_ENTRY_SKIP_DEPTH = 2;   // blocks below the head ⇒ already in the mine, do not re-surface
+// Routes the bot to the shaft head (headframe ANCHOR 0) before the executor descends, so entry follows
+// the existing staircase. Skipped once already below the entry.
+// locomotion.goTo is a Law 15 sub-loop API that owns its own movement retries.
+const SHAFT_ENTRY_SKIP_DEPTH = 2;   // blocks below the head: already in the mine, skip re-surfacing
 const HEADFRAME_BLUEPRINT = 'headframe';
 
-// ⚠ NEVER NAVIGATE TO `build_center`. IT IS NOT A PLACE — IT IS A DATUM.
-// build_center is the origin the blueprint's voxels are transposed AROUND (blueprint_survey's
-// transposeVoxel/transposeAnchorsForCandidate math). Nothing guarantees it is standable, and in
-// practice it is the opposite: it lands inside the finished structure, so it is a BUILT, PROTECTED
-// voxel. A* prices a protected voxel at PROTECTED_VOXEL_DETOUR_BUDGET and has no total-cost cap, so it must prove no
-// route cheaper than that budget exists before returning one — which means expanding the entire reachable set.
-// Targeting build_center burns the full node budget on every call — expanding the entire reachable set
-// to prove no cheaper route exists — and still only returns PARTIAL at a residual the arrival tolerance
-// accepts anyway, so the search cost buys nothing. Read build_center for GEOMETRY (a Y datum, a
-// transposition origin); never hand it to
-// locomotion. The place a bot may stand is an ANCHOR, and the way to stand on one is goToStand().
-//
-// Anchor 0 is the headframe's shaft head. Resolved live rather than cached because set_buildspot may
-// re-site the base between batches, and a remembered anchor would walk the bot to the old shaft.
+// transpose_origin is a geometry datum (the Y origin blueprint voxels are transposed around), not
+// a place to stand — it lands inside the built structure. Read it for geometry only; navigate to
+// an ANCHOR via goToStand(). Anchor 0 is the headframe's shaft head, resolved live since
+// set_buildspot may re-site the base between batches.
 function _shaftHeadAnchor() {
-  // ASKS whether the headframe is sited rather than provoking getWorldAnchors' coding violation and
-  // catching it. Mining can be dispatched before the base locks, so an unsited headframe is an ordinary
-  // early-run state and belongs in a predicate; a throw out of the transpose is a defect that must travel
-  // (Law 13, Law 16 — a catch is never the expected pathway). Same chair getWorldAnchors reads.
-  const site = hq.readBuildingChair(HEADFRAME_BLUEPRINT, 'set_buildspot');
-  if (!site?.build_center || typeof site.build_center.x !== 'number') {
-    watcher.warn(TAG, 'shaft-head anchor unavailable (headframe not sited yet) — skipping the headframe trip this batch.');
+  // Checks whether the headframe is sited before calling getWorldAnchors, since an unsited headframe
+  // is an ordinary early-run state, not a defect to catch (Law 13, Law 16).
+  const blueprinter = require('@perception/mining_blueprinter');
+  const site = blueprinter.shaftChair();
+  if (!site) {
+    watcher.warn(TAG, 'shaft-head anchor unavailable (shaft not sited yet) — skipping the shaft-head trip this batch.');
     return null;
+  }
+  // A standalone shaft (a builder's) has no headframe to stand on: the stand is the ground block
+  // just west of the top joint, since the descent runs east from it. Unverified on a live run.
+  if (blueprinter.shaftStructure() !== HEADFRAME_BLUEPRINT) {
+    const a = blueprinter.shaftTop(site);
+    return { x: a.x - 1, y: a.y, z: a.z };
   }
   const anchors = blueprintSurvey.getWorldAnchors(HEADFRAME_BLUEPRINT);
   return (anchors && anchors[0]) || null;
@@ -251,31 +335,26 @@ async function _routeToShaftHead(bot) {
     const head = _shaftHeadAnchor();
     if (!bot || !bot.entity || !bot.entity.position || !head) return { arrived: true, skipped: true };
     if (bot.entity.position.y < head.y - SHAFT_ENTRY_SKIP_DEPTH) return { arrived: true, skipped: true };
-    // goToStand, never goTo: an ANCHOR names the block the feet rest ON, so the feet cell is anchor+(0,1,0),
-    // and goToStand is the one home for that +1.
+    // goToStand, not goTo: an ANCHOR names the block the feet rest ON (feet cell = anchor+(0,1,0)).
     const nav = await locomotion.goToStand(head);
     return { arrived: !(!nav || nav.arrived === false), skipped: false };
 }
 
-// Mirror image of _routeToShaftHead, used at batch END to climb OUT to the shaft head. Where the
-// entry guard skips when the bot is deep (leave underground work alone), this exit skips when the bot
-// is already at/above the head (nothing to climb). Going UP naturally prefers the existing staircase:
-// the head sits at the top of it, so walking the stairs out-competes digging a parallel diagonal — the
-// diagonal shortcut only wins for LATERAL moves to a distant surface target, which is exactly the scar
-// this exit prevents by surfacing here first. locomotion.goTo is a Law 15 sub-loop API owning its own
-// movement retries; it returns arrived=false (never routes its own signal) so _exitMine decides.
+// Mirror of _routeToShaftHead, climbing out at batch end; skips when already at/above the head.
+// locomotion.goTo (Law 15 sub-loop API) returns arrived=false; it does not route its own signal.
 async function _returnToHeadframe(bot) {
     const head = _shaftHeadAnchor();
     if (!bot || !bot.entity || !bot.entity.position || !head) return { arrived: true, skipped: true };
     if (bot.entity.position.y >= head.y - SHAFT_ENTRY_SKIP_DEPTH) return { arrived: true, skipped: true };
-    // Same anchor, same reason as _routeToShaftHead above — and the same build_center trap avoided.
+    // Same anchor, same reason as _routeToShaftHead above — and the same transpose_origin trap avoided.
     const nav = await locomotion.goToStand(head);
     return { arrived: !(!nav || nav.arrived === false), skipped: false };
 }
 
 module.exports = {
     hasPickaxe,
-    hasMiningLight,
+    canEnterMine,
+    miningTorchNeed,
     receive: watcher.track(TAG, async function (signalType, payload) {
         if (signalType !== TAG) return;
         const foremanLink = require('@kernel/foreman_link');
@@ -289,21 +368,18 @@ module.exports = {
         }
 
         // Verify shaft site is locked
-        const site = hq.readBuildingChair('headframe', 'set_buildspot');
-        if (!site?.build_center || !site?.staircase) {
-            _release('staircase site not locked — building must find headframe first');
+        const site = require('@perception/mining_blueprinter').shaftChair();
+        if (!site) {
+            _release('staircase site not locked — the foreman sites the shaft first');
             return;
         }
 
         const jobWhat = magnet.what;
 
-        // ── Return from recursive_judge: executor finished ONE pass ──────
-        // The manager owns the batch loop: after each pass it either RE-
-        // DISPATCHES the executor for the next pass of the same batch (no replan) or ENDS the batch —
-        // surfacing, dumping, and releasing to job_board. A batch ends when the work is done/stuck OR
-        // MINING_PASSES_PER_DISPATCH passes have run. `passesCompleted` counts passes done so far; it
-        // rides the round trip on payload.mining_pass (recursive_judge preserves ...payload back to the
-        // stamped manager, the same channel dig_cell/mining_objective ride).
+        // ── Return from recursive_judge: executor finished one pass ──────
+        // Re-dispatches for the next pass of the same batch, or ends the batch (surface, dump,
+        // release) when the work is done/stuck, the body is at its last pickaxe, or a cell/segment hit MINING_PASSES_PER_DISPATCH re-passes.
+        // `passesCompleted` rides the round trip on payload.mining_pass.
         if (payload.from === 'recursive_judge') {
             const bot = global.bot;
             const passesCompleted = (payload.mining_pass || 0) + 1;
@@ -311,52 +387,53 @@ module.exports = {
             const N = MINING_PASSES_PER_DISPATCH;
 
             if (jobWhat === 'dig_shaft') {
-                // Re-scan to see whether the shaft still needs work. Complete or a scan failure ends the
-                // batch; otherwise advance one more segment (up to the cap). The executor already
-                // registered the segment it just dug (mining_executor owns built_segments), so the
-                // re-scan naturally surfaces the NEXT incomplete segment for the following pass. The
-                // executor also reports early satisfaction (deficiency_met) when this pass already
-                // gathered everything the brain's pull-list needed — end the batch then, so a shaft dig
-                // that was really about the cobble/ore it yields doesn't over-mine (preserves the
-                // executor's original early-return; the batch cap never over-rides a met need).
+                // Re-scans to see whether the shaft still needs work; mining_executor owns built_segments,
+                // so the re-scan surfaces the next incomplete segment.
                 const er = (payload.mining_executor || {}).exit_reason;
-                let complete = er === 'deficiency_met' || er === 'objective_met';
-                let reason = complete ? `shaft pass ${passesCompleted}/${N}: ${er}` : '';
+                let complete = false;
+                let reason = '';
                 if (BATCH_BLOCKED_EXITS.has(er)) {
                     complete = true;
                     reason = `shaft pass ${passesCompleted}/${N}: ${er} — ending the batch, a re-pass cannot supply it`;
                 }
+                // The upkeep pass works the whole finished shaft once; the trip ends with it, and damage it
+                // could not settle reposts the job.
+                if (er === 'shaft_pass') {
+                    complete = true;
+                    reason = `whole-shaft upkeep pass done — ${(payload.mining_executor || {}).steps_remaining || 0} step(s) left`;
+                }
                 if (!complete && bot && bot.blockAt) {
-                    const integrity = miningIntegrity.scan(bot);
+                    const integrity = miningIntegrity.scan(bot, null);
                     if (integrity.all_segments_complete) { complete = true; reason = 'shaft complete'; }
                     else { const seg = integrity.first_incomplete; reason = `segment pass ${passesCompleted}/${N} done — next: y=${seg?.world_position?.y || '?'}`; }
                 } else if (!complete) { complete = true; reason = 'bot not ready after pass'; }
+                // The body starts the next segment only while it holds more than the last pickaxe (keepsDigging);
+                // at the last one it surfaces, and the next trip down takes the shelf's stone pickaxes (takeMiningPicks).
+                const tool = keepsDigging(bot);
+                if (!complete && !tool.ok) { complete = true; reason = `shaft pass ${passesCompleted}: ${tool.reason}`; }
 
-                if (complete || capReached) { await _exitMine(bot, site, reason); return; }
+                // THE BODY THAT OWNS THE SHAFT STAYS DOWN while each pass moves a block: it works segment after
+                // segment top down and carries the shaft's fill (takeShaftFill), so surfacing between segments
+                // only spends the walk. Past the pass cap, a pass that moved nothing ends the trip, so a segment
+                // the world will not let settle is left, and the reposted job brings a body back to try again.
+                const m = (payload.mining_executor || {}).metrics || {};
+                const keepsGoing = er === 'segment_cap' && ((m.dig_ok || 0) + (m.place_ok || 0)) > 0;
+                if (complete || (capReached && !keepsGoing)) { await _exitMine(bot, site, reason); return; }
                 _redispatch(payload, passesCompleted, `${TAG}: dig_shaft pass ${passesCompleted + 1}/${N} → mining_executor`);
                 return;
             }
 
             // ── dig_cell return: the executor finished one cell pass ─────────
-            // Completion is decided by the INTEGRITY DIFF the executor re-ran (capsule.cell_clean), NOT
-            // by progress — a cell is a maintained blueprint, done ⇔ its diff is clean. Three outcomes
-            // drive the batch:
-            //   clean          → complete: mark + register the 3 outward neighbours (A* growth). END batch.
-            //   still shrinking → re-pass the SAME cell (the bot carved deeper and can reach more next
-            //                     pass) — RE-DISPATCH, up to the cap; the claim is HELD across the batch.
-            //   NOT shrinking   → stuck: a voxel no reachable stand can carve. Block it (Law 13 —
-            //                     surface for inspection, don't silently grow neighbours off a half-cell).
-            //                     END batch.
-            // The object claim is released only when the batch ENDS (complete / stuck / cap) — held
-            // across re-passes so a peer can't take the cell mid-progress.
+            // Completion is the integrity diff (capsule.cell_clean): clean → complete, register neighbours,
+            // end batch; shrinking → re-pass up to the cap; not shrinking → stuck, block for inspection
+            // (Law 13). The claim is held across re-passes, released only when the batch ends.
             if (jobWhat === 'dig_cell') {
                 const cell = payload.dig_cell;
                 const capsule = payload.mining_executor || {};
                 if (!cell || !cell.id) { await _exitMine(bot, site, 'dig_cell return: no cell on payload'); return; }
 
-                // maintenance:true = this dispatch was repairing an already-complete cell (a damaged
-                // built cell surfaced by selectMaintenanceCell), not carving a new one. It stays
-                // complete either way; a stuck repair must NOT un-complete or re-grow the field.
+                // maintenance:true means this dispatch is repairing an already-complete cell, not
+                // carving a new one; a stuck repair stays marked complete, leaving the field untouched.
                 const maintenance = !!cell.maintenance;
 
                 if (capsule.cell_clean) {
@@ -369,33 +446,64 @@ module.exports = {
                     const reason = maintenance
                         ? `cell ${cell.id} repaired (diff clean)`
                         : `cell ${cell.id} complete (diff clean) — ${added} neighbour(s) registered`;
-                    // A CLEAN CELL NO LONGER ENDS THE TRIP. The claim is already released and the cell
-                    // marked, so the batch may take the next one from where the bot stands — the descent
-                    // is paid once for N cells, which is the whole point of the batch (and is what the
-                    // shaft has always done with segments). Only when the cap is reached, or nothing is
-                    // selectable, does the bot surface — and _exitMine dumps at the chests on the way
-                    // out, which is why mining needs no dump JOB competing for the bot.
-                    if (!capReached) {
-                        const next = await _selectAndDispatchCell(payload, bot, passesCompleted);
+                    // A clean cell does not end the trip: the batch takes the next selectable cell from
+                    // where the bot stands, paying the descent once for as many cells as the pickaxes last.
+                    // The trip is bounded by tools (keepsDigging) — a body at its last pickaxe surfaces here,
+                    // with its cell closed; the re-pass count restarts at zero for the next cell.
+                    // Surfaces otherwise only when nothing is selectable; _exitMine dumps on the way out.
+                    const tool = keepsDigging(bot);
+                    // A STRIP TRIP KEEPS TO ITS LINE: the fan chose where this trip began; from there the body digs
+                    // the same tunnel straight on until its pickaxes run out or the line ends — a cave, a hazard,
+                    // the staircase, or a peer already on it — and then carries the whole haul up at once.
+                    if (tool.ok && rec && miningCellGraph.isStrip(rec)) {
+                        const ahead = miningCellGraph.lineContinuation(rec);
+                        const ends = !ahead ? 'nothing registered ahead' : ahead.blocked ? `blocked (${ahead.blocked})` : ahead.complete ? 'already dug' : null;
+                        const go = ends ? null : await _dispatchCandidate(payload, bot, ahead, 0);
+                        if (go && go.dispatched) {
+                            watcher.summary(TAG, `STRIP LINE ${rec.kind} ${rec.dir} ${rec.id} -> ${ahead.id} — ${tool.count} pickaxes in hand, same line.`);
+                            return;
+                        }
+                        const why = ends || go.reason;
+                        watcher.summary(TAG, `STRIP LINE END ${rec.kind} ${rec.dir} at ${rec.id}: ${why} — surfacing with the haul.`);
+                        await _exitMine(bot, site, `${reason} — line ends: ${why}`);
+                        return;
+                    }
+                    // A REPAIR ENDS THE TRIP AT ITS OWN CELL. The next damaged cell can lie in the tunnel beside this
+                    // one, and the short way there is through the wall this pass just sealed; the body surfaces by
+                    // the tunnel it is in, and that cell is reached from the gallery on its own trip.
+                    if (tool.ok && maintenance) {
+                        await _exitMine(bot, site, `${reason} — a repair trip ends at its cell`);
+                        return;
+                    }
+                    if (tool.ok) {
+                        const next = await _selectAndDispatchCell(payload, bot, 0);
                         if (next.dispatched) {
-                            watcher.summary(TAG, `${reason} — continuing this trip at cell ${next.cell.id}.`);
+                            watcher.summary(TAG, `${reason} — ${tool.count} pickaxes in hand, continuing this trip at cell ${next.cell.id}.`);
                             return;
                         }
                         await _exitMine(bot, site, `${reason}; ${next.reason}`);
                         return;
                     }
-                    await _exitMine(bot, site, `${reason} — batch cap (${N}) reached`);
+                    await _exitMine(bot, site, `${reason} — ${tool.reason}`);
                     return;
                 }
 
                 const remaining = capsule.cell_remaining ?? Infinity;
                 const prev = miningCellGraph.recordCellRemaining(cell.id, remaining);
 
+                // The last pickaxe worn out inside the cell: the room is unfinished for want of a tool, not
+                // unreachable, so it keeps its progress and its buildable standing and the body surfaces to
+                // restock; the board re-selects it. Only a no-shrink pass WITH a pickaxe is a stuck cell.
+                if (!hasPickaxe(bot).ok) {
+                    foremanLink.releaseClaim(`cell:${cell.id}`);
+                    await _exitMine(bot, site, `cell ${cell.id} left open at ${remaining} step(s) — no pickaxe left to finish it, surfacing to restock`);
+                    return;
+                }
+
                 if (!(remaining < prev)) {
-                    // No shrink across passes: the remaining voxels are unreachable from any stand the
-                    // bot can get to. Block for inspection rather than fake-complete (Law 13). A stuck
-                    // REPAIR blocks as 'maint_stuck' so it's skipped (bounded) yet stays inspectable;
-                    // the cell is still physically built, just can't finish this repair.
+                    // No shrink across passes means the remaining voxels are unreachable. Blocks for
+                    // inspection (Law 13); a stuck repair blocks as 'maint_stuck' so it stays skipped
+                    // but inspectable.
                     foremanLink.releaseClaim(`cell:${cell.id}`);
                     const stuck = maintenance ? 'maint_stuck' : 'stuck';
                     miningCellGraph.markCellBlocked(cell.id, stuck);
@@ -404,58 +512,31 @@ module.exports = {
                     return;
                 }
 
-                // Shrinking — more progress possible. Re-pass the same cell up to the cap, then surface
-                // (job_board may re-select it later for another batch; progress is recorded, so it resumes).
+                // Shrinking: more progress is possible. Re-passes the same cell up to the cap, then
+                // surfaces; job_board may re-select it later since progress is recorded.
                 if (capReached) {
                     foremanLink.releaseClaim(`cell:${cell.id}`);
-                    await _exitMine(bot, site, `cell ${cell.id} ${maintenance ? 'repairing' : 'progressed'} — batch cap (${N}) reached, ${remaining} step(s) left`);
+                    await _exitMine(bot, site, `cell ${cell.id} ${maintenance ? 'repairing' : 'progressed'} — re-pass cap (${N}) on this cell reached, ${remaining} step(s) left`);
                     return;
                 }
                 _redispatch(payload, passesCompleted, `${TAG}: dig_cell ${cell.id} re-pass ${passesCompleted + 1}/${N} (${remaining} left) → mining_executor`);
                 return;
             }
 
-            // ── mine_material return: targeted dig for a specific item ───────
-            // The executor stops early (exit_reason) once the objective is met or the shaft is
-            // exhausted; otherwise batch more passes toward the target, up to the cap.
-            // exit_reason is set on a real pass; a zero-work dispatch reports its stop code on
-            // .result instead (executor's segmentsProcessed===0 branch), so read both.
-            const capsule = payload.mining_executor || {};
-            const er = capsule.exit_reason || capsule.result;
-            const done = BATCH_BLOCKED_EXITS.has(er)
-                || er === 'objective_met' || er === 'deficiency_met' || er === 'shaft_complete' || er === 'no_work' || er === 'no_steps';
-            const reason = `${jobWhat} pass ${passesCompleted}/${N}: ${er || 'complete'}`;
-            if (done || capReached) { await _exitMine(bot, site, reason); return; }
-            _redispatch(payload, passesCompleted, `${TAG}: mine ${jobWhat} re-pass ${passesCompleted + 1}/${N} → mining_executor`);
-            return;
+            throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a mining job returned with what="${jobWhat}"; `
+                + 'assessors/mining posts only dig_shaft and dig_cell.');
         }
 
         // ── First dispatch from dispatcher ───────────────────────────────
 
-        // Tool gate: every mining job (dig_shaft / dig_cell / mine_material) breaks
-        // blocks, so require at least one pickaxe BEFORE dispatching. Without this the
-        // executor strip-mines with bare hands when the pickaxe breaks — agonizingly
-        // slow. Refusing here releases to recursive_judge → job_board, whose crafting
-        // tiers will produce a fresh pickaxe (Law 13: environmental shortage, soft-fail).
-        const pick = hasPickaxe(global.bot);
-        if (!pick.ok) {
-            _release(`mining blocked: ${pick.reason} — need a pickaxe before digging`);
-            return;
-        }
+        // Tool gating happens once, in job_board (toolGate). The light is the board's promise that the shelf
+        // can light this trip (assessors/mining); the body collects it here, before it walks to the shaft.
+        if (await takeMiningPicks(global.bot) === null) return;
+        if (await takeMiningLight(global.bot) === null) return;
+        if (jobWhat === 'dig_shaft' && await takeShaftFill(global.bot) === null) return;
 
-        // Light gate: see hasMiningLight. Same shape as the tool gate — release to the judge, which
-        // replans; the torch row is active, so the board answers a released descent with the craft that
-        // unblocks it (Law 13: environmental shortage, soft-fail).
-        const light = hasMiningLight(global.bot);
-        if (!light.ok) {
-            _release(`mining blocked: ${light.reason} — no descent without torches`);
-            return;
-        }
-
-        // Return to the headframe before the executor descends (covers every mining job — shaft,
-        // cell, material). An unreachable headframe is environmental (a caved access or a stranded
-        // bot), so soft-release to the judge with a stable readable it can count, rather than let
-        // the executor dig straight down from a bad position.
+        // Routes to the shaft head before any executor descends. An unreachable headframe is environmental
+        // (caved access, a stranded bot), so this soft-releases to the judge.
         const head = await _routeToShaftHead(global.bot);
         if (!head.arrived) {
             _release('headframe access unreachable — cannot enter the mine via the shaft head');
@@ -466,9 +547,23 @@ module.exports = {
         if (jobWhat === 'dig_shaft') {
             const bot = global.bot;
             if (bot && bot.blockAt) {
-                const integrity = miningIntegrity.scan(bot);
+                const integrity = miningIntegrity.scan(bot, null);
                 if (integrity.all_segments_complete) {
                     _release('shaft complete');
+                    return;
+                }
+                // A frontier the body cannot read has no step to give an executor: the body stands out of sight
+                // of the shaft. The claim goes back and the body goes to idle_park, which walks it home; the
+                // board offers the shaft again from there.
+                const frontier = integrity.first_incomplete;
+                if (frontier && Array.isArray(frontier.steps) && frontier.steps.length === 0) {
+                    const reason = `shaft frontier ${frontier.id || integrity.frontier_id} has no step to work yet (its cells are not loaded) — going home`;
+                    _releaseLine();
+                    const verdict = await require('@kernel/portable_judge').checkpoint(TAG, `idle: ${reason}`, 'forgiving');
+                    if (verdict === false) return;
+                    watcher.summary(TAG, reason);
+                    require('@thinking/dispatcher.js').clearMagnet();
+                    routeSignal(TAG, 'idle_park', { readable: `${TAG}: ${reason} → idle_park` });
                     return;
                 }
             }
@@ -484,28 +579,22 @@ module.exports = {
         }
 
         // ── dig_cell: strip-mine the nearest buildable fractal cell ──────
-        // Select (D6) → fresh hazard gate (scanCell, Law 17) → dispatch the executor with
-        // the cell stamped on the payload. The executor generates + diffs + digs it; the
-        // recursive_judge-return branch above marks it complete + registers neighbours.
+        // Selects, hazard-gates (scanCell, Law 17), and dispatches the executor with the cell
+        // stamped on the payload; the recursive_judge-return branch above completes it.
         if (jobWhat === 'dig_cell') {
             const bot = global.bot;
             if (!bot || !bot.blockAt) { _release('dig_cell: bot not ready'); return; }
 
             // Pass 0 — the first cell of a fresh surface trip. The bot has not descended yet, so a
-            // failed selection takes the plain release rather than _exitMine's surface-and-dump.
+            // failed selection takes the plain release; _exitMine's surface-and-dump applies once
+            // underground.
             const picked = await _selectAndDispatchCell(payload, bot, 0);
+            if (!picked.dispatched && picked.allHeld) miningCellGraph.noteAllHeldByPeers();
             if (!picked.dispatched) _release(picked.reason);
             return;
         }
 
-        // ── mine_material: dispatch mining_executor for a specific item ──
-        watcher.summary(TAG, `Dispatching mining_executor for ${magnet.hold_goal || 1}x ${jobWhat}`);
-        routeSignal(TAG, 'mining_executor', {
-            ...payload,
-            manager: TAG,
-            mining_pass: 0,   // batch pass counter — first pass of a fresh surface trip
-            mining_objective: { item: jobWhat, hold_goal: magnet.hold_goal || 1 },
-            readable: `${TAG}: mine ${magnet.hold_goal || 1}x ${jobWhat} → mining_executor`,
-        });
+        throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a mining job arrived with what="${jobWhat}"; `
+            + 'assessors/mining posts only dig_shaft and dig_cell.');
     }),
 };

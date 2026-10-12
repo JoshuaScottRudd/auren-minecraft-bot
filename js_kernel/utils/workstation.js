@@ -1,38 +1,30 @@
 'use strict';
-// workstation — the ONE answer to "which Java, which Minecraft server folder, and which extra module homes
-// does THIS machine have" (Law 16). Every JS caller asks here; the PowerShell side asks here too, through
+// workstation — the one answer to "which Java, which Minecraft server folder, and which extra module homes
+// does this machine have" (Law 16). Every JS caller asks here; the PowerShell side asks here too, through
 // the CLI at the bottom (`node workstation.js java|server`), so Java and the server folder each have
 // exactly one resolver in the tree.
 //
-// ── THE RULE, IN HIS WORDS (Architect 2026-09-11) ───────────────────────────────────────────────────────
-// *"if run then check stranger way, if fail then architect way. its deterministic code so failure is an
-// option. i want my side to be invisible to a stranger and invisible to me."*
-//
-// So every answer has exactly two legs, always in this order:
+// Every answer has exactly two legs, always in this order:
 //   1. THE STRANGER'S WAY — what anybody who downloaded this bot has: Java on PATH, a server folder named
 //      by AUREN_SERVER_DIR, the bot's own node_modules. A stranger's run succeeds or fails here, and the
 //      refusal it gets names only these things.
-//   2. THE ARCHITECT'S WAY — EXACT paths, read from ONE file one level above the bot:
-//      `../Architect_workstation/workstation.json`. It exists on his machines and on nobody else's, so on a
-//      stranger's machine this leg is a missing file and nothing more.
+//   2. THE OPERATOR'S WAY — exact paths, read from one file one level above the bot:
+//      `../Architect_workstation/workstation.json`. It exists on the operator's own machines and on
+//      nobody else's, so on a stranger's machine this leg is a missing file and nothing more.
 //
-// ── EXACT PATHS, NEVER A SEARCH ─────────────────────────────────────────────────────────────────────────
-// Nothing here globs, walks, or lists a directory above the bot. The folder above a download is somebody
-// else's disk — on his machines it sits under a synced personal folder — and a resolver that searched it
-// would be reading places it has no business reading. It opens one named file and tests the paths that
-// file names, and that is the whole reach.
+// Nothing here globs, walks, or lists a directory above the bot: that folder is somebody else's disk, and a
+// resolver that searched it would be reading places it has no business reading. It opens one named file and
+// tests the paths that file names, and that is the whole reach.
 //
-// ── NODE IS THE ONE TOOL THIS FILE NEVER RESOLVES ───────────────────────────────────────────────────────
-// Anything running this file is already running on a node that was resolved — by the stranger typing
-// `node`, or by `Auren_Workshop/scripts/_node.ps1` on his machines. A child process is started with
-// `process.execPath`, the same interpreter, and asking a second time could only produce a second answer.
-// The PowerShell resolver reads the `node` list in the same workstation file, which is the one place his
-// node paths are written.
+// Node is the one tool this file never resolves: anything running this file is already running on a node
+// that was resolved elsewhere — by the stranger typing `node`, or by `Auren_Workshop/scripts/_node.ps1` on
+// the operator's machines. A child process is started with `process.execPath`, the same interpreter, and
+// asking a second time could only produce a second answer. The PowerShell resolver reads the `node` list in
+// the same workstation file, the one place those node paths are written.
 //
-// ── A CANDIDATE IS RUN, NOT Test-Path'd (Law 25) ────────────────────────────────────────────────────────
-// Java is asked for its own home and its own version in one call (`-XshowSettings:properties -version`),
-// so the answer is the executable that actually ran and a version it reported about itself — never a file
-// that exists and might not start.
+// A candidate is run, not Test-Path'd (Law 25): Java is asked for its own home and its own version in one
+// call (`-XshowSettings:properties -version`), so the answer is the executable that actually ran and a
+// version it reported about itself — never a file that exists and might not start.
 
 const fs = require('fs');
 const path = require('path');
@@ -44,9 +36,8 @@ const ARCHITECT_FILE = path.join(ABOVE_BOT, 'Architect_workstation', 'workstatio
 
 // Minecraft decides this number, not this file: each release states the Java it needs in its own version
 // manifest (`javaVersion.majorVersion`), and 26.1 — the version SERVER_MINECRAFT_VERSION names — says 25.
-// An older Java on PATH is therefore not "a Java" for this purpose, and it is skipped rather than handed
-// to a server that will crash on its first class load. Raised from 21 on 2026-09-17 with the server jar:
-// 21 was 1.20.5's floor and would have picked a Java 21 that 26.1 refuses to boot under.
+// An older Java on PATH is not "a Java" for this purpose: it is skipped, never handed to a server that
+// will crash on its first class load.
 const JAVA_FLOOR = 25;
 
 // architectPaths(kind) → the exact paths his workstation file lists for `kind`, absolute, in his order.
@@ -128,11 +119,10 @@ function needServerDir() {
 }
 
 // ── THE CAMERA CREW'S GAME LAUNCHER (Prism) ─────────────────────────────────────────────────────────
-// A download keeps Prism INSIDE the bot, at PRISM_HOME, because that is the only folder a stranger's copy
-// owns. Until 2026-09-14 start_cameras computed three hops up and downloaded 1.1 GB into `tools/` beside
-// the bot folder — somebody else's disk on a stranger's machine, and the Architect's layout written into
-// shipped code. The stranger's way is that home, then a normally installed Prism; his way is the exact
-// folder his workstation file names.
+// A download keeps Prism inside the bot, at PRISM_HOME, since that is the only folder a stranger's copy
+// owns — a folder above the bot is somebody else's disk on a stranger's machine. The stranger's way is
+// that home, then a normally installed Prism; the operator's way is the exact folder his workstation file
+// names.
 const PRISM_HOME = path.join(BOT_ROOT, 'Auren_Workshop', 'camera', 'clients', 'PrismLauncher');
 const PRISM_EXE = 'prismlauncher.exe';
 
@@ -143,6 +133,15 @@ function findPrism() {
   if (process.env.LOCALAPPDATA) {
     candidates.push([path.join(process.env.LOCALAPPDATA, 'Programs', 'PrismLauncher', PRISM_EXE), 'installed Prism']);
   }
+  // The installer's machine-wide folders, under both of Windows' spellings of the name. A person who
+  // installs Prism the ordinary way on their own PC has no portable copy to find, and the bot's own
+  // Prism home is empty on that machine, so without these the only answer left is the architect file
+  // — which a download does not have.
+  for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
+    if (!base) continue;
+    candidates.push([path.join(base, 'Prism Launcher', PRISM_EXE), 'installed Prism (all users)']);
+    candidates.push([path.join(base, 'PrismLauncher', PRISM_EXE), 'installed Prism (all users)']);
+  }
   for (const dir of architectPaths('prism')) candidates.push([path.join(dir, PRISM_EXE), dir]);
   for (const [exe, label] of candidates) {
     if (fs.existsSync(exe)) return { exe, tried };
@@ -151,11 +150,10 @@ function findPrism() {
   return { exe: null, tried };
 }
 
-// ── THE RECORDER — THE ARCHITECT'S WAY ONLY ─────────────────────────────────────────────────────────
-// Recording camera windows to files is his equipment and does not ship (Architect 2026-09-14: *"i want obs
-// removed at best they should be able to watch"*). A download watches through the cameras and records with
-// whatever it chooses, so there is no stranger's leg to try here: the answer is the module his workstation
-// file names, or null.
+// ── THE RECORDER — THE OPERATOR'S WAY ONLY ──────────────────────────────────────────────────────────
+// Recording camera windows to files is the operator's own equipment and does not ship. A download watches
+// through the cameras and records with whatever it chooses, so there is no stranger's leg to try here: the
+// answer is the module his workstation file names, or null.
 // findRecorder() → absolute path of the recorder module, or null.
 function findRecorder() {
   for (const file of architectPaths('recorder')) {

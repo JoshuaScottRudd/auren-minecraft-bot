@@ -1,36 +1,33 @@
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/astar_reader_v2_bench.js');
 // tool: astar_reader_v2_bench — the live A/B/C that decides whether voxel_reader_v2_prototype ships.
-// Architect 2026-08-04: "ok build a prototype and AB with all your recommendations. use a live server to
-// determine if we save more time… i would like to see a signifigant reduction in scan time."
 //
 // SUPERSEDES astar_ab_bench.js, which compared raw blockAt against cartographer_prototype at the ADAPTER
-// level. That reader shipped; the open question moved to a different seam (computeAStar's own
-// opts.voxelReader), and three arms are needed to attribute the result rather than two. Keeping both
-// would be two instruments answering one question (Law 16) — the old one stays only as the evidence
-// behind the 2.35x already on the record, and is imported by nothing.
+// level; the open question now lives at a different seam (computeAStar's own opts.voxelReader), needing
+// three arms to attribute the result. Keeping both benches would be two instruments answering one
+// question (Law 16); the old one stays only as the evidence behind the 2.35x already on record and is
+// imported by nothing.
 //
 // ── THREE ARMS, ONE UNMODIFIED computeAStar ─────────────────────────────────────────────────────────
-//   A  baseline   raw bot.blockAt per read           — what the fleet ran before 2026-08-04
-//   B  shipped    voxel_reader, needs:['type']       — what the fleet runs now (2.35x over A)
-//   C  prototype  voxel_reader_v2 + flags classify   — column memo, zero per-read allocation, and
-//                                                      classifyFloorAt answering from packed bits
+//   A  baseline   raw bot.blockAt per read
+//   B  shipped    voxel_reader, needs:['type']
+//   C  prototype  voxel_reader_v2 + flags classify — column memo, zero per-read allocation, and
+//                                                    classifyFloorAt answering from packed bits
 // The SAME search runs three times per trial. Nothing about A* changes between arms except which reader
-// its world reads resolve to — that is what makes a timing difference attributable to the reader.
+// its world reads resolve to, which is what makes a timing difference attributable to the reader.
 //
 // ── ROUTE IDENTITY IS THE GATE, ACROSS ALL THREE ARMS, AND IT IS NEVER LOOSENED ─────────────────────
 // Every trial compares the full route — every cell and every edge type — A vs B vs C. One divergence
-// voids the trial and NO timing is printed. A faster reader that plans a different path has not sped
-// pathfinding up, it has broken it, and printing its speedup would be a true number certifying a false
-// claim (Law 25). C is the arm most able to diverge: it answers classifyFloor from flags instead of from
-// block fields, so this gate is the only thing standing between "derived identically" and "looks close".
+// voids the trial and NO timing is printed: a faster reader that plans a different path has not sped
+// pathfinding up, it has broken it (Law 25). C is the arm most able to diverge, since it answers
+// classifyFloor from flags instead of block fields, so this gate is what stands between "derived
+// identically" and "looks close".
 //
 // ── READ COUNTS WILL NOT MATCH BETWEEN B AND C, BY DESIGN ───────────────────────────────────────────
-// classifyFloorInline walks i=1..3 for 'jumpable' and then, on failure, walks i=1..2 AGAIN for
-// 'walkable'. The flags path counts consecutive passable cells once and breaks. Same verdict, strictly
-// fewer reads. The bench therefore reports reads per arm instead of asserting equality — an unequal read
-// count between B and C is the saving, not a warning sign. Between A and B it MUST be equal, and that
-// one is still asserted.
+// classifyFloorInline walks i=1..3 for 'jumpable' and then, on failure, walks i=1..2 again for
+// 'walkable'. The flags path counts consecutive passable cells once and breaks — same verdict, fewer
+// reads. The bench reports reads per arm instead of asserting equality: an unequal read count between B
+// and C is the saving, not a warning sign. Between A and B it must be equal, and that one is asserted.
 //
 // ── WHAT THIS CANNOT PROVE (Law 25) ─────────────────────────────────────────────────────────────────
 // One body, one server, one terrain sample, at whatever chunk-load state the day supplies. It measures
@@ -59,8 +56,8 @@ const flag = k => argv.includes(`--${k}`);
 const DIST     = Number(arg('dist', 32));
 const REPEAT   = Number(arg('repeat', 5));
 const MAXNODES = Number(arg('nodes', 8000));
-// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
-// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+// Version READ from architect_config, never restated here (Law 16) — a bench pinned to a different
+// Minecraft than the body grades this fleet against a game it is not playing.
 const { SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const VERSION  = arg('version', SERVER_MINECRAFT_VERSION);
 const HOST     = arg('host', 'localhost');
@@ -70,8 +67,8 @@ const USERNAME = arg('username', 'ReaderV2_AB');
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// A route's full identity: every cell AND the edge type used to enter it. Endpoints alone would pass two
-// genuinely different routes; length alone would pass two different routes of equal length.
+// A route's identity: every cell and the edge type entered on it, so two routes are equal only when both
+// match completely.
 function routeSignature(result) {
     if (!result) return 'NULL';
     const p = result.path || [];
@@ -85,9 +82,8 @@ async function main() {
     bot.on('error', e => { log('boot', `socket error: ${e.message}`); process.exit(1); });
     bot.on('kicked', r => { log('boot', `kicked: ${typeof r === 'string' ? r : JSON.stringify(r)}`); process.exit(1); });
     await new Promise(res => bot.once('spawn', res));
-    // Settle on the COLUMN COUNT, not a timer. A fixed sleep is a guess about how fast the server streams
-    // chunks, and guessing short is what put drift inside the first trial of the 2026-08-04 run. Wait
-    // until the loaded-column count stops growing for three consecutive samples.
+    // Settle on the COLUMN COUNT, not a timer: a fixed sleep is a guess about how fast the server streams
+    // chunks. Waits until the loaded-column count stops growing for three consecutive samples.
     log('boot', 'spawned — waiting for the loaded-chunk set to stop growing…');
     let prev = -1, stable = 0;
     for (let i = 0; i < 60 && stable < 3; i++) {
@@ -179,17 +175,14 @@ async function mutationPhase(bot, proto) {
 }
 
 // ── PHASE 1b: WHERE do the readers disagree, if they do? ────────────────────────────────────────────
-// Added 2026-08-04 because the A-vs-B read-count guard fired and said only THAT the arms diverged, on a
-// provably stable chunk set — which is a guard that can stop a bad run but cannot help fix one. A guard
-// that fires must be able to name a coordinate (Law 24: mechanism is the developer's to hold, but it has
-// to be recoverable at all). This sweeps the region the searches actually cover and compares the readers
-// on exactly the fields A* consults, so a disagreement lands as an address rather than a mystery.
+// A guard that fires must be able to name a coordinate (Law 24). This sweeps the region the searches
+// actually cover and compares the readers on exactly the fields A* consults, so a disagreement lands as
+// an address, not a mystery.
 function agreementPhase(bot, shipped, proto) {
     const feet = bot.entity.position.floored();
     const R = 40, YR = 12;
-    // The comparison key is the fields A* reads and NOTHING else. Adding light or biome here would fail
-    // the prototypes for a difference the search cannot see — that is the reader licensed for a job it
-    // was never given (its header says so), not a defect.
+    // The comparison key is exactly the fields A* reads — the reader is licensed only for that job (its
+    // header says so).
     const key = b => b === null ? 'NULL' : `${b.name}|${b.boundingBox}|${!!b.diggable}|${pathfinding.isFullHeightFloor(b)}`;
     let cells = 0, bad = 0;
     const firstBad = [];
@@ -229,19 +222,12 @@ async function abPhase(bot, shipped, proto) {
     bot.on('blockUpdate', () => { worldEvents++; });
 
     // ONE adapter for all three arms, and every arm goes through the SAME opts.voxelReader seam. The
-    // arms must differ in exactly one thing or the comparison is not about the reader.
-    //
-    // THE FIRST VERSION OF THIS BENCH GOT IT WRONG and its own guard is what caught it: arm A was given
-    // an adapter with no `world` and no `entity` (so _fastVoxelView would decline and leave raw blockAt
-    // in place), which meant arm A also searched with a different `entity` and a different `world` than
-    // arms B and C. It read 104 fewer voxels than arm B on a 604k-read search with a provably stable
-    // chunk set. Do not reintroduce the asymmetry to "keep arm A honest" — arm A stays honest by being
-    // a reader that forwards to bot.blockAt, which is exactly what the fleet did before 2026-08-04.
+    // arms must differ in exactly one thing — the reader — or the comparison is not about the reader.
+    // Arm A stays honest by being a reader that simply forwards to bot.blockAt through this same adapter.
     const adapter = { blockAt: p => bot.blockAt(p), inventory: bot.inventory, world: bot.world, version: bot.version, entity: bot.entity };
 
-    // Arm A as a READER: raw bot.blockAt behind the same seam. It allocates a Vec3 per read because that
-    // is what every pre-2026-08-04 call site did (`bot.blockAt(new Vec3(x, y, z))`) — this is the old
-    // path measured, not a stand-in for it. No classifyFloorAt, so the flags shortcut stays disarmed.
+    // Arm A as a READER: raw bot.blockAt behind the same seam, allocating a Vec3 per read — the path
+    // this measures, not a stand-in for it. No classifyFloorAt, so the flags shortcut stays disarmed.
     const rawStats = { reads: 0, unloaded: 0 };
     const armA = {
         fast: true,
@@ -298,17 +284,13 @@ async function abPhase(bot, shipped, proto) {
         const same = out[0].sig === out[1].sig && out[1].sig === out[2].sig;
         if (!same) mismatches++;
         // A vs B must be equal work — they ask identical questions of the same world. When they differ,
-        // there are exactly two candidate causes and they must not be confused: the READER answered
-        // differently (a real defect, voids the run) or the WORLD changed between the two arms. Guessing
-        // between them would be the criteria-usurpation Law 25 names, so the bench MEASURES which it was.
+        // there are two candidate causes: the READER answered differently (a defect, voids the run) or
+        // the WORLD changed between the two arms. The bench measures which it was, instead of guessing
+        // (Law 25).
         //
-        // THE FIRST VERSION OF THIS GUARD USED THE LOADED-COLUMN COUNT AND IT WAS TOO WEAK — recorded so
-        // it is not retried. A vanilla server is never frozen: grass spreads, leaves decay, water settles,
-        // every random tick can rewrite a block INSIDE an already-loaded column, which moves no column
-        // count at all. The guard fired on a stable count, and the localization pass then proved zero
-        // cells disagreed and that a re-run of arm A's OWN reader reproduced arm B's count — i.e. the
-        // variance was per-execution, not per-reader. The right sensor is the one the server already
-        // provides for exactly this: `blockUpdate`, the same event stream that keeps bot.world current.
+        // A vanilla server is never frozen — grass spreads, leaves decay, water settles — so a random
+        // tick can rewrite a block inside an already-loaded column without moving the column count.
+        // `blockUpdate`, the same event stream that keeps bot.world current, is the sensor for that.
         const colsAfter = bot.world.getColumns().length;
         const drifted = colsAfter !== colsBefore || worldEvents !== eventsBefore;
         if (readsOut[0] !== readsOut[1]) { if (drifted) driftTrials++; else readMismatch++; }

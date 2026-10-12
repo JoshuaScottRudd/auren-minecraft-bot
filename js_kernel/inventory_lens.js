@@ -2,49 +2,30 @@
 // purpose: THE ONE PLACE ANYTHING ASKS WHERE A MATERIAL IS AND HOW MUCH OF IT EXISTS. One question,
 //   one answer, one door — nothing assembles a material pool of its own and nothing counts a chest itself.
 //
-// ── WHY THIS EXISTS (Architect 2026-08-15) ────────────────────────────────────────────────────────
-// The counting primitives were never wrong. What was wrong is that every caller had to CHOOSE which
-// pool to count — pocket, chests, pocket+chests, or a build's credited subset — and choosing wrong is
-// SILENT. Three separate multi-hour losses were one mistake wearing three costumes:
-//     cobblestone 0/4   measured the POCKET            should have measured pocket + chests
-//     one-plank craft   measured PRESENCE (`> 0`)      should have measured affordability
-//     bone_meal kill    measured POCKET + CHESTS       should have measured the pocket
-// The third correction is the OPPOSITE of the first, and that asymmetry is the whole argument for this
-// module. "Make both sides agree" does not say WHICH side is right. The right pool is not a property of
-// the caller, the item, or the situation — it is a property of THE VERB THE ANSWER WILL BE SPENT ON.
-//
-// ── THE RULE THAT MAKES THE BUG CLASS UNREACHABLE ─────────────────────────────────────────────────
-// Nothing here is named for a place, and that is deliberate down to the field names of the answer.
-// `where()` returns no `total`. There is no neutral number to reach for, because reaching for the
-// neutral number IS the bug: a caller that wanted "how much is there" got a true count it could not
-// spend. Every figure the answer carries is named for what it may be used FOR:
+// ── WHAT EACH FIGURE IS FOR ────────────────────────────────────────────────
+// The right pool to count is not a property of the caller, the item, or the situation — it is a
+// property of THE VERB THE ANSWER WILL BE SPENT ON. Nothing here is named for a place: `where()`
+// returns no `total`, and every figure is named for what it may be used FOR:
 //     spendableForCraft   the POCKET — a craft consumes from the hand and cannot reach a chest
 //     reachableByFleet    pocket + every registered chest — a bot can WALK to a chest
 //     inBuildPool         the build layer — its credited chests and the pocket, less the bot's claim
 //     forChestRequest     the storage layer — everything, less the bot's claim and the build's
-// A function or field named for a place can be read from the wrong context and look correct. One named
-// for a verb argues back: `spendableForCraft` refuses to count a chest, and that refusal IS the fix for
-// the bone_meal kill rather than a comment asking a future reader to be careful.
 //
-// ── `locations` IS THE NEW CAPABILITY, NOT DECORATION ─────────────────────────────────────────────
-// None of the call sites this replaces could answer "where is it". That is exactly the question whose
-// absence cost a 73-minute run: supply_manager logged `bone=0` once a second for twenty minutes while
-// six bones sat in the chest, and the number was TRUE — no amount of reading it could reveal the
-// fault. An answer that carries its locations makes the same failure self-describing on its first line
-// (Law 6, and Law 25: a true figure that misleads about the situation is still a failed report).
+// ── `locations` NAMES WHERE THE ANSWER CAME FROM ───────────────────────────────────────────────────
+// An answer that carries its locations makes a stock-vs-reachability mismatch self-describing on its
+// first line (Law 6, and Law 25: a true figure that misleads about the situation is still a failed
+// report).
 //
-// ── THIS IS AN INTERFACE, NOT A SECOND IMPLEMENTATION (Law 16) ────────────────────────────────────
-// Every figure delegates to the existing primitives (fragment_utils' pool builders, inventory_calculator's
-// group-aware counter). Re-implementing the arithmetic here would create the second route this module
-// exists to abolish. The mechanism stays where it lives; what is new is that there is one door to it and
-// the door asks the question that determines the answer.
+// ── ONE DOOR TO THE EXISTING PRIMITIVES (Law 16) ───────────────────────────────────────────────────
+// Every figure delegates to fragment_utils' pool builders and inventory_calculator's group-aware
+// counter; the arithmetic stays where it lives, and this module is the one door that asks which
+// question determines the answer.
 //
-// ── LAW 26: THIS IS THE TRANSLATOR, HQ IS THE RECORD ──────────────────────────────────────────────
+// ── THE TRANSLATOR IN FRONT OF HQ (Law 26) ─────────────────────────────────────────────────────────
 // The chest side comes from station_registry, which reads corporate_headquarters — so this module is to
 // HQ what trace_monitor is to the watcher trace: the one reader standing between a record and everything
-// that depends on it. A consumer wired straight to raw chest arrays is the illegal joint. The POCKET is
-// deliberately NOT from HQ: it is read live from the body (Invariant B — it changes faster than any
-// record can hold, and it is the one number a stale read gets fatally wrong).
+// that depends on it. The POCKET is read live from the body, not from HQ (Invariant B): it changes
+// faster than a record can hold.
 
 'use strict';
 
@@ -61,15 +42,12 @@ const {
 // because a caller that needs a single number should not have to remember which field, and because a
 // named call site greps better than a field access.
 //
-// `inventory` is optional and it is not a convenience: most callers are mid-chain and already hold the
-// snapshot their decision was made against. Re-reading the body here would answer a DIFFERENT instant
-// than the rest of their reasoning — which is precisely the fault behind the one-plank craft, where two
-// reads of the same pocket disagreed. Passing what you already hold is the correct call.
-// ACCEPTS A LIST, AND THE LIST MEANS "ANY OF THESE WILL DO" — the fuel question, not a convenience.
-// A torch burns coal OR charcoal; a wall takes any structural_fill member. Asked one item at a time, a
-// caller has to sum the answers itself, and summing an any-of is where a per-member threshold gets
-// applied to a shared allowance by accident (the group-token rule: one allowance ACROSS members, never
-// one each). One call, one figure, one place that knows the semantics.
+// `inventory` is optional: most callers are mid-chain and already hold the snapshot their decision was
+// made against, and passing it avoids a second read of the body disagreeing with the first.
+//
+// Accepts a list meaning "any of these will do" — a torch burns coal or charcoal, a wall takes any
+// structural_fill member. Summed here so the group-token rule (one allowance across members, never one
+// each) is applied once, in the one place that knows the semantics.
 function where(item, inventory = null) {
     const items = Array.isArray(item) ? item : [item];
     const label = items.join('|');
@@ -88,7 +66,7 @@ function where(item, inventory = null) {
     if (pocket > 0) locations.push({ kind: 'pocket', count: pocket, label: 'pocket' });
     const stationRegistry = require('@perception/station_registry');
     for (const entry of Object.values(stationRegistry.getStations() || {})) {
-        if (!entry || entry.type !== 'chest') continue;
+        if (!stationRegistry.isStorage(entry)) continue;
         const chestCounts = chestItemCounts(entry);
         let count = 0;
         for (const one of items) count += countInInventory(one, chestCounts);
@@ -111,27 +89,23 @@ function where(item, inventory = null) {
           + ' — reachable by a TRIP, NOT by a craft'
         : `${item_}: ${pocket} pocket + ${chests} chests`;
 
-    // NO `total` FIELD, ON PURPOSE — see the header. A neutral number is the thing every one of these
-    // bugs reached for.
+    // No `total` field: a neutral number invites counting the wrong pool.
     return { item: item_, pocket, chests, spendableForCraft: pocket, reachableByFleet: fleet, locations, readable };
 }
 
 // ── NAMED READERS ─────────────────────────────────────────────────────────────────────────────────
-// CRAFTING CONSUMES FROM THE HAND. An ordinary ingredient sitting in a chest is not one a crafter can
+// Crafting consumes from the hand: an ordinary ingredient sitting in a chest is not one a crafter can
 // use — supply_manager crafts from its own inventory — so a gate counting it posts an order no fulfiller
-// can fill, which the board re-posts unchanged until the sentry kills the signal.
+// can fill.
 //
-// ONE CLASS IS EXEMPT AND IT IS NOT A LOOPHOLE: a CHAIN PRODUCT (charcoal, wheat) is a LEAF to
-// supply_manager, obtained by withdrawing from the storage chest its chain stocks — it has no
-// synchronous craft and no gather, so the withdrawal is the only way it is ever obtained. For that class
-// the reachable pool is the correct question and `reachableByFleet` below is the reader; job_gates'
-// chainGate is the one caller, and it passes that reader explicitly rather than widening this one.
-// Do not fold the exemption in here: this function's narrowness is what a caller relies on when it wants
-// the hand, and the two questions have different right answers for the same item.
-// NOT delegated to where(): this reads the pocket alone, and where() walks every registered station to
+// A CHAIN PRODUCT (charcoal, wheat) is a LEAF to supply_manager, obtained only by withdrawing from the
+// storage chest its chain stocks. For that class the reachable pool is the right question, and
+// `reachableByFleet` below is the reader job_gates' chainGate calls explicitly.
+//
+// Not delegated to where(): this reads the pocket alone, where() also walks every registered station to
 // build its locations. This is the hottest path in the gates (once per candidate job per sweep), so the
 // cheap question stays cheap. Same semantics, same any-of list handling — only the station walk is
-// skipped, and a pocket answer never needed one.
+// skipped.
 function spendableForCraft(item, inventory = null) {
     const counts = inventory || getBotInventory();
     const items = Array.isArray(item) ? item : [item];
@@ -140,8 +114,8 @@ function spendableForCraft(item, inventory = null) {
     return total;
 }
 
-// "Does this exist anywhere the fleet can get to it" — the right question for deciding whether to SEND
-// SOMEONE (a gather trip, a mining descent). The wrong question for deciding whether a craft can start.
+// Answers whether the fleet can reach material anywhere — the right question for deciding whether to
+// send someone (a gather trip, a mining descent), not whether a craft can start.
 function reachableByFleet(item) {
     const pool = accessibleMaterialPool();
     const items = Array.isArray(item) ? item : [item];
@@ -150,11 +124,31 @@ function reachableByFleet(item) {
     return total;
 }
 
-// Chests only — "is this already banked somewhere, so nobody needs to go and get more". A SOURCING
-// question, and the pocket is excluded because the asker is standing in it: material in the assessing
-// bot's own hands is not material sitting in a chest waiting to be fetched.
-// NOT the storage layer's stock level, which was this function's other reader until the layers were
-// separated — that question subtracts CLAIMS rather than a location and is `forChestRequest` below.
+// EVERYTHING THE FLEET HOLDS, WHEREVER IT IS — the question "how much of this material exists above ground",
+// asked by a balance of need against holdings (build_material_calculator.familyBalance). This body's pocket
+// and every registered chest, every peer's pocket as its chair last stated it, and every batch a furnace was
+// loaded with and has not been emptied of, counted as what it is becoming. A map, because the balance spends
+// it across a whole recipe tree.
+function fleetHoldings() {
+    const pool = { ...accessibleMaterialPool() };
+    const add = (name, count) => { if (name && count > 0) pool[name] = (pool[name] || 0) + count; };
+    const hq = require('@kernel/corporate_headquarters');
+    const me = process.env.BOT_ID || 'default';
+    for (const [botId, chair] of Object.entries(hq.getFullBoardroom({}) || {})) {
+        if (botId === me || !chair || !chair.inventory) continue;
+        for (const [name, count] of Object.entries(chair.inventory)) add(name, count);
+    }
+    for (const entry of Object.values(require('@perception/station_registry').getStations() || {})) {
+        const s = entry && entry.type === 'furnace' ? entry.smelt : null;
+        if (s && s.started_at && s.order) add(s.order, s.qty || 0);
+    }
+    return pool;
+}
+
+// Chests only: a SOURCING question, whether this is already banked somewhere so nobody needs to fetch
+// more. The pocket is excluded because the asker is standing in it: material in the assessing bot's own
+// hands is not material sitting in a chest waiting to be fetched. `forChestRequest` below answers the
+// storage layer's stock level, which subtracts claims.
 function inChests(item) {
     return Math.max(0, reachableByFleet(item) - spendableForCraft(item));
 }
@@ -171,46 +165,36 @@ function inChests(item) {
 // crafts a second, and a storage row's stock level is never vouched for by the pocket or by material the
 // build has already spoken for.
 //
-// COUNTING IS NOT SOURCING, AND CONFLATING THEM IS THE TRAP. These figures answer "what counts toward
-// this layer's requirement". They do not say where a fulfiller reaches: the bot's own stock rows are
-// still measured on the POCKET (a chest full of torches must not satisfy a bot that has none — it must
-// make the bot go and fetch them), and a craft still consumes from the hand. The layers change what is
-// counted as done, not what is reachable.
+// COUNTING IS NOT SOURCING. These figures answer what counts toward a layer's requirement, not where a
+// fulfiller reaches: the bot's own stock rows are still measured on the POCKET (a chest full of torches
+// does not satisfy a bot that has none — it must make the bot go and fetch them), and a craft still
+// consumes from the hand.
 //
-// WHY A CLAIM AND NOT A LOCATION — this is what makes the whole scheme survive TRANSIT. Material
-// withdrawn for a build sits in the pocket at the instant the build spends it, so a rule phrased as
-// "the build may not count the pocket" blinds every build to the material it just withdrew. `everything`
-// does not change when a block moves, so subtracting a claim from it leaves every layer's figure
-// unmoved by transit. The pocket's claim is its declared reserve; pocket stock above that reserve is
-// in transit and belongs to whichever layer withdrew it.
+// A CLAIM, NOT A LOCATION, is what survives TRANSIT. Material withdrawn for a build sits in the pocket
+// at the instant the build spends it, and `everything` does not change when a block moves, so
+// subtracting a claim leaves every layer's figure unmoved by transit. The pocket's claim is its declared
+// reserve; pocket stock above that reserve is in transit and belongs to whichever layer withdrew it.
 //
 // THE BOT'S CLAIM IS THE KEEP RESERVE, READ THROUGH THE ONE KEEP-MATH THAT ALREADY EXISTS.
-// `computeExcess` is the single dump-threshold math (Law 16) and it already returns exactly the wanted figure:
+// `computeExcess` is the single dump-threshold math (Law 16) and returns exactly the wanted figure:
 // everything ABOVE the bot's allowance, which is everything the bot layer does not claim. It is also
-// group-token correct — 'tools' and 'planks' hold ONE allowance across their concrete members, and a
-// per-member subtraction here would reserve that allowance several times over.
+// group-token correct — 'tools' and 'planks' hold ONE allowance across their concrete members.
 //
 // A ROW IS NOT THE ONLY WAY TO CLAIM SOMETHING. The keep-math also takes the bot's HELD ORDER, so a
-// material with no row at all is still claimed while an order in hand is waiting on it. Passing the
-// demand here is not an extra refinement — it is what keeps this figure equal to the dumper's, and the
-// two answer one fact from opposite sides ("does the bot claim this?" / "may I bank this?"). Blind to
-// demand, this lens would report material as free that its holder will not release, and a second bot's
-// order would clear its gate against stock its fulfiller can never spend — a claim/release loop, which
-// is why the demand read has exactly one home (`heldOrderDemand`). No row AND no order still means fully
-// excess, which remains the right answer: nothing claims it.
-// Both are lazily required and required upward on purpose — inventory_swapper already reaches for
-// job_board's whitelist the same way, and a top-level require from here would close the cycle
-// (job_board → assessors → this file).
+// material with no row at all is still claimed while an order in hand is waiting on it. This keeps the
+// figure equal to the dumper's (`heldOrderDemand` is the one home for reading demand); blind to demand,
+// this lens would report material as free that its holder will not release. No row AND no order still
+// means fully excess: nothing claims it.
+// Both are lazily required upward: inventory_swapper reaches for job_board's whitelist the same way, and
+// a top-level require from here would close the cycle (job_board → assessors → this file).
 // THE CLAIM IS MEASURED ON THE POCKET AND SUBTRACTED FROM THE TOTAL — never measured on the total.
-// `dump_threshold` is an allowance against the BODY ("do not dump this"), so running the keep-math over a pool that
-// includes chests lets the allowance swallow chest stock the bot never had: `tools: dump_threshold 99` reserved
-// fourteen swords sitting in a storage chest, storage's level read 0 with the chest visibly full,
-// and the fleet crafted a fifteenth every sweep. A reserve larger than a bot can carry is legal in the
-// config and must stay harmless here.
+// `dump_threshold` is an allowance against the BODY, so running the keep-math over a pool that includes
+// chests would let the allowance swallow chest stock the bot never had. A reserve larger than a bot can
+// carry is legal in the config and must stay harmless here.
 // So the claim is what the bot ACTUALLY HOLDS, capped at its allowance — held capped at the dump
 // threshold, expressed as held-minus-excess so the group-token distribution stays in the one math that
-// owns it. Transit is unaffected, which the whole scheme rests on: 30 cobblestone against a threshold of 20 still
-// claims 20 and leaves 10 to whichever layer withdrew them.
+// owns it. Transit is unaffected: 30 cobblestone against a threshold of 20 still claims 20 and leaves 10
+// to whichever layer withdrew them.
 function reservedByBot(inventory = null) {
     const { INVENTORY_WHITELIST } = require('@thinking/job_board.js');
     const { computeExcess, heldOrderDemand } = require('@api/inventory_swapper');
@@ -222,6 +206,28 @@ function reservedByBot(inventory = null) {
         if (held > free) reserved[name] = held - free;
     }
     return reserved;
+}
+
+// WHAT THE FLEET HOLDS THAT A BUILDING CAN BE HANDED — fleetHoldings less what every pocket keeps for its own
+// body (each pocket row's allowance). A building's order is delivered to the chests, so material a body keeps
+// in its pocket for itself is no part of what the order already has. Peers' pockets are read off their chairs.
+function deliverableHoldings() {
+    const { INVENTORY_WHITELIST } = require('@thinking/job_board.js');
+    const { computeExcess } = require('@api/inventory_swapper');
+    const hq = require('@kernel/corporate_headquarters');
+    const me = process.env.BOT_ID || 'default';
+    let pool = lessClaim(fleetHoldings(), reservedByBot());
+    for (const [botId, chair] of Object.entries(hq.getFullBoardroom({}) || {})) {
+        if (botId === me || !chair || !chair.inventory) continue;
+        const excess = computeExcess(chair.inventory, INVENTORY_WHITELIST, {});
+        const kept = {};
+        for (const [name, held] of Object.entries(chair.inventory)) {
+            const free = excess[name] || 0;
+            if (held > free) kept[name] = held - free;
+        }
+        pool = lessClaim(pool, kept);
+    }
+    return pool;
 }
 
 // Subtract a claim map from a pool map, never below zero. Separate from the claim itself because the same
@@ -236,38 +242,26 @@ function lessClaim(pool, claim) {
 }
 
 // Pocket plus the chests this blueprint is credited (its own, plus the shared headframe chests),
-// less the bot layer's claim. Gate, posted order and withdraw all credit the same set, so a
-// build's shortfall cannot be computed three ways — fragment_utils owns that set; this is its one
-// caller-facing question. The chest set stays the credited one rather than every chest in the world
-// because it is also the set preconstruction actually withdraws from: widening the count without
-// widening the reach would open a gate onto material no fulfiller can go and get.
+// less the bot layer's claim. Gate, posted order and withdraw all credit the same set — fragment_utils
+// owns that set; this is its one caller-facing question. The chest set is the credited one because it is
+// also the set preconstruction withdraws from: widening the count without widening the reach would open
+// a gate onto material no fulfiller can go and get.
 function inBuildPool(item, blueprint, inventory = null) {
     return countInInventory(item, buildPool(blueprint, inventory));
 }
 
-// ── THE WALK-BACK, ASKED AS A QUESTION RATHER THAN HANDED A POOL ──────────────────────────────────
-// craftShortfall needs the whole pool map, not a count, so its callers used to build one themselves —
-// `rootsStillNeeded(job, accessibleMaterialPool())`. That is the choice this module exists to remove,
-// just spelled with a bigger argument: the pool travels in, and nothing at the call site says why THAT
-// pool. Asked here it is settled once. FLEET-WIDE is correct for both root gates because both are
-// deciding whether to SEND SOMEONE — a mining descent or a gather trip can reach a chest, so material
-// already banked must not be re-commissioned (that exact mistake is the cobblestone 0/4 loop).
-// Deliberately NOT offered against the craft pool: a root walk answers "what must the world still give
-// us", which is never a question about one body's hands.
-// ── THE BUILD POOL AS A MAP, AND WHY THIS ONE IS ALLOWED TO HAND OUT A POOL ───────────────────────
+// ── THE BUILD POOL AS A MAP ─────────────────────────────────────────────────────────────────────────
 // Everything else here returns a figure, because a figure cannot be counted against the wrong set. This
 // returns the set itself, for the callers that genuinely need it: a build's remaining-material walk
 // consumes the whole map (it spends a shared budget across an ingredient tree), and a per-item lens call
-// inside that loop would re-walk every station once per ingredient.
-//
-// It is still the fix rather than a hole in it. The three sites that needed this each wrote the identical
-// four lines — pocket, spread the build-pool chest counts over it, close over it as `isAvailable` — and
-// the comments above all three already say they MUST agree (gate, dispatch gate, and withdrawer credit
-// the same set or the build orders material it is standing on). Three hand-written copies of a rule that
-// says "these must never disagree" is the Law 16 shape exactly. One definition, three readers.
+// inside that loop would re-walk every station once per ingredient. Gate, dispatch gate and withdrawer
+// must credit the same set (Law 16); this is the one definition.
+// THE CHESTS ARE COUNTED LESS WHAT OTHER BODIES HAVE CLAIMED OUT OF THEM (chest_ledger): a cube trip claims its
+// whole bill before it takes anything, so material a peer is about to withdraw is in nobody else's pool.
 function buildPool(blueprint, inventory = null) {
     const pool = { ...(inventory || getBotInventory()) };
-    for (const [name, count] of Object.entries(buildPoolChestCounts(blueprint))) {
+    const free = require('@perception/chest_ledger').lessClaims(buildPoolChestCounts(blueprint), process.env.BOT_ID || 'default');
+    for (const [name, count] of Object.entries(free)) {
         pool[name] = (pool[name] || 0) + count;
     }
     return lessClaim(pool, reservedByBot(inventory));
@@ -299,18 +293,44 @@ function forChestRequest(item, buildClaim = null) {
     return Math.max(0, have - claimed);
 }
 
+// ── THE POOL THE BOARD PRICES AN ORDER AGAINST IS THE FREE POOL, NEVER THE FULL ONE ───────────────
+// `accessibleMaterialPool` is pocket plus every barrel's raw contents. Priced against that, the board
+// would count material another body has already committed to and walked for, then post a second order
+// against the same stack.
+//
+// `chest_ledger` answers exactly this: the claim is what makes it ONE number that both read — realized
+// stock, less what is already spoken for. This is that subtraction, at the one question the board asks.
+//
+// CLAIMS ONLY, NOT PEERS' POCKETS. This does not narrow the pool to what one body can reach — a gather
+// trip or a mining descent can reach a barrel, so banked material must still not be re-commissioned. It
+// removes exactly what a peer has SPOKEN FOR, the one part of the barrel that is unavailable to the
+// next job.
+// ── AND THE BODY'S OWN KIT IS NOT FLEET MATERIAL EITHER ───────────────────────────────────────────
+// `reservedByBot` is the fleet's one definition of what this body holds that it is not going to give
+// up — the allowance the dump job leaves alone. `forChestRequest` one layer up already subtracts it;
+// this walk must too, or the board can credit a body's own kit against an order to put a matching item
+// on the shelf.
+//
+// The two subtractions are different facts and both are needed: a CLAIM is material a peer is walking
+// for, a RESERVE is material this body is keeping. Either one left in makes the board offer work the
+// fulfiller cannot do.
 function rootsNeededFleetWide(item, quantity, alreadyAtDestination = 0) {
     const { craftShortfall } = require('@utils/calculators/build_material_calculator');
-    return craftShortfall(item, quantity, accessibleMaterialPool(), alreadyAtDestination);
+    const chestLedger = require('@perception/chest_ledger');
+    const free = lessClaim(chestLedger.lessClaims(accessibleMaterialPool()), reservedByBot());
+    return craftShortfall(item, quantity, free, alreadyAtDestination);
 }
 
 module.exports = {
     where,
     spendableForCraft,
     reachableByFleet,
+    fleetHoldings,
+    deliverableHoldings,
     inChests,
     inBuildPool,
     buildPool,
+    reservedByBot,
     forChestRequest,
     rootsNeededFleetWide,
 };

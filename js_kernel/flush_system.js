@@ -25,11 +25,10 @@
 
 const watcher = require('@kernel/watcher');
 
-// Async only to keep the verb signature uniform with start/exit (operator_commands
-// awaits it); reset() itself is synchronous. A disk-write failure throws (Law 13:
-// a flush that didn't flush is a real problem, not something to soft-swallow).
+// The operator receives completion after the blank baseline reaches durable storage.
 async function flush() {
-  require('@kernel/corporate_headquarters').reset();
+  const flushed = await require('@kernel/corporate_headquarters').reset();
+  if (flushed === false) throw require('@utils/external_library_guard').violation('flush_system', 'HQ reset did not reach disk; see the corporate_headquarters warning');
   watcher.summary('flush_system', 'Reset corporate_headquarters (memory + disk) to empty — bot is fresh.');
 }
 

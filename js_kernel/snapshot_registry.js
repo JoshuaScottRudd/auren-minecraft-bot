@@ -20,9 +20,9 @@
 //      on faithfully (Law 26 drift). The loud failure is the survivable one.
 //
 // WHY A HASH AND NOT JUST A SNAPSHOT: a snapshot alone is safe but silent — edit the file, see nothing,
-// conclude the edit took effect, and build on that belief. Same unverified-belief failure, other
-// direction. The drift check makes the disagreement between disk and running state SAID rather than
-// inferred (Law 26: the boundary the mind and the machine both read). WARNING level, never error:
+// conclude the edit took effect, and build on that belief. The drift check makes the disagreement
+// between disk and running state SAID, not inferred (Law 26: the boundary the mind and the machine both
+// read). WARNING level, never error:
 // nothing is broken, the run is correct on a valid snapshot, and it waits for timed inspection. It must
 // NEVER throw — a disk edit during a run is a supported operator act, not a fault.
 //
@@ -33,7 +33,7 @@
 
 const fs     = require('fs');
 const crypto = require('crypto');
-const { guardExternalSync, violation } = require('@utils/external_library_guard');
+const { guardExternal, guardExternalSync, withCleanup, violation } = require('@utils/external_library_guard');
 
 // Accessors are called thousands of times per run, so the check must cost nothing in the common case:
 // a stat() at most this often, and a re-hash only when mtime/size actually moved. 10s is far below any
@@ -72,6 +72,7 @@ function createSnapshotRegistry({ filePath, fileName, tag, validate }) {
   let _lastSeenSig      = null;   // mtime:size of the last version we bothered to hash
   let _warnedUnreadable = false;
   const _warnedHashes   = new Set([BOOT_HASH]);
+  let _checking = null;
 
   // Lazily required so a registry can be pulled in by anything without a load-order dependency on the
   // watcher (and so a drift warn never becomes a require-time cycle).
@@ -80,14 +81,20 @@ function createSnapshotRegistry({ filePath, fileName, tag, validate }) {
   }
 
   function checkForDrift() {
+    if (_checking) return _checking;
     const now = Date.now();
     if (now - _lastStatAt < DRIFT_STAT_THROTTLE_MS) return;
     _lastStatAt = now;
+    _checking = withCleanup(tag, `check ${fileName} for drift`, inspectDrift, () => { _checking = null; });
+    return _checking;
+  }
 
-    const statted = guardExternalSync(tag, `stat ${fileName} for drift`, () => fs.statSync(filePath));
+  // Accessors return the validated boot snapshot while one asynchronous disk inspection is pending.
+  async function inspectDrift() {
+    const statted = await guardExternal(tag, `stat ${fileName} for drift`, () => fs.promises.stat(filePath));
     if (!statted.ok) {
-      // The file is gone right now — almost certainly the delete half of a delete-then-upload. This is
-      // precisely the window that used to kill the fleet; say so plainly and carry on.
+      // The file is gone right now — almost certainly the delete half of a delete-then-upload. Say so
+      // plainly and carry on; the snapshot already taken keeps the fleet running through this window.
       if (!_warnedUnreadable) {
         _warnedUnreadable = true;
         warn(`${fileName} is currently MISSING from disk. Nothing is broken — the fleet is running on the ` +
@@ -109,10 +116,10 @@ function createSnapshotRegistry({ filePath, fileName, tag, validate }) {
 
     const sig = `${stat.mtimeMs}:${stat.size}`;
     if (sig === _lastSeenSig) return;
-    _lastSeenSig = sig;
 
-    const read = guardExternalSync(tag, `read ${fileName} for drift`, () => fs.readFileSync(filePath, 'utf8'));
+    const read = await guardExternal(tag, `read ${fileName} for drift`, () => fs.promises.readFile(filePath, 'utf8'));
     if (!read.ok) return;   // vanished between stat and read — the next pass reports it
+    _lastSeenSig = sig;
 
     const hash = sha1(read.value);
     if (hash === BOOT_HASH) return;        // edited back to the running version — nothing to say

@@ -1,40 +1,36 @@
 // machine_load_sampler — writes a record of what this MACHINE was doing while a run happened.
 //
-// WHY IT EXISTS. Filming scales the wrong way: the fleet is heading for five bots, each with a camera
-// window, plus the Architect's eye — six 3D clients rendering at once beside a server, six bot processes
-// and a recorder. The question that governs whether that is possible ("does the GPU hold, or does it
-// spike") had no instrument at all, so the only available answer was somebody's impression of whether the
-// windows felt smooth. An impression does not survive the session and cannot be compared against the next
-// run at a different camera count. This writes the record; `monitoring/machine_load_lens.js` reads it.
+// Filming scales the wrong way: the fleet is heading toward several bots, each with a camera window,
+// plus an operator's eye — several 3D clients rendering at once beside a server, several bot processes
+// and a recorder. Whether the GPU holds or spikes had no instrument, only an impression of whether the
+// windows felt smooth, which does not survive the session or compare across camera counts. This writes
+// the record; `monitoring/machine_load_lens.js` reads it.
 //
 // ── WHAT IT MEASURES, AND WHAT IT DOES NOT ────────────────────────────────────────────────────────────
 // It measures MACHINE LOAD: GPU utilisation, VRAM, GPU temperature and power, CPU busy fraction, and free
-// system memory. It does NOT measure frame delivery. A hitch a human sees is a late frame, and nothing
-// outside the game process can see one — so a clean report here is evidence that the machine had headroom,
-// never proof that no window stuttered (Law 25: the verdict states what was actually measured, and the
-// asker's question was about smoothness, which is adjacent to this rather than identical to it).
+// system memory. It does not measure frame delivery — a hitch a human sees is a late frame, and nothing
+// outside the game process can see one, so a clean report is evidence the machine had headroom, never
+// proof that no window stuttered (Law 25: the verdict states what was actually measured).
 //
-// THE ONE EXCEPTION, AND IT IS THE USEFUL ONE: sample JITTER. Every row carries the real interval since the
-// row before it. This process asks for a sample on a fixed cadence and does almost nothing else, so when a
-// row lands late, something starved the whole machine for that long — not a rendering opinion but a
-// scheduling fact, and the closest thing to a stall this side of the game process. The lens reports it.
+// THE ONE EXCEPTION, AND IT IS THE USEFUL ONE: sample JITTER. Every row carries the real interval since
+// the row before it. This process asks for a sample on a fixed cadence and does almost nothing else, so a
+// late row is a scheduling fact — the closest thing to a stall this side of the game process. The lens
+// reports it.
 //
-// ── HOW IT SAMPLES, AND WHY nvidia-smi DRIVES THE CLOCK ───────────────────────────────────────────────
-// nvidia-smi runs ONCE in its own loop mode and streams a line per interval; every line it emits is one
-// sample, stamped and joined with a CPU/memory read taken at that instant. The alternative — a timer here
-// spawning nvidia-smi per sample — puts a process launch on the critical path of the very thing being
-// measured, and the launch cost is itself load. One long-lived child, one clock, no drift.
+// ── HOW IT SAMPLES ────────────────────────────────────────────────────────────────────────────────────
+// nvidia-smi runs once in its own loop mode and streams a line per interval; every line is one sample,
+// stamped and joined with a CPU/memory read taken at that instant. One long-lived child, one clock, no
+// drift.
 //
-// NO GPU IS NOT A FAILURE. On a machine with no NVIDIA card the CPU/memory half still records, with the GPU
-// fields absent rather than zeroed — a zero is a measurement and would read as an idle GPU (Law 25). The
-// lens says "not measured" for those columns.
+// NO GPU IS NOT A FAILURE. On a machine with no NVIDIA card the CPU/memory half still records, with the
+// GPU fields absent, never zeroed — a zero is a measurement and would read as an idle GPU (Law 25). The
+// lens reports "not measured" for those columns.
 //
 // ── LAW 8: IT DIES WITH THE RUN THAT RAISED IT ────────────────────────────────────────────────────────
-// It is raised by the filming overlay and reaped by it, through a pid file that is the only handle: `stop`
-// reads that file and kills what it names. Two independent belts, because a sampler is exactly the kind of
-// quiet background process nobody notices surviving a crashed conductor — (1) `--max-minutes` self-expiry,
-// so an orphan ends on its own even if nothing ever calls `stop`; (2) the pid file is deleted on the way
-// out by whichever path ends the process, so a later `stop` cannot kill a pid the OS has since reissued.
+// Raised by the filming overlay and reaped by it, through a pid file that is the only handle: `stop`
+// reads that file and kills what it names. Two independent belts: `--max-minutes` self-expiry so an
+// orphan ends on its own even if `stop` is never called, and the pid file is deleted on every exit path
+// so a later `stop` cannot kill a pid the OS has since reissued.
 //
 // Usage:
 //   node tools/machine_load_sampler.js run [--label=NAME] [--interval-seconds=1] [--max-minutes=180]
@@ -47,9 +43,6 @@ const path = require('path');
 const { spawn } = require('child_process');
 const os = require('os');
 
-// THE CONSTANT THAT STOOD HERE WAS CALLED REPO_ROOT AND HELD THE BOT ROOT. It was wrong for as long as
-// it existed and nothing said so, because inside Auren_Bot the two happened to differ by a level nobody
-// read (Law 7 — the name describes what it is). Both are asked of workshop_paths by their real names now.
 const paths = require('../workshop_paths');
 const RECORD_DIR = paths.fleetLogs('machine_load');
 const PID_FILE = paths.bot('js_kernel', 'machine_load_sampler.json');
@@ -60,7 +53,7 @@ function recordFileFor(label) {
   return path.join(RECORD_DIR, `machine_load_${label}.jsonl`);
 }
 
-// The GPU columns, in the order nvidia-smi is asked for them. One list, used to build the query AND to read
+// The GPU columns, in the order nvidia-smi is asked for them — one list, which builds the query and reads
 // the reply, so a column added to one cannot go missing from the other (Law 16).
 const GPU_FIELDS = [
   ['utilization.gpu', 'gpu_percent'],
@@ -70,9 +63,9 @@ const GPU_FIELDS = [
   ['clocks.current.graphics', 'gpu_clock_mhz'],
 ];
 
-// CPU busy fraction across all cores, from the deltas between two readings of the kernel's own counters.
-// Deltas rather than a single reading: os.cpus() reports time accumulated since BOOT, so one reading is an
-// average over days and would report a flat number no load could move.
+// CPU busy fraction across all cores, from the deltas between two readings of the kernel's own counters:
+// os.cpus() reports time accumulated since BOOT, so a single reading would average over days and report
+// a flat number no load could move.
 function cpuTotals() {
   let idle = 0, total = 0;
   for (const c of os.cpus()) {
@@ -139,16 +132,16 @@ function run(label, intervalSeconds, maxMinutes) {
       const gpu = {};
       GPU_FIELDS.forEach(([, name], i) => {
         const value = parseFloat(parts[i]);
-        // Absent rather than 0 when the driver reports something unparseable: a zero here would read as a
-        // measured idle GPU, which is the one wrong answer this record must never contain (Law 25).
+        // Left absent when the driver reports something unparseable: a zero here would read as a
+        // measured idle GPU, the one wrong answer this record must never contain (Law 25).
         if (Number.isFinite(value)) gpu[name] = value;
       });
       writeRow(gpu);
     }
   });
 
-  // A missing or failing nvidia-smi is ENVIRONMENTAL (not every machine has an NVIDIA card), so the CPU and
-  // memory half keeps recording on this file's own timer rather than the run losing its whole record.
+  // A missing or failing nvidia-smi is ENVIRONMENTAL (not every machine has an NVIDIA card); the CPU and
+  // memory half keeps recording on this file's own timer, so the record is not lost.
   child.on('error', () => {
     console.log('machine_load_sampler: no nvidia-smi on this machine — recording CPU and memory only.');
     setInterval(() => writeRow({}), intervalSeconds * 1000).unref?.();

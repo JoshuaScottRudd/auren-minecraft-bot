@@ -1,6 +1,6 @@
 # Auren Structural Laws (LLM Reference)
 
-> Condensed for per-prompt injection. Full canonical version: `Auren_Structural_Laws.md`
+> Condensed for session startup, post-compaction reloads, and decision making. Full canonical version: `Auren_Structural_Laws.md`
 > Laws are numbered chronologically and organized here by the five invariants they instantiate. Numbers never change; the section carries the shared WHY. A law serving several invariants is filed under its dominant one. Law 20 instantiates all five; Law 21 sits one scope further out (the making and amending of the laws themselves) and resolves through Law 20's cycle; Law 22 is Law 20's delegated mode — the artificial construct running a work-cycle alone on the Architect's ratified procedure of judgment when he is absent, authorized through Law 21's table.
 >
 > **This file is written under Law 29: one topic, one list.** Where a law states what is permitted, absence is the exclusion. The reasoning, the derivations and the christening documents live in the canonical file.
@@ -131,21 +131,15 @@ Every message carries a defined origin, routing path and termination point. The 
 
 All messages conform to a defined schema. Routing metadata travels separately from payload data. Every field is declared.
 
-## Law 14: Intent Summaries (for the Next AI Developer)
+## Law 14: Purpose Comments
 
-Every significant code unit carries a plain-English summary of its INTENT. **Audience: the next AI developer arriving cold, with no memory of the session that wrote it.** The Architect works from the record; a code file's commentary is machine-to-machine correspondence and reaches him through Law 24. This system is deliberately unconventional and a cold-start reader defaults to convention, so recorded intent is what lets a successor reach the decision the last one reached. **The test: would an AI developer with no context make this same decision again?** Information absent from the page makes the page incomplete.
+**The code states what it does. A purpose comment states what it is for.** Names, signatures and control flow carry the WHAT. A purpose comment carries the intent the code cannot say about itself: the job the unit holds in the system, the outcome a constant or branch protects, the law it serves.
 
-**Record WHY the code exists and why it is built this way.** Names, signatures and obvious control flow already carry the WHAT. Comment the non-obvious: the failure mode a constant guards, the law a branch enforces, why an unusual choice beat the obvious one.
+**A purpose comment is stateless.** One to three lines, present tense, about the code directly beneath it, true for as long as that code exists; it goes in the same edit as its code. **The test: does it still read true to someone arriving with no record of how the code came to be?** A Law or Invariant citation is a purpose.
 
-**Capture WHY as self-evident.** A WHY holds on its own, independent of who said it or when: a mechanism, a derivation, a structural rule, a Law/Invariant citation. Two kinds rot and are stripped on sight. **AUTHORITY** — a verbatim ruling, an attributed quote, a date, *"the Architect said X"* — is his architectural judgment and he may revisit it (Law 21), so it stops explaining anything the moment it is questioned rather than obeyed. **SITUATION** — a specific incident, a run ID, a one-off measured number — goes stale faster still, and nothing marks the comment as outdated when it does. What survives: a physics or math derivation a live constant depends on, a general technical fact true independent of any one incident, and a Law/Invariant citation.
+**The story of the code lives in the records** — how it came to be, what was tried, who decided and when, which run exposed it, and the case for a choice over its alternatives belongs in the commit message, the design scratchpad and the bug-diagnosis report.
 
-**Name the wrong turn where one is likely, in structural terms** — what was tried and why the mechanism made it fail — so a successor spends its round elsewhere. Keep it short.
-
-**A durable summary records the persistent WHY.** Status belongs in the scratchpad or the live code, which already track what is done and what remains. A summary is decoupled from its location: the same intent may live inline, in a markdown, or in a scratchpad and means the same thing. Optimize for the machine reader.
-
-**A comment dies with the code it explains — or it is the wrong kind.** A WHY cannot outlive its code: when the reason it records lapses, the code it justifies is deleted in the same edit and the comment goes with it. A WHAT can be silently outlived, and that is what *stale* means — the signature of the forbidden WHAT-comment. Where a behavioral claim genuinely must be asserted, its home is a **test**: the same claim made un-rottable, failing loudly the instant the code stops matching it. On finding a false WHAT, port the claim into a test beside the code.
-
-**Maintenance** (same law, separate axis). Fragments and nodes are the AI developer's territory, **standing-authorized for refurbishment**: the Architect does not read them, so a cold-start AI developer FIXES what it finds — asking permission for in-territory repair is the unloaded governor (Law 21). The authorization is **tiered by behavior risk**. *Comment/intent* refurbishment is **unconditional**: prune stale, redundant and status-rotted comments on touch — zero behavior risk. *Behavior-changing* refurbishment runs through Law 22's gates (understand the fault, reuse an established system, name the law it restores), recorded with its return address, reversible, default-stopped. Size is a review prompt: a file past ~1000 lines is FLAGGED for audit — re-read it for stale comments, and separately ask whether it should decompose (Law 0). A long file of all-necessary WHY stays long. Comment-pruning is Law 14 (no behavior risk, do it on touch); splitting logic is Law 0/16 (behavior-sensitive, its own deliberate pass).
+**Maintenance.** Comments are the AI developer's territory, standing-authorized for refurbishment: rewriting a comment into purpose form carries no behavior risk and is done on touch, without asking. Refurbishment that changes behavior runs through Law 22's gates.
 
 ## Law 23: Inbound Verification (Claims, Not Facts)
 
@@ -157,7 +151,7 @@ The inbound dual of Law 6. Law 6 governs what the artificial construct must expo
 
 ## Law 24: Architectural Translation (Reporting to the Architect)
 
-The Architect works at the architectural layer and reads the record. Every report reaching him is a translation, and the AI developer owns that translation. Law 14 aims the code's record at the next AI developer; Law 24 aims the AI developer's reports at the Architect. Same demand (Invariant C), two audiences: mechanism lives in the code record, responsibility lives in the report.
+The Architect works at the architectural layer and reads the record. Every report reaching him is a translation, and the AI developer owns that translation. Law 14 aims the code's purpose comments at the next AI developer; Law 24 aims the AI developer's reports at the Architect. Same demand (Invariant C), two audiences: mechanism lives in the code record, responsibility lives in the report.
 
 **Architecture is the assignment of responsibility:** who owns what, what each part is FOR, where a boundary sits, what may cross it, and which law governs the crossing. **The technical layer is mechanism:** the symbol, the field, the call site, the data structure, the order of operations. **The discriminator: architecture survives a rewrite in another language.**
 
@@ -233,7 +227,7 @@ A **category** = a system's native mode of operation, diagnosed by *how it stops
 
 # Invariant D — Ownership
 
-> Every state, failure, and voice has exactly one owner. Where ownership is shared or implicit, failures hide in the gap between owners. Read at the scope of behavior: a property is *enacted* in one place, so a property that can be settled by defining the thing is authored as a definition (Law 27). Read at the scope of correction: the assignment is worth something where the owner can act on it, so a question reaches a party that both caused the thing and can change it (Law 28).
+> Every state, failure, and voice has exactly one owner. Where ownership is shared or implicit, failures hide in the gap between owners. Read at the scope of behavior: a property is *enacted* in one place, so a property that can be settled by defining the thing is authored as a definition (Law 27). Read at the scope of correction: the assignment is worth something where the owner can act on it, so a question reaches a party that both caused the thing and can change it (Law 28). Read at the scope of a failure its owner cannot state: a party's silence is reported by the partner that needs it (Law 30).
 
 ## Law 9: Write-Delete Separation
 
@@ -300,6 +294,36 @@ A **regulation** is a rule that must be enforced — *I do or do not want you to
 **Supplying reach or moving where a question lands is a design act** — the Architect's table (Law 22 gate 2). Repair inside a scope you already own; beyond it, report the trace that failed.
 
 **Scope.** Settles WHERE A QUESTION LANDS and who can act on the answer. The world your things sit in, and what a separately-answering party holds, stay outside it. It excuses nobody from a limit that binds them anyway (Law 19), and it makes an owner reachable.
+
+## Law 30: Symbiosis (Who Watches the Watcher)
+
+**Some weaknesses cannot be covered from inside the party that has them. A party that has gone silent cannot report its own silence. That silence is reported by a separate party that needs it: one whose own work already depends on asking it for something. The need runs both ways, so each reports the silence the other cannot. The fault this law names is a party added only to watch for another party's silence.**
+
+**Where it applies.** A party whose weaknesses are all covered from inside stands alone, and most do. This law applies to one weakness: a failure that removes the party's ability to report — a crash, a freeze, a silence. Every failure a party can state itself stays its own (Law 13).
+
+**The regress.** A watcher added to report a silent party can go silent the same way. It calls for a watcher of its own, and that one for another. Every link added has the same weakness, so the chain has no last link. *Who judges the judge* is this question, and a second judge only asks it again.
+
+**The need ends it.** A connection has two parties (Invariant A). Two parties that need each other already ask each other for things in order to work. Each request is the check. An answer shows the partner is there. A request that does not come back within the bound that request carries is **silence**, and silence is the report. The check is work both already do, so no party is added.
+
+**What a party does on silence.** It stops and states the silent partner as the cause in its own diagnostic log (Law 5; Law 13: default state is stopped). A party that carries on is working from a partner that is no longer there (Invariant B).
+
+**Only a party's own request is a check.** A party learns its partner is gone by asking and getting nothing back. A party that asks its partner for nothing never learns. Need in one direction leaves one silence unreported.
+
+**Separate means one keeps running when the other stops.** Two parts that stop together are one party and share the weakness.
+
+**The check runs as often as the work.** A party asks when it works. A party with no work asks nothing and needs nothing, and the check resumes with its next request.
+
+**Many may need one.** Each pairing is its own connection of two, checked by its own requests. The many reach each other only through the one (Laws 1, 16), so each of the many learns of the one's silence alone, by its own unanswered request; each reports it in its own log and stops. The one stops when a member its work depends on goes silent.
+
+**The judge is a party like any other.** A judge decides whether its loop is making progress (Law 11); that is work, and it stays. The judge's own silence is this law's ground: the loop needs the judge's verdict to continue, so a loop whose judge does not answer stops. The rest of the system judges the judge, by needing it.
+
+**One law in both substrates.** The pistol shrimp digs the burrow and is nearly blind. The goby sees and has no burrow. The shrimp keeps an antenna on the goby each time it works outside, and when the goby is not there the shrimp stops. A unit keeps a request on its partner each time it works, and when the request does not come back the unit stops. Neither pair carries a third party whose only work is watching.
+
+**Build the check into the need (Law 27).** Where a party cannot report a failure of its own, find the party whose work already depends on it and make that party's own request the check.
+
+**The test:** *if this party went silent right now, who stops — and did it stop because its own request went unanswered?* An answer naming a party whose only work is watching is the regress.
+
+**Scope.** Settles who reports a silence its owner cannot report, while a partner is still running to report it. Both partners silent at once lies outside it. What caused the silence and who can change it is Law 28's. *(Christening document: `Cognitive_documents/.../auren_whitepapers/symbiosis_who_watches_the_watcher.md`.)*
 
 ---
 

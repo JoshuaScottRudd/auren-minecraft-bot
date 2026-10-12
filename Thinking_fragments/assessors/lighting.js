@@ -1,31 +1,30 @@
-// assessors/lighting — lifted verbatim out of job_board 2026-08-26. See assessor_registry.
+// assessors/lighting — base-lighting counterpart to assessors/farming. See assessor_registry.
 
 'use strict';
 
 const torchIntegrity = require('@perception/torch_integrity');
 
-// Architect-owned tables, imported never restated (Law 16 — one source).
+// Tunables imported from architect_config, never restated (Law 16 — one source).
 const {
     JOB_TYPE,
 } = require('@thinking/architect_config');
-// assess — the base-lighting counterpart to assessors/farming (combat refurbish §1b). Posts ONE
-// `light_base` job when torch_integrity reports dark surface cells in the headframe safe square AND the
-// bot holds torches to fix them. Gates exactly like farming: the "is there work / do we have materials"
-// decision lives in the integrity node (which logs its own silence), job_board only reads the verdict.
-// The job carries only `where` (the base center) — NOT the dark-cell list: the dispatcher magnet copies
-// a fixed field set that a cell array wouldn't survive, and passing a stale list would violate Invariant
-// B. The executor re-scans for fresh dark cells at run time, exactly as farm_executor re-derives its
-// till/plant/harvest work from live state.
+// assess — the base-lighting counterpart to assessors/farming. Posts ONE `light_base` job when
+// torch_integrity reports dark surface cells in the headframe safe square AND the bot holds torches to
+// fix them. Gates exactly like farming: whether there is work and whether materials are ready both live
+// in the integrity node (which logs its own silence); this only reads the verdict. The job carries only
+// `where` (the base center), not the dark-cell list — the dispatcher magnet copies a fixed field set a
+// cell array wouldn't survive, and a stale list would violate Invariant B. The executor re-scans for
+// fresh dark cells at run time, exactly as farm_executor re-derives its till/plant/harvest work from
+// live state.
 function assess() {
     const jobs = [];
     // UNHOOKED: the autonomous torch-lighting system is disabled wholesale. In-world it placed torches
-    // with no coherence — no block-awareness of where a torch already sat or whether a cell was inside a
-    // build footprint, so torches piled up everywhere and rogue torches landed on blueprint voxels
-    // (`torch:should_be_air` conflicts that stalled a headframe build_executor). Light-level detection is
-    // meaningless while placement is incoherent. Returning no jobs here makes the whole downstream dormant
-    // (torch_integrity.scan, the `light_base` job, the dispatcher route to torch_executor) without deleting
-    // it — this is the single off-switch to flip back on once the system is redesigned. Everything below
-    // is preserved for that rethink.
+    // with no coherence — no block-awareness of whether a torch already sat there or whether a cell was
+    // inside a build footprint, so torches piled up everywhere and rogue torches landed on blueprint
+    // voxels. Light-level detection is meaningless while placement is incoherent. Returning no jobs here
+    // makes the whole downstream dormant (torch_integrity.scan, the `light_base` job, the dispatcher
+    // route to torch_executor) without deleting it — the single off-switch to flip back on once the
+    // system is redesigned. Everything below is preserved for that.
     return { jobs };
 
     const bot = global.bot;

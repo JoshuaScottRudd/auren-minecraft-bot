@@ -2,82 +2,61 @@
 // OUTSIDE OBSERVER, into a stream the watcher never sees.
 //
 // ── ITS ONE CALLER ──────────────────────────────────────────────────────────────────────────────────
-// `tools/locomotion_course` uses this to sample a MOVEMENT leg at 20 Hz and reduces its own output
-// (`reduceLeg`), so the record and the reader are paired in one file and this module has exactly one
-// caller. The combat rationale below still holds — it is why 20 Hz does not belong in the watcher — but
-// read "combat" as "any sub-second question": the argument is not about mobs, it is about a sample rate
-// the trace cannot carry.
+// `tools/locomotion_course` samples a MOVEMENT leg at 20 Hz here and reduces its own output (`reduceLeg`),
+// so the record and the reader are paired in one file with exactly one caller. Read "combat" below as
+// "any sub-second question" — a sample rate the trace cannot carry.
 //
 // ── WHY IT IS NOT THE WATCHER, AND NOT trace_monitor ────────────────────────────────────────────────
-// Three reasons, each landing on a different law:
-//
-//   1. VOLUME. Combat correctness is decided in ~200 ms windows, so calibrating it needs ~20 samples a
-//      second. Law 5 permits exactly three persisted levels and per-step logging was deleted as noise;
-//      pushing 20 Hz into the watcher would bury every line the trace exists to carry. So this is not a
-//      fourth log level and must never become one — it is an INSTRUMENT READING, a separate stream with
-//      its caller's own reducer and a separate lifetime.
-//   2. OWNERSHIP. The construct records nothing new. Law 26: the thing under test must not produce the
-//      evidence of its own performance — a simulated guarantee is a deleted guarantee, and a bot that
-//      reports its own swing timings is grading its own paper. Every number here is read off the shared
-//      world by the scout, an observer with no vote in any SPA loop (Law 19).
-//   3. LIFETIME. Held until the next start command, exactly like the watcher trace. Law 8 is satisfied
-//      by the overwrite, not by the delete — the directory never grows without bound because a start
-//      command replaces it, so nothing is a zombie and nothing is released because a finding was taken
-//      from it. Scrubbing at the end of each piece was tried and deliberately removed (there is no
-//      --scrub flag left to reintroduce): releasing the raw as soon as a summary existed answered only
-//      the first question, and every later question about that same fight had to be answered by running
-//      again — a different world, defeating the calibration the instrument exists to serve.
+//   1. VOLUME. Combat correctness needs ~20 samples a second; Law 5's three persisted levels cannot carry
+//      that without burying every trace line. This is an INSTRUMENT READING with its own reducer and
+//      lifetime, never a fourth log level.
+//   2. OWNERSHIP. The construct records nothing new (Law 26). Every number is read off the shared world
+//      by the scout, an observer with no vote in any SPA loop (Law 19).
+//   3. LIFETIME. Held until the next start command, like the watcher trace — Law 8 by overwrite, not
+//      delete. The raw stays held past the first summary, so a later question about the same fight reads
+//      the same capture.
 //
 // ── WHAT IT DOES NOT DO ─────────────────────────────────────────────────────────────────────────────
-// It decides nothing, flags nothing, and asserts nothing. It does not compute what Minecraft would have
-// done — every field is a value the server sent. The derived numbers (distance, hp delta, closing speed)
-// are arithmetic over two observed positions, which is why they are safe; anything requiring a model of
-// Minecraft's rules is left to the caller's reducer, where it can be read against the raw beside it.
+// Decides nothing, flags nothing, asserts nothing. Every field is a value the server sent; the derived
+// numbers (distance, hp delta, closing speed) are arithmetic over two observed positions. A model of
+// Minecraft's rules lives in the caller's reducer, read against the raw beside it.
 //
 // ── FORMAT ──────────────────────────────────────────────────────────────────────────────────────────
-// `fleet_logs/arena/<runId>.jsonl`, one JSON object per line. Two record kinds, distinguished by `k`:
-//   k:'s'  SAMPLE — one observation tick. High volume; this is the maximal data.
-//   k:'o'  OBSERVED — a server-sent packet the sampler cannot see (a swing, a hit, a death). The
-//                   INSTANTS. See the block above scout.onObserved for why this is a separate kind.
-//   k:'e'  EVENT  — an authored mark from the caller (leg start, dispatch, arrival). Low volume; this is
-//                   the spine the reducer walks along.
-// jsonl rather than one JSON document: a run that crashes mid-fight still leaves every completed line
-// readable, and the reducer streams instead of loading a whole run into memory.
+// `fleet_logs/arena/<runId>.jsonl`, one JSON object per line. Three record kinds, by `k`:
+//   k:'s'  SAMPLE   — one observation tick, high volume, the maximal data.
+//   k:'o'  OBSERVED — a server-sent packet the sampler cannot see (a swing, a hit, a death).
+//   k:'e'  EVENT    — an authored mark from the caller (leg start, dispatch, arrival), low volume, the
+//                   spine the reducer walks along.
+// jsonl, not one JSON document: a crash mid-fight still leaves every completed line readable, and the
+// reducer streams instead of loading a whole run into memory.
 
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
-// The fleet's own name→group table, not a copy of it (Law 16 — the bench must not carry a second
-// opinion about what a monster is). Required LAZILY, inside createRecorder, and that is not stylistic:
-// a caller may import this module for ARENA_LOG_DIR alone without running the NODE_PATH bootstrap, and a
-// top-level @-alias require here would break it outright. Every caller that actually records has
-// bootstrapped by the time it calls createRecorder.
+// The fleet's own name→group table, not a copy (Law 16). Required lazily, inside createRecorder: a
+// caller may import this module for ARENA_LOG_DIR alone without the NODE_PATH bootstrap, which a
+// top-level @-alias require here would break.
 let _combatTactic = null;
 const combatTactic = name => (_combatTactic || (_combatTactic = require('@utils/combat_utils').combatTactic))(name);
 
-// The observer's engagement detector — the ONE implementation of "is a fight happening and between
-// whom" (Law 16). It lives in its own file rather than here because the standing fleet observer runs it
-// on its own escalating pulse with no recorder attached at all; a copy inside this file would be a
-// second detector that could disagree with the one the fleet audits by.
+// The observer's engagement detector, the ONE implementation of whether a fight is happening and between
+// whom (Law 16). Kept in its own file: the standing fleet observer runs it on its own escalating pulse
+// with no recorder attached.
 const { createEngagementDetector } = require('./combat_engagement');
 
 const ARENA_LOG_DIR = require('../workshop_paths').fleetLogs('arena');
 
-// 50 ms = one Minecraft tick. The bench's headline questions are all sub-second — "ticks from
-// jump-trigger to impact vs the modelled 7", "distance at the moment of the swing vs the 3.5-block
-// reach" — and a sampler coarser than the thing it measures cannot answer them. This is the ONE place
-// the volume is set, so the cost of the whole instrument is one number the Architect can move.
+// 50 ms = one Minecraft tick — the bench's headline questions are sub-second, and a coarser sampler
+// cannot answer them. The one place the sample rate is set.
 const SAMPLE_MS = 50;
 
-// A hard ceiling on one run's samples. NOT a quality knob — a runaway guard. At 20 Hz a forgotten
-// recorder writes ~72k lines an hour, and the failure mode of an unattended instrument is a disk, not a
-// bad measurement. Hitting it is reported, never silent (Law 25 — a truncated run must not read as a
-// complete one).
+// A hard ceiling on one run's samples — a runaway guard, not a quality knob (Law 25: hitting it is
+// reported, never silent).
 const MAX_SAMPLES = 200000;
 
-// The projectiles worth recording. Named explicitly rather than derived from a type field, because
-// mineflayer types every one of these as a bare object and the field cannot tell an arrow from a boat.
+// The projectiles worth recording, named explicitly: mineflayer types each as a bare object, so the type
+// field alone cannot tell an arrow from a boat.
 const PROJECTILE_NAMES = new Set(['arrow', 'spectral_arrow', 'trident']);
 
 function ensureDir() {
@@ -85,18 +64,15 @@ function ensureDir() {
 }
 
 // ── THE OVERWRITE ───────────────────────────────────────────────────────────────────────────────────
-// The held raw of the PREVIOUS start command, released here and only here. Deliberately not a caller's
-// obligation: an overwrite the caller has to remember is an overwrite that eventually does not happen,
-// and the failure is silent growth. First createRecorder of the process clears; every later one in the
-// same process appends to the same generation, because the unit is the START COMMAND, not the arena —
-// one invocation that runs several legs produces several files that belong to one capture.
+// The held raw of the PREVIOUS start command, released here and only here, not left as a caller
+// obligation: an overwrite someone has to remember is one that eventually does not happen. First
+// createRecorder of the process clears; later ones in the same process append to the same generation,
+// since the unit is the START COMMAND, not the arena.
 //
-// It fires on the first RECORDER, not at process start, so a run that dies in the survey (before any
-// data exists) leaves the previous capture intact. The operator cannot tell the difference; the case
-// where the new record never arrives is the only one where it matters, and there the old one is still
-// the only evidence there is.
+// Fires on the first RECORDER, not process start, so a run that dies before any data exists leaves the
+// previous capture intact.
 //
-// summaries/ is untouched — that is the reduced artifact and it outlives every raw generation.
+// summaries/ is untouched — the reduced artifact outlives every raw generation.
 let _clearedThisProcess = false;
 
 function clearHeldRuns() {
@@ -114,7 +90,7 @@ function clearHeldRuns() {
 }
 
 // runId: sortable, filename-safe, and carrying the terrain class so a directory listing reads as an
-// experiment log rather than a pile of hashes.
+// experiment log.
 function makeRunId(label) {
   const t = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
   return `${t}__${String(label || 'run').replace(/[^a-z0-9_-]/gi, '-')}`;
@@ -147,10 +123,9 @@ function createRecorder({ scout, runId, botName, label, sampleMs = SAMPLE_MS, ra
     lastMobs: new Map(),
     lastArrows: new Map(),
     capped: false,
-    // The detector is driven off THIS recorder's 20 Hz tick rather than its own escalating pulse: the
-    // samples are already being taken, so the proximity pass is free and the events land on the finest
-    // clock available. Its own confirmMs throttle is what keeps the ray at 2 Hz per pair regardless of
-    // how often it is asked — the escalation exists for the standing observer, which has no 20 Hz tick.
+    // Driven off THIS recorder's 20 Hz tick, not its own escalating pulse: the samples are already being
+    // taken, so the proximity pass is free and the events land on the finest clock available. Its own
+    // confirmMs throttle keeps the ray at 2 Hz per pair regardless of how often it is asked.
     engagement: createEngagementDetector({
       losFn: (from, to, maxDist) => scout.aggroLineOfSight(from, to, maxDist),
       // One name today because the arena runs one bot. The standing fleet observer passes the whole
@@ -166,8 +141,8 @@ function createRecorder({ scout, runId, botName, label, sampleMs = SAMPLE_MS, ra
   }
 
   // t: milliseconds since the run started, not wall clock. Every question this instrument answers is
-  // about an INTERVAL ("ticks from jump to impact"), and a relative clock makes those readable without
-  // subtracting ISO strings, while `startedAt` in the header keeps the absolute time recoverable.
+  // about an INTERVAL, and a relative clock makes those readable without subtracting ISO strings, while
+  // `startedAt` in the header keeps the absolute time recoverable.
   const now = () => Date.now() - state.startedAt;
 
   // The header is the first line of every run: what was authored, so the raw stream is self-describing
@@ -202,27 +177,18 @@ function createRecorder({ scout, runId, botName, label, sampleMs = SAMPLE_MS, ra
     const self = snap.entities.find(e => e.username === botName);
     if (!self) { state.dropped++; return; }              // bot out of the scout's loaded range
 
-    // Hostiles only, and only within `radius`. An unfiltered snapshot in a populated world is mostly
-    // dropped items and passive mobs, which multiplies the volume without answering any question the
-    // bench asks. A name-based filter that admitted any non-player entity would let a passive mob be
-    // picked as a reducer's nearest-mob target, attributing the whole swing ledger and every distance to
-    // something that was never in the fight. The predicate is combatTactic(), the fleet's own dispatch
-    // table (Law 16 — the bench must not carry a second opinion about what a monster is), so an unlisted
-    // name is excluded here exactly as it is undispatchable there.
+    // Hostiles only, within `radius`. The predicate is combatTactic(), the fleet's own dispatch table
+    // (Law 16 — the bench must not carry a second opinion about what a monster is), so an unlisted name
+    // is excluded here exactly as it is undispatchable there.
     const mobs = snap.entities.filter(e =>
       e.id !== self.id && e.name && e.username == null && combatTactic(e.name) !== null &&
       Math.hypot(e.position.x - self.position.x, e.position.y - self.position.y, e.position.z - self.position.z) <= radius);
 
-    // ── PROJECTILES, kept in their own array rather than by widening the mob predicate ────────────────
-    // The predicate above is deliberately the fleet's own dispatch table and must stay that way (an
-    // arrow is not a monster and must never reach a counter dispatch). But the question "could the bot
-    // act on an arrow already in flight" is answerable only from what a mineflayer client can actually
-    // SEE of one, and nothing in this repo had ever looked. So: a separate array, same snapshot, no
-    // change to what counts as a threat.
-    //
-    // Recorded to settle a decision, not to feed one: nothing in the bot reads this. If the flight time
-    // turns out to be shorter than the round trip needed to react, the honest answer is that no in-flight
-    // system is buildable at combat range and the record says so in numbers (Law 25).
+    // ── PROJECTILES, a separate array from the mob predicate ────────────────────────────────────────
+    // The mob predicate stays the fleet's own dispatch table; an arrow must never reach a counter
+    // dispatch. Whether the bot could act on an arrow in flight is answerable only from what mineflayer
+    // exposes, so this is a separate array over the same snapshot. Recorded to settle a decision, not to
+    // feed one: nothing in the bot reads this (Law 25).
     const arrows = snap.entities.filter(e =>
       e.name && e.username == null && PROJECTILE_NAMES.has(e.name) &&
       Math.hypot(e.position.x - self.position.x, e.position.y - self.position.y, e.position.z - self.position.z) <= radius);
@@ -230,13 +196,11 @@ function createRecorder({ scout, runId, botName, label, sampleMs = SAMPLE_MS, ra
     const t = now();
 
     // The observer's own verdict on whether a fight is happening and between whom, emitted only when it
-    // CHANGES. Two low-frequency events per engagement, on the same clock as everything else, so the
-    // reducer can line them up against battle_stations' `engage`/`end` rows without either side carrying
-    // a wall clock — which is what turns "did the bot notice in time" into a number.
+    // CHANGES, on the same clock as everything else, so the reducer can line it up against
+    // battle_stations' `engage`/`end` rows.
     //
-    // It is given the WHOLE snapshot, not the `mobs` array above: that array is already narrowed to one
-    // subject inside `radius`, and the detector's whole point is that it is nobody's subject in
-    // particular. Narrowing it here would rebuild the single-bot assumption the pair keying removes.
+    // Given the WHOLE snapshot, not the `mobs` array above: that array is already narrowed to one
+    // subject inside `radius`, and the detector's point is that it is nobody's subject in particular.
     for (const ev of state.engagement.update(snap, t)) {
       mark('engagement_observed', { ...ev, botHp: self.health });
     }
@@ -246,16 +210,15 @@ function createRecorder({ scout, runId, botName, label, sampleMs = SAMPLE_MS, ra
       v: self.velocity ? round3(self.velocity) : null,
       hp: self.health, yaw: self.yaw, pitch: self.pitch,
       ground: self.onGround, held: self.heldItem, eq: self.equipment,
-      // The bot's OWN living-entity flags, raw and undecoded, for the same reason the mobs' are carried:
-      // bit 0 is 'hand active', which is what a raised shield IS on the server. The construct can only
-      // report that it SENT the packet; this is the only place the fleet can see whether the server
-      // agreed (Law 26 — the thing under test must not produce the evidence of its own performance).
+      // The bot's own living-entity flags, raw and undecoded, same reason the mobs' are carried: bit 0 is
+      // hand-active, what a raised shield is on the server — the only place the fleet can see whether the
+      // server agreed (Law 26).
       md: self.metadata,
     };
 
-    // Deltas are computed HERE rather than in the reducer because they need the previous sample, and a
-    // reducer that reconstructs them from a stream with dropped ticks would silently attribute a gap's
-    // worth of change to one interval. dtMs travels with them so a delta across a gap is legible as one.
+    // Deltas computed here, not in the reducer, since they need the previous sample; a reducer
+    // reconstructing them across dropped ticks would misattribute a gap's change to one interval. dtMs
+    // travels with them so a delta across a gap reads as one.
     const prev = state.lastBot;
     const botDelta = prev ? {
       dHp: round2(botRec.hp - prev.hp),
@@ -319,22 +282,17 @@ function createRecorder({ scout, runId, botName, label, sampleMs = SAMPLE_MS, ra
   }
 
   // ── OBSERVED EVENTS (k:'o') — the instants the sampler structurally cannot see ────────────────────
+  // A swing or a hit happens BETWEEN samples and is gone by the next one; the scout listens
+  // (camera_scout.onObserved) and hands it here unchanged.
   //
-  // A swing and a hit happen BETWEEN samples and are gone by the next one. No sampling rate fixes that:
-  // they are announcements, not states, so the only way to record them is to listen. The scout listens
-  // (camera_scout.onObserved) and hands them here unchanged.
+  // A THIRD RECORD KIND by Law 26, not bookkeeping: `k:'e'` is AUTHORED, a mark the director made because
+  // it decided something; `k:'o'` is OBSERVED, a packet the server sent because Minecraft decided
+  // something. Collapsing them would leave the reduced summary unable to say which facts the bench chose
+  // and which the world produced.
   //
-  // A THIRD RECORD KIND, and the distinction is Law 26's, not bookkeeping. `k:'e'` is AUTHORED — a mark
-  // the director made because it decided something (summon this mob, start this wave). `k:'o'` is
-  // OBSERVED — a packet the server sent because Minecraft decided something. Collapsing them into one
-  // kind would make the reduced summary unable to say which of its facts the bench chose and which the
-  // world produced, which is the one distinction the whole bench rests on.
-  //
-  // GEOMETRY IS DELIBERATELY ABSENT from these lines. An event carries what its packet carried plus the
-  // entity's position at that instant; distance-at-swing, knockback travel and cycle time are all
-  // computed by the monitor against the 20 Hz sample stream beside it. Same rule the header already sets
-  // for the samples: this file stores what the server sent, and every model of what it MEANS lives in
-  // the reducer where it can be read against the raw.
+  // GEOMETRY IS ABSENT from these lines: an event carries what its packet carried plus the entity's
+  // position at that instant. Distance-at-swing, knockback travel and cycle time are computed by the
+  // monitor against the 20 Hz sample stream beside it.
   scout.onObserved((rec) => {
     if (state.closed) return;
     state.observed++;
@@ -363,9 +321,8 @@ function createRecorder({ scout, runId, botName, label, sampleMs = SAMPLE_MS, ra
       // dangling. An unterminated start row would make the reducer read the fight as running past the
       // end of the file (Law 8 — what is raised terminates with the owner that raised it).
       for (const ev of state.engagement.closeOpen(now())) mark('engagement_observed', ev);
-      // The trailer mirrors the header and carries the drop count. A run whose scout was down for half
-      // its length must not read as a clean run with sparse combat (Law 25 — the verdict states the true
-      // result, and "how much did we fail to see" is part of it).
+      // The trailer mirrors the header and carries the drop count, so a run whose scout was down for half
+      // its length does not read as a clean run with sparse combat (Law 25).
       state.events++;
       write({ k: 'f', t: now(), samples: state.samples, events: state.events, observed: state.observed, dropped: state.dropped, capped: state.capped });
       state.closed = true;

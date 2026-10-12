@@ -1,10 +1,10 @@
-// assessors/hunger — lifted verbatim out of job_board 2026-08-26. See assessor_registry.
+// assessors/hunger — the survival eat job. See assessor_registry.
 
 'use strict';
 
 const healthIntegrity = require('@perception/health_integrity');
 
-// Architect-owned tables, imported never restated (Law 16 — one source).
+// Tunables imported from architect_config, never restated (Law 16 — one source).
 const {
     JOB_TYPE,
     HUNGER_FULL,

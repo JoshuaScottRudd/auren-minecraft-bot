@@ -1,73 +1,79 @@
-// module: watcher — diagnostic logging (Law 5/6). One story file (watcher_<BotId>.json), three
-// persisted levels; a normal run needs nothing else. Every old fine-grained method
-// (action/signal/debug/…) was deleted or folded into these three (Law 16: one pathway).
+// module: watcher — diagnostic logging (Law 5/6). One story file (watcher_<BotId>.json) with three
+// persisted levels, all print AND persist, never suppressed (Law 16: one pathway):
+//   summary() 📊 — one aggregated line per completed phase; read only summaries to know what ran,
+//                  how long, and whether it worked.
+//   warn()    ⚠️ — environmental failure / retry / degraded op the system recovered from.
+//   error()   ❌ — unrecoverable; auto-dumps the deferred buffer first so context is never lost.
 //
-// The three levels (all print AND persist to the story file, never suppressed):
-//   summary() 📊 — primary channel. Accumulate over a phase, post ONE aggregated line when it
-//                  completes; read only summaries and you know what ran, how long, and if it worked.
-//   warn()    ⚠️ — environmental failure / retry / degraded op the system recovered from. Read these
-//                  first when diagnosing.
-//   error()   ❌ — critical failure; could not continue. Auto-dumps the deferred buffer first so
-//                  context is never lost.
+// buffer — per-stage context held in memory, reaching disk only if error() dumps it; summary()
+//          clears it on a clean phase.
+// track() — wraps a fn to record entry/exit/duration to in-memory history only.
 //
-// Two structural helpers:
-//   buffer  — per-stage context accumulated in memory (record), reaching disk ONLY if error() dumps
-//             it; summary() clears it on a clean phase. Keeps per-block detail off the happy path.
-//   track() — wraps a fn to record entry/exit/duration to in-memory history; never persists, never
-//             swallows exceptions.
-//
-// Deep "HOW did it decide" visibility on a NORMAL run is the separate trace file, gated by
+// Deep "how did it decide" visibility on a normal run is the separate trace file, gated by
 // ENABLE_TRACE below.
 
-// ── Watcher configuration — all runtime toggles live here ──
-// ENABLE_TRACE: master switch for the deep per-fragment trace file (watcher_<BotId>_trace.json).
-// When on, every log call + buffer.record() is mirrored, grouped by fragment, so a normal run shows
-// HOW each decision was made. OFF = no trace file, no tracking overhead. Either way the story log
-// stays exactly three persisted levels (Law 5).
+// ── Watcher configuration ──
+// ENABLE_TRACE: master switch for the deep per-fragment trace file (watcher_<BotId>_trace.json),
+// mirroring every log call grouped by fragment. The story log stays three persisted levels either
+// way (Law 5).
 const ENABLE_TRACE = false;
-const TRACE_MAX_PER_STAGE = 5000; // per-fragment ring cap so a long run can't grow the trace unbounded
+const TRACE_MAX_PER_STAGE = 5000; // per-fragment ring cap on the trace file
 
 // Component filtering for track()/console history (in-memory only — never the story log).
 const ENABLE_ALL = false;
-const ENABLED_COMPONENTS = [, 'battle_stations' ];
+const ENABLED_COMPONENTS = ['battle_stations'];
 const HIDDEN_COMPONENTS = [];
 const HIDDEN_SUBSTRINGS = [];
 const ENABLE_WATCHER_LOGS = false;
 
-// QUIET_FORWARD_STAGES: stages whose routine summary() chatter is KEPT in the bot's own story file
-// (watcher_<BotId>.json — every line, fully recoverable) but NOT mirrored to the merged foreman
-// stream that is the live signal-trace summary (and trace_monitor's default source). A sub-loop
-// (Law 15) like the navigator runs its own Sense-Plan-Act internally — A* plans, per-step progress,
-// unstick, pillar/bridge build-delivery — which are implementation detail, not signal-level events;
-// on a healthy run they flood the one window the fleet is watched in and bury the decision spine
-// (job posts → dispatcher picks → manager verdicts). Quieting only the FORWARD of summary() removes
-// the flood while losing nothing: the per-bot file still holds it all (Law 6), and warn()/error()
-// still forward so a genuine navigation failure surfaces immediately. Recover the detail on demand
-// with `trace_monitor.js --bot=<Id> watcher_<Id>.json`. Architect 2026-07-12: "hide the watcher log
-// for navigation, it's noisy — don't remove, just make it not part of the signal trace summary."
-const QUIET_FORWARD_STAGES = new Set(['navigator']);
+// ── THE REPORTING SWITCH: which sub-loops narrate a HEALTHY run ──
+// ROUTINE_QUIET names sub-loops (Law 15) whose summary() is demoted to the deferred buffer on a
+// healthy run: no print, no forward, no story line. warn() and error() are untouched, and error()
+// dumps the buffer first, so a failure still arrives with the routine lines that led to it.
+//
+// Two ways to turn a stage back on, both whitelists:
+//   AUREN_VERBOSE=navigator            (comma list, or `all`) — one run, nothing edited
+//   add the name to VERBOSE_STAGES below                       — every run on this machine
+//
+// SOFT_STAGES is the prototype whitelist: a stage listed here narrates in full even when
+// ROUTINE_QUIET also names it — a system with no track record has no basis to go quiet. Moving a name
+// from SOFT_STAGES to ROUTINE_QUIET is how a stage graduates to quiet-by-default.
+const SOFT_STAGES = new Set([
+    'pathfinding',             // workspace timing and memory cutoff census is inspectable during the prototype
+    'job_board_phase',          // the site-phase ladder (trees → terraform → basement) — prototype
+]);
+const ROUTINE_QUIET = new Set([
+    'navigator',                // A* plans, per-step progress, carve/pillar/unstick — the walking sub-loop
+    'pathfinding',              // navigator's own search tag (same sub-loop, second stage name)
+    'locomotion_dispatcher',    // route choice and door handling
+    'locomotion_judge',         // the walk's verdict on a successful trip
+    'job_board_stock',          // the board's per-sweep stock deliberation (its POSTED JOBS stay loud)
+]);
+// Named here or in AUREN_VERBOSE, a hardened stage reports in full again for one run. Empty is the default.
+const VERBOSE_STAGES = new Set(
+    String(process.env.AUREN_VERBOSE || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
+// A quiet stage still accumulates into its deferred buffer, so the buffer needs its own ceiling; the
+// ring keeps the LAST lines, since those are the ones an error wants.
+const BUFFER_MAX_PER_STAGE = 200;
+function _routineQuiet(stage) {
+    if (VERBOSE_STAGES.has('all')) return false;
+    const s = String(stage).toLowerCase();
+    if (SOFT_STAGES.has(s)) return false;          // a prototype always speaks
+    return ROUTINE_QUIET.has(s) && !VERBOSE_STAGES.has(s);
+}
 
 const fs = require('fs');
 const path = require('path');
 const _watcherBotId = process.env.BOT_ID || '';
-// A bot process (BOT_ID set) does NOT echo its own story to its local terminal: every line is
-// forwarded to the foreman, which is the single window the whole fleet is watched in. Nothing is
-// lost — the per-bot story file AND the foreman forward still receive every line (Law 6); only the
-// redundant local echo is dropped, so a bot window shows just its startup banner and then stays quiet
-// (instantly distinguishable from the foreman's live stream). Foreman/standalone (no BOT_ID) print
-// normally. This gates the three level prints + the buffer dump; it does NOT gate _forward or writes.
+// A bot process (BOT_ID set) drops its own local echo of the three levels + buffer dump — the story
+// file and the foreman forward still receive every line (Law 6). Foreman/standalone prints normally.
+// Does not gate _forward or the file writes.
 const SILENT_TERMINAL = !!_watcherBotId;
-// .jsonl, not .json — the extension IS the durability contract (see _writeWatcherFile). One story line
-// per file line, each JSON-encoded so a line may hold any character without escaping the format, and so
-// a reader can drop a torn final line without losing the ones before it.
-// WHERE THE RECORD LIVES IS ASKED, NEVER SPELLED (Architect 2026-08-31: the kernel holds only what a
-// bot needs to RUN, and a trace nothing in the fleet reads is not that). Seven files used to hold this
-// path; a reader looking in the directory the writer stopped using reports a confidently empty run.
-// RELATIVE, NOT `@utils`, and that is deliberate. This module is required from processes that never
-// register the alias table — a lens registers the three aliases it needs and no more, and a top-level
-// alias require here made the whole monitoring side die on load with MODULE_NOT_FOUND. The wiring smoke
-// test cannot see it: that harness registers every alias before loading anything, so the one caller
-// shape that breaks is the one it does not reproduce. A sibling directory needs no alias to be found.
+// .jsonl: one JSON-encoded story line per file line, so any character is safe and a torn final line
+// can be dropped without losing the ones before it. The record's location is asked from recordHomes,
+// never spelled here, so every reader agrees on where it lives.
+// Relative require, not `@utils` — this module loads in processes that register no alias table.
 const recordHomes = require('./utils/record_homes');
 const WATCHER_FILE = recordHomes.traceFile(_watcherBotId);
 
@@ -79,34 +85,21 @@ function encodeStoryLines(lines) {
 // Trace artifact — never mixed into WATCHER_FILE (Law 5: story = one file).
 const TRACE_FILE = recordHomes.deepTraceFile(_watcherBotId);
 
-// _selfFault: the watcher's ONE self-report channel (r34). The logger cannot report its own failure
-// through its own levels — warn() → _record → _writeWatcherFile → fault → warn() is unbounded
-// recursion — which is why every internal fault here was historically swallowed silently. The escape
-// from that was already in this file and merely unnamed: _writeWatcherFile/_safeWrite/flushNow have
-// always written their faults straight to console.error. This gives that channel one name (Law 16),
-// so "no silent swallow" is satisfiable INSIDE the logger without the recursion.
-//
-// Rules: console only, never a watcher level (that is the recursion). Never gated by SILENT_TERMINAL
-// — a bot process suppresses its own routine echo because the foreman forward carries it, but a
-// self-fault means the forward and the file are the very things that may be broken, so this is the
-// one line that must print locally regardless. stderr survives a wrecked stdout and the launcher
-// captures it.
+// _selfFault: the watcher's one self-report channel (Law 16) — a logger cannot report its own
+// failure through its own levels (warn() → _record → fault → warn() recurses), so internal faults go
+// straight to console.error, unconditionally, never gated by SILENT_TERMINAL: a self-fault means the
+// forward and the file may themselves be broken, so this is the one line that must print locally.
 function _selfFault(where, err) {
-  // The one terminal swallow in the system, and the only defensible one: if console.error itself
-  // throws (closed/EPIPE stderr), there is no remaining channel to report the failure to report.
-  // Anything beyond this point is unobservable by construction, not by choice.
+  // The one defensible terminal swallow: if console.error itself throws, there is no remaining
+  // channel left to report the failure to report.
   try {
     console.error(`[watcher:SELF-FAULT] ${where}: ${err && err.message ? err.message : String(err)}`);
   } catch (_) {}
 }
 
-// No catch (r34): the old `try { new Date(ts).toISOString() } catch { return String(ts) }` laundered a
-// coding violation into a plausible-looking string — a bad ts silently became file content that reads
-// like a timestamp (Invariant C). Only an invalid date throws here, and every caller passes Date.now()
-// or a stored epoch, so that is a caller bug. It is reported and marked LOUDLY rather than thrown:
-// the watcher is passive infrastructure and must never be able to kill the run it is observing
-// (Law 5). Law 13's intent is that a violation surfaces, not that this specific frame is the one to
-// die — the self-fault line plus an unmistakable in-band marker surface it without that power.
+// An invalid ts is a caller bug; it is self-faulted and marked loudly in-band, never thrown, since
+// the watcher is passive infrastructure and must never be able to kill the run it observes
+// (Law 5, Law 13).
 function formatTimestamp(ts) {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) {
@@ -123,23 +116,10 @@ function formatDuration(ms) {
 }
 
 // Runtime tag prepended to every terminal line: elapsed since this process started, re-based by
-// resetRuntimeClock() when a run formally begins.
-//
-// ── IT STARTS AT LOAD, AND THAT IS THE 2026-08-12 FIX (Architect: "fix the obvious issues like the
-//    clock") ──────────────────────────────────────────────────────────────────────────────────────────
-// It used to start as `null` and read `[0m 0s]` until something called `resetRuntimeClock()` — and the
-// only caller is `start_injector`, which runs on the OPERATOR VERB `start`. Any run that never issues
-// that verb has no clock at all: MEASURED on the 2026-08-12 `kiters` ladder, where every line of a
-// three-wave fight — sixty seconds of it — carried the stamp `[0m 0s]`.
-//
-// That is not a cosmetic blemish. `monitoring/trace_read.parseLine` derives `relSec` from this tag, so
-// `--from`, `--to`, `--around` and every lens that orders events by it were filtering a run whose lines
-// all claimed the same instant. The engagement lens duly reported "first struck 0s later" for every mob
-// in that run, and it was believable — a false measurement, not a missing one (Law 25).
-//
-// Module load IS process start for anything that logs, so a clock based there cannot be forgotten by a
-// launch path that does not know to ask for it (Law 13: the working state is the default, and the
-// verb re-bases it rather than switching it on).
+// resetRuntimeClock() when a run formally begins. Starts at module load, so a process that never
+// issues the `start` verb still has a working clock — `monitoring/trace_read.parseLine` derives
+// `relSec` from this tag, and every lens ordering events by it depends on it being real from the
+// first line (Law 25).
 let startTime = Date.now();
 function runtimeTag() {
   const elapsed = Date.now() - startTime;
@@ -162,22 +142,16 @@ class Watcher {
     this.loopId = 0;
     this.maxLoops = maxLoops;
 
-    // summaryLog: every summary/warn/error entry — the diagnostic record written to the story file.
-    // No cap; all entries kept.
+    // summaryLog: every summary/warn/error entry, uncapped — the diagnostic record written to the
+    // story file.
     this.summaryLog = [];
 
-    // Wall-clock of the last STORY line, used to stamp that line's ISO prefix. It was ALSO persisted as
-    // a `lastStoryAt` field until 2026-08-12, so a reader could judge liveness by content freshness
-    // rather than file mtime (the old 100ms refresh loop advanced mtime even through a hang, a false
-    // "alive"). Append-only killed both halves of that problem: nothing rewrites the file on a timer, so
-    // mtime now only moves when a line lands, and the last line's own ISO answers the freshness question
-    // without a second field to keep in step (Law 16). null until the first story line.
+    // Wall-clock of the last story line, in memory only — the last line's own ISO stamp answers the
+    // freshness question, so nothing persists it a second time (Law 16). Null until the first line.
     this._lastStoryAt = null;
 
-    // Named timers, in memory only. They were persisted into every whole-file rewrite until 2026-08-12
-    // and read by nothing outside this class; the append-only writer dropped them, and the 100ms
-    // refresh loop that existed solely to keep that dead field current went with them. Callers still
-    // read them live through the `timer` facade, and each start/stop already writes its own story line.
+    // Named timers, in memory only — read live through the `timer` facade; each start/stop writes its
+    // own story line.
     this.timers = {}; // name -> { startedAt, stoppedAt|null, meta? }
 
     // Serialized/throttled write state — prevents overlapping fs writes.
@@ -186,44 +160,15 @@ class Watcher {
     this._lastWriteStart = 0;
     this._scheduledTimeout = null;
     // Throttles DISK writes only; _record()'s in-memory push is unthrottled, so no entry is ever
-    // dropped (Law 6: 1-for-1 with stdout).
-    //
-    // 1000ms, chosen by the Architect on 2026-08-12 ("slow the writing i dont know why its 40ms thats
-    // wild"). 40ms was sized against Minecraft's 50ms tick back when the file was rewritten whole and a
-    // reader wanted the freshest possible snapshot. Appending removes the reason: a coalesced second of
-    // lines is one append of a few KB instead of twenty-five rewrites of 1.5 MB, and the only thing the
-    // delay costs is up to a second of trace on a hard power cut. An ERROR line does not wait for it —
-    // _record flushes those immediately, because the run that is about to die is the one whose last
-    // lines matter most (Law 13: the record of a halt must outlive the halt).
+    // dropped (Law 6). An ERROR line skips the wait — _record flushes those immediately, since the
+    // run about to die is the one whose last lines matter most (Law 13).
     this._MIN_WRITE_INTERVAL_MS = 1000;
-    // Index into summaryLog of the first line NOT yet on disk. Advances only on a reported-successful
-    // append — the whole crash-safety guarantee is that this never runs ahead of the file.
+    // Index into summaryLog of the first line not yet on disk; advances only on a successful append,
+    // so this never runs ahead of the file.
     this._writtenThrough = 0;
-    // ── THIS PROCESS'S FIRST WRITE OPENS THE FILE, IT DOES NOT JOIN ONE (Architect 2026-08-31) ──────
-    //
-    //   "remove no data accumulation. that is not allowed. thats a law violation. fresh state beats
-    //    remembered. the only reason why we keep data is a post mortem of that specific run. a new run
-    //    is fresh state and should always overwrite stale data."
-    //
-    // The append-only writer is right and is unchanged — what was missing is where the appending BEGINS.
-    // Every flush appended, including the first, so a unit whose process started without a fleet-wide
-    // sweep ahead of it carried on writing underneath the previous run's story. Two runs then shared one
-    // file with nothing marking the seam, and every reader of that file — a person, a lens, the wake
-    // watch — attributed one run's events to the other. That is remembered state presented as sensed
-    // state, which is the whole of Invariant B.
-    //
-    // WHY HERE AND NOT AT EACH LAUNCHER. fleet_control's run-start sweep clears the directory, which is a
-    // different job and still needed: it releases files belonging to units that will NOT start this run,
-    // and nothing but a directory sweep can do that. What it cannot do is guarantee freshness for a unit
-    // raised outside a fleet start — a foreman on its own, a camera, a probe raising a desk — and adding
-    // a clear to each of those launchers would be the same guarantee installed at N sites, where the
-    // N+1th ships without it and looks correct (Law 16). A process cannot start without this class, so
-    // this is the one place the guarantee cannot be bypassed.
-    //
-    // IT IS A TRUNCATE, NOT AN UNLINK: the file is opened for writing on the first flush and appended to
-    // for every one after. A unit that writes nothing never truncates anything, so a process that dies
-    // before its first line leaves the prior run's record intact for exactly the post mortem it is kept
-    // for — the seam moves to the first line of the new run, which is where a reader looks for it.
+    // This process's first write TRUNCATES the file; every write after that appends. A fresh run must
+    // never be read as continuing the previous process's story (Invariant B) — every process that logs
+    // goes through this constructor, so the guarantee holds regardless of how the process was launched.
     this._fileOpened = false;
     // Waiters resolved on the next completed write (judge awaits a stable snapshot via flush()).
     this._writeCompleteWaiters = [];
@@ -321,9 +266,8 @@ class Watcher {
     this._lastStoryAt = Date.now();
     const line = `[${formatTimestamp(this._lastStoryAt)}] ${entry}`;
     this.summaryLog.push(line);
-    // An error line skips the 1000ms coalescing window. The process that just logged ❌ is the one most
-    // likely to stop existing before the next tick, and its last lines are the whole reason to read the
-    // file at all. Everything else can wait a second (Law 13 — prove it is safe to defer, not to drop).
+    // An error line skips the coalescing window — the process that just logged ❌ may not survive to
+    // the next tick, and its last lines are the reason to read the file at all (Law 13).
     if (/❌/.test(entry)) { this._lastWriteStart = 0; }
     this._writeWatcherFile();
   }
@@ -352,26 +296,17 @@ class Watcher {
     if (t.unref) t.unref();
   }
 
-  // _forward: mirror one printed line to the foreman so both bots' streams can be watched in one
-  // place (tagged by bot on the foreman side). Best-effort and re-entry-guarded — the forward path
-  // must never log (it would recurse) and must never throw into a caller (Law 5: logging is passive).
-  //
-  // ── THE LEVEL TRAVELS AS A FIELD, NOT AS A GLYPH IN THE TEXT (Architect 2026-09-16) ──────────────
-  // The three call sites below each know which level they are, and until this date that knowledge was
-  // dropped at the wire and left recoverable only by looking for ❌/⚠️/📊 inside the formatted string.
-  // A live supervisor that needs to know whether this fleet has errored must not have to read the
-  // sentence to find out — reading the text to recover a fact the writer already had is the lens-shaped
-  // hop the Architect struck out ("it should skip that and talk directly"). `level` is that fact,
-  // stated once, by the only module entitled to state it.
+  // _forward: mirror one printed line to the foreman so both bots' streams are watched in one place.
+  // Best-effort and re-entry-guarded — the forward path must never log (it would recurse) or throw
+  // into a caller (Law 5). `level` travels as its own field, not a glyph inside the text, so a live
+  // reader can ask whether the fleet has errored without parsing the sentence.
   _forward(entry, level) {
     if (this._forwarding) return;
     this._forwarding = true;
     try {
-      // Relative for the same reason as the records-home require at the top of this file: a
-      // same-directory sibling is found in every caller shape, including the processes that register no
-      // alias table. That makes THIS line unconditional; it does not make the forward path work outside
-      // the fleet, because the module it reaches has alias requires of its own. Outside a bot the
-      // forward still self-faults, and that is the correct outcome — there is no foreman to forward to.
+      // Relative require, like record_homes above — found in every caller shape, including processes
+      // with no alias table. Outside a bot this still self-faults, correctly: there is no foreman to
+      // forward to.
       const link = require('./foreman_link');
       if (link && typeof link.forwardLog === 'function') link.forwardLog(entry, level);
     } catch (e) { _selfFault('_forward', e); }
@@ -382,13 +317,14 @@ class Watcher {
   // next phase's error() context starts clean.
   summary(stage, message) {
     const entry = `${runtimeTag()} [${stage.toUpperCase()}] 📊 ${message}`;
+    // A ROUTINE_QUIET stage narrates nothing on the happy path: the line becomes deferred context
+    // instead, without clearing the buffer, until error() dumps it or the ring drops the oldest.
+    if (_routineQuiet(stage)) { this._bufferRecord(stage, message); return; }
     if (!SILENT_TERMINAL) console.log(entry);
     this.currentLoop.push(entry);
     this._record(entry, { printed: true });
     this._traceRecord(stage, entry);
-    // Sub-loop chatter (QUIET_FORWARD_STAGES) is recorded to the per-bot file above but not mirrored
-    // to the foreman signal-trace stream — warn()/error() still forward, so failures never hide.
-    if (!QUIET_FORWARD_STAGES.has(stage)) this._forward(entry, 'summary');
+    this._forward(entry, 'summary');
     this._bufferClear(stage);
   }
 
@@ -450,6 +386,9 @@ class Watcher {
   _bufferRecord(stage, message) {
     if (!this._buffers[stage]) this._buffers[stage] = [];
     this._buffers[stage].push({ message, timestamp: Date.now() });
+    // Ring cap (BUFFER_MAX_PER_STAGE): a quiet stage's buffer is cleared by nothing on a healthy run,
+    // so without this a 15-minute walk would hold every step it ever took in memory.
+    if (this._buffers[stage].length > BUFFER_MAX_PER_STAGE) this._buffers[stage].shift();
     // Mirror per-block detail to the trace so a SUCCESSFUL run shows how each decision was made —
     // without promoting it to a 4th story level.
     if (ENABLE_TRACE) this._traceRecord(stage, `${runtimeTag()} [${String(stage).toUpperCase()}] ⚙️ ${message}`);
@@ -466,11 +405,8 @@ class Watcher {
       this.currentLoop.push(entry);
       this._lastStoryAt = Date.now();
       this.summaryLog.push(`[${formatTimestamp(this._lastStoryAt)}] ${entry}`);
-      // `context`, NOT `error`, and the distinction is load-bearing now that the foreman counts these.
-      // One error() dumps its whole deferred buffer first, so a stage holding twelve buffered lines
-      // would post one error and twelve more lines behind it — tallied as `error` that reads as
-      // thirteen failures where there was one. These lines are the CONTEXT for the error that follows,
-      // never failures of their own (Law 25 — a count that overstates is not a conservative count).
+      // `context`, not `error` — the foreman counts these, and one error() dumping a dozen buffered
+      // lines must not tally as a dozen failures (Law 25).
       this._forward(entry, 'context');   // error context belongs on the foreman, not just the bot's story file
     }
     this._buffers[stage] = [];
@@ -511,39 +447,17 @@ class Watcher {
     return group.base.replace(/\((-?\d+,-?\d+,-?\d+)\)/, group.coords.join(', '));
   }
 
-  // ── APPEND-ONLY WRITER (Architect 2026-08-12) ─────────────────────────────────────────────────
+  // THE RECORD IS ONLY EVER ADDED TO: every write appends, the first one of a process included, so a file
+  // holds every run of its world in order. A rollback start empties fleet_logs/ before any process exists
+  // (start_auren.js), and that is the one thing that deletes a line.
+  // ── APPEND-ONLY WRITER ──
+  // Each flush appends only the lines added since the last one — a whole-file rewrite is not durable
+  // against a hard power cut (Law 13). Nothing is persisted that nothing reads: `timers` and the last
+  // story timestamp are each answered from one home elsewhere (Law 16).
   //
-  //   "lets go with option 1 and slow the writing i dont know why its 40ms thats wild. […] can you
-  //    just scrap the whole thing and make a better system with better guards"
-  //
-  // WHAT THIS REPLACED AND WHY. Until today every story line rewrote the WHOLE file — ~1.5 MB, on a
-  // 40 ms floor — through a tmp+rename. On 2026-08-12 the machine lost power 39 minutes into a
-  // 60-minute soak and all three traces came back as pure NUL bytes at exactly the right length:
-  // 1,567,301 / 1,108,505 / 1,024,696 bytes, zero of them content. That is the filesystem's crash
-  // signature, not a torn write. NTFS journals METADATA, so the replay restored the rename and the
-  // file size; the DATA sat unflushed in the page cache and NTFS may not hand back another file's old
-  // blocks, so it returned zeros. tmp+rename was never a durability guard — it guards a READER from
-  // seeing a half-written file — and it made the cut worse in one way: it swaps a file whose bytes
-  // were durable for one whose bytes are not.
-  //
-  // The proof of the fix was in the next folder over: an append-only JSONL record came through the SAME
-  // power cut with every one of its thousands of rows intact, because its bytes were written once at
-  // stable offsets and flushed minutes earlier. So the story file is now append-only
-  // too: each flush appends ONLY the lines added since the last one.
-  //
-  // WHAT WENT AWAY WITH THE REWRITE, and none of it is a loss:
-  //   · `timers` was persisted on every one of those rewrites and read by NOTHING outside this class —
-  //     dead payload. With it gone, the 100 ms timer-refresh loop that existed only to keep it fresh
-  //     goes too, along with the false-liveness problem it caused (mtime advancing during a hang).
-  //   · `lastStoryAt` had one reader, the freeze detector. Every persisted line already carries its own
-  //     ISO stamp, so the last line IS the answer — one fact, one home (Law 16).
-  //   · The EBUSY/EPERM rename-lock branch is deleted with the rename. A Windows reader holding the
-  //     file open blocks a RENAME, never an APPEND, so the failure mode it latched on cannot occur.
-  //
-  // THE GUARD THAT REPLACES THEM: `_writtenThrough` only advances when the append REPORTS SUCCESS, so
-  // a failed write leaves its lines queued for the next flush instead of skipping them (Law 25 — the
-  // record may fall behind, it may never quietly lose a line). summaryLog stays the single in-memory
-  // truth and this is an index into it, never a second copy of the data.
+  // `_writtenThrough` advances only when the append reports success, so a failed write leaves its
+  // lines queued for the next flush instead of skipped (Law 25). summaryLog stays the single in-memory
+  // truth and this is only an index into it.
   _writeWatcherFile() {
     if (this._writing) { this._pending = true; return; }
     if (this._writtenThrough >= this.summaryLog.length) { this._afterWrite(); return; }
@@ -555,13 +469,9 @@ class Watcher {
         this._scheduledTimeout = null;
         this._writeWatcherFile();
       }, delay);
-      // Unref'd so the watcher's own write cadence never holds a process open past its work (Law 8:
-      // nothing runs on invisibly after the run that raised it). The exception is an AWAITED write:
-      // an unref'd retry lets node drain the loop and exit with the flush() promise unsettled, so the
-      // awaiting caller's continuation is discarded in silence — the "flush() that never settles"
-      // _afterWrite already names as worse than a throw. Measured: recursive_judge's Law-13 halt
-      // awaits flush() a few ms after its own error lines, lands in this branch every time, and
-      // handleSignal simply never returned.
+      // Unref'd so the write cadence never holds the process open past its work (Law 8) — unless a
+      // flush() is awaited, in which case unref'ing would let the process exit before the promise
+      // settles, stranding the caller.
       if (this._scheduledTimeout.unref && this._writeCompleteWaiters.length === 0) this._scheduledTimeout.unref();
       return;
     }
@@ -571,17 +481,10 @@ class Watcher {
       const upto = this.summaryLog.length;
       const chunk = encodeStoryLines(this.summaryLog.slice(this._writtenThrough));
       if (ENABLE_WATCHER_LOGS) { console.log(`Appending ${upto - this._writtenThrough} story line(s)`); }
-      // The first write of the process TRUNCATES; every one after appends. `_fileOpened` is set before
-      // the callback rather than inside it on purpose: a failed first write must not leave the flag down,
-      // or the retry would truncate a second time and drop whatever the first attempt did land.
-      const opening = !this._fileOpened;
-      this._fileOpened = true;
-      // The records room is made by whoever writes first — a fresh clone has no `fleet_logs/` at all.
-      if (opening) recordHomes.ensureTraceDir();
-      const write = opening ? fs.writeFile : fs.appendFile;
-      write(WATCHER_FILE, chunk, (err) => {
-        // Advance ONLY on success — see the guard note above. A failed append re-sends the same lines
-        // next cycle rather than leaving a hole nobody can see.
+      // A fresh clone has no `fleet_logs/` at all — whoever writes first makes the directory.
+      if (!this._fileOpened) { this._fileOpened = true; recordHomes.ensureTraceDir(); }
+      fs.appendFile(WATCHER_FILE, chunk, (err) => {
+        // Advance only on success, so a failed append re-sends the same lines next cycle.
         if (err) _selfFault(`_writeWatcherFile(${path.basename(WATCHER_FILE)})`, err);
         else this._writtenThrough = upto;
         this._writing = false;
@@ -596,8 +499,7 @@ class Watcher {
   // _afterWrite: tail of every write — start any pending write, then resolve flush() waiters.
   _afterWrite() {
     if (this._pending) {
-      // A write was queued mid-flight; ITS snapshot holds whatever set _pending (e.g. an error
-      // logged during the write). Resolve waiters only after it lands, or flush() could resolve a
+      // A write queued mid-flight resolves waiters only after it lands, or flush() could resolve a
       // cycle too early and the caller might crash before its data is on disk.
       this._pending = false;
       this._writeWatcherFile();
@@ -605,10 +507,8 @@ class Watcher {
     }
     const waiters = this._writeCompleteWaiters.splice(0);
     for (const resolve of waiters) {
-      // Each waiter is isolated: a throwing resolve() must not strand the waiters behind it in the
-      // list, which is the one thing worse than the throw itself (a flush() that never settles hangs
-      // its caller forever). Reported, never swallowed — and resolve() throwing at all is a coding
-      // violation, since these are Promise resolvers this class created in flush().
+      // Each waiter is isolated: a throwing resolve() must not strand the ones behind it, which would
+      // hang the caller forever.
       try { resolve(); } catch (e) { _selfFault('_afterWrite flush waiter', e); }
     }
   }
@@ -618,29 +518,23 @@ class Watcher {
   flush() {
     return new Promise((resolve) => {
       this._writeCompleteWaiters.push(resolve);
-      // A throttled write may already be scheduled on an unref'd timer from before this waiter
-      // existed; _writeWatcherFile returns early when one is pending, so re-ref here or the very
-      // first awaited flush after a burst never settles.
+      // Re-ref an already-scheduled unref'd timer, or the first awaited flush after a burst never
+      // settles.
       if (this._scheduledTimeout && this._scheduledTimeout.ref) this._scheduledTimeout.ref();
       this._writeWatcherFile();
     });
   }
 
   // flushNow: synchronous append for process-exit handlers where async isn't an option. Appends only
-  // the outstanding tail, so calling it after an async flush already landed writes nothing rather than
-  // duplicating the story — the exit path and the timer path share one index (Law 16).
+  // the outstanding tail, so calling it after an async flush already landed writes nothing, never a
+  // duplicate — the exit path and the timer path share one index (Law 16).
   flushNow() {
     if (this._writtenThrough >= this.summaryLog.length) return;
     const upto = this.summaryLog.length;
     try {
-      // Same rule on the exit path, and it matters most here: a process that only ever writes at exit
-      // (a launcher verb, a probe's teardown) would otherwise be the one case that always appends.
-      const opening = !this._fileOpened;
-      this._fileOpened = true;
-      if (opening) recordHomes.ensureTraceDir();
+      if (!this._fileOpened) { this._fileOpened = true; recordHomes.ensureTraceDir(); }
       const chunk = encodeStoryLines(this.summaryLog.slice(this._writtenThrough));
-      if (opening) fs.writeFileSync(WATCHER_FILE, chunk);
-      else fs.appendFileSync(WATCHER_FILE, chunk);
+      fs.appendFileSync(WATCHER_FILE, chunk);
       this._writtenThrough = upto;
     } catch (err) {
       _selfFault('flushNow', err);
@@ -651,11 +545,8 @@ class Watcher {
   startTimer(name = 'runtimer', meta = {}) {
     const now = Date.now();
     this.timers[name] = { startedAt: now, stoppedAt: null, meta };
-    // Bare call (r34). This was `try { … } catch (_) {}` — but summary() is this class's own method
-    // and is called bare from all 234 of its call sites repo-wide; guarding it at the only two sites
-    // inside the watcher itself claimed a throw the other 232 would equally have to fear. If summary()
-    // can throw, that is a watcher bug that must surface, not one to hide from at two arbitrary spots
-    // (Law 16: one pathway — call it the way every caller calls it).
+    // Called bare, like every other call site of summary() repo-wide (Law 16) — a throw here is a
+    // watcher bug that must surface, not one to catch at two arbitrary spots.
     this.summary('watcher.timer', `⏱️ Started timer '${name}' at ${formatTimestamp(now)}`);
     this._writeWatcherFile();
     return this.getTimer(name);

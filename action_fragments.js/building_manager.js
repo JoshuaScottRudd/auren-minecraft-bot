@@ -12,53 +12,41 @@ const watcher          = require('@kernel/watcher');
 const hq               = require('@kernel/corporate_headquarters');
 const buildingIntegrity = require('@perception/building_integrity');
 const inventoryLens = require('@kernel/inventory_lens');
-const { remainingRawForBuild, blocksCompletion } = require('@utils/calculators/build_material_calculator');
-const { countInInventory } = require('@utils/calculators/inventory_calculator');
+const { affordableNow } = require('@utils/calculators/build_material_calculator');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
-const { OPTIONAL_BUILD_MATERIALS } = require('@thinking/architect_config');
+const jobExclusions = require('@thinking/job_exclusions');
 
 const TAG = 'building_manager';
 
-// anchorRawShortfall — the raw materials the claimed anchor is still short, crediting the bot's
-// pocket + THIS building's own staging chests. This is the SAME gate `assessors/building` runs
-// before ever posting the build job (shared remainingRawForBuild calc — Law 16); replayed here at
-// DISPATCH time because the pocket is fluid between planning and dispatch (the bot burns planks
-// pillaring as it moves), so a job greenlit a cycle ago can arrive materials-short. Returns a
-// { raw: count } shortfall map — empty when the anchor is fully staged and may be dispatched.
+// anchorBuildableNow — what the claimed anchor can build from the pool right now, as { item: count },
+// crediting the bot's pocket plus the build pool chests (inventoryLens.buildPool, the pool the assessor
+// gates on and preconstruction withdraws from). It is a load, not a gate: an empty answer means "stage
+// nothing", and the executor reports what it actually finds; whether the job may run is asked exactly
+// once, in assessors/building. The map travels to preconstruction as `buildable`, which stages exactly
+// that load and no more.
 //
-// ── SHORT MEANS UNBUILDABLE, AND THAT IS THE WHOLE GATE ─────────────────────────────────────────────
-// A part-load route once released an anchor whenever it could do SOMETHING, walking a bot out to place
-// what little it had. It was made unnecessary by separating anchors that mix material types from ones
-// that don't, so an anchor's owed materials are now homogeneous and "full materials before dispatch"
-// is a coherent gate again — mixed-type anchors no longer freeze a fleet stocked in only one type
-// behind a chain that hasn't delivered. Partial dispatch's real cost was structural, not incidental: a
-// part-load withdraw-craft-abandon cycle mid-stage burns materials on byproducts the blueprint never
-// asked for. This gate and job_board's both say NO on any shortfall, so they cannot disagree and there
-// is no post → bounce → post spin to defend against (Law 16 — one rule, one answer).
-function anchorRawShortfall(integrity, anchorIndex, blueprintName) {
+// Narrows to the claimed anchor's lowest course still owing blocks (job_board's nextAnchor picks the
+// anchor), or its placeable cells on a pledge-approved plan (blueprint_registry.isPledgeApproved), then
+// asks the same affordability question building_integrity and assessors/building already ask, so all
+// three agree on what "can build" means (Law 16). The whole-anchor bill still sizes the shortfall order;
+// only the build itself is coursed.
+function anchorBuildableNow(integrity, anchorIndex, blueprintName, excluded) {
     const st = anchorIndex != null ? integrity?.anchor_status?.[anchorIndex] : null;
-    const mNeeded = st ? st.materials_needed : (integrity?.materials_needed || {});
+    const pledged = require('@kernel/blueprint_registry').isPledgeApproved(blueprintName);
+    const mNeeded = st
+        ? (pledged ? st.materials_needed_placeable : st.materials_needed_lowest_y)
+        : (integrity?.materials_needed || {});
     const remaining = Object.fromEntries(
-        Object.entries(mNeeded || {}).filter(([k, c]) => typeof c === 'number' && c > 0 && !OPTIONAL_BUILD_MATERIALS.has(k))
+        Object.entries(mNeeded || {}).filter(([k, c]) => typeof c === 'number' && c > 0 && !jobExclusions.excludes(excluded, k))
     );
-    // No material owed (a dig-only anchor, or one fully placed) — nothing to be short of, so it goes.
-    if (Object.keys(remaining).length === 0) return {};
-
-    // Credit the one pool: pocket + the build pool chests (own chests ∪ headframe chest — the
-    // shared base pool). buildPoolChestCounts is the SAME set job_board's gate credits and preconstruction
-    // withdraws from (Law 16), so a chest-less build (tree farm) is gated against the headframe chest
-    // it actually draws from, not an empty own-chest set.
-    return remainingRawForBuild(remaining, inventoryLens.buildPool(blueprintName));
+    return affordableNow(remaining, inventoryLens.buildPool(blueprintName), require('@perception/station_registry').stationUsable);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RECIPES — maps job_board `what` keys → execution fragments.
-//
-// LOCATING is no longer here: the lazy per-blueprint find route (a `find_buildingspot` recipe per
-// blueprint) is RETIRED as a redundant pathway (Law 16) — lock_all_buildspots locates and
-// locks every base build_center in one startup pass. building_manager now owns only the STRUCTURE build:
-// each `<blueprint>_execute` key dispatches preconstruction against the already-locked center. Keys match
-// BUILDING_REQUIREMENTS execute_key exactly (field == recipe-key == blueprint).
+// RECIPES — maps job_board `what` keys to execution fragments. lock_all_buildspots locates and locks
+// every base transpose_origin at startup; building_manager owns only the structure build, dispatching
+// preconstruction against the already-locked center. Keys match BUILDING_REQUIREMENTS execute_key
+// exactly (field == recipe-key == blueprint).
 // ─────────────────────────────────────────────────────────────────────────────
 const RECIPES = {
     headframe_execute: {
@@ -69,14 +57,21 @@ const RECIPES = {
         fragment:       'preconstruction',
         blueprint_name: 'contractor_house',
     },
+    laydown_yard_execute: {
+        fragment:       'preconstruction',
+        blueprint_name: 'laydown_yard',
+    },
+    waste_pit_execute: {
+        fragment:       'preconstruction',
+        blueprint_name: 'waste_pit',
+    },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Release back to recursive_judge after all build passes. NO dumpExcess here: offloading is a single
-// job_board job (inventory_dump), fired only when the pocket is nearly full — a second offload route
-// here would be a redundant pathway (Law 16). Keeping build byproducts in pocket between passes is
-// fine — even preferable, since the next pass has the materials on hand rather than re-gathering.
+// Release back to recursive_judge after all build passes. No dumpExcess here: offloading is a single
+// job_board job (inventory_dump), fired only when the pocket is nearly full (Law 16: one offload route).
+// Keeping build byproducts in pocket between passes is fine: the next pass has the materials on hand.
 function _release(reason) {
     watcher.summary(TAG, `Releasing: ${reason}`);
     routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
@@ -109,56 +104,32 @@ module.exports = {
         // finding a duplicate. No arbiter claim belongs here — a buildspot is a
         // task outcome, not a physical object being contested.
 
-        // For build jobs: verify structure still needs work before dispatching.
-        // Without this gate, a completed structure causes an infinite loop:
-        // preconstruction → build_executor reports all_complete → recursive_judge →
-        // back here → magnet still says execute → re-dispatch → loop.
+        // job_board is the one place that decides whether a build may run (Law 16: accountability is not
+        // split between two verifiers). This manager turns a job key into a dispatch; it still computes
+        // `buildable`, but only as the LOAD preconstruction stages, never as a verdict on whether the job
+        // should run. If the pool moved since planning, the honest report is what the executor finds after
+        // trying. If a posted build cannot proceed, job_board is what gets fixed.
+        // A pledge pass that found every cell held or none payable has finished this body's part of the
+        // job; the board, not another pass, decides what it does next.
+        const lastPass = payload?.executor === 'build_executor' ? payload?.build_executor?.result : null;
+        // A pass that found the structure complete (a peer placed the last block) ends the job outright.
+        if (lastPass === 'all_complete') {
+            _release(`${jobKey} — the structure is complete; handing back to the board`);
+            return;
+        }
+        if (typeof lastPass === 'string' && /^(no_payable_cell|cells_held_by_peers)\(/.test(lastPass)) {
+            const m = payload.build_executor.metrics || {};
+            _release(`${jobKey} — ${lastPass} after placing ${m.place_ok || 0} and digging ${m.dig_ok || 0}; `
+                + `this body's pledge is spent, handing back to the board`);
+            return;
+        }
+
+        let buildable = null;   // preconstruction's load, not a gate
         if (recipe.fragment === 'preconstruction') {
-            const integrity = buildingIntegrity.scan(
+            const integrity = await buildingIntegrity.scan(
                 global.bot, recipe.blueprint_name, recipe.blueprint_name, { quiet: true });
-            if (integrity?.all_complete) {
-                _release(`'${jobKey}' structure already complete — nothing to build`);
-                return;
-            }
 
-            // Per-anchor replan gate. In gated mode the magnet names ONE anchor. Once that anchor no
-            // longer owes work that BLOCKS completion, a build pass can't advance it — but the structure
-            // isn't done (another anchor still owes work). Re-dispatching the same anchor just churns
-            // (build_executor → blocked_remainder → judge → here → repeat) until the 3-strike forces
-            // job_board. Release NOW so job_board re-picks the next anchor. This MUST use the identical
-            // blocksCompletion rule (and the identical pool) as job_board's nextAnchor (Law 16) — if this
-            // gate treated the torch anchor as "no work" while job_board posted it, the two would desync:
-            // job_board posts → this bounces → job_board re-posts → spin, never a placed torch.
-            if (magnet.anchor_index != null) {
-                const st = integrity?.anchor_status?.[magnet.anchor_index];
-                const pool = inventoryLens.buildPool(recipe.blueprint_name);
-                const isAvailable = (item) => countInInventory(item, pool);
-                // `unloaded_count` is here for the same reason it is in job_board's nextAnchor, and MUST
-                // stay in lockstep with it (the Law 16 desync this comment already warns about): an
-                // unsensed anchor owes no steps, so without the clause this gate calls it finished and
-                // releases while job_board — which now keeps it live — immediately re-posts it.
-                const owesWork = !!st && (st.dig_count > 0 || st.unloaded_count > 0 ||
-                    Object.entries(st.materials_needed).some(([k, c]) => c > 0 && blocksCompletion(k, c, OPTIONAL_BUILD_MATERIALS, isAvailable)));
-                if (!owesWork) {
-                    _release(`'${jobKey}' anchor ${magnet.anchor_index} has no gating work left — replanning for the next anchor`);
-                    return;
-                }
-            }
-
-            // Materials-staging gate: do NOT dispatch preconstruction for an
-            // anchor whose raw materials aren't actually staged. Before this gate, a job greenlit while
-            // materials looked sufficient but arriving short (fluid pocket) sent preconstruction into a
-            // soft-fail that building_manager re-dispatched on the same anchor — a rapid 3x spin that
-            // recursive_judge eventually broke by replanning, but only after tripping the trace flags.
-            // Releasing to job_board HERE lets assessors/building re-gate (same calc, Law 16), see the
-            // shortfall, and post the supply job that gathers it — one clean handoff, no spin.
-            const shortfall = anchorRawShortfall(integrity, magnet.anchor_index, recipe.blueprint_name);
-            if (Object.keys(shortfall).length > 0) {
-                const shortList = Object.entries(shortfall).map(([k, v]) => `${k}:${v}`).join(', ');
-                _release(`'${jobKey}' anchor ${magnet.anchor_index ?? 'whole'} not materials-staged ` +
-                    `(short ${shortList}) — replanning so job_board posts the supply job`);
-                return;
-            }
+            buildable = anchorBuildableNow(integrity, magnet.anchor_index, recipe.blueprint_name, magnet.excluded);
         }
 
         const next = {
@@ -168,6 +139,11 @@ module.exports = {
             readable:       `${TAG}: ${jobKey} → ${recipe.fragment} (${recipe.blueprint_name})`,
         };
         if (magnet.anchor_index != null) next.anchor_index = magnet.anchor_index;
+        if (buildable) next.buildable = buildable;
+        // THE EXCLUSION LIST TRAVELS WITH THE WORK, off the magnet the dispatcher froze it onto. This
+        // manager does not decide it and does not announce it — it hands the board's answer to the
+        // executor that will act on it, which is the whole of its part in the arrangement.
+        if (magnet.excluded) next.excluded = magnet.excluded;
 
         watcher.summary(TAG, `Dispatching ${recipe.fragment} for '${jobKey}'`);
         routeSignal(TAG, recipe.fragment, next);

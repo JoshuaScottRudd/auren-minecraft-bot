@@ -1,42 +1,40 @@
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/plan_blueprint.js');
 // plan_blueprint — turn an IMPORTED downloaded blueprint into a build plan: what it is built from, where its ground
-// floor is, the basement and stair under it, and its 5×5×5 anchor cubes.
+// floor is, and its 5×5×5 anchor cubes covering the whole box.
 //
-//   node Auren_Workshop/tools/plan_blueprint.js "<downloaded_blueprints.json>" --name=<key>
-//        [--stair-side=north|south|east|west (north)] [--wood=spruce] [--leaves=yes|no] [--stair-width=2]
+//   node Auren_Workshop/tools/plan_blueprint.js "<downloaded_blueprints.json>" --name=<key> [--wood=spruce] [--leaves=yes|no]
 //
-// Three pure calculators do the work, in this order, each on the output of the one before:
+// Two pure calculators do the work, in this order, the second on the output of the first:
 //   js_kernel/blueprint_material_rule.js     what may be built (logs of one wood, stone, a little iron, dirt)
-//   js_kernel/blueprint_terraform.js         the one scrape: ground floor layer, parallel lines, crawlspace, stair
-//   js_kernel/blueprint_anchor_calculator.js 5×5×5 cubes in columns, stands, the descent, order for split chests
+//   js_kernel/blueprint_anchor_calculator.js the ground floor layer; 5×5×5 cubes over the WHOLE box, in columns,
+//                                            stands, the descent, order for split chests
+//
+// The ground is cleared by the same anchors that build the building; no terraform, stair, or basement
+// section — the way down to the anchors is navigation's to find.
 //
 // ── WHAT IT WRITES, AND WHY APART FROM THE IMPORT ───────────────────────────────────────────────────
 // Two files beside the downloaded_blueprints.json it reads:
-//   <name>.build_plan.json   the machine plan: material report, basement, anchor summary, every anchor's voxels
+//   <name>.build_plan.json   the machine plan: material report, ground floor, anchor summary, every anchor's voxels
 //   <name>.build_plan.md     the same plan written to be read
 // The import entry is never edited. It is the counted statement of what the download contains; a plan is derived
-// from it under choices (the wood, leaves, the stair side) that may change, so a plan is regenerated from the import
-// rather than overwriting it, and the import stays the one source both come from.
-// The stair side is north unless --stair-side names another (the default lives in blueprint_terraform.js).
+// from it under choices (the wood, leaves) that may change, so it is regenerated from the import each time,
+// keeping the import the one source both files come from.
 
 const fs = require('fs');
 const path = require('path');
 const paths = require('../workshop_paths');
 paths.registerAliases();
 
-const { applyMaterialRule } = require('@kernel/blueprint_material_rule');
-const { planTerraform } = require('@kernel/blueprint_terraform');
-const { computeAnchors } = require('@kernel/blueprint_anchor_calculator');
+const { applyMaterialRule, materialRatio } = require('@kernel/blueprint_material_rule');
+const { computeAnchors, groundFloorLayer, ENTRY_FEET_BELOW } = require('@kernel/blueprint_anchor_calculator');
+const { SCHEMA } = require('@kernel/downloaded_plan_registry');
 const { SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 
 function args() {
   const a = process.argv.slice(2);
   const flag = (k, d) => { const hit = a.find(x => x.startsWith(`--${k}=`)); return hit ? hit.slice(k.length + 3) : d; };
-  return {
-    file: a.find(x => !x.startsWith('--')), name: flag('name', null), wood: flag('wood', 'spruce'), leaves: flag('leaves', 'yes'),
-    stairSide: flag('stair-side', undefined), stairWidth: Number(flag('stair-width', '2')),
-  };
+  return { file: a.find(x => !x.startsWith('--')), name: flag('name', null), wood: flag('wood', 'spruce'), leaves: flag('leaves', 'yes') };
 }
 
 function table(headers, rows) {
@@ -46,7 +44,7 @@ const sorted = o => Object.entries(o).sort((a, b) => b[1] - a[1] || a[0].localeC
 const total = o => Object.values(o).reduce((s, n) => s + n, 0);
 
 function planMarkdown(name, entry, plan) {
-  const m = plan.material_rule, b = plan.terraform, s = plan.anchor_summary;
+  const m = plan.material_rule, g = plan.ground, s = plan.anchor_summary;
   const L = [];
   L.push(`# Build plan — ${name}`, '');
   L.push(`Written ${new Date().toISOString().slice(0, 10)} by \`Auren_Workshop/tools/plan_blueprint.js\` from the \`${name}\` import (${entry.source.file}, ${entry.dimensions.w} wide × ${entry.dimensions.h} tall × ${entry.dimensions.l} long). The machine copy is \`${name}.build_plan.json\`.`, '');
@@ -58,24 +56,22 @@ function planMarkdown(name, entry, plan) {
     ['built as a substitute', total(m.substituted)],
     ['left out (cell stays air)', total(m.left_out)],
     ['iron ingots needed', m.iron_ingots],
+    ['cobblestone needed, ground floor up', plan.material_ratio.cobblestone],
+    ['cobblestone per iron ingot', plan.material_ratio.cobblestone_per_iron],
   ]), '');
   L.push('### Substitutions', '', table(['downloaded → built', 'blocks'], sorted(m.substituted)), '');
   L.push('### Left out', '', table(['block', 'blocks'], sorted(m.left_out)), '');
   L.push('### Built as downloaded', '', table(['block', 'blocks'], sorted(m.kept)), '');
-  L.push('## The terraform — trees, then one scrape, then the seal', '');
-  L.push(`- **Trees first:** every log and leaf standing over the site comes down before the first scrape line, across the footprint plus a ${b.trees.region.margin}-block margin (${b.trees.region.x[0]}…${b.trees.region.x[1]} × ${b.trees.region.z[0]}…${b.trees.region.z[1]}), so nothing is left hanging in the air when the ground under it goes. Those logs are the build's wood supply and go to the hub chests.`);
-  L.push(`- **Ground floor:** blueprint layer **${b.ground_floor_layer}** (dirt covers ${Math.round(b.ground_floor_dirt_share * 100)}% of the footprint there). It is set at the natural ground height of the ring around the site.`);
-  L.push(`- **Lines:** **${b.scrape.lines}** parallel lines, 1 wide, running along **${b.scrape.axis}** (the longer side, ${b.scrape.run_length} blocks). ${b.scrape.lines} bots can scrape at once, one line each, and no two lines ever cross.`);
-  L.push(`- **Depth:** every layer from the highest block over the site down to ${b.scrape.layers_below_ground_floor} layers below the ground floor — ${b.scrape.footprint.columns} footprint columns. The basement is not a second job; it is where the scrape stops.`);
-  L.push(`- **Crawlspace:** ${plan.dimensions.w} × ${plan.dimensions.l}, ${b.crawlspace.height} high, directly under the blueprint's lowest layer, standing on layer ${b.floor_y}, which is never dug.`);
-  L.push(`- **Stair:** left behind by the scrape rather than cut. ${b.stair.width} wide on the **${b.stair.side}** side, centred, ${b.stair.steps} steps down to the crawlspace, **${b.stair.blocks_dug_if_ground_is_level} blocks** when the ground there is level. A step is two cells — the tread and the headroom — and nothing above it is touched, so it is a covered stairwell with the natural ground as its roof and only the mouth showing. Each layer down, the lane moves one step (${b.stair.width} blocks) further out. ${b.scrape.lane_extends_lines ? 'The lane is the same lines carrying on past the footprint edge.' : 'The lane is its own short lines outside the footprint, parallel to the rest.'}`);
-  L.push('- **Nothing here is a to-do list.** What is left to scrape is read off the world every cycle: the active layer is the highest one that still has a block in it, and a line is available while any of its cells at that layer does. An interrupted bot leaves nothing to repair.');
-  L.push(`- **The seal, when the building is done:** the stairwell is filled back with dirt — ${b.seal.blocks} blocks, deepest step first — so the mouth closes and a player sees natural ground. The crawlspace is left empty and unreachable. The bot rises with the fill and leaves through the mouth.`, '');
+  L.push('## The ground — cleared by the build itself', '');
+  L.push('- **Trees first:** every trunk standing on the footprint comes down before any column starts. Those logs are the build\'s wood supply.');
+  L.push(`- **Ground floor:** blueprint layer **${g.ground_floor_layer}** (dirt covers ${Math.round(g.ground_floor_dirt_share * 100)}% of the footprint there). It is set at the natural ground height of the ring around the site.`);
+  L.push(`- **No scrape, no crawlspace, no stair in this plan.** Every cell of the ${plan.dimensions.w} × ${plan.dimensions.h} × ${plan.dimensions.l} box belongs to one anchor cube; a cell the download leaves empty is an air target, so the dirt and stone standing in it are dug by the same pass that places the blocks.`);
+  L.push(`- **The way in is from underneath.** A body is sent to stand ${g.entry_feet_below} below the box's lowest layer, under a column's stand, and navigation finds its own way there — one straight diagonal stair from the surface and a tunnel under the box. Whatever that leaves is the basement. The survey checks the ground ${g.layers_below_ground_floor} layers below the ground floor for water and lava.`, '');
   L.push('## Anchor cubes (5 × 5 × 5)', '');
   L.push(table(['', ''], [
     ['grid offset (x, z)', `${s.offset.x}, ${s.offset.z}`],
     ['columns — how many bots can work at once', s.columns],
-    ['cubes, counting empty ones a column rises through', `${s.anchors} (${s.empty_anchors} empty)`],
+    ['cubes over the whole box', `${s.anchors} (${s.empty_anchors} hold only air targets)`],
     ['cube layers', s.cube_layers],
     ['blocks per cube (min / median / max)', `${s.voxels_per_anchor.min} / ${s.voxels_per_anchor.median} / ${s.voxels_per_anchor.max}`],
     ['cubes holding 1 to 5 blocks', s.anchors_with_5_or_fewer],
@@ -89,15 +85,15 @@ function planMarkdown(name, entry, plan) {
     ['blocks placed on the descents (total / median / worst column)', `${s.descent_blocks.total} / ${s.descent_blocks.median} / ${s.descent_blocks.max}`],
     ['inventory slots the descent needs, worst column', s.pocket_slots_max],
   ]), '');
-  L.push('Cubes in one column are built bottom to top by one bot at a time, and the column is sealed once on the way down after its top cube, so no bot ever digs a finished block to get out.', '');
-  L.push(`Every visit starts at the column's x,z in the crawlspace and pillars up on cheap filler (dirt) to the anchor's y. The stand column's own blueprint blocks are **not** placed on the way up — they go in on the single descent after the column's top cube, placed above the bot's head as it digs the filler out from under its feet. The bot carries them before it starts: **${s.pocket_slots_max} slots** in the worst column, **${s.descent_blocks.max} blocks**.`, '');
+  L.push('One anchor per trip. The next anchor any body takes is the lowest unfinished cube of some column — the lowest layer first, the lowest column number among equals — so the building rises level across the site. One body per column at a time.', '');
+  L.push(`Every visit starts under the column's stand and pillars up on cheap filler (dirt) to the anchor's y, clears and places that one cube, digs its filler back down and leaves to bank what it dug. The stand column's own blueprint blocks are **not** placed on the way up — they go in on the descent after the column's top cube, placed above the bot's head as it digs the filler out from under its feet. The bot carries them before that last trip: **${s.pocket_slots_max} slots** in the worst column, **${s.descent_blocks.max} blocks**.`, '');
   return L.join('\n');
 }
 
 function main() {
   const a = args();
   if (!a.file || !a.name) {
-    console.error('usage: node Auren_Workshop/tools/plan_blueprint.js "<downloaded_blueprints.json>" --name=<key> [--stair-side=north|south|east|west (north)] [--wood=spruce] [--leaves=yes|no] [--stair-width=2]');
+    console.error('usage: node Auren_Workshop/tools/plan_blueprint.js "<downloaded_blueprints.json>" --name=<key> [--wood=spruce] [--leaves=yes|no]');
     process.exit(1);
   }
   const src = path.resolve(a.file);
@@ -114,15 +110,26 @@ function main() {
   }
 
   const material = applyMaterialRule(entry.unassigned_voxels, { wood: a.wood, leaves: a.leaves === 'yes', serverVersion: SERVER_MINECRAFT_VERSION });
-  const terraform = planTerraform(material.voxels, entry.dimensions, { stairSide: a.stairSide, stairWidth: a.stairWidth });
-  if (!terraform.ok) { console.error(`plan_blueprint: ${terraform.reason}`); process.exit(1); }
+  const floor = groundFloorLayer(material.voxels);
+  const ground = {
+    ground_floor_layer: floor.layer,
+    ground_floor_dirt_share: floor.share,
+    world_y: 'world y = h - ground_floor_layer + blueprint y, where h is the ring-median natural ground height',
+    entry_feet_below: ENTRY_FEET_BELOW,
+    // How deep under the ground floor a body's cells reach: every layer of the box below the ground floor, plus
+    // the body standing beneath the box to enter a column. The foreman's survey checks exactly this deep.
+    layers_below_ground_floor: floor.layer + ENTRY_FEET_BELOW,
+  };
+  // THE BUILDING'S IRON-TO-STONE RATIO — a property of the blueprint, written into its plan: the gather has to
+  // bring iron and stone in this proportion or one runs out while the other piles up.
+  const ratio = materialRatio(material.voxels, floor.layer, material.report.iron_ingots);
   const { anchors, columns, summary } = computeAnchors(material.voxels, entry.dimensions);
 
   const plan = {
-    schema: 'auren.build_plan.v2', name: a.name, source_sha256: entry.source.sha256, server_version: SERVER_MINECRAFT_VERSION,
-    frame: 'blueprint min corner; layer 0 = the lowest layer; see terraform.world_y', dimensions: entry.dimensions,
+    schema: SCHEMA, name: a.name, source_sha256: entry.source.sha256, server_version: SERVER_MINECRAFT_VERSION,
+    frame: 'blueprint min corner; layer 0 = the lowest layer; see ground.world_y', dimensions: entry.dimensions,
     blocks_in_import: entry.unassigned_voxels.length, blocks_built: material.voxels.length,
-    material_rule: material.report, terraform, anchor_summary: summary, columns, anchors,
+    material_rule: material.report, material_ratio: ratio, ground, anchor_summary: summary, columns, anchors,
   };
   const outDir = path.dirname(src);
   const jsonFile = path.join(outDir, `${a.name}.build_plan.json`);
@@ -135,8 +142,8 @@ function main() {
 
   const m = material.report;
   console.log(`plan_blueprint: "${a.name}" — ${plan.blocks_in_import} blocks downloaded → ${plan.blocks_built} built (${total(m.kept)} as downloaded, ${total(m.substituted)} substituted), ${total(m.left_out)} left out; iron ${m.iron_ingots} ingots`);
-  console.log(`  terraform: ground floor layer ${terraform.ground_floor_layer} (dirt ${Math.round(terraform.ground_floor_dirt_share * 100)}%); ${terraform.scrape.lines} parallel lines along ${terraform.scrape.axis}, ${terraform.scrape.run_length} long; down ${terraform.scrape.layers_below_ground_floor} layers below the ground floor; stair ${terraform.stair.width} wide × ${terraform.stair.steps} steps on the ${terraform.stair.side} side, ${terraform.scrape.lane_extends_lines ? 'extending the lines' : 'its own lines outside the footprint'}`);
-  console.log(`  cubes: offset ${summary.offset.x},${summary.offset.z}; ${summary.columns} columns; ${summary.anchors} cubes (${summary.empty_anchors} empty); ${summary.cube_layers} layers; no stand ${summary.columns_without_a_stand}; off-centre stands ${summary.stands_off_centre}; split pieces ${JSON.stringify(summary.split_across_cubes)}; reach max ${summary.reach_max} (${summary.anchors_beyond_reach} beyond ${summary.reach_limit})`);
+  console.log(`  ground: floor layer ${ground.ground_floor_layer} (dirt ${Math.round(ground.ground_floor_dirt_share * 100)}%); bodies enter ${ground.entry_feet_below} under the box, ${ground.layers_below_ground_floor} layers below the ground floor`);
+  console.log(`  cubes: offset ${summary.offset.x},${summary.offset.z}; ${summary.columns} columns; ${summary.anchors} cubes (${summary.empty_anchors} air-only); ${summary.cube_layers} layers; no stand ${summary.columns_without_a_stand}; off-centre stands ${summary.stands_off_centre}; split pieces ${JSON.stringify(summary.split_across_cubes)}; reach max ${summary.reach_max} (${summary.anchors_beyond_reach} beyond ${summary.reach_limit})`);
   console.log(`  descent: tallest pillar ${summary.filler_height_max}; ${summary.descent_blocks.total} blocks placed on descents (worst column ${summary.descent_blocks.max}, ${summary.pocket_slots_max} slots in the pocket)`);
   console.log(`  wrote ${jsonFile}`);
   console.log(`  wrote ${mdFile}`);

@@ -1,37 +1,18 @@
 // shared primitive: anchored_repair
-// purpose: The ONE stationary anchor-build routine shared by build_executor and
-//          mining_executor (Law 16 / D3 — one repair primitive under two separate
-//          executors). Given a stand position and a set of integrity-diff steps, the
-//          bot stands ONCE at the anchor and digs ALL reachable targets (top-down),
-//          then places ALL reachable targets (bottom-up) — every voxel of a cell-sized
-//          volume is within the 4.5 reach radius, so no pillaring/vantage movement is
-//          needed. Enclosed corners (an air pocket whose six faces are all solid, no
-//          raycastable face) place via the non-raycast findAttachable path (a "cheat
-//          place"). Valid on a vanilla server with no anti-cheat / no LOS enforcement.
-//
-// WHY this is a shared primitive and not two copies:
-//   Building and mining are SEPARATE executors serving different purposes (building finds
-//   a fresh spot; mining procedurally extends a descent + collects ore). But the mechanism
-//   by which each turns a blueprint+integrity diff into repaired blocks is IDENTICAL:
-//   stand at an anchor, dig-all then place-all within reach, cheat the enclosed corners.
-//   That identical mechanism lives here ONCE. Each executor keeps its own domain logic
-//   (item resolution, stations, ore/gravity, descent bookkeeping) and injects the two
-//   per-block mechanics that legitimately differ — digOne and placeOne — as callbacks.
+// The ONE stationary anchor-build routine shared by build_executor and mining_executor (Law 16):
+// given a stand and integrity-diff steps, the bot stands ONCE, digs ALL reachable targets
+// top-down, then places ALL reachable targets bottom-up (every voxel of a cell-sized volume is
+// within the 4.5 reach radius). Enclosed corners place via the non-raycast findAttachable path
+// (a "cheat place"). Valid on a vanilla server with no anti-cheat / no LOS.
 //
 // CONTRACT — repairAtAnchor(bot, job, ops):
-//   job = { stand:{x,y,z}, steps:[integrity steps], label:string }
-//     - stand is the FEET cell the bot occupies (anchor floor block Y + 1).
-//     - steps are already grouped for THIS anchor by the caller (build_executor groups by
-//       blueprint anchor_index; mining groups by nearest-anchor reach). The primitive does
-//       not re-group — it digs/places exactly what it is handed, gating each on live reach.
+//   job = { stand:{x,y,z}, steps:[integrity steps], label:string }  // stand = the FEET cell
+//     (anchor floor block Y + 1); steps are already grouped for THIS anchor by the caller.
 //   ops = {
-//     digOne(step) -> Promise<bool>            // executor's per-block dig (mining adds the
-//                                              //   gravity-column repeat-mine; building is plain)
-//     placeOne(step, ev) -> 'already'|'skipped'|true|false   // executor's per-block place
-//                                              //   (consumes ev.pos/anchor/face/underFeet)
+//     digOne(step) -> Promise<bool>            // executor's per-block dig
+//     placeOne(step, ev) -> 'already'|'skipped'|true|false   // executor's per-block place (ev has pos/anchor/face/underFeet)
 //     resolveItem(type) -> name|null           // does the bot hold a block satisfying `type`?
 //     isOptional(type) -> bool                 // may this place defer when unheld (torches)?
-//     stationTypes: Set<string>                // types needing a non-station attach face
 //     tag: string                              // watcher scope of the calling executor
 //     maxPlaceAttempts: number
 //   }
@@ -46,10 +27,8 @@ const locomotion = require('@locomotion/locomotion_dispatcher');
 
 const { normalizeBlockName, BLOCK_REACH } = require('@utils/fragment_utils');
 const { MIN_PLACEMENT_DIST } = require('@utils/pathfinding_utils');
-// Entered through combatCheckpoint, never battleStations directly (Architect 2026-08-08: "remove it
-// from the callers"). One process-wide 500 ms clock, shared with the dig and drive primitives that now
-// carry the same gate, plus the engaging/escaping bypass so combat's own arms cannot re-enter it. The
-// whole reasoning is in its header; a call a primitive already paid for costs nothing here.
+// One process-wide 500 ms clock, shared with the dig and drive primitives; the engaging/escaping
+// bypass keeps combat's own arms from re-entering it.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { stepHorizontal } = require('@utils/movement/drive');
 const { microCenter } = require('@utils/movement/motion_primitives');
@@ -58,9 +37,8 @@ const { isAir, dist3, classifyFloor } = require('@utils/movement/terrain_predica
 const STEP_WAIT_MS = 200;
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 
-// A place step is equip + lookAt + placeBlock (+ one clearing dig). All of that should land well
-// under a second; anything at or past this is a penalised dig or a stalled placeBlock, and is called
-// out by name in the phase summary rather than averaged away.
+// A place step is equip + lookAt + placeBlock (+ one clearing dig), normally well under a second;
+// at or past this it is a penalised dig or a stalled placeBlock, named in the phase summary.
 const SLOW_PLACE_MS = 2000;
 
 // EYE_FACTOR — vanilla eye height as a fraction of entity height (eye = feet + height*0.9).
@@ -86,10 +64,8 @@ const ATTACH_DIRS = [
   { d: new Vec3(0, 0, -1), face: new Vec3(0, 0, 1) },
 ];
 
-// Solid-neighbor check — no raycast. If any of the 6 neighbors is a solid full block,
-// that face qualifies as a placeBlock reference. Raycasts false-negative when the bot is
-// close or the ray clips a block edge; solid-neighbor is deterministic. Interactable
-// blocks (chests/doors) are a last-resort fallback — placing against them can open a UI.
+// findAttachable — the nearest solid full-block neighbor of pos to place against (no raycast).
+// Interactable blocks (chests/doors) are a last-resort fallback (placing against them opens a UI).
 function findAttachable(bot, pos) {
   let interactableFallback = null;
   for (const { d, face } of ATTACH_DIRS) {
@@ -106,12 +82,8 @@ function findAttachable(bot, pos) {
   return interactableFallback;
 }
 
-// describeNeighborhood — the six face-neighbours of a voxel, by name, in ATTACH_DIRS order.
-// The ONE owner (Law 16) of "what is around this block": evaluatePlacement built this string
-// inline for its no_attach_point branch, and mining_executor's placeOne needs the same answer to
-// explain a refused place (Architect 2026-07-15: "upgrade it to state what is currently in the spot
-// its trying to place and whats around it"). Fixed order so two dumps from different passes diff by
-// eye. Names only — a caller wanting attach geometry calls findAttachable, which decides it.
+// describeNeighborhood — the six face-neighbours of pos, by name, in ATTACH_DIRS order; the one
+// owner (Law 16) of what is around this block, used by callers explaining a refused place.
 function describeNeighborhood(bot, pos) {
   return ATTACH_DIRS.map(({ d }) => {
     const nb = bot.blockAt(pos.plus(d));
@@ -119,10 +91,9 @@ function describeNeighborhood(bot, pos) {
   }).join(' ');
 }
 
-// A target air voxel whose six face-neighbours are ALL solid is a diagonal corner an
-// ordinary player could not place (no exposed face to raycast). Placing it via
-// findAttachable + bot.placeBlock(ref, face) is a cheat placement — counted so the
-// Architect can watch it on the live run.
+// A target air voxel whose six face-neighbours are ALL solid is a diagonal corner with no
+// exposed face to raycast; placing it via findAttachable is a cheat placement, counted for
+// visibility on the live run.
 function isEnclosedCorner(bot, pos) {
   for (const { d } of ATTACH_DIRS) {
     const nb = bot.blockAt(pos.plus(d));
@@ -131,13 +102,9 @@ function isEnclosedCorner(bot, pos) {
   return true;
 }
 
-// botOccupiesCell — does the bot's bounding box currently overlap the unit cell at pos?
-// A normal bot.placeBlock into a cell the bot stands in never fires blockUpdate and times
-// out after 5s (the server refuses to place a block inside the player). evaluatePlacement
-// classifies the footing by the KNOWN stand cell at EVAL time, but after the dig phase
-// removes the bot's own floor/footing block the bot FALLS into the target cell — so by
-// PLACE time it occupies a cell that was not the stand cell at eval time. This live AABB
-// check catches that at place time → route to the under-feet (pillarStep) path.
+// botOccupiesCell — does the bot's bounding box currently overlap the unit cell at pos? A
+// placeBlock into an occupied cell never fires blockUpdate and times out; this catches that at
+// place time and routes to the under-feet (pillarStep) path.
 function botOccupiesCell(bot, pos) {
   const e = bot && bot.entity;
   if (!e || !e.position) return false;
@@ -149,19 +116,14 @@ function botOccupiesCell(bot, pos) {
          (p.z + hw) > pos.z && (p.z - hw) < (pos.z + 1);
 }
 
-// standEye — the bot's eye position when microCentered on the stand block. Every dig/place is
-// preceded by a microCenter onto the stand, so the bot IS at the block's X/Z center; reach
-// measured from here is DETERMINISTIC (independent of live drift), which is what makes an
-// out-of-reach target a coding fault rather than a positioning accident (see assertReachable).
+// standEye — the bot's eye position when microCentered on the stand block; every dig/place
+// microCenters first, so reach measured from here is deterministic (see assertReachable).
 function standEye(bot, stand) {
   return { x: stand.x + 0.5, y: stand.y + (bot.entity.height || 1.8) * EYE_FACTOR, z: stand.z + 0.5 };
 }
 
-// nearestFaceDist — distance from an eye point to the NEAREST point of the unit cube at pos.
-// This is how the vanilla server range-checks a block interaction: eye → the clicked point on
-// the block's SURFACE, not eye → block center. Measuring to the center under-reports reach by
-// up to ~0.5 (half a block) and wrongly rejects blocks the server would accept — packet-send
-// placement skips the line-of-sight raycast but NOT this distance check.
+// nearestFaceDist — distance from an eye point to the nearest point of the unit cube at pos,
+// matching how the server range-checks a block interaction (eye to surface, not eye to center).
 function nearestFaceDist(eye, pos) {
   const nx = Math.max(pos.x, Math.min(eye.x, pos.x + 1));
   const ny = Math.max(pos.y, Math.min(eye.y, pos.y + 1));
@@ -170,22 +132,14 @@ function nearestFaceDist(eye, pos) {
 }
 
 // reachFromStand — deterministic server-accurate reach from the microCentered stand block to a
-// target voxel. ONE metric (Law 16), shared by the mining anchor-assignment and the in-loop
+// target voxel; the one reach metric (Law 16) shared by mining anchor-assignment and the in-loop
 // reach gate below. pos may be a Vec3 or a plain {x,y,z}.
 function reachFromStand(bot, stand, pos) {
   return nearestFaceDist(standEye(bot, stand), pos);
 }
 
-// assertReachable — Law 13 reach gate. The bot microCenters onto the stand block before every
-// dig and place, so it is deterministically at the block center; reach from there is a pure
-// function of the blueprint/anchor geometry. A target beyond BLOCK_REACH from the stand-block
-// eye is therefore NOT a positioning accident a retry could fix — it is an anchor/blueprint
-// COVERAGE fault (a voxel assigned to an anchor that cannot reach it). Per Law 13 that is a
-// coding violation: throw immediately rather than soft-skip and limp on leaving a hole. (Every
-// current anchored blueprint clears this: worst face-reach headframe 3.66, chest 3.37, cell
-// 2.67, staircase 4.14 — so this only ever fires on a genuine future coverage regression.)
-// The staircase figure is the live one: re-measured through reachFromStand itself after the
-// staircase box was filled solid, so it already covers the filled shell's far corners.
+// assertReachable — Law 13 reach gate. Reach from the microCentered stand is deterministic, so a
+// target beyond BLOCK_REACH is an anchor/blueprint coverage fault, and the gate raises on it.
 function assertReachable(bot, stand, pos, kind, label) {
   const d = reachFromStand(bot, stand, pos);
   if (d > BLOCK_REACH) {
@@ -199,11 +153,9 @@ function assertReachable(bot, stand, pos, kind, label) {
   return d;
 }
 
-// evaluatePlacement — generic placement geometry (no executor domain knowledge). Decides
-// whether the target is the bot's own footing (under-feet → pillarStep in the executor's
-// placeOne), out of reach, too close, or reachable with a solid attach face. `stand` is the
-// KNOWN anchor feet cell so the footing block classifies deterministically regardless of
-// the bot's momentary drift between eval and place.
+// evaluatePlacement — generic placement geometry (no executor domain knowledge): decides whether
+// the target is the bot's own footing (under-feet → pillarStep in placeOne), out of reach, too
+// close, or reachable with a solid attach face. `stand` classifies footing deterministically.
 function evaluatePlacement(bot, step, stand) {
   const pos = new Vec3(step.place.x, step.place.y, step.place.z);
   const feet = bot.entity.position.floored();
@@ -213,11 +165,9 @@ function evaluatePlacement(bot, step, stand) {
     return { ok: true, pos, underFeet: true };
   }
 
-  // out_of_range is a LIVE drift check (server reach from the bot's actual eye, nearest-face) —
-  // its only job is to trigger a re-anchor when the bot has drifted off the stand; the
-  // deterministic assertReachable (from the stand center) already threw on any true coverage
-  // fault before this runs. too_close stays a CENTER measurement (it guards the lookAt aim
-  // angle, which degrades when the block center is almost under the eye, not when a face is near).
+  // out_of_range is a live drift check from the bot's actual eye (nearest-face), triggering a
+  // re-anchor when the bot has drifted off the stand. too_close is a center measurement — it
+  // guards the lookAt aim angle.
   const eye = { x: bot.entity.position.x, y: bot.entity.position.y + (bot.entity.height || 1.8) * EYE_FACTOR, z: bot.entity.position.z };
   if (nearestFaceDist(eye, pos) > BLOCK_REACH) return { ok: false, reason: 'out_of_range', pos };
   const centerD = dist3({ x: pos.x + 0.5, y: pos.y + 0.5, z: pos.z + 0.5 }, eye);
@@ -229,23 +179,13 @@ function evaluatePlacement(bot, step, stand) {
   return { ok: true, pos, anchor: attach.anchor, face: attach.face, underFeet: false };
 }
 
-// resolveStandableAnchor — given a plot/anchor FLOOR cell (the block the bot stands ON to service the
-// plot), return a standable stand to work FROM: the anchor's own feet if that floor is standable, else
-// the nearest standable cell within reach of the anchor. This is "search for a standable anchor within
-// the placement radius, then build/tend from there" (Architect 2026-07-18) — the fix for a plot whose
-// baked stand block was lost to dynamic water (a decomposed wheat_plot_pair tuple: if the block the bot
-// should stand on is now water, it cannot stand on it to rebuild it, so it stands on a dry lip nearby
-// and places the missing block from the side/apex). Returns { floor, feet, alternate } or null when
-// NOTHING standable reaches the plot (a truly stranded plot — the caller marks it non-actionable rather
-// than livelock: bot bobs → escape → re-dispatch → bob …, the halt this fixes). Reuses the scanner's
-// own standability predicate (classifyFloor: solid walkable floor + clear feet/head) and reachFromStand
-// (Law 16 — one standability metric, one reach metric). A wheat_plot_pair is one anchor + an adjacent
-// crop, so a cell within BLOCK_REACH of the anchor reaches the whole plot; the small ring reflects that.
-//
-// opts.fallback === false — the anchor's own floor or nothing. A blueprint whose anchors are BUILT BY EACH OTHER
-// (wheat_tine_row: the next row stands on this row's land block) declares `stand_fallback: false`: a missing
-// stand there means "the row behind has not laid it yet", and the nearest dry lip would be farmland or another
-// row's anchor, so the row waits stranded until the row behind rebuilds it.
+// resolveStandableAnchor — given a plot/anchor FLOOR cell, returns a standable stand to work
+// from: the anchor's own feet if standable, else the nearest standable cell within reach.
+// Returns { floor, feet, alternate } or null when nothing standable reaches the plot. Reuses
+// classifyFloor and reachFromStand (Law 16 — one standability metric, one reach metric).
+// opts.fallback === false restricts to the anchor's own floor or nothing, for a blueprint whose
+// anchors are built by each other (wheat_tine_row: a missing stand means the row behind hasn't
+// laid it yet).
 function resolveStandableAnchor(bot, anchorFloor, opts = {}) {
   const reach = opts.reach || BLOCK_REACH;
   const af = new Vec3(anchorFloor.x, anchorFloor.y, anchorFloor.z);
@@ -256,8 +196,8 @@ function resolveStandableAnchor(bot, anchorFloor, opts = {}) {
     return { floor: { x: af.x, y: af.y, z: af.z }, feet: feetOf(af.x, af.y, af.z), alternate: false };
   }
   if (opts.fallback === false) return null;
-  // Fallback: nearest standable floor in an expanding ring (±1 in Y for a stepped bank) whose feet-eye
-  // still reaches the anchor cell — the dry lip beside the water-damaged plot.
+  // Fallback: nearest standable floor in an expanding ring (±1 in Y for a stepped bank) whose
+  // feet-eye still reaches the anchor cell.
   for (let r = 1; r <= 2; r++) {
     let best = null, bestD = Infinity;
     for (let dx = -r; dx <= r; dx++) {
@@ -278,39 +218,41 @@ function resolveStandableAnchor(bot, anchorFloor, opts = {}) {
   return null;
 }
 
-// findStandableNeighbor — a cardinal cell beside the stand the bot can stand on: solid full-block
-// support below, air at feet + head. Returns { dx, dz } or null. Used to step OFF the anchor so the
-// footing block underneath can be modified without the bot standing on it (see sidestepFooting).
+// findStandableNeighbor — a cardinal cell beside stand with solid support below and air at
+// feet/head. Returns { dx, dz } or null: a cell to step off the anchor onto, so its footing can
+// be modified without the bot standing on it.
+// The same level is asked first; on a staircase the cells beside the stand are one step up and one step
+// down, so those are asked next and come back with `dy`.
 function findStandableNeighbor(bot, stand) {
-  for (const { dx, dz } of [{ dx: 1, dz: 0 }, { dx: -1, dz: 0 }, { dx: 0, dz: 1 }, { dx: 0, dz: -1 }]) {
-    const support = bot.blockAt(new Vec3(stand.x + dx, stand.y - 1, stand.z + dz));
-    const feet    = bot.blockAt(new Vec3(stand.x + dx, stand.y,     stand.z + dz));
-    const head    = bot.blockAt(new Vec3(stand.x + dx, stand.y + 1, stand.z + dz));
-    if (support && support.boundingBox === 'block'
-        && (!feet || isAir(feet.name)) && (!head || isAir(head.name))) {
-      return { dx, dz };
+  for (const dy of [0, 1, -1]) {
+    for (const { dx, dz } of [{ dx: 1, dz: 0 }, { dx: -1, dz: 0 }, { dx: 0, dz: 1 }, { dx: 0, dz: -1 }]) {
+      const support = bot.blockAt(new Vec3(stand.x + dx, stand.y + dy - 1, stand.z + dz));
+      const feet    = bot.blockAt(new Vec3(stand.x + dx, stand.y + dy,     stand.z + dz));
+      const head    = bot.blockAt(new Vec3(stand.x + dx, stand.y + dy + 1, stand.z + dz));
+      if (support && support.boundingBox === 'block'
+          && (!feet || isAir(feet.name)) && (!head || isAir(head.name))) {
+        return { dx, dz, dy };
+      }
     }
   }
   return null;
 }
 
-// sidestepFooting — do the work on the block the bot stands on (the footing at stand.y-1) WITHOUT the old
-// fall-and-pillar dance. The footing must exist continuously (it is what holds the bot up), so a
-// naive dig-all/place-all split drops the bot into the cell and pillarSteps it back — the "it fell
-// off the anchor" bug. Instead: step to a solid neighbor, dig the old footing + place the new one
-// FROM THE SIDE (the bot no longer occupies the cell, so evaluatePlacement sees a normal side attach,
-// not under-feet), then step back onto the fresh footing. Movement is stepHorizontal (one cardinal
-// block, no goTo) so it never reaches the locomotion judge. Returns { handled, digOk, ... }; handled
-// is false when no neighbor exists to stand on — the caller then DEFERS the footing (never falls).
-// Handles a REPLACE (dig+place), a bare PLACE, or a bare DIG; the step-back is conditional on the
-// footing actually being there afterwards, which is what makes the bare-dig case safe.
+// sidestepFooting — replaces the block the bot stands on (footing at stand.y-1) without dropping
+// the bot into the cell: step to a solid neighbor, dig/place the footing from the side (a normal
+// side attach, not under-feet), then step back onto it if it now exists. Movement is
+// stepHorizontal (one cardinal block, no goTo) so it never reaches the locomotion judge. Returns
+// { handled, digOk, ... }; handled is false when no neighbor exists — the caller then defers.
 async function sidestepFooting(bot, stand, footingDig, footingPlace, ops) {
   const { digOne, placeOne } = ops;
   const nb = findStandableNeighbor(bot, stand);
   if (!nb) return { handled: false };
 
+  // One cardinal block on the level is a plain step; a step up or down a stair is a walk of one cell.
+  const aside = { x: stand.x + nb.dx, y: stand.y + nb.dy, z: stand.z + nb.dz };
+  const walk = async (to) => !!(await locomotion.goTo({ x: to.x, y: to.y, z: to.z, exact: true, leg: 'work' }))?.arrived;
   await microCenter(bot);
-  if (!await stepHorizontal(bot, nb.dx, nb.dz)) return { handled: false };
+  if (!(nb.dy ? await walk(aside) : await stepHorizontal(bot, nb.dx, nb.dz))) return { handled: false };
   await microCenter(bot);
 
   let digOk = 0, digFail = 0, placeOk = 0, placeFail = 0;
@@ -326,58 +268,41 @@ async function sidestepFooting(bot, stand, footingDig, footingPlace, ops) {
     }
   }
 
-  // Return onto the footing ONLY IF IT STILL EXISTS — re-sensed, never assumed (Law 23). With a replace
-  // this is a formality (the place just rebuilt it). With a BARE footing dig there is now a hole, and the
-  // old unconditional step-back would have walked the bot straight into the drop it stepped aside to
-  // avoid — turning the safety manoeuvre into the fall. Staying aside is the correct end state: the caller
-  // re-runs ensureAtAnchor on the next phase and locomotion re-approaches from wherever the bot actually is.
+  // Return onto the footing only if it still exists — re-sensed, never assumed (Law 23); staying
+  // aside otherwise is the correct end state, and the caller re-runs ensureAtAnchor next phase.
   const footingCell = new Vec3(stand.x, stand.y - 1, stand.z);
   const footingNow = bot.blockAt(footingCell);
   const footingSolid = !!(footingNow && footingNow.boundingBox === 'block');
   if (footingSolid) {
-    await stepHorizontal(bot, -nb.dx, -nb.dz);
+    if (nb.dy) await walk(stand); else await stepHorizontal(bot, -nb.dx, -nb.dz);
     await microCenter(bot);
   }
   return { handled: true, digOk, digFail, placeOk, placeFail, steppedBack: footingSolid };
 }
 
-// repairAtAnchor — the shared stationary dig-all/place-all routine. See file header for
-// the full contract. Mirrors build_executor's proven innerBuildStationary loop exactly;
-// the per-block mechanics (digOne/placeOne) and item policy (resolveItem/isOptional) are
+// repairAtAnchor — the shared stationary dig-all/place-all routine (see file header for the
+// contract). Per-block mechanics (digOne/placeOne) and item policy (resolveItem/isOptional) are
 // injected so mining and building share the control flow without merging their domains.
 async function repairAtAnchor(bot, job, ops) {
   const { stand, steps, label } = job;
-  const { digOne, placeOne, resolveItem, isOptional, stationTypes, tag } = ops;
+  const { digOne, placeOne, resolveItem, isOptional, tag } = ops;
   const maxPlaceAttempts = ops.maxPlaceAttempts || 3;
 
   let digOk = 0, digFail = 0, placeOk = 0, placeFail = 0, alreadyOk = 0;
-  let cheatPlaced = 0, deferred = 0, underFeetOk = 0, materialShort = 0, skipped = 0;
+  let cheatPlaced = 0, deferred = 0, underFeetOk = 0, pocketShort = 0, skipped = 0;
   let placeMsTotal = 0, slowestPlaceMs = 0, slowestPlaceAt = null, slowPlaces = 0;
   const digFailPositions = [];
   const placeFailPositions = [];
   const deferReasons = {};
-  // material_short is its OWN bucket, never folded into `deferred` — a REQUIRED block the bot doesn't
-  // hold. A defer waits on a support a later pass places (retrying helps); a material short won't heal
-  // by retrying (a fresh block won't appear), so the caller must RELEASE for resupply instead of
-  // spinning the same doomed pass. Conflating the two masked build_executor's anchor-abandon guard and
-  // let a dirt-out build spin until the strict judge killed it (Architect 2026-07-13, the halt this fixes).
+  // pocket_short is its own bucket, never folded into `deferred` — a required block this body
+  // does not hold; unlike a defer it will not heal by retrying, so the caller releases for resupply.
   const shortMaterials = {};
 
-  // Footing = the block the bot stands on (stand.y-1). When the blueprint REPLACES it (a place step
-  // there, optionally paired with a dig step), doing that in the bulk pass drops the bot into the cell
-  // and pillarSteps it back — the fall the caller wants gone. If ops.footingSidestep is set (build
-  // opts in; mining does not, so its descent model is untouched), pull those steps OUT of the bulk
-  // loops and handle them atomically via sidestepFooting AFTER the rest of the cell is built (the bot
-  // keeps standing on the old footing meanwhile). Only a REPLACE (footingPlace present) is diverted; a
-  // bare footing dig with no replacement stays in the bulk pass (genuine floor removal, left as-is).
-  //
-  // A BARE FOOTING DIG (dig with no replacement) IS ALSO DIVERTED, as of 2026-07-21 — it used to stay in
-  // the bulk pass as "genuine floor removal, left as-is", which is the hole the Architect hit: the bot mined
-  // the block it was standing on. Under the opt-in it is now stepped aside for like any other footing work,
-  // and deferred if there is nowhere to step. Callers that legitimately dig their own floor — the mining
-  // descent, locomotion's dig-down — simply never set `footingSidestep`, so their model is untouched; that
-  // opt-in is what keeps this from becoming a global ban on digging downward (Law 16: one behaviour, chosen
-  // by the caller that owns the domain, not a second dig pathway).
+  // Footing = the block the bot stands on (stand.y-1). Replacing it in the bulk pass drops the
+  // bot into the cell, so when ops.footingSidestep is set those steps are pulled out and handled
+  // atomically via sidestepFooting after the rest of the cell is built. Callers that legitimately
+  // dig their own floor (mining descent, locomotion's dig-down) leave it unset (Law 16: one
+  // behaviour, chosen by the caller that owns the domain).
   const footingSidestep = !!ops.footingSidestep;
   const atFooting = (s) => s.place.x === stand.x && s.place.y === stand.y - 1 && s.place.z === stand.z;
   const footingPlace = footingSidestep ? (steps.find(s => s.action === 'place' && atFooting(s)) || null) : null;
@@ -387,65 +312,83 @@ async function repairAtAnchor(bot, job, ops) {
   watcher.buffer.open(tag);
   await combatCheckpoint(bot, 'repair');
 
+  // A STAND THE BODY CANNOT GET TO IS WORKED TOWARD FROM WHERE THE BODY STANDS. A stand hanging in a cave has
+  // no floor to walk onto until this job's own blocks are placed. The walk is tried once; when it does not
+  // arrive, `from` becomes the cell the body stopped in and every step is measured from there: a step in
+  // reach is worked, a step out of reach is deferred, and the caller's next pass walks further on the floor
+  // this pass laid.
+  let from = stand;
+  let offStand = false;
+  const outOfReach = (pos) => offStand && reachFromStand(bot, from, pos) > BLOCK_REACH;
   async function ensureAtAnchor() {
     const feet = bot.entity.position.floored();
-    // Stand DIRECTLY on the anchor — the exact stand cell (anchor block Y+1), never a block off.
-    // Reach here is measured deterministically from the microCentered stand block, so even a
-    // 1-block offset puts the far voxels of a cell-sized volume out of reach (Architect: "it cant
-    // reach everything if its a block off"). goTo exact-mode lands the FEET on the cell rather than
-    // within 1.5, so once arrived feet === stand and this skips goTo on every later phase of the
-    // pass — it never re-issues an identical goTo (the thing that tripped the strict locomotion
-    // guard back when goTo could only arrive within tolerance and the offset persisted). A genuine
-    // can't-stay-on-the-anchor loop DOES re-fire goTo and is still correctly caught as a stall.
-    if (feet.x !== stand.x || feet.y !== stand.y || feet.z !== stand.z) {
-      await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z, exact: true });
+    // Stand directly on the anchor cell (never a block off) — reach from the microCentered stand
+    // is deterministic, so a 1-block offset puts far voxels out of reach.
+    if (!offStand && (feet.x !== stand.x || feet.y !== stand.y || feet.z !== stand.z)) {
+      // A stand with nothing under it is never walked onto: the body goes to the nearest floor that reaches it
+      // (resolveStandableAnchor), or stays where it is when there is none.
+      const floor = { x: stand.x, y: stand.y - 1, z: stand.z };
+      const under = bot.blockAt(new Vec3(floor.x, floor.y, floor.z));
+      const near = under && under.boundingBox === 'block' ? { feet: stand, alternate: false } : resolveStandableAnchor(bot, floor);
+      // With no floor to aim at, a body still far off walks toward the stand as far as the route goes (the
+      // navigator stops where the ground does); a body already close works from where it is.
+      const far = Math.hypot(feet.x - stand.x, feet.y - stand.y, feet.z - stand.z) > 2 * BLOCK_REACH;
+      const to = near ? near.feet : far ? stand : null;
+      const went = to ? await locomotion.goTo({ x: to.x, y: to.y, z: to.z, exact: true, leg: 'work' }) : null;
+      const now = bot.entity.position.floored();
+      if (now.x !== stand.x || now.y !== stand.y || now.z !== stand.z) {
+        offStand = true;
+        from = { x: now.x, y: now.y, z: now.z };
+        watcher.summary(tag, `STAND_UNREACHED ${label} stand=(${stand.x},${stand.y},${stand.z}) working_from=(${from.x},${from.y},${from.z}) `
+          + `reason=${!to ? 'no floor under the stand and none near it' : !near || near.alternate ? 'no floor under the stand' : (went?.reason || 'none given')}`);
+      }
     }
     await microCenter(bot);
   }
-  // ── Dig ALL (top-down). Cheat-dig: reach-distance gate only, no LOS — the server
-  // accepts breaking an occluded block (proven by shaft mining). Reach is asserted from the
-  // microCentered stand block (deterministic): an unreachable dig target is a coverage fault
-  // → Law 13 throw (assertReachable), never a soft skip that would leave rock in the walkway.
+  // ── Dig ALL (top-down). Cheat-dig: reach-distance gate only, no LOS. Reach is asserted from
+  // the microCentered stand; an unreachable target is a coverage fault → Law 13 throw.
   await ensureAtAnchor();
   const digSteps = steps.filter(s => s.action === 'dig' && !isFootingStep(s)).sort((a, b) => b.place.y - a.place.y);
   for (const s of digSteps) {
     const pos = new Vec3(s.place.x, s.place.y, s.place.z);
-    const reach = assertReachable(bot, stand, pos, 'dig', label);
+    if (outOfReach(pos)) { deferred++; deferReasons.off_stand = (deferReasons.off_stand || 0) + 1; continue; }
+    const reach = assertReachable(bot, from, pos, 'dig', label);
     await combatCheckpoint(bot, 'repair');
     const had = bot.blockAt(pos);
     watcher.buffer.record(tag, `dig (${pos.x},${pos.y},${pos.z}) ${had?.name || '?'} reach=${reach.toFixed(2)} (want ${normalizeBlockName(s.type)})`);
     if (await digOne(s)) { digOk++; watcher.buffer.record(tag, `  → cleared`); }
-    else { digFail++; digFailPositions.push(`(${pos.x},${pos.y},${pos.z})`); watcher.buffer.record(tag, `  → FAILED`); watcher.warn(tag, `Dig failed at (${pos.x},${pos.y},${pos.z}) type=${s.type}`); }
+    else { digFail++; digFailPositions.push(`(${pos.x},${pos.y},${pos.z})`); watcher.buffer.record(tag, `  → FAILED`); }
   }
   const digFailStr = digFailPositions.length ? ` | failed: ${digFailPositions.join(' ')}` : '';
   watcher.summary(tag, `${label} dig: cleared ${digOk}, failed ${digFail} (of ${digSteps.length})${digFailStr}`);
 
-  // ── Place ALL (bottom-up so each course has a placed reference below). findAttachable
-  // picks a solid neighbour and bot.placeBlock(ref, face) places against it with no raycast
-  // — the corner cheat is intrinsic here.
+  // ── Place ALL (bottom-up so each course has a placed reference below). findAttachable picks a
+  // solid neighbour and bot.placeBlock(ref, face) places against it with no raycast.
   await ensureAtAnchor();
   const placeSteps = steps.filter(s => s.action === 'place' && !isFootingStep(s)).sort((a, b) => a.place.y - b.place.y);
   for (const s of placeSteps) {
     await combatCheckpoint(bot, 'repair');
     const dt = normalizeBlockName(s.type);
     const pos = new Vec3(s.place.x, s.place.y, s.place.z);
-    // Deterministic reach gate (Law 13): unreachable from the microCentered stand = coverage
-    // fault → throw. A footing block (at/under the stand) is always within reach, so this never
-    // fires on the under-feet path; only a genuinely too-far voxel trips it.
-    assertReachable(bot, stand, pos, 'place', label);
+    // Deterministic reach gate (Law 13): unreachable from the microCentered stand is a coverage
+    // fault → throw. A footing block is always within reach, so this never fires on that path.
+    if (outOfReach(pos)) { deferred++; deferReasons.off_stand = (deferReasons.off_stand || 0) + 1; continue; }
+    assertReachable(bot, from, pos, 'place', label);
 
     let outcome = null;        // 'ok' | 'already' | 'skipped' | 'defer' | 'fail'
     let lastReason = null;
     let wasUnderFeet = false, wasCorner = false;
+    // The caller's own preparation of this step (a builder stands up a block's support first), and its cleanup
+    // once the step is tallied, whatever the outcome.
+    if (ops.beforePlace) await ops.beforePlace(s);
 
     for (let attempt = 1; attempt <= maxPlaceAttempts; attempt++) {
-      const ev = evaluatePlacement(bot, s, stand);
+      const ev = evaluatePlacement(bot, s, from);
 
       if (!ev.ok) {
         lastReason = ev.reason || '?';
-        // out_of_range on a stationary cell-sized build almost always means the bot drifted
-        // or fell one block off the anchor — re-anchor and retry before deferring.
-        // no_attach_point/too_close are genuine "wait for a neighbour" defers.
+        // out_of_range means the bot drifted off the anchor — re-anchor and retry before
+        // deferring. no_attach_point/too_close are genuine "wait for a neighbour" defers.
         if (ev.reason === 'out_of_range' && attempt < maxPlaceAttempts) {
           watcher.buffer.record(tag, `out_of_range (${pos.x},${pos.y},${pos.z}) — re-anchoring (attempt ${attempt}/${maxPlaceAttempts})`);
           await ensureAtAnchor();
@@ -456,10 +399,8 @@ async function repairAtAnchor(bot, job, ops) {
         break;
       }
 
-      // Runtime under-feet re-check: if the bot's body now occupies the target cell (it dug
-      // its own footing/floor and fell into it since eval time), force the under-feet path —
-      // a normal placeBlock here would time out. The executor's placeOne pillarSteps, which
-      // settles the bot before placing.
+      // Runtime under-feet re-check: if the bot now occupies the target cell (fell in since eval
+      // time), force the under-feet path so placeOne pillarSteps before placing.
       if (!ev.underFeet && botOccupiesCell(bot, pos)) {
         ev.underFeet = true;
         watcher.buffer.record(tag, `runtime under-feet: bot occupies (${pos.x},${pos.y},${pos.z}) → pillarStep`);
@@ -467,50 +408,16 @@ async function repairAtAnchor(bot, job, ops) {
       wasUnderFeet = ev.underFeet;
       wasCorner = isEnclosedCorner(bot, pos);
 
-      // ── A STATION WITH NOTHING BUT STATIONS TO LEAN ON IS A DEFER, NOT A CRASH ────────────────────
-      // This threw as a Law 13 coding violation until 2026-09-01, on the theory that only a bad
-      // BLUEPRINT could produce a station whose every solid neighbour is another station. The first
-      // live run after it was written disproved that outright, and the Architect called it from the
-      // trace: *"it legitimatley made a placing mistake and didnt put a plank down then couldnt put a
-      // furnace on top of it and then it crashed. thats an enviormental problem so remove that code 13
-      // violation and let it retry."*
-      //
-      // He is right, and the reason is worth keeping because the same mistake is easy to make again:
-      // **the check measured the WORLD and returned a verdict about the DESIGN.** The headframe authors
-      // planks directly under that furnace — the blueprint is sound. What was missing was a block the
-      // build had not laid yet, or had failed to lay, which is the definition of a transient. A halt
-      // there converts one unplaced plank into a dead fleet, and it takes the whole run down with it
-      // (Law 13's own line: environmental failure defers, only a contradiction throws).
-      //
-      // So it defers with the neighbour list on the record, joining the `no_attach_point` family, and
-      // the build comes back to it once something non-station is standing beside it.
-      if (stationTypes && stationTypes.has(dt)) {
-        let hasNonStationNeighbor = false;
-        const solidNeighbors = [];
-        for (const { d } of ATTACH_DIRS) {
-          const nb = bot.blockAt(pos.plus(d));
-          if (nb && !isAir(nb.name)) {
-            solidNeighbors.push(nb.name);
-            if (!stationTypes.has(nb.name)) hasNonStationNeighbor = true;
-          }
-        }
-        if (solidNeighbors.length > 0 && !hasNonStationNeighbor) {
-          lastReason = `station_needs_non_station_face [${solidNeighbors.join(',')}]`;
-          outcome = 'defer';
-          watcher.buffer.record(tag, `defer (${pos.x},${pos.y},${pos.z}) ${dt}: ${lastReason} — waiting for a non-station neighbour`);
-          break;
-        }
-      }
+      // A station whose every reachable neighbour is another station still defers (no_attach_point):
+      // an unplaced neighbour is an environmental transient, not a blueprint fault.
 
       if (!resolveItem(dt)) {
         if (isOptional(dt)) { outcome = 'skipped'; break; }
-        // REQUIRED block not held. Its own outcome (not a defer): a fresh unit won't appear on retry, so
-        // the caller releases for resupply rather than re-running the pass. Recorded to the buffer, not
-        // warned — with the pool model a required-short mid-build (dual-role dirt burned pillaring) is an
-        // expected transient the supply loop refills, not a gate failure. build_executor warns once on release.
-        lastReason = 'material_short';
-        watcher.buffer.record(tag, `material_short (${pos.x},${pos.y},${pos.z}) ${dt}: required block not in inventory`);
-        outcome = 'material_short'; break;
+        // Required block not held — its own outcome, not a defer: it won't appear on retry, so
+        // the caller releases for resupply instead of re-running the pass.
+        lastReason = 'pocket_short';
+        watcher.buffer.record(tag, `pocket_short (${pos.x},${pos.y},${pos.z}) ${dt}: required block not in inventory`);
+        outcome = 'pocket_short'; break;
       }
 
       const cls = wasUnderFeet ? 'footing/pillar' : (wasCorner ? 'corner-cheat' : 'normal');
@@ -518,13 +425,9 @@ async function repairAtAnchor(bot, job, ops) {
       watcher.buffer.record(tag, `place (${pos.x},${pos.y},${pos.z}) ${dt} [${cls}] ref=${refStr} attempt ${attempt}/${maxPlaceAttempts}`);
       const tPlace = Date.now();
       const result = await placeOne(s, ev);
-      // Per-step wall clock. placeOne's cost is bounded by its own dig+placeBlock, so a step running
-      // for seconds means the underlying dig is being penalised (server-side dig speed: head-in-water
-      // and off-ground each multiply dig time 5x, 25x together) — invisible before, because every
-      // record in this loop is buffered and a clean run never dumps the buffer. A whole phase could
-      // burn minutes and report only "placed 19, failed 0" (observed live: 19 places / 5m10s of
-      // total silence, farm anchor 0, 2026-07-15). Track the worst offender and the total so the
-      // phase summary can never again hide its own duration (Law 5/6).
+      // Per-step wall clock: a step running for seconds means the underlying dig is penalised
+      // (head-in-water / off-ground dig-speed multipliers). Tracked so the phase summary can
+      // never hide its own duration (Law 5/6).
       const stepMs = Date.now() - tPlace;
       placeMsTotal += stepMs;
       if (stepMs > slowestPlaceMs) { slowestPlaceMs = stepMs; slowestPlaceAt = `${dt}@(${pos.x},${pos.y},${pos.z}) [${cls}]`; }
@@ -545,31 +448,29 @@ async function repairAtAnchor(bot, job, ops) {
     if (outcome === 'ok') {
       placeOk++;
       if (wasCorner) cheatPlaced++;
-      // An under-feet placement pillared the bot up one block — return to the anchor stand
-      // position so remaining steps measure reach correctly (never keep building displaced).
+      // An under-feet placement pillared the bot up one block — return to the stand so
+      // remaining steps measure reach correctly.
       if (wasUnderFeet) { underFeetOk++; await ensureAtAnchor(); }
       watcher.buffer.record(tag, `  → placed${wasCorner ? ' (corner cheat)' : ''}${wasUnderFeet ? ' (footing pillar)' : ''}`);
     } else if (outcome === 'already') {
       alreadyOk++; watcher.buffer.record(tag, `  → already correct`);
     } else if (outcome === 'skipped') {
-      // An optional step whose material is not held. A first-class terminal outcome, NOT a no-op: the
-      // caller needs a nonzero count to tell "skipped an optional" from "did nothing", else an
-      // optional-only anchor loops zero-progress into a portable_judge strict-kill. Distinct from
-      // material_short (required → resupply): an optional is provisioned independently and never gates.
-      // UNREACHABLE while OPTIONAL_BUILD_MATERIALS is empty — kept because the branch is what makes the
-      // set's emptiness a policy the config owns rather than a shape this file cannot express.
+      // Optional step whose material is not held — a first-class terminal outcome, not a no-op:
+      // the caller needs a nonzero count to tell "skipped an optional" from "did nothing", else an
+      // optional-only anchor loops zero-progress into a strict-kill.
       skipped++; watcher.buffer.record(tag, `  → skipped (optional, not in inventory)`);
-    } else if (outcome === 'material_short') {
-      materialShort++;
+    } else if (outcome === 'pocket_short') {
+      pocketShort++;
       shortMaterials[dt] = (shortMaterials[dt] || 0) + 1;
       watcher.buffer.record(tag, `  → material short`);
     } else if (outcome === 'defer') {
       deferReasons[lastReason || '?'] = (deferReasons[lastReason || '?'] || 0) + 1;
       deferred++;
     } else {
-      placeFail++; placeFailPositions.push(`(${pos.x},${pos.y},${pos.z})${dt}`);
-      watcher.buffer.record(tag, `  → FAILED`);
+      placeFail++; placeFailPositions.push(`(${pos.x},${pos.y},${pos.z})${dt}${s.failReason ? `[${s.failReason}]` : ''}`);
+      watcher.buffer.record(tag, `  → FAILED${s.failReason ? `: ${s.failReason}` : ''}`);
     }
+    if (ops.afterPlace) await ops.afterPlace(s);
   }
   // ── Footing REPLACE (sidestep): after the rest of the cell is built, swap the block the bot has
   // been standing on — step aside, dig+place it from the side, step back. No fall (see sidestepFooting).
@@ -582,8 +483,7 @@ async function repairAtAnchor(bot, job, ops) {
       if (res.placeFail) placeFailPositions.push(`(${fp.x},${fp.y},${fp.z})${normalizeBlockName(footingPlace.type)}`);
       watcher.buffer.record(tag, `footing (${fp.x},${fp.y},${fp.z}) replaced by sidestep: dig ${res.digOk}/${res.digOk + res.digFail}, place ${res.placeOk}/${res.placeOk + res.placeFail}`);
     } else {
-      // No neighbor to stand on right now — DEFER rather than fall. A later pass (more of the cell
-      // built) usually opens a neighbor; if never, the anchor's stuck logic takes over.
+      // No neighbor to stand on right now, so the footing swap defers.
       deferred++;
       deferReasons['footing_no_sidestep'] = (deferReasons['footing_no_sidestep'] || 0) + 1;
       await ensureAtAnchor();
@@ -594,15 +494,15 @@ async function repairAtAnchor(bot, job, ops) {
   const cheatStr = cheatPlaced > 0 ? ` (${cheatPlaced} corner cheat-placed)` : '';
   const footStr = underFeetOk > 0 ? `, footing ${underFeetOk}` : '';
   const deferStr = Object.keys(deferReasons).length ? ` | deferred: ${Object.entries(deferReasons).map(([r, c]) => `${c}×${r}`).join(', ')}` : '';
-  const shortStr = materialShort > 0 ? ` | material_short: ${Object.entries(shortMaterials).map(([m, c]) => `${c}×${m}`).join(', ')}` : '';
+  const shortStr = pocketShort > 0 ? ` | pocket_short: ${Object.entries(shortMaterials).map(([m, c]) => `${c}×${m}`).join(', ')}` : '';
   const failStr = placeFailPositions.length ? ` | failed: ${placeFailPositions.join(' ')}` : '';
   const timeStr = ` | ${(placeMsTotal / 1000).toFixed(1)}s`;
   const slowStr = slowPlaces > 0
     ? ` (${slowPlaces} slow ≥${SLOW_PLACE_MS / 1000}s, worst ${(slowestPlaceMs / 1000).toFixed(1)}s ${slowestPlaceAt})`
     : '';
   watcher.summary(tag, `${label} place: placed ${placeOk}${cheatStr}${footStr}, failed ${placeFail}, already ${alreadyOk}, deferred ${deferred} (of ${placeSteps.length})${timeStr}${slowStr}${deferStr}${shortStr}${failStr}`);
-  // A phase that spent most of its wall clock inside slow steps is degraded even though every step
-  // "succeeded" — the failure mode has no failure count, so it must warn on duration or stay invisible.
+  // A phase spent mostly in slow steps is degraded even though every step "succeeded" — warn on
+  // duration since that failure mode has no failure count.
   if (slowPlaces > 0 && placeMsTotal >= SLOW_PLACE_MS * 2) {
     watcher.warn(tag, `${label} place ran ${(placeMsTotal / 1000).toFixed(1)}s for ${placeSteps.length} step(s) — ${slowPlaces} step(s) ≥${SLOW_PLACE_MS / 1000}s, worst ${(slowestPlaceMs / 1000).toFixed(1)}s at ${slowestPlaceAt}. Dig-speed penalty (head in water / off ground = 5x each, 25x together) or a stalled placeBlock.`);
   }
@@ -610,10 +510,43 @@ async function repairAtAnchor(bot, job, ops) {
   return {
     dig_ok: digOk, dig_fail: digFail, place_ok: placeOk, place_fail: placeFail,
     already_ok: alreadyOk, deferred, cheat_placed: cheatPlaced, under_feet_ok: underFeetOk,
-    material_short: materialShort, short_materials: shortMaterials, skipped,
+    pocket_short: pocketShort, short_materials: shortMaterials, skipped,
     place_ms_total: placeMsTotal, slowest_place_ms: slowestPlaceMs, slow_places: slowPlaces,
     dig_fail_positions: digFailPositions, place_fail_positions: placeFailPositions, defer_reasons: deferReasons,
   };
 }
 
-module.exports = { repairAtAnchor, evaluatePlacement, findAttachable, describeNeighborhood, isEnclosedCorner, botOccupiesCell, reachFromStand, nearestFaceDist, resolveStandableAnchor, findStandableNeighbor, ATTACH_DIRS, isInteractable };
+// ── A VOXEL SET IS WORKED UNTIL IT SETTLES ────────────────────────────────────────────────────────────
+// One cycle is: read the world (`rescan` → the steps still owed), dig every dig step, place every place step
+// (`work`). Cycles repeat so what a dig sets loose — gravel dropping into a cleared cell, the empty slot it
+// left in the ceiling or wall — is dug and sealed before the caller moves on. The loop ends on exactly one of:
+//   clean      the rescan owes nothing;
+//   no_moves   a cycle dug and placed nothing (what is left is deferred, short or refused);
+//   repeat     the rescan owes a step set already worked this settle — the world undid the work;
+//   cycle_cap  SETTLE_MAX_CYCLES cycles ran.
+// It never routes a signal: it returns, and the caller routes once (Law 4).
+const SETTLE_MAX_CYCLES = 6;
+
+async function settle({ rescan, work, label, tag }) {
+  const totals = { dig_ok: 0, dig_fail: 0, place_ok: 0, place_fail: 0, deferred: 0, cheat_placed: 0, skipped: 0, pocket_short: 0, short_materials: {} };
+  const worked = new Set();
+  let cycles = 0, stop = null, steps = rescan();
+  while (true) {
+    if (steps.length === 0) { stop = 'clean'; break; }
+    const sig = steps.map(s => `${s.action}:${s.place.x},${s.place.y},${s.place.z}:${s.type}`).sort().join('|');
+    if (worked.has(sig)) { stop = 'repeat'; break; }
+    if (cycles >= SETTLE_MAX_CYCLES) { stop = 'cycle_cap'; break; }
+    worked.add(sig);
+    cycles++;
+    const r = await work(steps, cycles);
+    for (const k of ['dig_ok', 'dig_fail', 'place_ok', 'place_fail', 'deferred', 'cheat_placed', 'skipped', 'pocket_short']) totals[k] += r[k] || 0;
+    for (const [m, c] of Object.entries(r.short_materials || {})) totals.short_materials[m] = (totals.short_materials[m] || 0) + c;
+    const moved = (r.dig_ok || 0) + (r.place_ok || 0);
+    steps = rescan();
+    if (moved === 0 && steps.length > 0) { stop = 'no_moves'; break; }
+  }
+  watcher.summary(tag, `${label} settle: ${stop} after ${cycles} cycle(s) — dug ${totals.dig_ok}, placed ${totals.place_ok}, ${steps.length} step(s) left`);
+  return { ...totals, cycles, stop, remaining: steps.length, remaining_steps: steps };
+}
+
+module.exports = { settle, SETTLE_MAX_CYCLES, repairAtAnchor, evaluatePlacement, findAttachable, describeNeighborhood, isEnclosedCorner, botOccupiesCell, reachFromStand, standEye, nearestFaceDist, resolveStandableAnchor, findStandableNeighbor, ATTACH_DIRS, isInteractable };

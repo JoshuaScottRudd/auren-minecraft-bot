@@ -1,75 +1,45 @@
 // fragment: death_manager (action / death recovery) — the MANAGER seat for coming back from a death.
 //
-// ── THE SEAT ───────────────────────────────────────────────────────────────────────────────────────────
-// Law 11's Manager: it takes the diff (there is no body / the body is in the wrong place), produces an
-// ORDERED action plan, and VERIFIES each result. That verification is what makes this a manager and not a
-// one-shot executor — it is the same discipline eat_manager runs, and it earns the name the same way:
-//   ACT 1  spawn    — click respawn, then SENSE whether a body came back.
-//   ACT 2  teleport — put the body on the recovery point, then SENSE whether it actually moved.
+// Law 11's Manager: takes the diff (no body, or the body is in the wrong place), produces an ordered
+// action plan, and verifies each result — the same discipline eat_manager runs.
+//   ACT 1  spawn    — click respawn, then sense whether a body came back.
+//   ACT 2  teleport — put the body on the recovery point, then sense whether it actually moved.
 // Neither act trusts its own command. A respawn packet accepted is not a body; an RCON `tp` returning
-// cleanly is not an arrival (Law 26 — a machine's truth guarantee holds only for what actually ran, and
-// what ran here is the SERVER, so the outcome is read, never assumed; Law 25 — the verdict this fragment
-// reports is measured against "is the bot standing where it was asked to be", not "did I send the two
-// commands").
+// cleanly is not an arrival (Law 26 — the outcome is read off the server, never assumed; Law 25 — the
+// verdict is measured against where the bot is standing, not which commands were sent).
 //
-// It delegates to no executor, and that is deliberate rather than an omission: each act is a single
-// command whose entire substance is the verification around it. An executor per packet would be a
-// fragment that forwards one string and reports what it cannot check (Law 0 — that is not a second verb,
-// it is half of this one).
+// Delegates to no executor: each act is a single command whose entire substance is the verification
+// around it (Law 0 — an executor per packet would forward one string and report what it cannot check).
 //
-// ── HOW IT TELEPORTS ────────────────────────────────────────────────────────────────────────────────────
-// It is not a mineflayer client command — a plain client has no console. The fleet has RCON:
-// `js_kernel/utils/rcon_link` is the ONE shared
-// implementation (camera_rig, fleet_control, lanista and the probes all reach it — Law 16, consolidated
-// from three copies), it reads the local `server.properties`, and any process on this box can open a
-// session. So the bot cannot teleport ITSELF as a client, and the fleet can teleport it as an operator.
+// Teleport goes through RCON (`js_kernel/utils/rcon_link`, the one shared implementation — Law 16), since
+// a plain client has no console and cannot teleport itself. No walk fallback: a teleport that cannot
+// happen is reported as a failure and the judge replans from where the body actually is.
 //
-// NO WALK FALLBACK, on purpose. An earlier draft walked home with goToStand when the teleport was
-// unavailable, and that is precisely the fallback Law 16 forbids: a second route that silently does the
-// primary's job, reached exactly when nobody is watching. A teleport that cannot happen is reported as a
-// failure and the judge replans from where the body actually is.
-//
-// ── THE RECOVERY POINT — TWO LADDERS, ONE PER SPECIES ─────────────────────────────────────────────────
-// Only the DESTINATION is species-dependent. ACT 1 is identical (a corpse is a corpse, and master_core
-// runs with respawn:false either way) and ACT 2 is identical (a cell goes in, an arrival is sensed), so
-// the branch lives in recoveryPoint and nowhere else. A second death manager for contractors would be
-// Law 16's forbidden parallel route: same two acts, same verification, a different table.
-// A CONTRACTOR'S LADDER IS IN recoveryPoint ITSELF — its own sited house, then the human who summoned it,
-// then world spawn. The estate's three tiers below are the HOMESTEADER'S, every one anchored on the
+// Only the destination is species-dependent; both acts are identical for every species, so the branch
+// lives in recoveryPoint alone. A contractor's ladder is its own sited house, then the human who summoned
+// it, then world spawn. The homesteader's ladder is the three tiers below, every one anchored on the
 // headframe.
 //
-// ACT 1 IS ALSO CALLABLE ON ITS OWN, as `reviveBody`. A body that died and was stopped comes back as a
-// corpse whose spawn gate the client library consumes without firing, so nothing hung off `spawn` runs
-// and the process never registers — a state the death SIGNAL cannot reach, because reaching it requires
-// the registration that did not happen. The revive therefore has to be available at the login edge,
-// before any signal or command exists.
+// ACT 1 is also callable on its own, as `reviveBody`: a body that died and was stopped comes back as a
+// corpse whose spawn gate the client library consumes without firing, so the death signal never reaches
+// it. The revive is therefore available at the login edge, before any signal or command exists.
 //
-// ── THE HOMESTEADER'S RECOVERY POINT — THREE TIERS ────────────────────────────────────────────────────
-//   1. ANCHOR 0 of the headframe. Safety is INHERITED, not re-derived: building_integrity already
-//      checks the blueprint against the world, so an anchor 0 that owes no work is a floor that exists.
-//      A second safety opinion here would be a redundant pathway (Law 16) that could disagree with the
-//      one the builder trusts.
-//   2. A `spawn_spot` site near the headframe. That blueprint is FOUND, NEVER BUILT — a one-column
-//      predicate (a standable floor cell with three clear above), which is exactly "somewhere a body
-//      fits". find_buildingspot.locate is the production scan engine for that question and was extracted
-//      to run from an arbitrary origin, so the origin is the headframe centre. NOT lanista's arena_sites:
-//      that is a tool reached over RCON, and a fragment reaching into it would cross the tool/production
-//      boundary to get a scan production already owns.
-//   3. Nothing sited → the body stays where vanilla put it, UNLESS that is inside the spawn-protected
-//      square, in which case leaving the square is the recovery (`noHome` below, and the note on it).
+// The homesteader's recovery point, three tiers:
+//   1. Anchor 0 of the headframe. Safety is inherited: building_integrity already checks the blueprint
+//      against the world, so an anchor 0 that owes no work is a floor that exists.
+//   2. A `spawn_spot` site near the headframe, found (never built) by find_buildingspot.locate — the
+//      fleet's one production site scan — from an origin at the headframe centre.
+//   3. Nothing sited → the body stays where vanilla put it, unless that is inside the spawn-protected
+//      square, in which case leaving the square is the recovery (`noHome` below).
 //
-// THE +1 IS APPLIED ONCE, HERE, AND IT IS THE SAME +1 FOR BOTH TIERS. Every tier returns the FLOOR block
-// and the feet go one above it: the headframe's anchor 0 sits at relative [-4,1,0] with the voxel above it
-// authored `air`, and spawn_spot declares one natural_block floor with three clear layers over it. An
-// RCON `tp` places the entity's FEET at the y it is given, so the offset cannot be implicit the way it was
-// when this walked with goToStand ("stand ON this anchor" carried it). Read from the blueprints rather
-// than restated as a constant — an anchor that moves in the blueprint moves here with it.
+// The feet land one block above the tier's floor block, applied once, here: an RCON `tp` places the
+// entity's feet at the y it is given, and each tier's floor position is read live from the blueprint,
+// never restated as a constant, so a moved anchor moves the recovery point with it.
 //
-// ── WHY THE DESTINATION IS DECIDED HERE AND NOT ON THE BOARD ─────────────────────────────────────────
-// job_board's sweep is synchronous and runs while the bot is still a CORPSE. Tier 2's scan is async, and
-// every tier reads world state that only means something once there is a body to read it from (Invariant B
-// — a destination computed from the death position is remembered state by the time it is used). The board
-// owns WHETHER a recovery happens and that it outranks everything; this owns WHERE and HOW.
+// The destination belongs here: the board offers recovery while the bot is still a corpse,
+// and every tier reads world state that only means
+// something once there is a body to read it from (Invariant B). The board owns whether a recovery
+// happens; this owns where and how.
 
 'use strict';
 
@@ -85,34 +55,26 @@ const TAG = 'death_manager';
 // layer that asked for the scan.
 const SPAWN_SPOT_MAX_DISTANCE = 48;
 
-// THE TWO ACTS AND THE PREDICATE ARE NOT WRITTEN HERE. They are `js_kernel/body_recovery`, shared with
-// every other place a body is stood up — a natural death (this file), a continue's preflight, a launch
-// onto dead playerdata, and a human's `foreman get` landing on a corpse. They used to be written twice,
-// and the two copies disagreed about whether a respawn click may be sent before the first health packet
-// arrives; one of them was right and the difference was invisible from inside either (Law 16, and the
-// Architect's ruling that every situation standing a body up runs identical logic).
+// The two acts and the predicate are shared with every other place a body is stood up
+// (`js_kernel/body_recovery`): a natural death (this file), a continue's preflight, a launch onto dead
+// playerdata, and a human's `foreman get` landing on a corpse (Law 16 — one definition of standing a body
+// up).
 //
-// WHAT STAYS HERE IS THE POLICY: where a recovered body GOES. That is two ladders, one per species, and
-// it is the part that is genuinely this seat's.
+// What stays here is the policy: where a recovered body goes. That is two ladders, one per species.
 const recovery = require('@kernel/body_recovery');
 const { isDead, reviveBody, teleportTo, anchorZeroPoint, ARRIVAL_TOLERANCE } = recovery;
 
-// ── THE THIRD TIER IS NOT "STAY PUT" ANY MORE (Architect 2026-09-15) ────────────────────────────────
-// *"it should be the highest bot task. check if in spawn area. very first task is to move 50 blocks outside
-// of it."*
+// ── THE THIRD TIER LEAVES THE SPAWN-PROTECTED SQUARE, NOT JUST "STAY PUT" ────────────────────────────
+// A vanilla respawn with no bed lands at world spawn, the centre of the one square where this fleet can
+// neither break nor place. The desk refuses to launch a crew within PERSON_CLEAR_OF_SPAWN of world spawn
+// (foreman.js); this tier holds the same clearance on the way back from a death, measured by the same
+// module.
 //
-// A VANILLA RESPAWN WITH NO BED LANDS AT WORLD SPAWN, which is the centre of the one square where this
-// fleet can neither break nor place — so the tier that teleports nowhere was, in the exact case it fires
-// (no headframe locked, i.e. the whole early game and the most death-prone window there is), the tier that
-// parks the body inside the keep-out and leaves it there. The desk refuses to LAUNCH a crew within 50 blocks
-// of world spawn (foreman.js, PERSON_CLEAR_OF_SPAWN) and nothing held the same line on the way back from a
-// death. This closes that asymmetry: the same number, the same metric, measured by the same module.
-//
-// THE SITE IS FOUND, NEVER ASSUMED. `find_buildingspot.locate` is the fleet's one site scan and it already
-// refuses a footprint touching the square, so "somewhere a body fits, clear of spawn" is asked of the
-// production scanner from an origin set outside the square rather than computed here (Law 16). When it finds
-// nothing the body genuinely stays put — and the verdict SAYS it is standing in the square (Law 25), instead
-// of reading like an ordinary fallthrough.
+// The site is found, never assumed: find_buildingspot.locate is the fleet's one site scan and already
+// refuses a footprint touching the square, so whether somewhere a body fits, clear of spawn, is asked of
+// the production scanner from an origin outside the square (Law 16). When it finds nothing the body stays
+// put, and the verdict says it is standing in the square (Law 25), instead of reading like an ordinary
+// fallthrough.
 const { isSpawnProtectedAt, worldSpawnPoint, chebyshevFromWorldSpawn } = require('@perception/spawn_protection');
 const { PERSON_CLEAR_OF_SPAWN } = require('@thinking/architect_config');
 
@@ -122,15 +84,13 @@ const { PERSON_CLEAR_OF_SPAWN } = require('@thinking/architect_config');
 const CLEAR_SEARCH_MARGIN = 8;
 
 // anchorZeroBuilt(bot, blueprintName, field) → does anchor 0 owe any work?
-// Safety is inherited, not re-derived: an anchor with nothing left to place and
-// nothing left to dig is a floor that is actually there. An absent or unreadable anchor 0 returns false —
-// default stopped (Law 13), which drops to tier 2 rather than teleporting onto an unverified cell. That
-// default covers a MISSING answer, never a BROKEN scan: building_integrity is ours, so a throw out of it is
-// a defect, and translating it into "anchor 0 is unavailable" would send every death to world spawn while
-// the log read like an ordinary tier fallthrough.
-function anchorZeroBuilt(bot, blueprintName, field) {
+// Safety is inherited, not re-derived: an anchor with nothing left to place and nothing left to dig is a
+// floor that is actually there. An absent or unreadable anchor 0 returns false — default stopped (Law 13):
+// drops to tier 2, never onto an unverified cell. Covers only a missing answer, never a broken scan:
+// building_integrity is ours, so a throw out of it is a defect, not a tier fallthrough.
+async function anchorZeroBuilt(bot, blueprintName, field) {
   const buildingIntegrity = require('@perception/building_integrity');
-  const scan = buildingIntegrity.scan(bot, blueprintName, field);
+  const scan = await buildingIntegrity.scan(bot, blueprintName, field);
   if (scan.all_complete === true) return true;
   const a0 = Array.isArray(scan.anchor_status) ? scan.anchor_status.find((a) => a.anchor_index === 0) : null;
   if (!a0) return false;
@@ -161,7 +121,7 @@ async function noHome(bot, why) {
     requireDirtGround: false,
     existingFootprints: findSpot.getExistingFootprints(),
   });
-  const c = result && result.found && result.candidate && result.candidate.build_center;
+  const c = result && result.found && result.candidate && result.candidate.transpose_origin;
   if (!c || !Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) {
     return { kind: 'world_spawn', at: null, why: `${why}, AND THE BODY IS STANDING IN THE SPAWN-PROTECTED SQUARE — no clear site was found to move it to (${result?.reason || 'no candidate'}), so every dig and placement it attempts from here will be refused` };
   }
@@ -178,45 +138,26 @@ async function noHome(bot, why) {
 
 // recoveryPoint(bot) → { kind, at, why }.
 //
-// `at` is the FEET cell (the floor block's y already +1) so the caller teleports to it verbatim, and it is
-// null for the world-spawn tier — which is not a failure but the third tier arriving at "stay put". Named
-// rather than returned as a bare null, because a tier that can only say "no" carries no information
-// (Law 25).
+// `at` is the feet cell (the floor block's y already +1); null for the world-spawn tier, which is the
+// third tier arriving at "stay put", not a failure. Named instead of a bare null so a tier that can only
+// say "no" still carries a reason (Law 25).
 async function recoveryPoint(bot) {
-  const { readBuildCenter } = require('@utils/fragment_utils');
+  const { readTransposeOrigin } = require('@utils/fragment_utils');
 
   // ── THE CONTRACTOR'S LADDER — ITS OWN HOUSE, FIRST AND ALWAYS ─────────────────────────────────
-  // Two rungs, and the estate's three do not apply: a contractor may never see a headframe, and a
-  // spawn_spot scan around one it has no relationship to would send it home to a stranger's base.
+  // Two rungs; the estate's three do not apply, since a contractor may never see a headframe. The locked
+  // site is the home, not the built house: the site is the fact, and the structure is work in progress on
+  // top of it. Its safety is inherited from find_buildingspot's siting predicate (flat, clear, standable
+  // ground with nothing overhead), the same discipline the headframe tier runs on, so no second opinion is
+  // taken here (Law 16).
   //
-  // THE LOCKED SITE IS THE HOME, NOT THE BUILT HOUSE. The Architect's ruling — *"as soon as it locks in
-  // a place then it will always teleport there after death, weather its built or not."* The site is the
-  // fact; the structure is work in progress on top of it. Waiting for `all_complete` would mean the
-  // recovery point does not exist during exactly the stretch a contractor is most likely to die — out
-  // gathering the material for its own walls — and would then flip from world spawn to the house on the
-  // day the last block went in, which is a destination nobody could predict from the outside.
-  //
-  // AND ITS SAFETY IS INHERITED, not re-derived. A locked build_center passed find_buildingspot's siting
-  // predicate: flat, clear, standable ground with nothing overhead. That is the same discipline the
-  // headframe tier runs on (an anchor owing no work is a floor that exists), so no second opinion is
-  // taken here — one would be a redundant pathway able to disagree with the siter (Law 16).
-  //
-  // THE HOUSE OUTRANKS THE OWNER, AND THE OWNER OUTRANKS NOTHING AT ALL. A person is a moving
-  // destination: a death beside them and a death an hour later land in different worlds, so once a fixed
-  // address exists the fixed address wins — the human can walk to it and the body can always find it.
-  //
-  // But BEFORE a house is sited there is no fixed address, and the rung below is not "nowhere". A
-  // contractor exists because a particular person asked for one, so the person is the only home it has
-  // yet; dropping it at vanilla world spawn strands a body the length of the map from the human who
-  // summoned it, for the whole window between birth and the first completed layout survey. A moving
-  // destination beats no destination — the objection above is an argument for ranking the house first,
-  // never for leaving the gap beneath it empty.
-  //
-  // Read live rather than remembered: where the owner WAS at birth is exactly the stale answer this
-  // ladder exists to avoid (Invariant B). An unreachable read falls to world spawn — a homing point that
-  // cannot be sensed is not a homing point, and the bench runs with no server at all.
+  // The house outranks the owner, and the owner outranks nothing at all: once a fixed address exists it
+  // wins, since a person is a moving destination and the house is not. Before a house is sited, the person
+  // who asked for the contractor is its only home. Read live, not the position remembered from birth
+  // (Invariant B — a stale owner position is exactly what this ladder avoids). An unreachable read falls
+  // to world spawn.
   if (require('@kernel/bot_mandate').isContractor()) {
-    const house = readBuildCenter('contractor_house');
+    const house = readTransposeOrigin('contractor_house');
     if (house && typeof house.x === 'number') {
       return {
         kind: 'contractor_house',
@@ -237,22 +178,27 @@ async function recoveryPoint(bot) {
     return noHome(bot, `no contractor house is sited yet and ${owner} could not be located (${read.ok ? 'not in the world' : read.reason}) — nothing to come back to`);
   }
 
-  const buildCenter = readBuildCenter('headframe');
-  if (!buildCenter || typeof buildCenter.x !== 'number') {
-    return noHome(bot, 'no headframe centre is locked — nothing is sited yet');
+  // THIS CREW'S OWN HOME — 'headframe' was hardcoded here, and the branch above already peels off the
+  // CONTRACTOR by species, so a BUILDER fell straight through to a structure it never raises: no centre
+  // locked, no tier 1, `noHome` on every death for the whole run. `homeBlueprint()` answers for all three
+  // species from the one tuple, and the message now names whichever home was actually missing (Law 16).
+  const home = require('@kernel/bot_mandate').homeBlueprint();
+  const transposeOrigin = readTransposeOrigin(home);
+  if (!transposeOrigin || typeof transposeOrigin.x !== 'number') {
+    return noHome(bot, `no ${home} centre is locked — nothing is sited yet`);
   }
 
   // ── TIER 1 ──
-  if (anchorZeroBuilt(bot, 'headframe', 'headframe')) {
-    const floor = anchorZeroPoint('headframe', buildCenter);
+  if (await anchorZeroBuilt(bot, home, home)) {
+    const floor = anchorZeroPoint(home, transposeOrigin);
     if (floor) {
       return {
         kind: 'anchor_0',
         at: { x: floor.x, y: floor.y + 1, z: floor.z },
-        why: `headframe anchor 0 owes no work, so its floor at (${floor.x},${floor.y},${floor.z}) exists — standing one above it`,
+        why: `${home} anchor 0 owes no work, so its floor at (${floor.x},${floor.y},${floor.z}) exists — standing one above it`,
       };
     }
-    watcher.warn(TAG, 'headframe anchor 0 is complete but the blueprint declares no anchor position — falling to the spawn_spot scan.');
+    watcher.warn(TAG, `${home} anchor 0 is complete but the blueprint declares no anchor position — falling to the spawn_spot scan.`);
   }
 
   // ── TIER 2 ──
@@ -266,7 +212,7 @@ async function recoveryPoint(bot) {
       blueprintName: 'spawn_spot',
       building,
       dims,
-      origin: buildCenter,
+      origin: transposeOrigin,
       requireShaft: false,
       requireDirtGround: false,
       existingFootprints: findSpot.getExistingFootprints(),
@@ -276,19 +222,17 @@ async function recoveryPoint(bot) {
       if (typeof d === 'number' && d > SPAWN_SPOT_MAX_DISTANCE) {
         return noHome(bot, `nearest spawn_spot is ${Math.round(d)}b from the headframe, past the ${SPAWN_SPOT_MAX_DISTANCE}b recovery radius — that is a second base, not a way home`);
       }
-      // A candidate's position is `build_center`, NOT bare x/y/z on the candidate itself — see
+      // A candidate's position is `transpose_origin`, not bare x/y/z on the candidate itself — see
       // find_buildingspot.makeCandidate, which is the one place that shape is authored.
       //
-      // A missing field here reads as undefined, and an offset applied to it reads as NaN — the fragment
-      // would dutifully issue a `tp` with non-finite coordinates, which the server refuses, so the body
-      // never moves and the failure surfaces as an arrival timeout, a message describing a slow teleport
-      // rather than a malformed one. Law 13: a missing field is never defaulted — it is validated before
-      // it is used.
-      const c = result.candidate && result.candidate.build_center;
+      // A missing field here reads as undefined, and an offset applied to it reads as NaN: the fragment
+      // would issue a `tp` with non-finite coordinates, which the server refuses, so the failure surfaces
+      // as an arrival timeout. Law 13: a missing field is never defaulted — it is validated before use.
+      const c = result.candidate && result.candidate.transpose_origin;
       if (!c || !Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) {
         // Not a throw: the scan is an environmental read and a candidate that cannot be expressed as a
         // cell is a world fact, not a coding fault. It drops to the tier below with the reason intact.
-        watcher.warn(TAG, `spawn_spot scan returned a candidate with no usable build_center (${JSON.stringify(result.candidate)}) — falling to world spawn rather than teleporting to a cell that does not exist.`);
+        watcher.warn(TAG, `spawn_spot scan returned a candidate with no usable transpose_origin (${JSON.stringify(result.candidate)}) — falling to world spawn rather than teleporting to a cell that does not exist.`);
         return noHome(bot, 'the spawn_spot candidate carried no usable position');
       }
       return {
@@ -303,27 +247,26 @@ async function recoveryPoint(bot) {
 
 // teleportTo(bot, at) → { moved, from, to, error }. ACT 2, command plus its verification.
 //
-// The `tp` goes through js_kernel/utils/rcon_link's `once` (open, run, close) rather than a held session: this fires
-// at most once per death, so a persistent link would be a socket kept alive for an event that may not
-// happen for an hour (Law 8 — nothing runs on past the lifecycle that raised it).
+// The `tp` goes through js_kernel/utils/rcon_link's `once` (open, run, close), not a held session: this
+// fires at most once per death, so a persistent link would be a socket kept alive for an event that may
+// not happen for an hour (Law 8 — nothing runs on past the lifecycle that raised it).
 //
-// THE VERIFY IS A POSITION READ, NEVER THE COMMAND'S REPLY. RCON answers with the server's own text, which
-// says a command was executed, not that this bot's body is standing anywhere in particular — and the
-// client learns its new position from a separate packet that arrives later. So the arrival is sensed off
-// bot.entity.position, which is the only thing that can disagree with a lie (Law 26).
-// reviveBody — CLICK RESPAWN AND SENSE WHETHER A BODY CAME BACK. Returns; never routes, never throws
+// The verify is a position read, never the command's reply: RCON answers with the server's own text,
+// which says a command was executed, not that this body is standing anywhere in particular, and the
+// client learns its new position from a separate packet that arrives later. The arrival is sensed off
+// bot.entity.position, the only thing that can disagree with a lie (Law 26).
+// reviveBody — click respawn and sense whether a body came back. Returns; never routes, never throws
 // upward on a failed revive.
 //
-// EXTRACTED FROM THE DEATH SIGNAL SO A BODY CAN BE STOOD UP WITH NO SIGNAL IN FLIGHT. A bot that died
-// and was stopped is written to disk as a corpse, and on the next login mineflayer's health plugin
-// consumes the one-shot spawn gate without firing it — so every handler hung off `spawn` never runs and
-// the process joins the world without registering. The death signal cannot fix that, because reaching
-// the signal requires the registration that never happened. The revive therefore has to be callable
-// from the login edge, before any command exists to carry it.
+// Extracted from the death signal so a body can be stood up with no signal in flight: a bot that died and
+// was stopped is written to disk as a corpse, and on the next login mineflayer's health plugin consumes
+// the one-shot spawn gate without firing it, so every handler hung off `spawn` never runs and the process
+// joins the world without registering. The revive is callable from the login edge, before any command
+// exists to carry it.
 //
-// RETURNS RATHER THAN ABANDONING (Law 15/Law 25). Inside the signal chain a failed revive belongs to the
+// Returns instead of routing (Law 15/Law 25): inside the signal chain a failed revive belongs to the
 // judge; on the login edge there is no chain to abandon and no judge listening yet, so the verdict goes
-// back to whoever asked and they decide. Same act, two callers, one honest answer.
+// back to whoever asked. Same act, two callers, one honest answer.
 module.exports = {
   // Exported so job_board's planner shares this fragment's definition of dead, and so a bench can drive
   // the decision without a death (Law 16 — one definition of "no body" and one of "where home is").
@@ -350,9 +293,9 @@ module.exports = {
     };
 
     // ── ACT 1: SPAWN ────────────────────────────────────────────────────────────────────────────────
-    // master_core runs with `respawn: false`, so NOTHING else sends this packet. That gating is what makes
+    // master_core runs with `respawn: false`, so nothing else sends this packet. That gating is what makes
     // a death a hard stop: a corpse cannot walk, mine or place, so the chain that was running when the bot
-    // died is inert by physics rather than by a check arriving in time (Law 13, default-stopped).
+    // died is inert by physics, not by a check arriving in time (Law 13, default-stopped).
     const revival = await reviveBody(bot);
     if (revival.wasDead && !revival.revived) {
       // The one state this design can strand the fleet in, and it gets the error level for that reason:
@@ -365,9 +308,6 @@ module.exports = {
 
     const spawnedAt = bot.entity.position.floored();
     watcher.summary(TAG, `ACT 1 ✓ body is back at (${spawnedAt.x},${spawnedAt.y},${spawnedAt.z}) — choosing a recovery point.`);
-    // (The out-loud voice used to forget its last sentence here, so the first thing said after a death
-    // was news again. `bot_voice` is deleted — a contractor no longer narrates at all, and a human who
-    // wants to know says `foreman where`. See THE BOT DOES NOT SPEAK in Thinking_fragments/dispatcher.js.)
 
     // ── ACT 2: TELEPORT ─────────────────────────────────────────────────────────────────────────────
     const point = await recoveryPoint(bot);

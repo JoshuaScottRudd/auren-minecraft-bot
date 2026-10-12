@@ -1,40 +1,31 @@
 // Auren_Workshop/tools/world_forge.js
-// Generate a candidate world, prove a bot can actually live in it, and report the measurements — so a
-// test world is CHOSEN against stated criteria instead of accepted because it happened to generate.
+// Generates a candidate world, proves a bot can live in it, and reports the measurements against stated
+// criteria.
 //
-// WHY (Architect 2026-08-08): the conductor and the lanista bench were sharing one world, so a standard
-// test's rollback would destroy whatever the combat session was standing on. Separating them needs a
-// second world, and a second world is only useful if the ground is usable: "some spawn the bots on a
-// mountain in the ocean. best way to know is if the bots spawn close to world center and its a forest
-// biome. or better yet, world center biome should be a forest or plain type."
+// THE CRITERIA ARE HIS, AND THIS FILE ONLY COMPARES AGAINST THEM (Law 25). ACCEPTABLE_BIOMES below is
+// his biome criterion made executable and is his to edit. "Close to world center" and "too high" carry
+// no number from him, so those are flags with defaults, and the report names each default as the tool's
+// own, not a measured fact.
 //
-// THE CRITERIA ARE HIS, AND THIS FILE ONLY COMPARES AGAINST THEM (Law 25). He set the biome test in
-// words, so ACCEPTABLE_BIOMES below is his sentence made executable and is meant to be edited by him.
-// He did NOT set a number for "close to world center" or for how high is too high, so this file does
-// not quietly own one: both are flags with defaults, and the report SAYS the default was the tool's
-// rather than presenting it as a measured fact. A performer that invents the threshold and then stamps
-// PASS against it has usurped the one number only the asker can set.
+// THE FOREMAN BRINGS THE CANDIDATE UP, the one way every world comes up. This file writes level-name and
+// level-seed while nothing runs, then asks the foreman for that world with no crew; the foreman's own
+// proved steps generate it, start the server, join its body and read the world spawn, which it publishes
+// on its door (`run.spawn`). Where bodies land IS the world spawn, so the spawn checks read that. A
+// candidate the foreman cannot bring up has failed before a single measurement is taken.
 //
-// IT REUSES THE WHOLE EXISTING BRING-UP AND ADDS NO GATE (Law 22 gate 2). `fleet_control up --world=X`
-// already repoints level-name, generates the world on first launch, starts the fleet, and waits on each
-// bot's own "Online at (" line before returning. So "can the bots use it" is answered by the gate that
-// already exists — this file spends no effort re-asking it, and a candidate that fails to bring a bot
-// online has failed the most important criterion before a single measurement is taken.
-//
-// WHY THE SEED IS WRITTEN HERE AND NOT BY fleet_control: `level-name` says which world to point at and
-// is fleet_control's; `level-seed` is a world-GENERATION input that only means anything at the moment a
-// folder is created, and it is authored while the server is STOPPED (Law 26 — build while off, drive
-// while on). Writing it into a live server would be authoring an internal of a running machine, and it
-// would also do nothing, which is the worse half: a silent no-op that looks like a control.
+// `level-name` says which world to point at and is fleet_control's; `level-seed` is a world-generation
+// input that only means anything at the moment a folder is created, so it is authored here while the
+// server is STOPPED (Law 26 — build while off, drive while on). A live server reads both exactly once,
+// at JVM start.
 //
 // Usage:
 //   node tools/world_forge.js try  --name=NAME [--seed=N] [--replace] [--down]
 //   node tools/world_forge.js keep --name=NAME [--snapshot=NAME]   (server must be down)
 //   node tools/world_forge.js                                       (this help)
 //
-// Exit codes: 0 the candidate MET his criteria · 2 it generated and was measured but MISSED · 1 the
-//             attempt could not be completed (no bot, no rcon, refused precondition).
-// 2 IS NOT AN ERROR — it is a candidate honestly reporting it is not the one. Try another seed.
+// Exit codes: 0 the candidate met every criterion · 2 it generated and was measured but missed · 1 the
+//             attempt could not be completed (no bot, no rcon, refused precondition). 2 is not an
+//             error — a candidate honestly reporting it is not the one.
 
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/world_forge.js');
@@ -42,6 +33,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/worl
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const benchWorld = require('../bench_world');
 
 const paths = require('../workshop_paths');
 const TOOLS_DIR = __dirname;
@@ -51,21 +43,17 @@ const SNAPSHOT_DIR = path.join(SERVER_DIR, 'world_snapshots');
 const PROPS = path.join(SERVER_DIR, 'server.properties');
 const FLEET = paths.workshop('fleet_control.js');
 
-// His words — "world center biome should be a forest or plain type" — as an editable list. Grouped so
-// the reasoning survives an edit: flat/walkable ground with trees or without, and nothing whose defining
-// feature is that a body cannot cross it. Jungle, swamp, desert, badlands, any snowy/peak/ocean variant
-// and the caves are excluded ON PURPOSE, not by oversight: they are the "mountain in the ocean" family
-// he named, plus the ones whose terrain would confound a locomotion or combat measurement.
+// The operator's biome criterion for world center, as an editable list: flat, walkable ground, forested
+// or open. Jungle, swamp, desert, badlands, snowy/peak/ocean variants and caves are excluded — terrain
+// that would confound a locomotion or combat measurement.
 const ACCEPTABLE_BIOMES = [
   'minecraft:plains', 'minecraft:sunflower_plains', 'minecraft:meadow',
   'minecraft:forest', 'minecraft:birch_forest', 'minecraft:flower_forest',
   'minecraft:dark_forest', 'minecraft:old_growth_birch_forest', 'minecraft:taiga',
 ];
 
-// Worlds this tool may never delete, however the flags read. A mistyped `--name=sub_agent_01 --replace`
-// would otherwise erase the world both sessions work in. The rule is deliberately broader than a deny
-// list: ANY world someone bothered to snapshot is someone's, and a forge candidate by definition has no
-// snapshot yet — so having one is the proof it is not a candidate.
+// Worlds this tool may never delete, whatever the flags read. A snapshot existing for a world is proof
+// someone means to keep it; a forge candidate by definition has none yet.
 const HARD_DENY = new Set(['Test world', 'work world']);
 
 const argv = process.argv.slice(2);
@@ -78,25 +66,19 @@ const has = k => flags.has(k);
 const opt = (k, d) => (flags.has(k) && flags.get(k) !== true ? String(flags.get(k)) : d);
 
 // ── Defaults this tool owns, and says so ─────────────────────────────────────────────────────────
-// Named constants rather than inline numbers so the report can print WHERE each came from. The Architect
-// set the biome criterion in words and set no number for these two; they are the tool's until he rules.
+// Named so the report can print where each number came from. The operator set the biome criterion in
+// words and set no number for these two; they are the tool's until he rules.
 const DEFAULT_CENTER_RADIUS = 200;   // blocks from (0,0) — Minecraft's own spawn search fans out from center
 const DEFAULT_MAX_Y = 100;           // above this is the "mountain" half of "a mountain in the ocean"
 const DEFAULT_MIN_Y = 60;            // at/below sea level (63) is the "ocean" half
 
-// MEASURED, not guessed (2026-08-08). The first world that met every criterion above still could not
-// host a standard test: the conductor's own short soak surfaced
-//     wheat_plot_pair: ✗ NOT FOUND — 0 plots (water 160, candidates 10). The base has no anchor.
-// A world can be flat, forested, and centred and still have no water within reach of spawn, and the
-// base-layout job anchors the whole run on a wheat plot pair. So "the bots can use it" needs a fourth
-// measurement that the three above cannot see. River proximity is the proxy — it is what `locate biome`
-// can answer cheaply, and it is where the open water actually is.
+// A world can be flat, forested and centred and still have no water within reach of spawn, and the
+// base-layout job anchors the run on a wheat plot pair. River proximity is the proxy for that — it is
+// what `locate biome` can answer cheaply, and it is where the open water actually is.
 //
-// THIS THRESHOLD IS THE TOOL'S, and it is a proxy for a criterion owned by the base-layout blueprint,
-// not by this file. It is deliberately NOT a re-derivation of that blueprint's rule (which would be a
-// second place the same question lives, Law 16): the authoritative check is still running the fleet and
-// seeing whether the base anchors. This only stops candidates that obviously cannot, before that costs
-// a bring-up.
+// THIS THRESHOLD IS THE TOOL'S, a proxy for a criterion owned by the base-layout blueprint, not this
+// file (Law 16: the authoritative check is running the fleet and seeing whether the base anchors). This
+// only stops candidates that obviously cannot, before that costs a bring-up.
 const DEFAULT_WATER_RADIUS = 120;
 
 const t0 = Date.now();
@@ -111,8 +93,8 @@ function fleet(args, inherit = true) {
 }
 
 // ── RCON, read-only ──────────────────────────────────────────────────────────────────────────────
-// Goes through fleet_control's one rcon route rather than opening a second socket implementation
-// (Law 16). It prints `rcon: <reply>`; anything else is a failure to reach the server, not an answer.
+// Goes through fleet_control's one rcon route (Law 16). Prints `rcon: <reply>`; anything else is a
+// failure to reach the server, not an answer.
 function rcon(command) {
   const r = node([FLEET, 'rcon', command]);
   const out = `${r.stdout || ''}${r.stderr || ''}`;
@@ -121,8 +103,8 @@ function rcon(command) {
   return { ok: true, reply: m[1].trim() };
 }
 
-// `locate biome` answers from the COMMAND SOURCE's position, so `execute positioned 0 ~ 0` is what makes
-// this a question about world center rather than about wherever the console happens to be.
+// `locate biome` answers from the command source's position; `execute positioned 0.0 64.0 0.0` makes it
+// a question about world center.
 // Reply on success: `The nearest minecraft:forest is at [120, ~, -8] (67 blocks away)`
 // Reply on failure: `Could not find a biome of type "minecraft:forest" within reasonable distance`
 function biomeDistanceFromCenter(biome) {
@@ -133,14 +115,6 @@ function biomeDistanceFromCenter(biome) {
   return { found: true, x: +m[1], z: +m[2], distance: +m[3] };
 }
 
-// Reply: `AurenBot has the following entity data: [123.5d, 68.0d, -45.2d]`
-function botPosition(bot) {
-  const r = rcon(`data get entity ${bot} Pos`);
-  if (!r.ok) return { ok: false, detail: r.reply };
-  const m = /\[(-?[\d.]+)d, *(-?[\d.]+)d, *(-?[\d.]+)d\]/.exec(r.reply);
-  if (!m) return { ok: false, detail: r.reply };
-  return { ok: true, x: +m[1], y: +m[2], z: +m[3] };
-}
 
 // ── server.properties ────────────────────────────────────────────────────────────────────────────
 function setProperty(key, value) {
@@ -156,7 +130,7 @@ function getProperty(key) {
 }
 
 // ── try ──────────────────────────────────────────────────────────────────────────────────────────
-function tryCandidate() {
+async function tryCandidate() {
   const name = opt('name', null);
   if (!name) { console.error('world_forge: --name=<world> is required.'); return 1; }
 
@@ -171,16 +145,16 @@ function tryCandidate() {
     return 1;
   }
   if (exists) {
-    // Deleting a world is the one destructive act in this file, so the guards are checked before it and
-    // are broader than a name list: a snapshot is proof somebody meant to keep this world.
+    // Deleting a world is the one destructive act in this file; the guard runs before it. A snapshot is
+    // proof somebody meant to keep this world.
     if (HARD_DENY.has(name) || fs.existsSync(path.join(SNAPSHOT_DIR, name))) {
       console.error(`\nworld_forge: REFUSING to replace '${name}' — it is a kept world (a snapshot exists ` +
         `for it, or it is on the protected list). Forge candidates have no snapshots; that is the test.`);
       return 1;
     }
     if (getProperty('level-name') === name) {
-      // Not fatal in principle, but the server must be down for the delete to be safe, and taking it
-      // down is below. Report it so a running fleet is never a surprise.
+      // The server must be down for the delete to be safe; taking it down happens below. Reported so a
+      // running fleet is never a surprise.
       console.log(`\nworld_forge: '${name}' is the world the server is currently pointed at — it will be ` +
         `taken down before the folder is removed.`);
     }
@@ -188,10 +162,11 @@ function tryCandidate() {
 
   banner(`FORGE '${name}'${has('seed') ? ` from seed ${opt('seed', '')}` : ' from a random seed'}`);
 
-  // Everything below is authored while the server is STOPPED. A live server reads level-name and
-  // level-seed exactly once, at JVM start, so writing them into a running one is a silent no-op.
-  console.log(`${el()} taking any running fleet down — level-name and level-seed are read at JVM start.`);
-  fleet(['down']);
+  // Everything below is authored while the server is STOPPED (Law 26); a live server reads level-name
+  // and level-seed once, at JVM start.
+  console.log(`${el()} taking any running world down — level-name and level-seed are read at JVM start.`);
+  const stopped = await benchWorld.stopRunning();
+  if (!stopped.ok) { console.error(`\nworld_forge: ${stopped.why}. Nothing was changed.`); return 1; }
 
   if (exists) {
     console.log(`${el()} DELETING the previous '${name}' world folder (${worldDir}) — --replace was given.`);
@@ -199,32 +174,31 @@ function tryCandidate() {
   }
 
   setProperty('level-seed', has('seed') ? opt('seed', '') : '');
-  console.log(`${el()} level-seed=${getProperty('level-seed') || '(random)'}`);
+  setProperty('level-name', name);
+  console.log(`${el()} level-name=${name}  level-seed=${getProperty('level-seed') || '(random)'}`);
 
-  // ONE command generates the world, launches the fleet, and waits on the bot's own online marker. If
-  // this fails, the candidate has failed the criterion that matters most and no measurement is needed.
-  banner(`GENERATE + PROVE A BOT CAN LIVE IN IT — fleet_control up --count=1 --world=${name}`);
-  const up = fleet(['up', '--count=1', `--world=${name}`]);
-  if (up.status !== 0) {
-    console.error(`\n${el()} '${name}' FAILED the first criterion: no bot reached ONLINE in it. ` +
-      `The failing gate is named in the output above; this file does not diagnose it.`);
+  banner(`GENERATE — the foreman brings '${name}' up and proves each step`);
+  const up = await benchWorld.up({ start: 'continue' });
+  if (!up.ok) {
+    console.error(`\n${el()} '${name}' FAILED the first criterion: ${up.why}`);
+    await benchWorld.down(up.foreman);
     return 1;
   }
-
-  return vet(name);
+  const code = await vet(name);
+  if (has('down')) { console.log(`\n${el()} --down: ${(await benchWorld.down(up.foreman)).why}.`); }
+  return code;
 }
 
 // ── vet ──────────────────────────────────────────────────────────────────────────────────────────
-function vet(name) {
+async function vet(name) {
   const centerRadius = parseFloat(opt('center-radius', String(DEFAULT_CENTER_RADIUS)));
   const maxY = parseFloat(opt('max-y', String(DEFAULT_MAX_Y)));
   const minY = parseFloat(opt('min-y', String(DEFAULT_MIN_Y)));
-  const bot = opt('bot', 'AurenBot');
 
   banner(`MEASURE '${name}'`);
 
-  // 1. The biome AT WORLD CENTER — his "or better yet" criterion, and the strongest of the three,
-  //    because it is a property of the world rather than of one spawn roll.
+  // 1. The biome at world center — the strongest of the three checks, since it is a property of the
+  //    world itself, not of one spawn roll.
   const hits = [];
   let unreachable = null;
   for (const b of ACCEPTABLE_BIOMES) {
@@ -241,10 +215,10 @@ function vet(name) {
   const nearest = hits[0] || null;
   const centerIsAcceptable = !!nearest && nearest.distance === 0;
 
-  // 2. Where the body actually landed.
-  const pos = botPosition(bot);
-  if (!pos.ok) {
-    console.error(`\n${el()} the server did not report ${bot}'s position — ${pos.detail}\n` +
+  // 2. Where bodies land — the world spawn, as the foreman read it off its own body.
+  const pos = await benchWorld.spawnNow();
+  if (!pos) {
+    console.error(`\n${el()} the foreman's door did not report a world spawn (is a foreman running this world?)\n` +
       `  Nothing was measured, so this candidate is UNJUDGED rather than failed.`);
     return 1;
   }
@@ -253,7 +227,7 @@ function vet(name) {
   // 3. Read out, then judge — kept separate so the numbers are visible even when the verdict is MISSED.
   console.log(`\n  world              : ${name}`);
   console.log(`  seed               : ${getProperty('level-seed') || '(random — the generated one is in level.dat)'}`);
-  console.log(`  ${bot} spawned at  : (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`);
+  console.log(`  world spawn        : (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`);
   console.log(`  distance from 0,0  : ${fromCenter} blocks`);
   console.log(`  biome at 0,0       : ${centerIsAcceptable ? nearest.biome : (nearest ? `NOT an accepted type — nearest accepted is ${nearest.biome} at ${nearest.distance}b` : 'no accepted biome found within range')}`);
   if (hits.length) {
@@ -261,7 +235,7 @@ function vet(name) {
     for (const h of hits.slice(0, 5)) console.log(`      ${String(h.distance).padStart(5)}b  ${h.biome}`);
   }
 
-  // 2b. Open water near centre — the criterion the first passing world taught us it was missing.
+  // 2b. Open water near centre — the base needs a wheat plot pair within reach of spawn.
   const waterRadius = parseFloat(opt('water-radius', String(DEFAULT_WATER_RADIUS)));
   const river = biomeDistanceFromCenter('minecraft:river');
   const waterDist = river.found ? river.distance : Infinity;
@@ -270,8 +244,8 @@ function vet(name) {
   const checks = [
     { name: 'world centre is a forest/plains type', pass: centerIsAcceptable, owner: 'HIS — stated in words, encoded in ACCEPTABLE_BIOMES' },
     { name: `open water within ${waterRadius}b of centre (the base needs a wheat plot pair)`, pass: waterDist <= waterRadius, owner: has('water-radius') ? 'HIS — given on the command line' : `THE TOOL'S default (${DEFAULT_WATER_RADIUS}b) — added after a world that passed everything else could not anchor a base` },
-    { name: `the bot spawned within ${centerRadius}b of world centre`, pass: fromCenter <= centerRadius, owner: has('center-radius') ? 'HIS — given on the command line' : `THE TOOL'S default (${DEFAULT_CENTER_RADIUS}b) — he has not set this number` },
-    { name: `the bot is standing between y=${minY} and y=${maxY}`, pass: pos.y >= minY && pos.y <= maxY, owner: (has('min-y') || has('max-y')) ? 'HIS — given on the command line' : `THE TOOL'S default (${DEFAULT_MIN_Y}–${DEFAULT_MAX_Y}) — stands in for "not a mountain, not the ocean"` },
+    { name: `the world spawn is within ${centerRadius}b of world centre`, pass: fromCenter <= centerRadius, owner: has('center-radius') ? 'HIS — given on the command line' : `THE TOOL'S default (${DEFAULT_CENTER_RADIUS}b) — he has not set this number` },
+    { name: `the world spawn is between y=${minY} and y=${maxY}`, pass: pos.y >= minY && pos.y <= maxY, owner: (has('min-y') || has('max-y')) ? 'HIS — given on the command line' : `THE TOOL'S default (${DEFAULT_MIN_Y}–${DEFAULT_MAX_Y}) — stands in for "not a mountain, not the ocean"` },
   ];
 
   banner(`VERDICT for '${name}'`);
@@ -282,13 +256,11 @@ function vet(name) {
   const met = checks.every(c => c.pass);
   console.log(`\n  ${met ? '✅ MET every criterion' : '❌ MISSED — this is not the world'}`);
 
-  if (has('down')) { console.log(`\n${el()} --down: taking the fleet down.`); fleet(['down']); }
-  else console.log(`\n${el()} the fleet is STILL UP on '${name}' so the ground can be looked at. ` +
-    `Take it down with: node Auren_Workshop/fleet_control.js down`);
+  if (!has('down')) console.log(`\n${el()} the foreman is STILL RUNNING '${name}' (window 'auren desk') so the ground can be ` +
+    `looked at. Stop it with: node Auren_Workshop/fleet_control.js verb shutdown`);
 
   if (met) {
-    console.log(`\n  Keep it with:  node Auren_Workshop/fleet_control.js down` +
-      `\n                 node Auren_Workshop/tools/world_forge.js keep --name=${name}`);
+    console.log(`\n  Keep it with:  node Auren_Workshop/tools/world_forge.js keep --name=${name}   (stops the world first)`);
   } else {
     console.log(`\n  Try another:   node Auren_Workshop/tools/world_forge.js try --name=${name} --replace [--seed=N]`);
   }
@@ -298,22 +270,20 @@ function vet(name) {
 // ── keep ─────────────────────────────────────────────────────────────────────────────────────────
 // Delegates to fleet_control's snapshot, which delegates to rollback.ps1 — the one implementation, and
 // the one that already refuses while the server is up (a snapshot of a live world is a torn copy).
-function keep() {
+async function keep() {
   const name = opt('name', null);
   if (!name) { console.error('world_forge: --name=<world> is required.'); return 1; }
   const snapshot = opt('snapshot', `${name}_fresh_start`);
   banner(`KEEP '${name}' as snapshot '${snapshot}'`);
+  const stopped = await benchWorld.stopRunning();
+  if (!stopped.ok) { console.error(`\nworld_forge: ${stopped.why}, so no clean copy can be taken.`); return 1; }
   const r = fleet(['snapshot', `--world=${name}`, `--name=${snapshot}`]);
   if (r.status !== 0) { console.error(`\nworld_forge: the snapshot did not complete.`); return 1; }
-  // The hint names the FIELDS to set, not a command line to type: a run's world is authored now, and a
-  // hint that handed back `--world=` would be pointing at a door that was deleted (Law 16).
-  console.log(`\n  '${name}' is now restorable. To run on it, point the one page at it —\n` +
-    `  Auren_Workshop/run_config.js:\n` +
-    `    worldName   '${name}'\n` +
-    `    snapshot    '${snapshot}'\n` +
-    `    world       'fresh'      (so it rolls back to that snapshot)\n` +
-    `  then:\n` +
-    `    node Auren_Workshop/run.js`);
+  // The hint names the fields to set, not a command line to type — a run's world is authored now (Law 16).
+  console.log(`\n  '${name}' is now restorable. To run on it, make it the server's world (level-name '${name}'\n` +
+    `  in server.properties) and start the foreman with start 'rollback' in foreman_config.js — it puts\n` +
+    `  the world back to its fresh-start copy before the server starts:\n` +
+    `    node start_auren.js`);
   return 0;
 }
 
@@ -337,12 +307,8 @@ Exit: 0 met every criterion · 2 measured and MISSED (try another seed) · 1 cou
 
 if (require.main === module) {
   const verb = positional[0];
-  let code = 1;
-  if (verb === 'try') code = tryCandidate();
-  else if (verb === 'vet') code = vet(opt('name', ''));
-  else if (verb === 'keep') code = keep();
-  else usage();
-  process.exit(code);
+  const run = verb === 'try' ? tryCandidate : verb === 'vet' ? () => vet(opt('name', '')) : verb === 'keep' ? keep : async () => { usage(); return 1; };
+  run().then(code => process.exit(code));
 }
 
 module.exports = { ACCEPTABLE_BIOMES, HARD_DENY, DEFAULT_CENTER_RADIUS, DEFAULT_MIN_Y, DEFAULT_MAX_Y };

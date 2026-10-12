@@ -1,166 +1,94 @@
 ﻿// module: pathfinding_utils — A* pathfinder, one algorithm for all locomotion callers.
 //
 // Non-obvious contracts:
-//  - Pure graph algorithm: no watcher, no signal_bus, no file I/O (Law 15 utility).
-//  - Operates on FLOOR-block positions — y is the block stood ON, not the feet cell. Every edge
-//    and goal check assumes this; mixing in a feet-Y coordinate silently corrupts the search.
-//  - The parent map stores { parentKey, edgeType } per step so the executor knows HOW to cross
-//    each cell (walk/climb/door/dig/bridge/swim/pillar), not just WHERE. There is no fall edge.
-//  - Goals are always exact (position / multi / los) — locomotion never decides "close enough".
-//  - Out of budget → returns the closest explored node with partial:true, so the SPA loop makes
-//    incremental progress on long-range goals that have no proximity target.
-//  - ASYNC + THROTTLED (Architect 2026-07-19): computeAStar is async and cedes a macrotask every ~one
-//    server tick via the shared voxel_scan_throttle pacer — the SAME pacer the heavy scanners use
-//    (Law 16, one pacer). WHY: the old flat 1500-node cap existed only to stop a long search freezing
-//    the tick; it made the search return a distance-greedy PARTIAL before it could find the real
-//    (longer, all-walkable) route down the mine staircase, so a deep cell dispatched the bot to carve
-//    a diagonal shortcut that dead-ends at the room ceiling above its floor stand (live: TessaBot cell
-//    62|13|-10, 64m48s, astar_no_path 6.4 short). Throttling instead of capping lets the budget go
-//    effectively uncapped (a runaway backstop only) while NEVER blocking the shared world longer than a
-//    tick — the Architect's ratio: a search that takes longer but never stalls the run beats a fast one
-//    that does. Every caller therefore awaits it.
+//  - Pure graph body; the timing wrapper admits expensive work through the foreman's computation gate.
+//  - Operates on FLOOR-block positions — y is the block stood ON, not the feet cell.
+//  - The parent map stores { parentKey, edgeType } per step so the executor knows HOW to cross each
+//    cell, not just WHERE. There is no fall edge. Goals are always exact (position/multi/los).
+//  - Out of budget → returns the closest explored node with partial:true, incremental SPA progress.
+//  - ASYNC + THROTTLED: cedes a macrotask every ~tick via execution_yield (Law 16); every caller awaits it.
 
 const Vec3 = require('vec3');
 const { BLOCK_REACH, STATION_TYPES } = require('@utils/fragment_utils');
 const { isWalkableSurface, isOpenTopContainer, isStationFloor, belowDepthFloor } = require('@utils/movement/terrain_predicates');
-const { makeScanThrottle } = require('@utils/voxel_scan_throttle');
+const { makeExecutionPacer } = require('@utils/execution_yield');
 const { guardExternalSync } = require('@utils/external_library_guard');
+const memoryWorkspace = require('@utils/memory_workspace');
 
 // Interaction geometry — each value encodes a failure mode, not a preference.
 const MIN_PLACEMENT_DIST = 0.5;  // closer: lookAt angle too steep, placeBlock/anchor clicks misfire
 const LOS_MAX_Y_GAP = 2;         // steeper feet→target: placement fails even when the raycast passes
-const LOS_REFINE_BUDGET = 30;    // extra nodes explored after a valid vantage to find a closer one (else it stops at 2.8 when 1.0 is one step away)
-// No free-fall edge: the pathfinder never plans a straight drop. Every descent is a reversible
-// one-block move — a diagonal stair (climb_down / dig_climb_down) where there is lateral room, or a
-// vertical dig_down (one block, landing hazard-checked) where there is not. Jumping off a ledge and
-// baritone-style parkour are disallowed outright (Architect 2026-07-14; Law 17 self-preservation +
-// the reversibility invariant — a move with no return route is not a legal descent).
+const LOS_REFINE_BUDGET = 30;    // extra nodes explored after a valid vantage, to find a closer one
+// No free-fall edge: every descent is reversible — climb_down, a straight dug staircase to the goal's
+// level (dig_stair_down, STAIR LINES below), or a vertical dig_down. Jumping off a ledge is disallowed
+// (Law 17 — a move with no return route is not legal).
+//
+// ── STAIR LINES: THE DIAGONAL MOVE IS ONE WHOLE SECTION OF STAIRCASE ─────────────────────────────────────
+// A dug descent or ascent is ONE move: a straight run, one block over and one down (or up) per step, to
+// a level the goal stands on. There is no one-step dig stair, so nothing turns mid-descent. Each step
+// clears THREE cells — feet, head, and the headroom climb_up needs to walk it back up, so it is two-way
+// from the moment it is dug. Priced under dig_down's per-block cost, so a whole stair wins wherever it
+// fits; where it does not (bedrock, hazard, closed box) dig_down and pillar remain.
 
 // ── Movement cost: four tiers + the per-edge catalog ─────────────────────────
-// A* sums edge costs; cheapest route wins. The spread exists so altering/slogging through the world
-// LOSES to a walk-around unless none exists. All finite — even PROTECTED_VOXEL_DETOUR_BUDGET is a number, not a ban, so an
-// entombed bot can still carve out. Tune these tiers; there are no others.
-//
-// THREE MEASUREMENTS AND TWO POLICIES, and the split is the thing to keep straight. COST_LOW/HIGH/PLACE
-// approximate real EFFORT. PROTECTED_VOXEL_DETOUR_BUDGET and FLOW_*_DETOUR_BUDGET below are DETOUR
-// BUDGETS: nothing about the move is intrinsically harder, we simply prefer it not happen, and the
-// number says how many extra walk-steps that preference is worth.
+// A* sums edge costs; cheapest route wins, so a walk-around beats altering the world unless none exists.
+// All tiers are finite. COST_LOW/HIGH/PLACE approximate real EFFORT; the *_DETOUR_BUDGET constants
+// below are PREFERENCE — how many extra walk-steps avoiding a move is worth.
 const COST_LOW   = 1.0;     // free traversal — cross the world unchanged
-const COST_HIGH  = 15.0;    // dig one block / swim — ~15 walk-steps, so any shorter detour wins
-const COST_PLACE = 25.0;    // place a block (pillar up, bridge a gap) — consumes inventory and commits a
-                            //   permanent structure, so it costs MORE than digging; A* prefers a dig-stair
-                            //   (COST_HIGH) or a walk-around over pillaring/bridging.
-// PROTECTED_VOXEL_DETOUR_BUDGET — deliberately NOT named COST_*, because it is not the same kind of
-// number as the three above and treating it as one is what mis-set it. COST_LOW/HIGH/PLACE approximate
-// real EFFORT: a dig genuinely costs about fifteen walk-steps of time, so those are measurements. This is
-// a POLICY: how many EXTRA steps — beyond the direct route — the bot should walk to spare one blueprint
-// or station voxel. Nothing about digging a protected block is intrinsically expensive; we simply prefer
-// it not happen.
-//
-// READ AS A DETOUR BUDGET, NEVER AS A JOURNEY CEILING, and the difference is not pedantry. A* sums edges
-// over a WHOLE route, so a protected dig is added to whatever walking remains after it — it never
-// replaces the journey. A 260-step walk across open ground therefore never "exceeds" this and never
-// triggers a dig: the cut-through route would cost this budget PLUS the same 260 steps. The dig can only
-// win where it is a genuine shortcut, and then only when the detour it saves is longer than this number.
-//
-// WHY 50 AND NOT THE 250 IT WAS: the number's real cost is not what it buys, it is what the search must
-// spend to REJECT it. A* returns the cheapest route, so before it may accept an edge priced N it must
-// rule out every route cheaper than N — expanding every cell within N walk-steps. At 250 that meant
-// sweeping a 250-step radius, blind, every time a goal sat behind the build. Measured on the 2026-08-15
-// soak: three routes of four to seven steps each examined ~310,000 cells and stood the body still for
-// ~9s, while two genuine 200-step walks examined a third as many. Expansion tracks PRICE, not distance,
-// so this constant sets a flood radius as surely as it sets a preference. 50 still refuses the cut
-// wherever any walk-around under fifty extra steps exists, which is every ordinary perimeter, at a
-// twenty-fifth of the search area.
+const COST_HIGH  = 15.0;    // dig one block / swim
+const COST_PLACE = 25.0;    // place a block (pillar, bridge) — consumes inventory, costs more than digging
+const COST_WATER_EXIT = 3.0;     // walk out of water onto a bank level with it — the cheapest way out of water there is
+const COST_STAIR_STEP = 10.0;    // one step of a dug staircase — under dig_down's per-block cost (STAIR LINES)
+const MAX_STAIR_RUN = 48;        // longest staircase one edge may be; deeper stairs to the bound, then other edges
+// PROTECTED_VOXEL_DETOUR_BUDGET — a POLICY number: extra walk-steps the bot spends to spare a blueprint
+// or station voxel, added to the remaining walk. Also sets the search's flood radius (A* must rule out
+// every cheaper route before accepting a priced edge).
 const PROTECTED_VOXEL_DETOUR_BUDGET = 50.0;
 
 // ── Flow creation: a dig that opens a face onto a liquid ─────────────────────
-// Breaking a block that touches water or lava lets the liquid pour into the space just opened. The
-// hole dug to pass through fills behind the body (or ahead of it): a water flow washes the bot off
-// its route and re-floods the same cell on every retry, which is the classic way a digging bot gets
-// stuck; a lava flow kills it. mineflayer-pathfinder carries the same rule as dontCreateFlow and
-// treats it as a hard BAN — the move simply does not exist.
-//
-// A BAN IS WRONG HERE (Architect 2026-08-18, ruled at the table while porting the rule in). Auren digs
-// to ESCAPE as often as to travel, so deleting the move would strand a bot whose only way out of a
-// flooded shaft is through the wet wall — the same argument that makes PROTECTED_VOXEL_DETOUR_BUDGET a
-// number and not a prohibition. So: a price, and one the search can always choose to pay.
-//
-// TWO TIERS, because the two liquids are not the same failure. A water flow is a nuisance — the route
-// is lost and the bot re-plans wet. A lava breach is fatal (Law 17), so it is priced at the model's
-// CEILING and therefore loses to every other move the cost table can express.
-//
-// WHY LAVA IS NOT PRICED HIGHER, since "lethal" invites a large number. Two reasons and both bind.
-// (a) A cost sets a search FLOOD RADIUS (see PROTECTED_VOXEL_DETOUR_BUDGET above): before A* may accept
-// an edge priced N it must rule out every route cheaper than N, so a "safely enormous" lava number
-// re-creates the ~310,000-cell sweep the old 250 caused. (b) PROTECTED_VOXEL_DETOUR_BUDGET is documented
-// — here and at the navigator's penalty ladder — as the most the fleet will ever pay for one edge, and a
-// tier above it would be a second cost model beside the one this header describes (Law 16). Lava sits AT
-// the ceiling rather than above it, which is why these are combined with Math.max at the charge sites
-// and never added: no edge may leave this file priced above the ceiling.
-const FLOW_DETOUR_BUDGET = 30.0;                                    // dig opens a face onto water
-const LAVA_FLOW_DETOUR_BUDGET = PROTECTED_VOXEL_DETOUR_BUDGET;      // onto lava — the ceiling, BY REFERENCE so it cannot drift above it
+// Breaking a block touching water or lava lets it pour into the opened space. A dig onto water is
+// no edge (opensOntoWater — the bot never makes a flow trap); a dig onto lava is priced at the
+// model's ceiling.
+const LAVA_FLOW_DETOUR_BUDGET = PROTECTED_VOXEL_DETOUR_BUDGET;      // onto lava — the ceiling, by reference
 
 // ── One search, goal-focused ─────────────────────────────────────────────────
-// A single A* frontier (f = g + W*h) serves EVERY goal - a walk across town and a build anchor
-// hanging in open air are the same search. Cost governs the ROUTE: a bridge/pillar costs 25x a walk,
-// so a walk-around is always chosen when one exists; the build only happens where it is genuinely the
-// cheapest (often only) route, the last gap into an air anchor.
-//
-// W = 1.0 (Architect 2026-08-04, ruled at the table). The heuristic is straight-line distance, which
-// can never overestimate real travel, so at W=1.0 it is ADMISSIBLE and the returned route is PROVABLY
-// the cheapest one that exists. That is the entire reason for the value: the Architect requires a
-// binary answer - "this is the only way" or "I have the best way" - and a weighted search can deliver
-// neither. At the previous W=1.5 the route was merely bounded at 1.5x optimal: it could be half again
-// longer than the best route with nothing in the system able to tell.
-//
-// WHAT W>1 WAS GUARDING, because it was not arbitrary and removing it moves the failure, not deletes
-// it. Weighting focused expansion at the goal so a distant or air-suspended cell was REACHED instead
-// of the frontier flooding the cheap flat field and exhausting its budget short of the target (the
-// failure a separate greedy "delivery" mode had been bolted on to paper over - deleted since, Law 16).
-// At W=1.0 every search explores strictly more, so the guard that now fails first is the NODE BUDGET:
-// an exhausted budget returns `partial: true`, and a partial cannot support "the only way" either.
-// Optimality and completeness are two separate fixes and only the first is made here - if partial
-// rates climb on air-anchor searches, MAX_NODES is the dial, never this constant.
+// A single A* frontier (f = g + W*h) serves every goal. W = 1.0: straight-line distance is always
+// admissible, so the returned route is provably the cheapest that exists (NO NODE BUDGET below).
 const HEURISTIC_WEIGHT = 1.0;
 //
 // EDGE CATALOG — every edgeType the pathfinder emits, its walker (navigator.js), and its cost. This is
-// the single inspection point for "what edges exist and what do they cost"; keep it in sync on a retune.
-//   walk            COST_LOW  (1)      bridgeLevelStep   one flat cell            (leaf floor → COST_HIGH)
+// the single inspection point for what edges exist and what they cost; keep it in sync on a retune.
+//   walk            COST_LOW  (1)      bridgeLevelStep   one flat cell
 //   climb_up        COST_LOW  (1)      stairUpStep       step up an existing +1 tread
-//   climb_down      COST_LOW  (1)      stairDownStep     step down an existing -1 floor (diagonal)
+//   climb_down      COST_LOW  (1)      stairDownStep     step down an existing -1 floor (diagonal); where the
+//                                                        head's crossing cell holds a block it is one dig_stair_down step
 //   door            COST_LOW  (1)      stepToFeet        walk through a wooden door
 //   swim            COST_HIGH (15)     swimStep          enter / traverse water
+//   water_exit      COST_WATER_EXIT(3) swimStep          WATER TO LAND: onto a solid block level with the surface cell,
+//                                                        feet and head cells above it clear. The first way out of water.
+//   water_bank_out  COST_PLACE+COST_WATER_EXIT+COST_LOW(29)  waterBankOutStep   WATER TO LAND BY PLACING, onto a bank one
+//                                                        block over the water: a block set in the surface cell beside the
+//                                                        body, against the bank; out onto it; one step up. The second way out.
+//   * no edge DIGS from a water node, and no edge steps UP from one without placing.
 //   dig_through     COST_HIGH (15)     digThroughStep    dig a same-Y wall, step in
 //   dig_down        COST_HIGH (15)     digDownStep       dig the floor, drop 1
-//   dig_climb_up    COST_HIGH (15)     stairUpStep       dig a blocked +1 stair — the preferred ASCENT
-//   dig_climb_down  COST_HIGH (15)     stairDownStep     dig a blocked -1 stair
+//   dig_stair_down  COST_STAIR_STEP(10)/step  stairDownStep  ONE straight dug stair to the goal's level (STAIR LINES)
+//   dig_stair_up    COST_STAIR_STEP(10)/step  stairUpStep    the same, upward; treads must exist
 //   bridge          COST_PLACE(25)     bridgeLevelStep   place a block over a gap, cross
-//   pillar          COST_PLACE(25)     pillarUpStep      place underfoot + rise — the ONLY straight-up
-//                                                        move (digs a plain ceiling as it goes)
-//   * any edge that digs or covers a PROTECTED / station voxel is charged PROTECTED_VOXEL_DETOUR_BUDGET instead of its base.
-//   * any edge that DIGS is additionally floor-priced by flowPrice() when a broken face would open water
-//     (FLOW_DETOUR_BUDGET) or lava (LAVA_FLOW_DETOUR_BUDGET). Math.max against the base, never a sum — the
-//     edge is charged its worst applicable tier and never more than the ceiling.
+//   pillar          COST_PLACE(25)     pillarUpStep      place underfoot + rise — the ONLY straight-up move
+//   * a cell inside one of opts.closedBoxes is not in the graph at all — see CLOSED BOXES in the search body.
+//   * a leaf is never a floor: no edge lands on one (terrain_predicates.isWalkableSurface).
+//   * any edge that digs or covers a PROTECTED / station voxel is charged PROTECTED_VOXEL_DETOUR_BUDGET.
+//   * any edge that DIGS is additionally floor-priced by flowPrice() (LAVA_FLOW_DETOUR_BUDGET), by
+//     Math.max against the base, never a sum; an edge whose dig opens onto water is not offered.
 
-// Standing ON tree leaves is legal (mineflayer rests a body on a leaf block) but a trap: the canopy
-// is walk-ONTO-able yet not reliably traversable, so a bot A* routes onto it strands and livelocks
-// (both bots died this way). Leaves are NOT a Law-17 hazard (those are excluded from A* entirely) —
-// they're passable-but-costly: a leaf-FLOOR step is charged COST_HIGH so A* detours up to ~15
-// walk-steps around a canopy, yet still crosses one if nothing else reaches (finite — one cost
-// model, no separate leaf-ban pathway, Law 16). floorMoveCost is the single place the base per-step
-// cost is decided, so every move edge (walk/climb) agrees on what a leaf floor costs.
+// The name test lives in `leaf_authority`, asked here, not duplicated (Law 16). The voxel reader's
+// flag table reads it per block state, and the dig-down edge reads it to bring a body out of a canopy.
 function isLeafFloor(block) {
-  return !!(block && typeof block.name === 'string' && block.name.endsWith('leaves'));
-}
-function floorMoveCost(floorBlock) {
-  return isLeafFloor(floorBlock) ? COST_HIGH : COST_LOW;
+  return require('@utils/movement/leaf_authority').isLeafBlock(block);
 }
 
-// Digging a station costs PROTECTED_VOXEL_DETOUR_BUDGET (same tier as blueprint voxels) — the PRICE is
-// this file's to set; WHICH BLOCKS are stations is not. That membership was a second list here until it
-// had drifted six blocks apart from the canonical one (fragment_utils.STATION_TYPES carries the full
-// account). A cost table asking someone else "is this a station" is the shape that cannot drift.
+// Digging a station costs PROTECTED_VOXEL_DETOUR_BUDGET; WHICH blocks are stations is fragment_utils.STATION_TYPES (Law 16).
 const keyOf = (p) => `${p.x},${p.y},${p.z}`;
 const straightLine = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 
@@ -207,19 +135,22 @@ class MinHeap {
 }
 
 // ── computeAStar — the pathfinder. ──
-// Params:
-//   bot      — mineflayer bot (inline bot.blockAt queries)
-//   startPos — Vec3/{x,y,z}, the bot's FLOOR position (block stood ON)
-//   goal     — { type:'position', pos } | { type:'multi', positions:[…] } | { type:'los', targetPos }
-//   opts     — { maxNodes?, blacklist?, movePenalties?, protectedBlocks?, trace?, deadlineMs?, owner? }
-// Returns { path:[{key,pos,edgeType}], target, cost, partial, residual, provenBound, complete },
-// or null when no path exists.
+// bot — mineflayer bot. startPos — Vec3/{x,y,z}, the bot's FLOOR position (block stood ON).
+// goal — { type:'position', pos } | { type:'multi', positions:[…] } | { type:'los', targetPos }.
+// opts — { maxNodes?, blacklist?, movePenalties?, protectedBlocks?, closedBoxes?, trace?, deadlineMs?, owner?, sense? }.
+// sense() supplies fresh world-dependent options after workspace admission.
+// Returns { path:[{key,pos,edgeType}], target, cost, partial, residual, provenBound, complete }, or
+// null when no path exists.
 
 // Water: swimmable, not walkable. Also in HAZARD_BLOCKS so no walk/climb edge routes through a
 // submerged column (the bot can't walk underwater); swim edges carry all water traversal instead.
 const WATER_BLOCKS = new Set(['water', 'flowing_water']);
 
 function isWaterBlock(block) { return block && WATER_BLOCKS.has(block.name); }
+
+// isStillWater — a water SOURCE (level 0), the only water a body swims. Flowing water (level 1-15)
+// carries a body like a current, so it is a hazard kept out of every route, the same as lava.
+function isStillWater(bot, x, y, z) { return require('@utils/gravity_utils').isWaterSource(bot, x, y, z); }
 
 // Wooden doors — openable by hand (activateBlock). Iron doors excluded: they need redstone.
 const DOOR_BLOCKS = new Set([
@@ -229,8 +160,7 @@ const DOOR_BLOCKS = new Set([
 
 function isDoorBlock(block) { return block && DOOR_BLOCKS.has(block.name); }
 
-// findWaterSurface: from a water block, climb to the surface Y (topmost water with air above for
-// the head), or null if the column is capped by solid — underwater with no way up, so no swim node.
+// findWaterSurface: from a water block, climb to the surface Y, or null if capped by solid (no swim node).
 function findWaterSurface(bot, x, y, z) {
   let surfY = y;
   for (let i = 1; i <= 12; i++) {
@@ -243,8 +173,7 @@ function findWaterSurface(bot, x, y, z) {
   return surfY;
 }
 
-// Never passable, never a walkable floor. Water forces swim edges (not walk); the rest are
-// Law 17 hazards the planner must route around, not through.
+// Never passable. Water forces swim edges; the rest are Law 17 hazards the planner routes around.
 const HAZARD_BLOCKS = new Set([
   'water', 'flowing_water', 'bubble_column',
   'lava', 'flowing_lava',
@@ -265,12 +194,17 @@ const PASSABLE_BLOCKS = new Set([
   'snow',
 ]);
 
-// Mirrors getClearance in movement/terrain_predicates, but on a raw block (no relative offset).
+// Mirrors getClearance in movement/terrain_predicates, on a raw block (no relative offset). A phantom
+// leaf is passable overhead and is no floor underfoot (isWalkableSurface) — clearance and footing are
+// two separate questions, asked of the same block.
 function isBlockPassable(block) {
   if (!block) return false;
   if (PASSABLE_BLOCKS.has(block.name)) return true;
   if (HAZARD_BLOCKS.has(block.name)) return false;
-  return block.boundingBox === 'empty';
+  if (block.boundingBox === 'empty') return true;
+  // Reads global.bot, not a threaded parameter: called from A*'s innermost loop through call sites with
+  // no bot in scope. A worldless caller (lanista, a bench) has no global and gets `false`.
+  return global.bot ? require('@utils/movement/leaf_authority').isPhantom(global.bot, block) : false;
 }
 
 function isBlockSolid(block) {
@@ -278,9 +212,8 @@ function isBlockSolid(block) {
   return block.boundingBox !== 'empty' && block.name !== 'air';
 }
 
-// Blocks that fall when their support is removed — digging one directly OVERHEAD drops it onto the
-// bot's head (Law 17 suffocation). Excluded as ceiling for the upward pillar / dig_climb_up edges;
-// horizontal dig_through is unaffected (nothing drops sideways).
+// Blocks that fall when their support is removed — digging one OVERHEAD drops it on the bot's head
+// (Law 17). Excluded as ceiling for the upward pillar / dig_stair_up edges.
 const FALLING_BLOCKS = new Set([
   'sand', 'red_sand', 'gravel',
   'anvil', 'chipped_anvil', 'damaged_anvil',
@@ -291,9 +224,8 @@ const FALLING_BLOCKS = new Set([
   'brown_concrete_powder', 'green_concrete_powder', 'red_concrete_powder', 'black_concrete_powder',
 ]);
 
-// isCeilingDiggable: safe to dig a block sitting ABOVE the bot. Solid + diggable, and neither a
-// hazard (water/lava would flood the shaft) nor a gravity block (drops on the head). The upward dig
-// edges gate their overhead cells on this; a sideways dig has no such risk so it doesn't apply.
+// isCeilingDiggable: safe to dig a block sitting ABOVE the bot — solid, diggable, not a hazard or a
+// gravity block. Gates the upward dig edges only; a sideways dig has no such risk.
 function isCeilingDiggable(block) {
   if (!isBlockSolid(block)) return false;
   if (!block.diggable) return false;
@@ -302,82 +234,78 @@ function isCeilingDiggable(block) {
   return true;
 }
 
-// Lava, named apart from HAZARD_BLOCKS on purpose. That set answers "may the body ENTER this", one
-// answer for every hazard; this one answers "how bad is opening a face onto it", where lava's answer
-// differs from water's. Same two block names, two different questions, so two sets rather than one set
-// asked a question it was not built to answer.
+// Lava, named apart from HAZARD_BLOCKS: that set answers whether the body may enter a cell; this one
+// answers how bad it is to open a face onto it.
 const LAVA_BLOCKS = new Set(['lava', 'flowing_lava']);
 
-// The cells a liquid can reach a newly-broken block from: the four cardinals and the one ABOVE. Never
-// BELOW — liquid does not flow upward, so a pool under the floor cannot enter the space above it. This
-// is exactly mineflayer-pathfinder's neighbour set for the same rule; the omission is deliberate there
-// too, and copying it without the reason is how it would get "fixed" back to six.
+// The cells a liquid can reach a newly-broken block from: the four cardinals and the one ABOVE, never
+// BELOW — liquid does not flow upward.
 const FLOW_NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]];
 
-// flowPrice — the floor price for a dig that would open a liquid into the space it clears, or 0.
+// opensOntoWater — true when breaking the cell at (x,y,z) would let water flow into it: water on one
+// of its FLOW_NEIGHBORS. The one predicate for "a dig here creates flow" — A* reads it through
+// flowPrice and dig_authority.performDig reads it directly, so a planned dig and an executed dig
+// answer the same question (Law 16).
 //
-// `cells` is the list of [x,y,z] the edge actually BREAKS. A cell that is already passable is not being
-// opened and contributes nothing, so callers pass only the solid ones — which also keeps this off the
-// hot path for the common all-clear edge.
-//
-// Returns the WORST tier across all of them, not the sum: a two-block dig is priced by its most
-// dangerous face. Summing would let a wide-but-shallow breach out-price a lava wall, and would also
-// climb above the cost ceiling, which nothing in the model is allowed to do.
-//
-// THE ONE PLACE THE RULE LIVES (Law 16). Every dig edge in this file calls it, so travel routes, combat
-// retreats and escape digs inherit the same price by construction rather than by five agreeing copies —
-// which is what this file already was: dig_down carried a water-only HARD BAN of its own and the other
-// four dig edges carried nothing, so the bot would refuse to sink one shaft beside a pond and then
-// happily tunnel sideways into the same pond one cell over.
-//
-// A null (unloaded) neighbour is NOT charged, which is the one place this parts company with Law 13's
-// read-the-unknown-as-unsafe. A price is not a safety gate: the dig gates above already refuse a cell
-// they cannot read, and charging for unloaded chunks would make every dig at a chunk border expensive
-// for a reason that has nothing to do with liquid.
+// The cell broken is not the only cell opened. Sand or gravel resting on it falls into the gap, and the
+// cells that column LEAVES at its top are open too, so each of those is asked the same question. The
+// column falls as far as the first solid block under the broken cell.
+const FALL_SCAN_DOWN = 8;
+function touchesWater(bot, x, y, z) {
+  for (const [dx, dy, dz] of FLOW_NEIGHBORS) {
+    const b = bot.blockAt(new Vec3(x + dx, y + dy, z + dz));
+    if (b && WATER_BLOCKS.has(b.name)) return true;
+  }
+  return false;
+}
+function opensOntoWater(bot, x, y, z) {
+  if (touchesWater(bot, x, y, z)) return true;
+  let top = y;
+  for (;;) {
+    const b = bot.blockAt(new Vec3(x, top + 1, z));
+    if (!b || !FALLING_BLOCKS.has(b.name)) break;
+    top++;
+  }
+  if (top === y) return false;
+  let drop = 1;
+  for (; drop <= FALL_SCAN_DOWN; drop++) {
+    const b = bot.blockAt(new Vec3(x, y - drop, z));
+    if (b && b.boundingBox === 'block') break;
+  }
+  for (let cy = top; cy > top - drop && cy > y; cy--) if (touchesWater(bot, x, cy, z)) return true;
+  return false;
+}
+
+// flowPrice — the floor price for a dig, given the [x,y,z] cells the edge actually BREAKS: 0 for a
+// dry dig, the lava ceiling for a dig that opens onto lava, and null for a dig that opens onto water,
+// which is no edge at all (performDig refuses it, so A* never offers it).
 function flowPrice(bot, cells) {
-  let worst = 0;
+  for (const [x, y, z] of cells) if (opensOntoWater(bot, x, y, z)) return null;
   for (const [x, y, z] of cells) {
     for (const [dx, dy, dz] of FLOW_NEIGHBORS) {
       const b = bot.blockAt(new Vec3(x + dx, y + dy, z + dz));
-      if (!b) continue;
-      if (LAVA_BLOCKS.has(b.name)) return LAVA_FLOW_DETOUR_BUDGET;   // ceiling — nothing can outrank it
-      if (WATER_BLOCKS.has(b.name)) worst = FLOW_DETOUR_BUDGET;
+      if (b && LAVA_BLOCKS.has(b.name)) return LAVA_FLOW_DETOUR_BUDGET;   // ceiling — nothing can outrank it
     }
   }
-  return worst;
+  return 0;
 }
 
-// Placeable as a pillar/bridge block — membership only. It reads scaffold_block, the gravity-FILTERED
-// exposure, which is a deliberate under-count of what a pillar can lay: this set gates bridge decisions
-// too, and "the bot holds sand, so it can bridge" plans a crossing that falls out from under it. The
-// wrong answer this way costs a detour; the other way costs the walker (Law 13).
-// This was a hand-maintained copy: "what is a placeable block" was defined in FIVE places (here,
-// group_to_item, navigator's BUILD_PREFS, and a FILL_PREFERENCE in each of mining_executor and
-// farm_executor), and only one read the canonical table. A planner list that drifts from the executor
-// list plans routes the walker cannot lay.
-// No `|| []` — an absent group is a coding violation here, and an empty set makes isScaffoldBlock answer
-// "no scaffolding" for every block in the game: a well-formed falsehood the pillar/bridge fuel checks
-// would act on without ever failing loudly (Law 13, Law 26).
+// Placeable as a pillar/bridge block — reads scaffold_block, the gravity-filtered exposure, so a bridge
+// is never planned over a block that falls from under it (Law 13), from the one canonical list (Law 16).
+// No `|| []`: an absent group is a coding violation (Law 13, Law 26).
 const SCAFFOLD_BLOCKS = new Set(
   require('@utils/fragment_utils').group_to_item.scaffold_block
 );
 function isScaffoldBlock(name) { return SCAFFOLD_BLOCKS.has(name); }
 
-// isFloorSafe: is this block a standable floor for A*? Delegates to terrain_predicates.isWalkableSurface
-// — the ONE walkability definition the STEP EXECUTOR also uses (Law 16). They MUST agree: this copy
-// used to only reject hazards + empty-bbox blocks, so it accepted fences/gates/walls (boundingBox
-// 'block') as floors. Those collide to 1.5 blocks — an off-grid half-perch the 1-block navigator
-// can't hold — so A* planned routes ONTO the fence line, the walker bumped and drifted, and the bot
-// "slid to the entrance after a few retries" (the farm-perimeter fence stalls). Sharing the predicate
-// makes the planner route AROUND fences the executor already refuses to stand on.
+// isFloorSafe: is this block a standable floor for A*? Delegates to isWalkableSurface, the one
+// walkability definition the step executor also uses (Law 16).
 function isFloorSafe(block) {
   return isWalkableSurface(block);
 }
 
-// isFullHeightFloor: does the floor's collision top reach y=1.0? Partial-height blocks (chest
-// 0.875, slab 0.5, bed, enchant table) report boundingBox='block' but their surface sits below
-// y+1. Walk edges tolerate it; climb_up does NOT — A* assumes feet at floorY+1 but the bot lands
-// at floorY+surface, flooring to a lower Y. So this gates climb_up edges only.
+// isFullHeightFloor: does the floor's collision top reach y=1.0? Partial-height blocks (chest, slab,
+// bed) report boundingBox='block' but sit below y+1, which climb_up cannot tolerate; gates climb_up only.
 function isFullHeightFloor(block) {
   if (!block || !block.shapes || block.shapes.length === 0) return true;
   let maxY = 0;
@@ -385,25 +313,15 @@ function isFullHeightFloor(block) {
   return maxY >= 1.0;
 }
 
-// classifyFloorInline: terrain_predicates.classifyFloor via bot.blockAt (no offset needed).
-// 'jumpable' = 3 air above (room to jump onto), 'walkable' = 2 air, null = blocked/unsafe.
-//
-// THE FLAGS PATH (`_classifyFloorAt`) IS THE LIVE ONE whenever the search runs against a real world:
-// _fastVoxelView arms it from the shipped reader. The block path below is NOT a fallback in the Law 16
-// sense — it is the only path a worldless caller has (lanista's four-field adapter, the virtual
-// playground), where there are no state ids to read flags from. Two implementations of one verdict is a
-// real hazard, so they are pinned equal by test rather than by discipline:
-// It must answer identically, and it does by derivation rather than by transcription: isFloorSafe IS
-// terrain_predicates.isWalkableSurface, and the clearance test IS isBlockPassable — the same two
-// predicates the flag table calls to build its WALKABLE and PASSABLE bits.
+// classifyFloorInline: terrain_predicates.classifyFloor via bot.blockAt. 'jumpable' = 3 air above,
+// 'walkable' = 2 air, null = blocked/unsafe. `_classifyFloorAt` is the live path against a real world
+// (armed by _fastVoxelView); the block path below is the only path a worldless caller has (lanista, the
+// virtual playground) — it answers identically by derivation: isFloorSafe IS isWalkableSurface.
 function classifyFloorInline(bot, floorBlock) {
   if (!floorBlock) return null;
   if (bot._classifyFloorAt) {
     const p = floorBlock.position;
-    // The floor's state id is handed over because the caller ALREADY read this cell to obtain
-    // floorBlock. Without it the flags path re-reads the floor and costs one extra read per call —
-    // enough to make it read MORE than the block path it replaces (measured, before this argument).
-    return bot._classifyFloorAt(p.x, p.y, p.z, floorBlock.stateId);
+    return bot._classifyFloorAt(p.x, p.y, p.z, floorBlock.stateId);  // caller already read this cell
   }
   if (!isFloorSafe(floorBlock)) return null;
   const pos = floorBlock.position;
@@ -443,16 +361,9 @@ function heuristic(pos, goal) {
   return 0;
 }
 
-// endsOnStation — the last gate every goal type passes through: a route may cross a station, but it may
-// not come to rest on one (terrain_predicates.isStationFloor carries the reasoning).
-//
-// Ordered AFTER each goal type's own cheap test on purpose. This is a world read, and goalReached runs on
-// every popped node — hundreds of thousands in one search — so it may only run on a cell that has already
-// answered "this is the goal". Placed before the LOS raycast for the same reason: a Set lookup is the
-// cheaper of the two disqualifiers, so it should be the one that fires first.
-//
-// A node is a FLOOR cell (goals are built at target y-1), so this reads the node's own block: the body
-// stands on it.
+// endsOnStation — the last gate every goal type passes through: a route may cross a station but may not
+// rest on one (terrain_predicates.isStationFloor). Run only after a goal type's own cheap test, since
+// this is a world read and goalReached runs on every popped node.
 function endsOnStation(bot, nodePos, trace) {
   const floor = bot.blockAt(nodePos);
   if (!isStationFloor(floor)) return false;
@@ -478,9 +389,8 @@ function goalReached(bot, nodePos, goal, trace) {
     return !endsOnStation(bot, nodePos, trace);
   }
   if (goal.type === 'los') {
-    // Two proximity gates before LOS matters — the bot must be close enough AND
-    // at a usable height. Without these, A* accepts vantage points where the
-    // raycast passes but the interaction angle is too steep to actually place/dig.
+    // Two proximity gates before LOS matters: close enough, and at a usable height — without them A*
+    // accepts a vantage whose raycast passes but whose interaction angle is too steep to place/dig.
     const feetY = nodePos.y + 1;
     const dx = goal.targetPos.x - nodePos.x;
     const dy = goal.targetPos.y - feetY;
@@ -501,16 +411,9 @@ function goalReached(bot, nodePos, goal, trace) {
     if (endsOnStation(bot, nodePos, trace)) return false;
     return checkLOS(bot, nodePos, goal.targetPos, trace);
   }
-  // A 'near' GOAL TYPE LIVED HERE FOR ONE DAY, and its deletion is the record of a design that was
-  // right about the bug and wrong about the answer. It asked "stand within N blocks of this block", with
-  // no raycast — built 2026-08-31 to fix a station-use loop, deleted the same day when the Architect
-  // ruled the stand must be the blueprint's own ANCHOR instead: *"the anchor is a designated building
-  // point and is a pre approved location to stand and reach every block within its domain so reuse it
-  // instead of making some non deterministic way to stand."* A radius admits many cells and the search
-  // picks whichever is cheapest, which is a different cell on a different approach — including one
-  // OUTSIDE the building, reaching a chest through a wall. The anchor is one cell, authored, the same
-  // every time (Law 19). Station approach is now `locomotion.goToStationStance`, which resolves the
-  // owning anchor and uses the ordinary exact-position goal; nothing needs a radius goal.
+  // THERE IS NO 'near' GOAL TYPE. A station is approached through its blueprint ANCHOR — one authored
+  // cell, always the same (Law 19) — via `locomotion.goToStationStance`, which resolves the owning
+  // anchor and uses the ordinary exact-position goal.
   return false;
 }
 
@@ -558,34 +461,11 @@ function checkLOS(bot, floorPos, targetPos, trace) {
   return false;
 }
 
-// _fastVoxelView — swap this search's world reads onto the per-state-id table (Architect 2026-08-04,
-// approved after the live A/B). Every `bot.blockAt` below is unchanged; only what it resolves to moves.
-//
-// WHY A SHADOWED VIEW AND NOT ~50 EDITED CALL SITES: the search's logic must stay byte-identical, because
-// the evidence for this change is that it produces THE SAME ROUTE faster (routes identical cell-by-cell
-// and edge-by-edge in 10/10 live trials, at equal read counts — tools/astar_ab_bench). Rewriting fifty
-// reads would put that identity at risk for no gain. Object.create keeps `world`, `entity` and
-// `inventory` resolving to the real bot, so checkLOS's raycast and the place edges are untouched.
-//
-// WHAT IT BUYS: 36,548 ms -> 15,522 ms on a 200k-node search (19.1 million reads for one route). The
-// win is not skipped work — it is that `name`/`boundingBox` are functions of the block's number, so they
-// are computed once per number instead of rebuilt into a fresh ~20-field description on every read.
-//
-// RETURNS THE BOT UNCHANGED when there is no `world` to read state ids from. That is not a defensive
-// nicety: lanista and the benches pass a four-field adapter with a `blockAt` and nothing else, and
-// silently ignoring their reader would search a different world than the caller asked about (Law 25).
-//
-// `readerOverride` (opts.voxelReader) is a MEASUREMENT SEAM, not a feature: it lets an A/B bench run a
-// candidate reader through this exact search instead of forking it, which is the only way a timing and a
-// route-identity check can be about the reader alone. No production caller passes one.
-//
-// ONE READER PER BOT, NOT ONE PER SEARCH (Law 8). The reader registers chunkColumnLoad/chunkColumnUnload
-// listeners to drop its held column, so building one per computeAStar call would pile listeners onto
-// bot.world for the life of the process — Node warns at 11 and the leak is silent before that. The
-// WeakMap holds it against the bot so it is collected WITH the bot and never needs an explicit dispose;
-// this is the same holder pattern surface_filter already uses, reused rather than re-invented (Law 22
-// gate 2). Keyed on the bot because the held column is per-bot state: two bots sharing one reader would
-// thrash the memo against each other.
+// _fastVoxelView — swaps this search's world reads onto the per-state-id table; every `bot.blockAt`
+// call is unchanged, only what it resolves to moves. Object.create keeps `world`, `entity` and
+// `inventory` resolving to the real bot. Returns the bot unchanged when there is no `world` to read
+// state ids from, so a worldless caller (lanista, a bench) searches the world it asked about (Law 25).
+// One reader per bot, not per search (Law 8), held in a WeakMap so it is collected with the bot.
 const _readerForBot = new WeakMap();
 function _fastVoxelView(bot, readerOverride) {
   if (!bot || typeof bot.world?.getColumnAt !== 'function') return bot;
@@ -602,36 +482,14 @@ function _fastVoxelView(bot, readerOverride) {
   return view;
 }
 
-// ── THE SEARCH CENSUS (Architect 2026-08-04: "calculate the time each pathfinding takes and post it
-// for watcher tracer to look at") ───────────────────────────────────────────────────────────────────
-// What one search cost, accumulated here and POSTED BY THE CALLER. This module stays watcher-free on
-// purpose (same reason `trace` is an injected sink): a util that talks to the watcher cannot be run by
-// the benches or the virtual playground, which is where the search's evidence comes from.
-//
-// WHY AN ACCUMULATOR AND NOT A LINE PER SEARCH. One navigation runs the search many times — plan, then
-// re-plan on every floor recovery, blacklist retry and stream refresh (navigator has seven call sites).
-// A summary per search would bury the trace in exactly the per-step noise Law 5 deleted; one aggregated
-// line per unit of work is the level Law 5 names as the primary channel.
-//
-// SAFE AS MODULE STATE because a decision-maker is one process holding one `global.bot`, and Law 4 gives
-// it one active signal: whatever accumulates between two drains belongs to the one owner that was
-// running. A second bot in-process would need this keyed per bot — it is not, deliberately, because
-// that is not the deployment and a per-bot map would imply it is.
-//
-// ── WHY IT IS KEYED BY OWNER (Invariant D — one owner per state) ────────────────────────────────────
-// One active signal does NOT mean one caller: this module is a util, and any fragment holding the signal
-// may search. The navigator drains and posts the result as its own trip's cost, so every search another
-// caller made between two navigations was billed to a navigation that never made it. That is not a small
-// blur — the two callers search under DIFFERENT deadlines, so the drained totals reported a timeout count
-// that no single deadline could reconcile against the drained time, and the aggregate could not say which
-// number was lying (neither was; the mix was). Keying by owner is what makes both numbers true at once,
-// and it is why a caller passes `opts.owner`: a search's owner is the one fact this module cannot sense
-// for itself.
-// Untagged is a NAMED bucket, not a defaulted field (Law 13): the benches and the virtual playground call
-// this directly and are correct systems, so "no owner declared" is a real category rather than a bug —
-// but it is never silently folded into a caller's bill.
+// ── THE SEARCH CENSUS — what each pathfind costs, posted where a trace reader can see it ────────────
+// Accumulates cost per search, drained and posted by the caller. Watcher-free (like `trace`) so it can
+// run from the benches and the virtual playground too — one aggregated line per unit of work (Law 5).
+// Module-level state is safe because a decision-maker holds one `global.bot` (Law 4).
+// KEYED BY OWNER (Invariant D): any fragment may search, so a tally billed to the last drainer would mix
+// different callers' deadlines. `opts.owner` names the true owner; untagged is its own bucket (Law 13).
 const UNATTRIBUTED_SEARCH_OWNER = 'unattributed';
-const _blankTally = () => ({ searches: 0, totalMs: 0, maxMs: 0, nodes: 0, partial: 0, timedOut: 0, failed: 0, incomplete: 0 });
+const _blankTally = () => ({ searches: 0, totalMs: 0, maxMs: 0, nodes: 0, partial: 0, timedOut: 0, failed: 0, incomplete: 0, workspaceWaitMs: 0, activeMs: 0, resourceLimited: 0 });
 const _census = new Map();   // owner → tally
 function drainSearchCensus() {
   const total = _blankTally();
@@ -646,30 +504,13 @@ function drainSearchCensus() {
   _census.clear();
   return { ...total, byOwner };
 }
-// The timing wrapper is the ONLY way in (the body below is not exported), so no call site can be added
-// that escapes the census — the alternative, recording at each of the body's four return points, is one
-// forgotten `return` away from an undercount that reads as a speedup (Law 25).
+// The timing wrapper is the ONLY way in, so no call site can escape the census (Law 25).
 // ── pathStillWalkable — re-verify a plan instead of re-planning it ──────────────────────────────────
-// Answers "is the route I am walking still legal?" for the cells not yet walked. Lives here rather than
-// in the navigator because it must agree with the search by DERIVATION, not by transcription: it calls
-// the same classifyFloorInline over the same per-bot reader the search itself used, so a verdict here
-// cannot drift from the verdict that planned the route. A second, separately-written walkability test
-// would not throw when it disagreed — it would quietly re-plan a fine path, or walk a broken one.
-//
-// WHY IT EXISTS (Architect 2026-08-04): the navigator re-planned every 2s or 20 steps unconditionally.
-// Measured: one healthy 97-second walk ran 27 searches for 23.3s — over half the fleet's entire
-// pathfinding bill for a ten-minute run — and reported no partials, no timeouts and no lost routes.
-// Every one of those searches re-answered a question already answered correctly. Verification is ~4
-// reads per remaining cell against ~1.4 million for a replan, and it is also the more correct instrument:
-// a timer is remembered state that fires whether or not the world moved, while this re-senses (Invariant
-// B). Known and accepted limit: it checks STILL-VALID, never STILL-OPTIMAL — a shortcut opening mid-walk
-// goes unnoticed, which is the exact re-optimisation the cadence was paying for and the Architect ruled
-// not worth it.
-//
-// Only the edges that need standable ground are checked. A dig/bridge/pillar step is *going* to change
-// the world at its destination, so "not walkable yet" is its normal state, not a fault — verifying those
-// would invalidate every carve plan on its first step. Their failures are caught by the executor and
-// priced through movePenalties instead.
+// Answers whether the route being walked is still legal, for the cells not yet walked, via the same
+// classifyFloorInline over the same per-bot reader the search used (Invariant B — re-senses; never trusts
+// a timer). Checks STILL-VALID, never STILL-OPTIMAL. Only edges needing standable ground are
+// checked; a dig/bridge/pillar step is going to change its destination, so that is caught by the
+// executor and priced through movePenalties instead.
 const VERIFIABLE_EDGES = new Set(['walk', 'climb_up', 'climb_down', 'door', 'jump_out']);
 function pathStillWalkable(bot, path, fromIdx) {
   if (!Array.isArray(path)) return false;
@@ -684,179 +525,185 @@ function pathStillWalkable(bot, path, fromIdx) {
 
 async function computeAStar(bot, startPos, goal, opts = {}) {
   const t0 = Date.now();
-  const res = await _computeAStarBody(bot, startPos, goal, opts);
+  const liveStart = bot.entity?.position;
+  const startsAtBody = liveStart && startPos.x === Math.floor(liveStart.x)
+    && startPos.z === Math.floor(liveStart.z) && startPos.y === Math.floor(liveStart.y) - 1;
+  let activeAt = t0;
+  const res = await require('@kernel/foreman_link').withComputationWorkspace(() => {
+    activeAt = Date.now();
+    // A queued body can move under physics; a route from its body starts at the newly sensed floor.
+    const current = bot.entity?.position;
+    const from = startsAtBody && current ? new Vec3(Math.floor(current.x), Math.floor(current.y) - 1, Math.floor(current.z)) : startPos;
+    const sensedOpts = opts.sense ? { ...opts, ...opts.sense() } : opts;
+    return memoryWorkspace.withTemporaryMemory(track => _computeAStarBody(bot, from, goal, sensedOpts, track));
+  });
   const ms = Date.now() - t0;
   const owner = opts.owner || UNATTRIBUTED_SEARCH_OWNER;
   let tally = _census.get(owner);
   if (!tally) { tally = _blankTally(); _census.set(owner, tally); }
   tally.searches++;
   tally.totalMs += ms;
+  tally.workspaceWaitMs += activeAt - t0;
+  tally.activeMs += ms - (activeAt - t0);
   if (ms > tally.maxMs) tally.maxMs = ms;
   if (res) {
     tally.nodes += res.nodesVisited;
     if (res.partial) tally.partial++;
     if (res.timedOut) tally.timedOut++;
-    // Counted separately from `partial` because the pair is what carries the verdict, and only one of
-    // the four combinations is a lie waiting to happen:
-    //   found + complete    — the optimal route, proven.
-    //   partial + complete  — the frontier ran dry: genuinely no route in the world the bot can see.
-    //   partial + INCOMPLETE— a budget or clock cut the search off. This one must never be read as
-    //                         "unreachable"; all it supports is "nothing cheaper than provenBound".
-    // Tracking it makes the difference countable instead of a thing a reader has to know (Law 25).
+    // Paired with `partial` to carry the full verdict (Law 25): partial+complete is a proven no-route,
+    // partial+INCOMPLETE reads only as nothing cheaper than provenBound, never as unreachable.
     if (!res.complete) tally.incomplete++;
+    if (res.resourceLimited) tally.resourceLimited++;
   } else {
     tally.failed++;
   }
   return res;
 }
 
-async function _computeAStarBody(bot, startPos, goal, opts = {}) {
+async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
+  const heapAtStart = process.memoryUsage().heapUsed;
+  const boundedMemory = memoryWorkspace.enabled();
+  let resourceLimited = false;
   bot = _fastVoxelView(bot, opts.voxelReader);
   const start = new Vec3(Math.floor(startPos.x), Math.floor(startPos.y), Math.floor(startPos.z));
   const startKey = keyOf(start);
 
-  // ── NO NODE BUDGET (Architect 2026-08-04: "im always against the budget cap… remove the cap") ──────
-  // There is no maxNodes and no default one. A count of nodes is a measure of EFFORT SPENT, and the only
-  // question worth bounding is COVERAGE — and no formula can convert one to the other, because the number
-  // of cells inside a radius is a property of the terrain (open plain vs cave system differ by an order of
-  // magnitude at the same distance), not of the radius. So every distance→nodes rule was a guess, and a
-  // guess that ran out emitted "unreachable" for a place the bot could walk to. That is a false verdict,
-  // and a false verdict outranks a slow one (Law 25).
-  //
-  // WHAT TERMINATES INSTEAD — three, and none of them invented:
-  //   1. the goal pops        → the optimal route, proven. The normal exit; 31 ms median, live.
-  //   2. the HEAP EMPTIES     → every reachable cell examined. Guaranteed to arrive, because an unloaded
-  //      column yields no block and therefore no edge, so the frontier physically cannot cross the edge of
-  //      the loaded region. "No route" then means it, rather than "I stopped counting".
-  //   3. opts.deadlineMs      → a bound the WORLD imposed (a creeper fuse; how long a body may stand
-  //      still), not one the search invented about itself. Reports timedOut + provenBound, never a false
-  //      unreachable. No caller is given one by default.
-  // Underneath all three: the pacer cedes a macrotask every ~tick, so an uncapped search cannot freeze the
-  // shared world however long it runs — voxel_scan_throttle's own header names that as its purpose
-  // ("throttling is what makes an UNCAPPED whole-loaded-area search safe"), and arms a combat gate so a
-  // long search is not a blind window. This search is uncapped BECAUSE that pacer exists.
-  //
-  // `maxNodes` survives ONLY as an opt-in for a caller with a real reason (a bench pinning a comparison).
-  // Infinity is the default and no production caller sets it; if one ever does, it owes a WHY here.
+  // ── NO NODE BUDGET ─────────────────────────────────────────────────────────────────────────────────
+  // No maxNodes, no default one — a guessed distance→nodes cap emits a false "unreachable" for ground
+  // the bot could walk to (Law 25). What terminates instead: the goal pops; the heap empties (genuinely
+  // no route); or opts.deadlineMs (timedOut + provenBound). `maxNodes` survives only as a bench opt-in.
   const maxNodes = opts.maxNodes || Infinity;
 
-  // The shared cooperative pacer (Law 16): run a burst for up to one tick, then cede a macrotask so
-  // this bot's physics, the server tick, and every peer bot get a slice before the search resumes.
-  // `bot` arms the pacer's combat gate: a long route search is the single biggest blind window a bot
-  // has (5502ms measured on one hop, 2026-08-03), and it used to hold that window with no threat check
-  // in it at all. opts.combatGate === false turns it off for a search with no live body behind it — the
-  // arena's reachability criterion computes routes it never walks, and a gate there would abandon a
-  // measurement to the judge.
-  const pace = makeScanThrottle(opts.combatGate === false ? {} : { bot, source: 'locomotion' });
+  // The shared cooperative pacer (Law 16): runs a burst for up to one tick, then cedes a macrotask so
+  // physics, the tick and peer bots get a slice. `bot` arms the pacer's combat gate against a long blind
+  // window; opts.combatGate === false turns it off for a search with no live body behind it.
+  const pace = makeExecutionPacer(opts.combatGate === false ? {} : { bot, source: 'locomotion' });
 
-  // ── TWO WAYS TO DISPREFER A CELL, and they are NOT interchangeable ──────────────────────────────
-  // `blacklist` DELETES cells from the graph. Legitimate for exactly one thing: a caller's hard rule
-  // about where it will not go, whatever the price. Combat's retreat search is the only user — a cell
-  // that moves the bot TOWARD the threat must never be routed through, and a finite charge would let a
-  // cheap approach win the very trade the tactic exists to refuse.
+  // `blacklist` DELETES cells from the graph — a hard rule a caller will not cross whatever the price.
+  // Combat's retreat is the only user: a cell toward the threat must never be routed through.
   const blacklist = opts.blacklist || null;
 
-  // Read ONCE per search rather than per node: the answer cannot change mid-search (the start cell is
-  // fixed), and re-deriving it inside the pop loop would price a config read into every one of tens of
-  // thousands of nodes. See the pop-loop rejection below for what it does.
+  // Read once per search, not per node — the answer cannot change mid-search.
   const depthFloorArmed = !belowDepthFloor(start.y);
 
-  // `movePenalties` ("x,y,z|edgeType" -> extra cost) CHARGES instead of deleting. This is what a *failed
-  // step* gets, and the distinction is not cosmetic — deleting a cell can delete the only route to it,
-  // INCLUDING THE GOAL. That is a live defect, not a hypothetical: a final step stumbled, the navigator
-  // banned its destination, and the destination was the goal — so the re-plan was asked to prove something
-  // false and spent the whole search doing it while the bot walked to that exact cell one second later. A
-  // finite charge cannot make anything unreachable; it makes it a last resort. Same idiom the cost model
-  // already uses twice: leaf floors at COST_HIGH, blueprint voxels at PROTECTED_VOXEL_DETOUR_BUDGET — finite, never forbidden,
-  // so an entombed bot can still carve out.
-  //
-  // KEYED BY THE MOVE, NOT BY THE CELL, and the difference is what the walker actually observed. A failed
-  // step reports "bridging into X did not work" — a fact about a MOVE. Charging the cell instead widens
-  // that into "X is a bad place", which is a claim nothing measured (Law 23): the bot then avoids arriving
-  // at X by every other means too, including a plain walk in from another side that would have succeeded.
-  // The cell-shaped key was inherited from the hard ban this replaced — the ban had to name a cell because
-  // deletion has nowhere else to land — and the target was never re-asked when the ban became a charge.
+  // `movePenalties` ("x,y,z|edgeType" -> extra cost) CHARGES a cell instead of deleting it, so a finite
+  // charge is a last resort, never unreachable. Keyed by the MOVE, not the cell: a failed step is a fact
+  // about a move ("bridging into X failed"), not a claim about the cell (Law 23).
   const movePenalties = opts.movePenalties || null;
-  // Charged once per key per search. A cheaper route discovered to the same move after the charge lands
-  // gets in uncharged, which under-prices it slightly — accepted, because the penalty's job is "prefer
-  // another way", not to be an exact cost. Bounding it to once is what keeps the pop loop terminating.
+  // Charged once per key per search; charging once keeps the pop loop terminating.
   const penaltyCharged = movePenalties ? new Set() : null;
 
-  // Active blueprint voxels ("x,y,z" keys). Digging one costs PROTECTED_VOXEL_DETOUR_BUDGET — near-forbidden but
-  // finite, so a trapped bot can still break out (no entombment).
+  // Active blueprint voxels ("x,y,z" keys), charged PROTECTED_VOXEL_DETOUR_BUDGET to dig — finite, so a
+  // trapped bot can still break out.
   const protectedBlocks = opts.protectedBlocks || null;
 
-  // Optional (label, message) sink — keeps this module watcher-free while callers can still see
-  // inside the search. Null = silent.
+  // Optional (label, message) sink — keeps this module watcher-free. Null = silent.
   const trace = opts.trace || null;
 
-  // WORLD-ALTERING EDGES ON/OFF (Architect 2026-07-31, for the arena's reachability criterion:
-  // "pillar step and any move that requires digging or placing blocks is not allowed").
-  //
-  // Default TRUE, so the live fleet's every search is bit-identical to before — locomotion NEEDS these
-  // edges (a buried bot digs out; a build anchor in open air is bridged to). False deletes all six at
-  // GENERATION time: dig_climb_up, dig_climb_down, dig_through, dig_down, bridge, pillar. What survives
-  // is walk / climb_up / climb_down / door / swim — every move that leaves the world as it found it.
-  //
-  // WRONG TURN, and it is the tempting one: run the search normally and reject the result if its path
-  // contains an altering edge. That is unsound. A* returns the CHEAPEST route, so a dig (COST_HIGH) can
-  // win over a legal 30-step walk-around, and post-filtering would then report "unreachable" for a place
-  // the body could plainly walk to. The edge set has to be restricted before the search, not after it.
+  // WORLD-ALTERING EDGES ON/OFF, for a reachability criterion where no move may dig or place. Default
+  // TRUE; false deletes all six dig/place edges at GENERATION time (restricted before the search, not
+  // filtered after, or A* would report "unreachable" for ground reachable by a plain walk).
   const allowWorldAlteration = opts.allowWorldAlteration !== false;
-  // SPLIT INTO DIG vs PLACE (Architect 2026-08-01, for the combat navigator: "no digging but pillaring
-  // is allowed. digging takes too long"). The single boolean above could only say all-six or none, and
-  // a tactical retreat needs exactly the middle: keep pillar/bridge (a placement is one jump), delete
-  // every dig (breaking a block costs seconds the fuse does not have). Each defaults to the old flag,
-  // so every existing caller — which passes neither — searches bit-identically to before.
+  // Split DIG vs PLACE for the combat navigator: a retreat allows pillar/bridge but not digging (too
+  // slow for the fuse). Each defaults to the flag above.
   const allowDig   = opts.allowDig   !== undefined ? !!opts.allowDig   : allowWorldAlteration;
   const allowPlace = opts.allowPlace !== undefined ? !!opts.allowPlace : allowWorldAlteration;
 
-  // THE SPAWN SQUARE IS NOT A TERM IN THIS SEARCH ANY MORE (Architect 2026-09-15). It used to be hoisted
-  // here and consulted per cell to suppress the six altering edges. It is now handled one layer below
-  // the search: `spawn_protection.maskWorldReads` makes every cell inside the square read as BEDROCK, so
-  // the reader this search runs on reports it solid, undiggable and unplaceable, and no dig, bridge or
-  // pillar edge can be generated there in the first place. The cost model needs no keep-out clause,
-  // because the graph no longer contains the cells (the lava treatment: not priced, not present).
-  //
-  // WHAT CHANGED IN BEHAVIOUR, stated because it is a real trade the old note promised the other way: a
-  // route may no longer be planned THROUGH the square — a solid column is not walkable — so the fleet
-  // walks around a 33x33 block of ground it used to be able to cross. The base stands at least 50 blocks
-  // clear of it (`PERSON_CLEAR_OF_SPAWN`), so what this costs is an occasional detour, and what it buys
-  // is that no part of this fleet has to know the square exists.
+  // ── CLOSED BOXES: GROUND THE ROUTE MAY NOT ENTER ────────────────────────────────────────────────────
+  // `opts.closedBoxes` ([{min, max}]) is every box closed to this body: a downloaded building once its
+  // trees are down, and the ground a working peer holds a claim over. Each is closed to ENTRY: a goal
+  // inside one is refused before the search, and a node inside one is deleted at the pop unless the
+  // route reached it without ever leaving that box — so a body standing inside when it closed walks out,
+  // and the column the body starts in stays open as its stand shaft. `held` answers one bit per box.
+  const MAX_CLOSED_BOXES = 30;   // one bit each in a 32-bit mask
+  const boxes = (opts.closedBoxes || []).slice(0, MAX_CLOSED_BOXES);
+  const inBox = (b, x, y, z) => x >= b.min.x && x <= b.max.x && y >= b.min.y && y <= b.max.y
+    && z >= b.min.z && z <= b.max.z;
+  let startMask = 0;
+  boxes.forEach((b, i) => { if ([0, 1, 2].some(d => inBox(b, start.x, start.y + d, start.z))) startMask |= (1 << i); });
+  const held = (x, y, z) => {
+    let mask = 0;
+    for (let i = 0; i < boxes.length; i++) {
+      if (!inBox(boxes[i], x, y, z)) continue;
+      if ((startMask & (1 << i)) && x === start.x && z === start.z) continue;
+      mask |= (1 << i);
+    }
+    return mask;
+  };
+  const closed = boxes.length ? (x, y, z) => held(x, y, z) !== 0 : () => false;
+  const nodeHeld = (p) => held(p.x, p.y, p.z) | held(p.x, p.y + 1, p.z) | held(p.x, p.y + 2, p.z);
+  const inRun = new Map([[startKey, startMask]]);
+  if (boxes.length && goal && goal.type === 'position' && nodeHeld(goal.pos) !== 0) {
+    if (trace) trace('pathfinding', `A* REFUSED: goal (${goal.pos.x},${goal.pos.y + 1},${goal.pos.z}) is inside a closed box.`);
+    return null;
+  }
 
-  // WALL-CLOCK DEADLINE (Architect 2026-08-01: "it must plan that route in about 0.25 seconds and give
-  // partial if it cant"). maxNodes alone cannot express this — node cost varies with how much of the
-  // chunk is loaded, so the same budget is 40 ms in open air and 400 ms through a cave mouth, and a
-  // caller inside a 1350 ms creeper fuse needs the CLOCK bounded, not the node count. On expiry the
-  // loop breaks into the partial reconstruction that already exists below, so a deadline hit returns
-  // real progress toward the goal rather than null (Law 25: a truthful short result, never a false
-  // failure). `timedOut` is reported so the caller can tell "the world has no route" from "I did not
-  // look long enough" — two different next moves.
+  // THE SPAWN SQUARE IS NOT A TERM IN THIS SEARCH — `spawn_protection.maskWorldReads` makes every cell
+  // inside it read as bedrock, so no dig/bridge/pillar edge is ever generated there.
+
+  // WALL-CLOCK DEADLINE. maxNodes alone cannot express "plan in ~0.25s" — node cost varies with chunk
+  // load. On expiry, breaks into the same partial reconstruction as an exhausted heap (Law 25).
   const deadlineAt = opts.deadlineMs > 0 ? Date.now() + opts.deadlineMs : 0;
   let timedOut = false;
 
-  // THE GOAL IS A TYPED MESSAGE AND AN UNTYPED ONE IS A CODING VIOLATION (Law 10, Law 13 — added
-  // 2026-08-06 after it cost two runs). Both readers of `goal` — heuristic() and goalReached() — end with
-  // an unguarded fall-through: an unrecognized type makes the first return 0 and the second return
-  // undefined. That pair is the worst possible silent failure this search can have, because neither looks
-  // like an error from outside: h=0 is a legal heuristic (it just turns A* into an undirected Dijkstra
-  // flood) and a goal test that is never true is indistinguishable from genuinely unreachable terrain. The
-  // search then runs to exhaustion and reports "no route" — a WELL-FORMED FALSEHOOD (Law 26), which every
-  // caller faithfully believed. drop_collector passed a bare Vec3 here for the life of the fragment; the
-  // measured cost was 0 items collected across every run ever recorded, 0 of 598 items recovered from 10
-  // deaths, and 36-54% of fleet wall-clock spent inside floods that could not have succeeded.
-  //
-  // Throwing is the fix rather than defaulting a type: a caller that did not say which goal it meant has a
-  // bug, and guessing one for it reinstates exactly the silence this replaces (Law 13 — prove safe to
-  // continue, never soft-handle a malformed payload).
+  // THE GOAL IS A TYPED MESSAGE (Law 10, Law 13). An unrecognized type makes heuristic() return 0 and
+  // goalReached() return undefined — a silent flood reported as no route (Law 26). Thrown, never
+  // defaulted: a caller that did not say which goal it meant has a bug (Law 13).
   if (!goal || (goal.type !== 'position' && goal.type !== 'multi' && goal.type !== 'los')) {
     throw new Error(`[pathfinding] CODING VIOLATION: goal must be {type:'position'|'multi'|'los'}, got ${goal && goal.type !== undefined ? `type='${goal.type}'` : require('util').inspect(goal)}. An untyped goal silently makes the heuristic 0 and the goal test never-true, so the search reports a false 'no route'.`);
   }
 
-  // Single frontier for every goal (see HEURISTIC_WEIGHT). f = g + W*h: cost accumulates in g, so the
-  // route obeys the cost tiers - a walk-around beats a bridge whenever a walk exists. An exact caller
-  // that pins a cell hanging in open air (a build anchor above its own shaft) gets its footing built by
-  // the SAME search: bridging that final gap is simply the cheapest route once no walk reaches it.
+  // THE LEVELS A STAIR LINE ENDS ON (STAIR LINES). 'los' stands the feet at the target's own height;
+  // 'multi' offers its distinct floors, nearest first, bounded to four.
+  const stairLevels = goal.type === 'position' ? [goal.pos.y]
+    : goal.type === 'los' ? [Math.floor(goal.targetPos.y) - 1]
+    : [...new Set(goal.positions.map(p => p.y))].sort((a, b) => Math.abs(a - start.y) - Math.abs(b - start.y)).slice(0, 4);
+
+  // stairLine — the whole staircase from floor (x0,y0,z0), `k` steps in cardinal (dx,dz), one block over
+  // and one down/up per step. Returns { cost, steps:[Vec3 floor], protectedVoxel, flowCharge } or null
+  // the moment any step cannot be taken. Down: tread solid safe ground, three cells above open/diggable.
+  // Up: tread already solid full-height (dug, never built). A step with nothing to dig costs its floor.
+  const stairLine = (x0, y0, z0, dx, dz, vy, k, edgeType) => {
+    const steps = [];
+    let cost = 0, owned = false, flow = 0;
+    for (let i = 1; i <= k; i++) {
+      const fx = x0 + i * dx, fy = y0 + i * vy, fz = z0 + i * dz;
+      if (depthFloorArmed && belowDepthFloor(fy)) return null;
+      const tread = bot.blockAt(new Vec3(fx, fy, fz));
+      if (!tread || !isBlockSolid(tread) || !isFloorSafe(tread) || HAZARD_BLOCKS.has(tread.name)) return null;
+      if (vy > 0 && !isFullHeightFloor(tread)) return null;
+      // The cells this step opens. Down: over the new tread. Up: the origin's ceiling, then feet and head.
+      const cells = vy < 0
+        ? [[fx, fy + 1, fz], [fx, fy + 2, fz], [fx, fy + 3, fz]]
+        : [[fx - dx, fy + 2, fz - dz], [fx, fy + 1, fz], [fx, fy + 2, fz]];
+      if (closed(fx, fy, fz)) return null;
+      const dug = [];
+      let stepOwned = false;
+      for (const [x, y, z] of cells) {
+        if (closed(x, y, z)) return null;
+        const b = bot.blockAt(new Vec3(x, y, z));
+        if (isBlockPassable(b)) continue;
+        const diggable = vy < 0
+          ? (isBlockSolid(b) && b.diggable && !HAZARD_BLOCKS.has(b.name))
+          : isCeilingDiggable(b);
+        if (!diggable) return null;
+        dug.push([x, y, z]);
+        if ((protectedBlocks && protectedBlocks.has(`${x},${y},${z}`)) || STATION_TYPES.has(b.name)) stepOwned = true;
+      }
+      if (stepOwned) owned = true;
+      const stepFlow = dug.length ? flowPrice(bot, dug) : 0;
+      if (stepFlow === null) return null;
+      if (stepFlow > flow) flow = stepFlow;
+      const base = dug.length === 0 ? COST_LOW : (stepOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_STAIR_STEP);
+      cost += Math.max(base, stepFlow);
+      if (movePenalties) cost += movePenalties.get(`${fx},${fy},${fz}|${edgeType}`) || 0;
+      steps.push(new Vec3(fx, fy, fz));
+    }
+    return { cost, steps, protectedVoxel: owned, flowCharge: flow };
+  };
+
+  // Single frontier for every goal. A build anchor hanging in open air gets its footing built by the
+  // SAME search — bridging the final gap is simply the cheapest route once no walk reaches it.
   const fScore = (g, h) => g + HEURISTIC_WEIGHT * h;
 
   if (trace) trace('pathfinding', `A* START: floor (${start.x},${start.y},${start.z}) → goal type=${goal.type} ${goal.type === 'los' ? `target (${goal.targetPos.x},${goal.targetPos.y},${goal.targetPos.z})` : goal.type === 'position' ? `pos (${goal.pos.x},${goal.pos.y},${goal.pos.z})` : `${goal.positions?.length || 0} candidates`} budget=${maxNodes}`);
@@ -865,19 +712,18 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
   const gCost = new Map();     // key → g-score
   const visited = new Set();
   const heap = new MinHeap();
+  track(() => {
+    parent.clear(); gCost.clear(); visited.clear(); inRun.clear(); heap.data.length = 0;
+    if (penaltyCharged) penaltyCharged.clear();
+  });
 
   gCost.set(startKey, 0);
   heap.push({ pos: start, key: startKey, g: 0, f: fScore(0, heuristic(start, goal)) });
 
   // ── THE ONE PLACE A WALK EDGE MUST BE JUMPED ────────────────────────────────────────────────────────
-  // The body is standing INSIDE an open-top container (a composter, a cauldron) — its feet cell is the bin
-  // itself, so the floor node beneath is the block the bin sits on and every outgoing edge looks like
-  // ordinary flat ground. It is not: the rim rises a full block from the bin's inner floor, well over the
-  // 0.6 auto-step, so a plain walk presses `forward` into a wall until the stall guard calls no_progress.
-  //
-  // Scoped to the START node deliberately, and it is the only cell that can ever need this: with
-  // isOpenTopContainer wired into isWalkableSurface the search will not route ONTO a bin, so no node
-  // downstream of the start can have a bin under its feet. A bot only gets in one by falling in.
+  // The body starts INSIDE an open-top container (a composter, a cauldron) — the rim rises over the
+  // auto-step, so a plain walk stalls; the first move is re-typed 'jump_out'. Scoped to the START node
+  // only: no downstream node can have a bin under its feet (isOpenTopContainer blocks routing onto one).
   const startFeetBlock = bot.blockAt(new Vec3(start.x, start.y + 1, start.z));
   const startInsideBin = !!(startFeetBlock && isOpenTopContainer(startFeetBlock));
   if (startInsideBin && trace) trace('pathfinding', `A* START is INSIDE '${startFeetBlock.name}' at (${start.x},${start.y + 1},${start.z}) — first move re-typed 'jump_out'.`);
@@ -892,9 +738,8 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
   let bestPartialPos = start;
   let bestPartialH = heuristic(start, goal);
 
-  // LOS refinement: after the first valid vantage, search LOS_REFINE_BUDGET more nodes for a closer
-  // one. First hits sit at the edge of reach (~3 blocks); one more step often halves that, so the
-  // bot walks up and digs several blocks in a line instead of repositioning for each.
+  // LOS refinement: after the first valid vantage, search LOS_REFINE_BUDGET more nodes for a closer one
+  // — first hits sit at the edge of reach, one more step often halves that.
   let bestLOSKey = null;
   let bestLOSPos = null;
   let bestLOSDist = Infinity;
@@ -902,38 +747,57 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
 
   while (heap.size > 0 && nodesVisited < maxNodes) {
     await pace();   // cheap clock-check per node; cedes a real macrotask only at each ~1-tick slice boundary
-    // Checked AFTER pace() rather than before: pace() is where the wall clock actually advances (it cedes
-    // a macrotask at each slice boundary), so testing first would let a whole slice overrun the deadline.
+    // Checked after pace(), which is where the wall clock actually advances.
     if (deadlineAt && Date.now() >= deadlineAt) { timedOut = true; break; }
+    // Measured growth is a cooperative bound, sampled between nodes; a partial result is never a no-route proof.
+    if (boundedMemory && nodesVisited % 128 === 0) {
+      const growthBytes = memoryWorkspace.budget().growthBytes;
+      if (process.memoryUsage().heapUsed - heapAtStart > growthBytes) {
+        resourceLimited = true;
+        if (trace) trace('pathfinding', `A* RESOURCE LIMIT: temporary heap growth exceeded ${growthBytes} bytes after ${nodesVisited} nodes; search incomplete.`);
+        break;
+      }
+    }
     const current = heap.pop();
     if (visited.has(current.key)) continue;
+    // ── A STAIR LINE IS PRICED WHEN IT IS REACHED, NOT WHEN IT IS OFFERED ────────────────────────────
+    // Reading a whole line costs four cells a step, ~30x an ordinary edge — too costly at every offer.
+    // Pushed at its DUG price, read only when it pops; a line that cannot be dug whole is dropped.
+    if (current.stairOffer) {
+      const o = current.stairOffer;
+      const line = stairLine(o.x0, o.y0, o.z0, o.dx, o.dz, o.vy, o.k, o.edgeType);
+      if (!line) continue;
+      const ng = o.g0 + line.cost;
+      if (gCost.has(current.key) && gCost.get(current.key) <= ng) continue;
+      gCost.set(current.key, ng);
+      parent.set(current.key, { parentKey: o.fromKey, edgeType: o.edgeType, line: line.steps, protectedVoxel: line.protectedVoxel, flowCharge: line.flowCharge });
+      heap.push({ pos: current.pos, key: current.key, g: ng, f: fScore(ng, heuristic(current.pos, goal)) });
+      continue;
+    }
     if (blacklist && blacklist.has(current.key)) { visited.add(current.key); continue; }
-    // THE DEPTH FLOOR (architect_config WORLD_DEPTH_FLOOR_Y). Deletes every cell below the floor from
-    // the graph, exactly as `blacklist` does and for the same reason — this is a hard rule about where
-    // the fleet will not go, whatever the price, so a finite charge is wrong here: a cheap dig down
-    // would still win against an expensive walk-around, which is the trade the floor exists to refuse.
-    //
-    // AT THE POP, not at the twelve push sites: a node below the floor may be pushed but is never
-    // expanded, so no edge is ever generated OUT of it and the region is unreachable through it. One
-    // edit where the other graph-level rejections already sit, instead of twelve chances to miss one.
-    //
-    // SUSPENDED WHEN THE BODY STARTS BELOW THE FLOOR. Applying it then would delete the start node on
-    // the first pop, empty the heap, and report "unreachable" for every goal in the world — a bot that
-    // fell into the layer could never route out of it again. The floor bars descent, not return.
+    // THE CLOSED BOXES (see their note above): inside one only on a route that has not left it since the start.
+    if (boxes.length && current.key !== startKey) {
+      const inside = nodeHeld(current.pos);
+      if (inside !== 0) {
+        const from = parent.get(current.key);
+        const stayed = from ? (inRun.get(from.parentKey) || 0) : 0;
+        if ((inside & ~stayed) !== 0) { visited.add(current.key); continue; }
+        inRun.set(current.key, inside & stayed);
+      }
+    }
+    // THE DEPTH FLOOR (architect_config WORLD_DEPTH_FLOOR_Y) deletes every cell below it from the graph
+    // at the pop, a hard rule like `blacklist`. Suspended when the body starts below the floor, so a bot
+    // that fell into the layer can still route back out — the floor bars descent, not return.
     if (depthFloorArmed && belowDepthFloor(current.pos.y)) { visited.add(current.key); continue; }
-    // min_y floor: reject nodes that would put feet (floorY+1) below the caller's working height,
-    // so the bot walks horizontally at level instead of sinking through lower ground.
+    // min_y floor: reject nodes whose feet would sink below the caller's working height.
     if (goal.min_y != null && current.pos.y < goal.min_y - 1) { visited.add(current.key); continue; }
+    // max_y ceiling: reject nodes whose feet would rise above the caller's working height, so a walk
+    // under a structure stays under it. Open to a body that starts above it, which comes down.
+    if (goal.max_y != null && start.y <= goal.max_y - 1 && current.pos.y > goal.max_y - 1) { visited.add(current.key); continue; }
 
-    // Charge the penalty HERE rather than at each of the twelve push sites, and the two are equivalent:
-    // A* pops in nondecreasing f, so re-pushing a node with g raised by P delays it by exactly what
-    // paying P on entry would have cost. One edit where the old hard ban sat, instead of twelve chances
-    // to charge one edge wrong. Not marked visited — it must come back around and be expanded.
-    //
-    // The move-shaped key is available here WITHOUT moving the charge to those twelve sites: `parent`
-    // already records which edge reached this node, so the pop knows both halves of the key. That is the
-    // whole reason the charge can stay at one site while addressing a move — a cell entered by walk and
-    // the same cell entered by bridge arrive with different parent edges and are priced separately.
+    // Charged here, not at the twelve push sites: A* pops in nondecreasing f, so re-pushing with g
+    // raised by P delays it exactly as paying P on entry would. Not marked visited — it comes back
+    // around and is expanded again.
     if (penaltyCharged) {
       const arrivedBy = parent.get(current.key);
       const moveKey = arrivedBy ? `${current.key}|${arrivedBy.edgeType}` : null;
@@ -951,18 +815,13 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
 
     visited.add(current.key);
     nodesVisited++;
-    // The proven cost frontier: every route cheaper than this has been ruled out, because the heap pops
-    // in nondecreasing f and the heuristic is admissible at W=1.0. This is what lets a short result say
-    // "no route under 87 exists" instead of the false "unreachable" a node count can only imply
-    // (Law 25). Sound ONLY at W=1.0 — a weighted search's f-order proves nothing.
+    // The proven cost frontier: every route cheaper than this is ruled out, since the heap pops in
+    // nondecreasing f and the heuristic is admissible at W=1.0 (sound only at that weight).
     provenBound = current.f;
 
     const h = heuristic(current.pos, goal);
-    // The partial is returned as a route the body walks and then STOPS on, so it is an endpoint and answers
-    // to the same rule as the goal — gating only goalReached would leave the station stance reachable
-    // through every timed-out search, which is the common case near a cluttered base.
-    // Skipped WITHOUT lowering bestPartialH: recording the station's h would lock out every legal cell
-    // behind it, turning one refused stance into no partial at all.
+    // The partial is a route the body walks and stops on, so it answers to the same station rule as the
+    // goal. Skipped WITHOUT lowering bestPartialH, or the station would lock out every cell behind it.
     if (h < bestPartialH && !endsOnStation(bot, current.pos, null)) {
       if (trace && (bestPartialKey === startKey || h < bestPartialH - 1)) trace('pathfinding', `A* progress: node#${nodesVisited} (${current.pos.x},${current.pos.y + 1},${current.pos.z}) h=${h.toFixed(1)} (was ${bestPartialH.toFixed(1)})`);
       bestPartialH = h;
@@ -1009,6 +868,14 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     // swimStep (no digging, correct underwater Y model).
     const curNodeBlock = bot.blockAt(new Vec3(cx, cy, cz));
     const fromWater = isWaterBlock(curNodeBlock);
+    // A body on a solid floor with water over both its feet and its head cell is afloat to dig_authority
+    // (bobbing), which makes no dig there. No dig edge leaves such a node; it walks or swims out.
+    const submerged = !fromWater && isWaterBlock(bot.blockAt(new Vec3(cx, cy + 1, cz))) && isWaterBlock(bot.blockAt(new Vec3(cx, cy + 2, cz)));
+
+    // ── THE BODY MUST BE ABLE TO JUMP FROM WHERE IT IS, NOT ONLY LAND WHERE IT IS GOING ──────────────
+    // A +1 step needs a free cell above the head at the ORIGIN (cy+3), not only clearance at the
+    // destination — read via the `jumpable`/`walkable` distinction from classifyFloorInline (Law 16).
+    const originJumpable = isBlockPassable(bot.blockAt(new Vec3(cx, cy + 3, cz)));
 
     if (trace && nodesVisited <= 3) {
       const floorBlock = bot.blockAt(new Vec3(cx, cy, cz));
@@ -1037,10 +904,10 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       if (walkClass) {
         const wk = keyOf(walkFloorPos);
         if (!visited.has(wk)) {
-          const ng = currentG + floorMoveCost(walkFloor);
+          const ng = currentG + (fromWater ? COST_WATER_EXIT : COST_LOW);
           if (!gCost.has(wk) || ng < gCost.get(wk)) {
             gCost.set(wk, ng);
-            parent.set(wk, { parentKey: current.key, edgeType: fromWater ? 'swim' : (startInsideBin && current.key === startKey ? 'jump_out' : 'walk') });
+            parent.set(wk, { parentKey: current.key, edgeType: fromWater ? 'water_exit' : (startInsideBin && current.key === startKey ? 'jump_out' : 'walk') });
             heap.push({ pos: walkFloorPos, key: wk, g: ng, f: fScore(ng, heuristic(walkFloorPos, goal)) });
           }
         }
@@ -1051,14 +918,46 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       const upFloorPos = new Vec3(nx, cy + 1, nz);
       const upFloor = bot.blockAt(upFloorPos);
       const upClass = classifyFloorInline(bot, upFloor);
-      if (upClass && isFullHeightFloor(upFloor)) {
+      // originJumpable is the third term and the one that was missing — see its note above.
+      // FROM WATER THERE IS NO STEP UP. A water node's `pos` is the surface cell the body floats IN, so a
+      // floor one above it is a block and a half over the body's feet. That bank is left by
+      // water_bank_out, below, which makes a bank level with the water first.
+      if (upClass && isFullHeightFloor(upFloor) && originJumpable && !fromWater) {
         const uk = keyOf(upFloorPos);
         if (!visited.has(uk)) {
-          const ng = currentG + floorMoveCost(upFloor);
+          const ng = currentG + COST_LOW;
           if (!gCost.has(uk) || ng < gCost.get(uk)) {
             gCost.set(uk, ng);
-            parent.set(uk, { parentKey: current.key, edgeType: fromWater ? 'swim' : 'climb_up' });
+            parent.set(uk, { parentKey: current.key, edgeType: 'climb_up' });
             heap.push({ pos: upFloorPos, key: uk, g: ng, f: fScore(ng, heuristic(upFloorPos, goal)) });
+          }
+        }
+      }
+      // --- water_bank_out: WATER TO LAND BY PLACING, where the bank stands one block over the water ---
+      // The neighbour (nx,cy,nz) is the surface water cell beside the body. A block placed IN it, against
+      // the bank block that stands level with the water, is a bank level with the water: the body leaves the
+      // water onto it as water_exit does, and from there the bank's top is one ordinary step up. The edge
+      // lands on that top, so it is one move with one destination. Offered from the surface cell only.
+      if (fromWater && allowPlace && !isWaterBlock(bot.blockAt(new Vec3(cx, cy + 1, cz)))
+        && isStillWater(bot, nx, cy, nz)
+        && isBlockPassable(bot.blockAt(new Vec3(nx, cy + 1, nz))) && !isWaterBlock(bot.blockAt(new Vec3(nx, cy + 1, nz)))
+        && isBlockPassable(bot.blockAt(new Vec3(nx, cy + 2, nz))) && isBlockPassable(bot.blockAt(new Vec3(nx, cy + 3, nz)))) {
+        for (const [ex, , ez] of CARDINAL) {
+          const bx = nx + ex, bz = nz + ez;
+          if (bx === cx && bz === cz) continue;
+          const bankSide = bot.blockAt(new Vec3(bx, cy, bz));          // the block the placed one is set against
+          const bankTop = bot.blockAt(new Vec3(bx, cy + 1, bz));       // the floor the move ends on
+          if (!isBlockSolid(bankSide) || HAZARD_BLOCKS.has(bankSide.name)) continue;
+          if (!classifyFloorInline(bot, bankTop) || !isFullHeightFloor(bankTop)) continue;
+          const topPos = new Vec3(bx, cy + 1, bz);
+          const tk = keyOf(topPos);
+          if (visited.has(tk)) continue;
+          if (!bot.inventory.items().some(i => i.count > 0 && isScaffoldBlock(i.name))) break;
+          const ng = currentG + COST_PLACE + COST_WATER_EXIT + COST_LOW;
+          if (!gCost.has(tk) || ng < gCost.get(tk)) {
+            gCost.set(tk, ng);
+            parent.set(tk, { parentKey: current.key, edgeType: 'water_bank_out' });
+            heap.push({ pos: topPos, key: tk, g: ng, f: fScore(ng, heuristic(topPos, goal)) });
           }
         }
       }
@@ -1067,75 +966,48 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       const downFloorPos = new Vec3(nx, cy - 1, nz);
       const downFloor = bot.blockAt(downFloorPos);
       const downClass = classifyFloorInline(bot, downFloor);
+      // The body crosses into the lower column at the height it stands, so its head passes through the
+      // cell over the landing's own head (nx, cy+2). 'jumpable' says that cell is open and the step is a
+      // walk. Where it holds a block the walker opens it, so the search reads it as every dug cell is
+      // read: closed ground is no edge, a protected voxel is charged, and the step is a dug stair step.
       if (downClass) {
         const dk = keyOf(downFloorPos);
-        if (!visited.has(dk)) {
-          const ng = currentG + floorMoveCost(downFloor);
+        const headDug = downClass !== 'jumpable' && !fromWater;
+        const over = headDug ? bot.blockAt(new Vec3(nx, cy + 2, nz)) : null;
+        const headFlow = headDug ? flowPrice(bot, [[nx, cy + 2, nz]]) : 0;
+        const offered = !headDug || (allowDig && !submerged && !closed(nx, cy + 2, nz) && headFlow !== null
+          && isBlockSolid(over) && over.diggable && !HAZARD_BLOCKS.has(over.name));
+        if (offered && !visited.has(dk)) {
+          const headOwned = headDug && ((protectedBlocks && protectedBlocks.has(`${nx},${cy + 2},${nz}`)) || STATION_TYPES.has(over.name));
+          const ng = currentG + (headDug ? Math.max(headOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_STAIR_STEP, headFlow) : COST_LOW);
           if (!gCost.has(dk) || ng < gCost.get(dk)) {
             gCost.set(dk, ng);
-            parent.set(dk, { parentKey: current.key, edgeType: fromWater ? 'swim' : 'climb_down' });
+            parent.set(dk, headDug
+              ? { parentKey: current.key, edgeType: 'dig_stair_down', protectedVoxel: !!headOwned, flowCharge: headFlow }
+              : { parentKey: current.key, edgeType: fromWater ? 'swim' : 'climb_down' });
             heap.push({ pos: downFloorPos, key: dk, g: ng, f: fScore(ng, heuristic(downFloorPos, goal)) });
           }
         }
       }
 
-      // --- Dig-assisted stair-UP edge (+1Y, staircase mined into a wall) ---
-      // climb_up fires only when the cells above the tread are already clear. When the tread itself
-      // is solid full-height ground but a diggable wall caps it, this edge digs the headroom and
-      // stairs up — one of the two ascent primitives that let a buried bot climb toward the surface
-      // (goal usually above) instead of boring a flat COST_HIGH tunnel across (Architect 2026-07-11).
-      // COST_HIGH so a clear walk-around/climb always wins; reuses stairUpStep, which already digs
-      // the obstructing foot/head blocks. Overhead cells are ceiling-checked (no flood, no gravity).
-      if (allowDig && !upClass && !fromWater && isBlockSolid(upFloor) && isFloorSafe(upFloor) && isFullHeightFloor(upFloor)) {
-        const curHead = bot.blockAt(new Vec3(cx, cy + 3, cz));   // clearance above the current head, to rise
-        const upFoot  = bot.blockAt(new Vec3(nx, cy + 2, nz));   // cell the feet enter after stepping up
-        const upHead  = bot.blockAt(new Vec3(nx, cy + 3, nz));   // cell the head enters — overhead of the tread
-        const okOverhead = (b) => isBlockPassable(b) || isCeilingDiggable(b);
-        if (okOverhead(curHead) && okOverhead(upFoot) && okOverhead(upHead)) {
-          const uk = keyOf(upFloorPos);
-          if (!visited.has(uk)) {
-            const owned = [[cx, cy + 3, cz], [nx, cy + 2, nz], [nx, cy + 3, nz]]
-              .some(([x, y, z]) => (protectedBlocks && protectedBlocks.has(`${x},${y},${z}`)));
-            // Only the SOLID overhead cells are broken; the passable ones are already open (flowPrice).
-            const upDug = [];
-            if (isBlockSolid(curHead)) upDug.push([cx, cy + 3, cz]);
-            if (isBlockSolid(upFoot))  upDug.push([nx, cy + 2, nz]);
-            if (isBlockSolid(upHead))  upDug.push([nx, cy + 3, nz]);
-            const upFlow = flowPrice(bot, upDug);
-            const ng = currentG + Math.max(owned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH, upFlow);
-            if (!gCost.has(uk) || ng < gCost.get(uk)) {
-              gCost.set(uk, ng);
-              parent.set(uk, { parentKey: current.key, edgeType: 'dig_climb_up', protectedVoxel: owned, flowCharge: upFlow });
-              heap.push({ pos: upFloorPos, key: uk, g: ng, f: fScore(ng, heuristic(upFloorPos, goal)) });
-            }
-          }
-        }
-      }
-
-      // --- Dig-assisted stair-DOWN edge (-1Y, descent mined through a wall) ---
-      // Mirror of dig_climb_up: the landing one down-and-over is solid, but a diggable wall blocks
-      // the step into it. Dig foot+head and stair down. Sideways-and-down dig, so no gravity guard
-      // (nothing lands on the head as the bot moves away/below). Reuses stairDownStep. COST_HIGH.
-      if (allowDig && !downClass && !fromWater && isBlockSolid(downFloor) && isFloorSafe(downFloor)) {
-        const dnFoot = bot.blockAt(new Vec3(nx, cy, nz));        // new feet cell
-        const dnHead = bot.blockAt(new Vec3(nx, cy + 1, nz));    // new head cell
-        const okDig = (b) => isBlockPassable(b) || (isBlockSolid(b) && b.diggable && !HAZARD_BLOCKS.has(b.name));
-        if (okDig(dnFoot) && okDig(dnHead)) {
-          const dk = keyOf(downFloorPos);
-          if (!visited.has(dk)) {
-            const owned = [[nx, cy, nz], [nx, cy + 1, nz]]
-              .some(([x, y, z]) => (protectedBlocks && protectedBlocks.has(`${x},${y},${z}`)));
-            const dnDug = [];
-            if (isBlockSolid(dnFoot)) dnDug.push([nx, cy, nz]);
-            if (isBlockSolid(dnHead)) dnDug.push([nx, cy + 1, nz]);
-            const dnFlow = flowPrice(bot, dnDug);
-            const ng = currentG + Math.max(owned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH, dnFlow);
-            if (!gCost.has(dk) || ng < gCost.get(dk)) {
-              gCost.set(dk, ng);
-              parent.set(dk, { parentKey: current.key, edgeType: 'dig_climb_down', protectedVoxel: owned, flowCharge: dnFlow });
-              heap.push({ pos: downFloorPos, key: dk, g: ng, f: fScore(ng, heuristic(downFloorPos, goal)) });
-            }
-          }
+      // --- Dug stair LINES (STAIR LINES in the header) — one whole section to a level the goal stands on ---
+      // The offer carries the optimistic price; the line is priced again, and read, when it pops (below).
+      if (allowDig && !fromWater && !submerged) {
+        for (const level of stairLevels) {
+          const rise = level - cy;
+          const k = Math.abs(rise);
+          if (k === 0 || k > MAX_STAIR_RUN) continue;
+          const vy = rise > 0 ? 1 : -1;
+          const landing = new Vec3(cx + k * dx, level, cz + k * dz);
+          const lk = keyOf(landing);
+          if (visited.has(lk)) continue;
+          const g0 = currentG;
+          // Offered at the DUG price; a partly-open line reads cheaper when it pops and re-enters at that
+          // lower cost. Pricing the offer at COST_LOW instead would pop nearly every offer on the flood.
+          const ng = g0 + k * COST_STAIR_STEP;
+          if (gCost.has(lk) && gCost.get(lk) <= ng) continue;
+          heap.push({ pos: landing, key: lk, g: ng, f: fScore(ng, heuristic(landing, goal)),
+            stairOffer: { x0: cx, y0: cy, z0: cz, dx, dz, vy, k, g0, fromKey: current.key, edgeType: vy > 0 ? 'dig_stair_up' : 'dig_stair_down' } });
         }
       }
 
@@ -1143,7 +1015,9 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       if (trace && nodesVisited <= 3) {
         const edges = [];
         if (walkClass) edges.push(`walk(${walkClass})`);
-        if (upClass) edges.push('climb_up');
+        // Printed with the reason it was refused, because "no climb_up" and "no climb_up because the
+        // ceiling is 1 block too low" are the same line to a reader and different faults (Law 25).
+        if (upClass) edges.push(originJumpable ? 'climb_up' : 'climb_up:BLOCKED(origin not jumpable)');
         if (downClass) edges.push(`climb_down(floor=${downFloor?.name})`);
         if (!walkClass && !upClass && !downClass) {
           const wfName = walkFloor ? `${walkFloor.name}(bbox=${walkFloor.boundingBox})` : 'null';
@@ -1157,15 +1031,12 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       }
 
       // --- No fall edge ---
-      // A straight drop off a ledge is never planned (Architect 2026-07-14): it is a multi-block,
-      // irreversible move (no return route without pillaring) — parkour, disallowed. A ledge is
-      // descended by a diagonal stair (climb_down / dig_climb_down carve one below-and-over) or, with
-      // no lateral room, a vertical dig_down — both one block at a time and reversible.
+      // A straight drop off a ledge is never planned (irreversible, no return without pillaring). A
+      // ledge is descended by climb_down, one straight dig_stair_down, or a vertical dig_down instead.
 
       // --- Door edge (same Y, through a closed wooden door) ---
-      // Doors have a solid bbox so walk edges skip them. Destination is the floor 2 cells out
-      // (past the door) so the bot never halts inside the door block. COST_LOW (walk tier) so
-      // A* opens doors rather than digging around them.
+      // Doors have a solid bbox so walk edges skip them. Destination is the floor past the door, so the
+      // bot never halts inside it. COST_LOW keeps A* opening doors over digging around them.
       if (!walkClass && !fromWater) {
         const doorFoot = bot.blockAt(new Vec3(nx, cy + 1, nz));
         const doorHead = bot.blockAt(new Vec3(nx, cy + 2, nz));
@@ -1189,29 +1060,22 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       }
 
       // --- Dig-through edge (same Y, through a wall) ---
-      // Neighbor has a solid floor (support after digging) + diggable foot/head: dig one column,
-      // step in. A* chains these across thick walls. Blocked from water — digging while swimming
-      // is far too slow and unreliable.
-      if (allowDig && !walkClass && !upClass && !fromWater) {
+      // Neighbor has a standable floor (support after digging) + diggable foot/head: dig one column,
+      // step in. A* chains these across thick walls. Blocked from water.
+      if (allowDig && !walkClass && !upClass && !fromWater && !submerged) {
         const dtFloor = bot.blockAt(new Vec3(nx, cy, nz));
         const dtFoot  = bot.blockAt(new Vec3(nx, cy + 1, nz));
         const dtHead  = bot.blockAt(new Vec3(nx, cy + 2, nz));
-        if (isBlockSolid(dtFloor) && !HAZARD_BLOCKS.has(dtFloor.name)
+        if (isBlockSolid(dtFloor) && isFloorSafe(dtFloor) && !HAZARD_BLOCKS.has(dtFloor.name)
             && dtFoot && isBlockSolid(dtFoot) && dtFoot.diggable
             && dtHead && (isBlockPassable(dtHead) || (isBlockSolid(dtHead) && dtHead.diggable))) {
           const dtPos = new Vec3(nx, cy, nz);
           const dtk = keyOf(dtPos);
-          if (!visited.has(dtk)) {
-            // PROTECTED_VOXEL_DETOUR_BUDGET if either dug block belongs to a blueprint/station (don't chew structures),
-            // else COST_HIGH for the dig itself.
+          const dtFlow = flowPrice(bot, (isBlockSolid(dtHead) && dtHead.diggable) ? [[nx, cy + 1, nz], [nx, cy + 2, nz]] : [[nx, cy + 1, nz]]);
+          if (!visited.has(dtk) && dtFlow !== null) {
             const headDug = isBlockSolid(dtHead) && dtHead.diggable;
             const footOwned = (protectedBlocks && protectedBlocks.has(`${nx},${cy + 1},${nz}`)) || STATION_TYPES.has(dtFoot.name);
             const headOwned = headDug && (((protectedBlocks && protectedBlocks.has(`${nx},${cy + 2},${nz}`))) || STATION_TYPES.has(dtHead.name));
-            // The sideways bore is the edge that most often opens a pond or a lava lake into a corridor,
-            // and it is the one that carried no flow rule at all before 2026-08-18.
-            const dtDug = [[nx, cy + 1, nz]];
-            if (headDug) dtDug.push([nx, cy + 2, nz]);
-            const dtFlow = flowPrice(bot, dtDug);
             const ng = currentG + Math.max((footOwned || headOwned) ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH, dtFlow);
             if (!gCost.has(dtk) || ng < gCost.get(dtk)) {
               gCost.set(dtk, ng);
@@ -1224,8 +1088,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
 
       // --- Bridge edge (same Y, floor not solid) ---
       // Complement of dig_through: place a block over a non-solid gap (air, lava) to make a floor.
-      // Lava-safe — the placed block covers the hazard. Water excluded (bot swims it, doesn't fill
-      // it) and blocked from water nodes (placement while swimming is unreliable). A* chains gaps.
+      // Water excluded (the bot swims it instead) and blocked from water nodes. A* chains gaps.
       if (allowPlace && !walkClass && !fromWater) {
         const brFloor = bot.blockAt(new Vec3(nx, cy, nz));
         if (brFloor && !isBlockSolid(brFloor) && !isWaterBlock(brFloor)) {
@@ -1249,17 +1112,16 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
       }
 
       // --- Swim edge (horizontal water entry / traversal) ---
-      // Enter adjacent water at cy/cy±1, or continue water→water. Water→land EXIT isn't here —
-      // walk/climb edges cover it (they gate on the destination floor, not the source). Fall-INTO-water
-      // is gone with the fall edge (Architect 2026-07-14): dropping off a ledge into water is still a
-      // jump-off, disallowed even though water negates the damage — the bot descends by stair/dig_down.
+      // Enter adjacent water at cy/cy±1, or continue water→water. Water→land is water_exit and
+      // water_bank_out, above. No fall-into-water edge either —
+      // a ledge is descended by stair/dig_down, never a drop. Only still water is swum: the entered cell
+      // and the surface cell must both be sources (isStillWater).
       {
-        // Water in the neighbor column at cy / cy+1 / cy-1.
         for (const checkY of [cy, cy + 1, cy - 1]) {
           const checkBlock = bot.blockAt(new Vec3(nx, checkY, nz));
           if (isWaterBlock(checkBlock)) {
             const surfY = findWaterSurface(bot, nx, checkY, nz);
-            if (surfY !== null) {
+            if (surfY !== null && isStillWater(bot, nx, checkY, nz) && isStillWater(bot, nx, surfY, nz)) {
               const swimPos = new Vec3(nx, surfY, nz);
               const sk = keyOf(swimPos);
               if (!visited.has(sk)) {
@@ -1278,25 +1140,22 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     }
 
     // --- Dig-down edge (same XZ, -1Y) ---
-    // Dig the floor, drop onto the block below (which must be solid and safe). Blocked from water nodes.
-    // Adjacent liquid used to DELETE this edge outright — the file's one flow rule, water-only, on this
-    // one edge. It is now flowPrice()'d like every other dig (Architect 2026-08-18): the ban meant a bot
-    // in a pit ringed by water had no down move at all, and a bot that must go down to live should pay
-    // rather than be refused. It now also sees lava, which the ban never did.
-    if (allowDig && !fromWater) {
+    // Dig the floor, drop onto the block below (solid, standable), priced by flowPrice() like every
+    // other dig; a floor that opens onto water is no edge. A body standing on a leaf comes down through
+    // the canopy by this edge: from a leaf floor the landing may be a leaf too.
+    if (allowDig && !fromWater && !submerged) {
       const curFloorBlock = bot.blockAt(new Vec3(cx, cy, cz));
       const belowBlock = bot.blockAt(new Vec3(cx, cy - 1, cz));
       if (curFloorBlock && curFloorBlock.diggable
-          && belowBlock && isBlockSolid(belowBlock) && !HAZARD_BLOCKS.has(belowBlock.name)) {
+          && belowBlock && isBlockSolid(belowBlock) && !HAZARD_BLOCKS.has(belowBlock.name)
+          && (isFloorSafe(belowBlock) || (isLeafFloor(curFloorBlock) && isLeafFloor(belowBlock)))) {
         const ddPos = new Vec3(cx, cy - 1, cz);
         const ddk = keyOf(ddPos);
-        if (!visited.has(ddk)) {
-          // PROTECTED_VOXEL_DETOUR_BUDGET if the floor belongs to a blueprint/station, else COST_HIGH for the dig.
+        // Both the floor cell and the feet cell above it are offered to flowPrice: the bot drops
+        // through the feet cell too, so liquid there pours straight down the hole.
+        const ddFlow = flowPrice(bot, [[cx, cy, cz], [cx, cy + 1, cz]]);
+        if (!visited.has(ddk) && ddFlow !== null) {
           const floorOwned = (protectedBlocks && protectedBlocks.has(`${cx},${cy},${cz}`)) || STATION_TYPES.has(curFloorBlock.name);
-          // The shaft opened is the floor cell AND the feet cell above it: the bot drops out of the feet
-          // cell, so liquid reaching it pours straight down the hole it just made. Offering both to
-          // flowPrice keeps the old ban's full sensing reach (cardinals at both levels) as a price.
-          const ddFlow = flowPrice(bot, [[cx, cy, cz], [cx, cy + 1, cz]]);
           const ng = currentG + Math.max(floorOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH, ddFlow);
           if (!gCost.has(ddk) || ng < gCost.get(ddk)) {
             gCost.set(ddk, ng);
@@ -1308,22 +1167,11 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     }
 
     // --- Pillar edge (same XZ, +1Y) — the ONE straight-up move ---
-    // pillarStep places a block underfoot mid-jump and rises; there is no "dig up and float" move
-    // (digging opens space, it does not lift the body). One executor (pillarUpStep). Charged COST_PLACE
-    // (the placement tier, 50) — pricier than a dig-stair (dig_climb_up, COST_HIGH 25), so A* prefers to
-    // build a walkable diagonal staircase (a permanent two-way pathway) and only chimneys straight up
-    // when that is genuinely shorter or nothing else reaches. A ceiling that belongs to a blueprint or
-    // station is PROTECTED_VOXEL_DETOUR_BUDGET instead — the build owns its blocks (Law 16). Feet/head cells may read solid
-    // against the STATIC world for a mid-shaft node (they are the shaft the prior pillar carves at
-    // runtime); pillarStep clears both overhead before placing, so diggable there is allowed and the
-    // shaft chains up through thick overburden. Hazard/gravity ceilings excluded (isCeilingDiggable).
-    // DRY pillar: only from a solid-floored node (!fromWater), place cell passable. WATER bob-pillar
-    // (Architect 2026-07-18): the place cell p1 floods AND a solid floor sits within BLOCK_REACH below —
-    // the bot bobs and fills the column DOWN to it (never sinking; sink-to-any-depth is the deferred
-    // mode), then stands out. This fires from a bobbing/water node too (fromWater is fine) as long as
-    // that reachable floor exists; deeper than reach → no edge. "Needs a face to place against"
-    // (Architect): the face is a solid within reach below — one block down is almost never enough, so
-    // the scan looks the full BLOCK_REACH down, matching the executor's fill. p2/p3 keep plain shaftOk.
+    // pillarStep places a block underfoot mid-jump and rises. Charged COST_PLACE, pricier than a dug
+    // stair step, so A* chimneys up only when no whole stair fits. A protected ceiling is charged
+    // PROTECTED_VOXEL_DETOUR_BUDGET instead (Law 16). DRY pillar: solid-floored node, place cell
+    // passable. WATER bob-pillar: place cell floods, a solid floor within BLOCK_REACH below — bobs and
+    // fills the column down, then stands out.
     if (allowPlace) {
       const pillarDest = new Vec3(cx, cy + 1, cz);
       const pk = keyOf(pillarDest);
@@ -1332,7 +1180,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
         const p2 = bot.blockAt(new Vec3(cx, cy + 2, cz));   // head cell
         const p3 = bot.blockAt(new Vec3(cx, cy + 3, cz));   // ceiling / jump-peak
         const shaftOk = (b) => isBlockPassable(b) || isCeilingDiggable(b);
-        const overWater = isWaterBlock(p1);
+        const overWater = isWaterBlock(p1) && isStillWater(bot, cx, cy + 1, cz);
         let waterFloorInReach = false;
         if (overWater) {
           const maxDown = Math.max(1, Math.floor(BLOCK_REACH));
@@ -1344,20 +1192,16 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
         const dryOk = !fromWater && shaftOk(p1);
         const clear = (dryOk || (overWater && waterFloorInReach)) && shaftOk(p2) && shaftOk(p3);
         const hasBlocks = bot.inventory.items().some(i => i.count > 0 && isScaffoldBlock(i.name));
-        if (clear && hasBlocks) {
+        const pDug = [];
+        if (isBlockSolid(p1)) pDug.push([cx, cy + 1, cz]);
+        if (isBlockSolid(p2)) pDug.push([cx, cy + 2, cz]);
+        if (isBlockSolid(p3)) pDug.push([cx, cy + 3, cz]);
+        const pFlow = flowPrice(bot, pDug);
+        if (clear && hasBlocks && pFlow !== null) {
           const ceilingOwned = protectedBlocks && (protectedBlocks.has(`${cx},${cy + 2},${cz}`) || protectedBlocks.has(`${cx},${cy + 3},${cz}`));
-          // Water-pillar carries a bob surcharge (COST_PLACE + COST_HIGH) over a dry pillar: bobbing and
-          // filling down is slower and less certain than a grounded jump-place, so A* prefers any dry
-          // route and a swim (COST_HIGH) to CROSS water, reserving the bob-pillar for getting OUT/UP
-          // where nothing dry reaches.
-          // pillarUpStep BREAKS whatever solid sits in the shaft as it rises, so the pillar is a dig edge
-          // too and carries the same flow price. The bob-pillar's own water (p1) is not charged: it is
-          // below the cells being broken and liquid does not flow up.
-          const pDug = [];
-          if (isBlockSolid(p1)) pDug.push([cx, cy + 1, cz]);
-          if (isBlockSolid(p2)) pDug.push([cx, cy + 2, cz]);
-          if (isBlockSolid(p3)) pDug.push([cx, cy + 3, cz]);
-          const pFlow = flowPrice(bot, pDug);
+          // Water-pillar carries a bob surcharge (COST_PLACE + COST_HIGH) over a dry pillar, reserved for
+          // getting out where nothing dry reaches. pillarUpStep BREAKS the shaft as it rises, so it is a
+          // dig edge too and carries the same flow price; the bob-pillar's own water (p1) is not charged.
           const pillarCost = Math.max(ceilingOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : (overWater ? COST_PLACE + COST_HIGH : COST_PLACE), pFlow);
           const ng = currentG + pillarCost;
           if (!gCost.has(pk) || ng < gCost.get(pk)) {
@@ -1374,8 +1218,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     }
   }
 
-  // Loop ended with a valid vantage recorded but the refine-break never fired (fewer than
-  // LOS_REFINE_BUDGET extra nodes existed) — use it.
+  // Loop ended with a valid vantage recorded but the refine-break never fired — use it.
   if (!reachedKey && bestLOSKey) {
     reachedKey = bestLOSKey;
     reachedPos = bestLOSPos;
@@ -1388,6 +1231,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
   const endPos = reachedPos || bestPartialPos;
 
   if (endKey === startKey) {
+    if (resourceLimited) return { path: [], target: start, cost: 0, nodesVisited, maxNodes, partial: true, residual: bestPartialH, timedOut, resourceLimited, provenBound, complete: false };
     // Goal satisfied at the start node (e.g. bot already has LOS). Empty path = "already there";
     // null = "no progress possible" — callers branch on the difference.
     if (reachedKey) {
@@ -1401,31 +1245,28 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     return null;
   }
 
-  // `flowCharge` rides the step for the same reason and is a NUMBER, not a flag: 0, FLOW_DETOUR_BUDGET or
-  // LAVA_FLOW_DETOUR_BUDGET, so the reader learns WHICH liquid the route commits to opening without
-  // re-reading the world (by the time anyone reads the trace, the dig has already changed it — Invariant B
-  // cuts the other way here, which is exactly why the price is carried rather than recomputed).
-  //
-  // `protectedVoxel` rides the step because CUTTING THE BUILD IS A DECISION SOMEBODY MUST HEAR ABOUT, and
-  // only the search knows it was made. A* considers a protected edge on nearly every base-adjacent search
-  // and discards almost all of them, so announcing at the charge site would cry wolf continuously; the
-  // commitment happens here, when a charged edge survives into the returned route. Re-deriving it in the
-  // caller was the alternative and it is a second implementation of edge geometry (which cells a
-  // dig_climb_up actually breaks is known here and nowhere else) — Law 16.
+  // `flowCharge` rides the step as a NUMBER (0, FLOW_DETOUR_BUDGET or LAVA_FLOW_DETOUR_BUDGET) so a
+  // reader learns which liquid the route commits to opening without re-reading a changed world.
+  // `protectedVoxel` rides the step because cutting the build is a decision the caller must hear about,
+  // announced only where a charged edge survives into the route, never at every charge site (Law 16).
+  // A stair line is one edge to the search and k steps to the walker, unrolled here into one
+  // path entry per step so a failed step is charged to its own cell.
   const path = [];
   let cur = endKey;
   while (cur && cur !== startKey) {
     const entry = parent.get(cur);
     if (!entry) break;
     const [px, py, pz] = cur.split(',').map(Number);
-    path.push({ key: cur, pos: new Vec3(px, py, pz), edgeType: entry.edgeType, protectedVoxel: !!entry.protectedVoxel, flowCharge: entry.flowCharge || 0 });
+    const cells = entry.line || [new Vec3(px, py, pz)];
+    for (let j = cells.length - 1; j >= 0; j--) {
+      path.push({ key: keyOf(cells[j]), pos: cells[j], edgeType: entry.edgeType, protectedVoxel: !!entry.protectedVoxel, flowCharge: entry.flowCharge || 0 });
+    }
     cur = entry.parentKey;
   }
   if (cur !== startKey) return null;
   path.reverse();
 
-  // Residual: endpoint's remaining distance to goal — the caller judges whether the partial
-  // progress is acceptable; locomotion only reports it.
+  // Residual: endpoint's remaining distance to goal; the caller judges if a partial is acceptable.
   const residual = isPartial ? bestPartialH : 0;
 
   return {
@@ -1437,33 +1278,26 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}) {
     partial: isPartial,
     residual,
     timedOut,
-    // What the search PROVED, as distinct from what it spent. `complete` true means the frontier ran dry
-    // — every reachable cell was examined, so "no route" is a fact rather than a shortfall. False means
-    // a budget or a clock stopped it, and then `provenBound` is the honest claim: nothing cheaper than
-    // this exists. A caller that only reads `partial` learns it got less than it asked for; these two say
-    // exactly how much less, which is what turns a give-up into a resumable answer (Law 25).
+    resourceLimited,
+    // `complete` true means the frontier ran dry (a proven "no route"); false means a budget or clock
+    // stopped it, and `provenBound` is the honest claim: nothing cheaper than this exists (Law 25).
     provenBound,
-    complete: !timedOut && nodesVisited < maxNodes,
+    complete: !timedOut && !resourceLimited && nodesVisited < maxNodes,
   };
 }
 
 module.exports = {
   keyOf, straightLine,
-  COST_LOW, COST_HIGH, COST_PLACE, PROTECTED_VOXEL_DETOUR_BUDGET,
+  COST_LOW, COST_HIGH, COST_PLACE, COST_STAIR_STEP, PROTECTED_VOXEL_DETOUR_BUDGET,
   DOOR_BLOCKS, isDoorBlock,
   MIN_PLACEMENT_DIST,
-  FLOW_DETOUR_BUDGET, LAVA_FLOW_DETOUR_BUDGET,
+  LAVA_FLOW_DETOUR_BUDGET, opensOntoWater,
   computeAStar, drainSearchCensus, pathStillWalkable, MinHeap,
   isScaffoldBlock,   // exported so the navigator's give-up post-mortem counts pillar/bridge fuel from the one definition (Law 16)
-  // EXPORT-ONLY, no behaviour change (2026-08-04). tools/voxel_classifier_prototype builds a
-  // per-state-id table of these same verdicts and must derive it by CALLING these, never by copying
-  // PASSABLE_BLOCKS/HAZARD_BLOCKS into a second list. A copied membership set is the exact failure
-  // this file's own SCAFFOLD_BLOCKS comment records — "what is a placeable block" defined in five
-  // places, only one of them canonical — and here the drift would be silent and structural: a
-  // classifier that disagrees about passability plans routes through walls.
+  // EXPORT-ONLY, no behaviour change. tools/voxel_classifier_prototype derives its per-state-id table
+  // by CALLING these, never by copying PASSABLE_BLOCKS/HAZARD_BLOCKS into a second list (Law 16).
   isBlockPassable, isBlockSolid, isFullHeightFloor, isLeafFloor,
-  // classifyFloorInline is the single definition of "is this a standable dry cell"
-  // (safe floor + clear feet/head; water-feet fail because water isn't passable). Exported
-  // so the water-escape gate reuses it instead of re-deriving shore detection (Law 16).
+  // classifyFloorInline is the single definition of a standable dry cell. Exported so the water-escape
+  // gate reuses it, never re-deriving shore detection (Law 16).
   classifyFloorInline,
 };

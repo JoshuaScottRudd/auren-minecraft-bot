@@ -1,86 +1,44 @@
-// fragment: compost_executor — feed compostables into a composter, and take the bone meal out.
+// fragment: compost_executor — feed compostables into a composter and collect the bone meal it yields.
 //
-// A LIBRARY, NOT A SIGNAL TARGET. One entry point: `feedFromPocket(bot, want)`, a Law 15 API called by
-// inventory_swapper.dumpExcess. It has no `receive`, no registry entry, and nothing on the job board — the
-// same conversion land_prep and farm_executor got. Both verbs of the block live inside one visit.
+// THE COMPOST JOB. Every body banks its compostables in the fleet's barrels like
+// any other surplus (inventory_swapper.dumpExcess). When COMPOST_BATCH_MIN of them sit banked,
+// assessors/compost posts one shared `compost_feed` chest-band job and `receive` below runs it: withdraw
+// the whole banked batch, feed it in one visit, bank the bone meal. One walk per batch, not one per body.
 //
-// ── WHY IT IS ALL ONE VISIT, AND WHY NEITHER HALF IS A JOB ────────────────────────────────────────────
-// Dump access places items directly into the compost bin, and if there is none it simply holds the
-// material in the bot. Filling and emptying the bin are one operation, not two: if placing items fills
-// the bin partway through, the executor takes the bone meal out and continues — collecting compost is
-// part of using the compost bin, not a separate errand.
+// Filling and emptying the composter is one visit, not two errands: `_feedLoop` harvests mid-loop
+// whenever a full block blocks a feed, and sweeps once more at the end so a visit that fills the bin
+// with its last item still collects the bone meal it made.
 //
-// The old shape had the composter as a STORAGE with an errand at each end: the dump filed a sapling in a
-// chest, a `compost_load` job pulled it back out and carried it to the block, and a `compost_collect`
-// job later went to empty the block. Three moves for one item, and the errands were ranked at the bottom of
-// a board the fleet never emptied, sitting unclaimed for long stretches while both bots ran at high
-// occupancy. **A waste-disposal errand that must compete for a bot will always lose, so it stopped being
-// an errand.**
+// A composter takes no inventory-window interaction — every transfer is a right-click via activateBlock,
+// and the HELD ITEM selects the verb: holding a compostable feeds, an empty hand harvests. `unequip`
+// always precedes a harvest click, since a held compostable would feed a full block instead of emptying it.
 //
-// EMPTYING IS NOT A SEPARATE TRIP because a full block is not a separate situation — it is what a feed run
-// into. The bot is standing at the block with the lock in hand; harvesting is one right-click with an empty
-// hand; a job to send someone back for it later is a whole dispatch to repeat a move already available for
-// free. So `_feedLoop` harvests whenever the level blocks it, and sweeps once more at the end of the visit
-// so a run that fills the bin with its last item never walks away from the bone meal it just made.
-// `compost_load`, `compost_collect`, `compost_manager` and `COMPOST_MIN_INPUT` all died with those errands
-// (Law 16 — the route they served no longer exists).
+// The composter publishes its fill level 0-8 as a readable blockstate, so nothing about it is tracked in
+// HQ or station_registry beyond the transfer lock (Invariant B — every question here asks the block).
 //
-// THE ONE CASE THIS GIVES UP, recorded so a successor does not "fix" it by reintroducing the job: a bin
-// left at level 8 waits for the next bot that arrives holding compostables, because there is no longer
-// anything that visits the block empty-handed. That is acceptable — the fleet dumps constantly, so the
-// wait is a cycle or two, and the errand that would have shortened it demonstrably went unclaimed anyway.
+// Each compostable has a 30% chance to raise the level by one; seven levels make one bone meal.
 //
-// ── IT IS NOT A CONTAINER, AND THAT DECIDES THE WHOLE INTERACTION ───────────────────────────────────
-// A composter takes no inventory-window interaction: placing and removing are both right-clicks, not
-// pick/drop through an open window. So every transfer here is activateBlock, one item per
-// click, and the HELD ITEM is what selects between the two verbs — a right-click holding a compostable
-// feeds, the same right-click with an empty hand harvests. That is why an `unequip` precedes every
-// harvest: skipping it does not throw, it silently feeds a full block instead, and the level never moves.
-//
-// The obvious alternative was to model it on the furnace — register it in station_registry, track its
-// progress in HQ. station_registry validates every registration against an OPENED WINDOW, and there is no
-// window; but the deeper reason is that a furnace needs HQ state because its progress is INVISIBLE unless
-// opened, while a composter publishes its fill level 0–8 as a blockstate readable from across the room.
-// Nothing to remember, and remembering it would be strictly worse (Invariant B, with the unusual luxury
-// that fresh state is also the cheaper read). Every question this fragment asks, it asks the block.
-//
-// ── THE ARITHMETIC, STATED PLAINLY SO NOBODY RE-DERIVES IT OPTIMISTICALLY ───────────────────────────
-// Each compostable has a 30% chance to raise the level by one; seven levels make one bone meal. So it is
-// ~23 items in per bone meal out, and one bone meal is one growth stage of one plant. It is a real
-// accelerant on waste the fleet was accumulating anyway, and it is not a food revolution — bones off
-// skeletons are the volume source, which is now the `bone_meal` row's craft route rather than a
-// promise. The ratio is accepted as adequate for a passive, background conversion.
-//
-// ── WHAT IT REFUSES TO COMPOST ──────────────────────────────────────────────────────────────────────
-// Only items in COMPOST_INPUTS, and only what dumpExcess has already ruled SURPLUS. Feeding a composter
-// the wheat_seeds the farm is short of would convert a planting into a 30%-chance-of-one-eighth of a bone
-// meal, which is a loss in every world — so the keep question is asked ONCE, by the one calculation that
-// owns it, and this fragment never re-derives it (Law 16). The dump also offers a wanting STORAGE the
-// item before this ever sees it, which is what makes "anything above 32 goes to the compost bin"
-// expressible: the chest takes its number first, and only the overflow arrives here.
+// Only items in COMPOST_INPUTS that no standing stock row still wants are fed (`surplusCompostable`).
 
 'use strict';
 
 const watcher = require('@kernel/watcher');
-const { groupToAllItems, readBuildCenter, sleep } = require('@utils/fragment_utils');
-const {
-  COMPOST_INPUTS,
-  COMPOST_SEARCH_RADIUS,
-  COMPOSTER_READY_LEVEL,
-} = require('@thinking/architect_config');
-
+const { groupToAllItems, readTransposeOrigin, sleep } = require('@utils/fragment_utils');
+const { routeToJudge } = require('@utils/signal_utils');
 const TAG = 'compost_executor';
 
-// How long a bot waits in line at the composter before giving up and keeping its material. Shorter than
-// the chest queue's two minutes on purpose: a chest queue blocks a job that cannot proceed without the
-// chest, while this one blocks a DUMP whose material is welcome to ride along another cycle. Waiting out
-// a crashed holder to shed a sapling is the worse trade.
-const COMPOST_LOCK_TIMEOUT_MS = 30000;
+// Opt-in list: only these item groups are fed to a composter. `wheat_seeds` is deliberately excluded —
+// reserved for planting.
+const COMPOST_INPUTS = ['saplings', 'leaf_litter'];
 
-// composterLevel(block) → 0-8, or null if it is not a composter. Same probe chain as getWheatAge: the
-// modern property first, raw metadata as the fallback for older block shapes. The name check lives INSIDE
-// the reader for the reason getWheatAge's header records — a caller that has to remember to check the name
-// first is a guard that will eventually be forgotten.
+// How far from a blueprint centre this looks for a placed composter.
+const COMPOST_SEARCH_RADIUS = 24;
+
+// Full fill level of a composter; yields exactly one bone meal.
+const COMPOSTER_READY_LEVEL = 8;
+
+// composterLevel(block) → the block's fill level 0-8, or null if it is not a composter. Reads the modern
+// property first, falling back to raw metadata for older block shapes (same probe chain as getWheatAge).
 function composterLevel(block) {
   if (!block || block.name !== 'composter') return null;
   if (typeof block.getProperties === 'function') {
@@ -92,16 +50,8 @@ function composterLevel(block) {
 }
 
 // isCompostable(itemName) → is this concrete item name a member of an opt-in COMPOST_INPUTS group?
-// The tokens are GROUPS ('saplings') and a pocket holds concrete names ('oak_sapling'), so the membership
-// test has to expand the group — matching the token against the name directly finds nothing and silently
-// composts none of it. countInInventory is the fleet's one group-aware counter and this is its predicate
-// half (Law 16 — never a second matching rule).
-//
-// REPLACED `spareCompostables`, which measured the pocket against a `holder:'bot'` keep row and was the
-// blocker on "anything above 32 goes to the compost bin": seeds keep their number on a CHEST row, so the
-// bot-row lookup found nothing, defaulted the keep to zero, and would have composted the fleet's whole
-// reserve. dumpExcess already owns the one surplus calculation the fleet honours; asking it instead of
-// re-deriving a second one is what makes the overflow rule expressible at all.
+// The tokens are GROUPS ('saplings') and a pocket holds concrete names ('oak_sapling'), so membership
+// expands the group via groupToAllItems, the fleet's one group-aware matcher (Law 16).
 function isCompostable(itemName) {
   if (!itemName) return false;
   for (const token of COMPOST_INPUTS) {
@@ -112,58 +62,73 @@ function isCompostable(itemName) {
   return false;
 }
 
-// The composter's lock id. Deliberately the same `x|y|z` shape station_registry mints for a chest, and
-// fed to the SAME lock primitives — reusing the chest queue logic rather than standing up a second lock
-// system (Law 16). Nothing about lockChest/getLockHolder/waitUntilChestFree requires the id to name a
-// registered station — the lock is a string on the holder's magnet, so a block with no window locks
-// exactly as well as a chest with one, and clearMagnet() releases it at job end for free (Law 8: no
-// orphan).
+// surplusCompostable(itemName) → compostable AND no standing stock row still wants it (a still-wanted
+// sapling is stock arriving late, not waste). Reads the crew's selected stock rows (Law 16).
+function surplusCompostable(itemName) {
+  if (!require('@thinking/requested_work').activeWorkRequirements().includes('compost')) return false;
+  if (!isCompostable(itemName)) return false;
+  for (const row of require('@thinking/requested_work').activeStockRows()) {
+    if (row.deficit_below == null) continue;
+    const members = groupToAllItems(row.item);
+    if (row.item === itemName || (Array.isArray(members) && members.includes(itemName))) return false;
+  }
+  return true;
+}
+
+// bankedCompostables() → [{ name, count }] of surplus compostables sitting in the fleet's chests, by
+// concrete item name — what one compost job withdraws. Asked of the inventory lens (Invariant B).
+function bankedCompostables() {
+  const inventoryLens = require('@kernel/inventory_lens');
+  const banked = [];
+  for (const token of COMPOST_INPUTS) {
+    const members = groupToAllItems(token);
+    for (const name of (Array.isArray(members) && members.length ? members : [token])) {
+      if (!surplusCompostable(name)) continue;
+      const count = inventoryLens.inChests(name);
+      if (count > 0) banked.push({ name, count });
+    }
+  }
+  return banked;
+}
+
+// The composter's lock id — the same `x|y|z` shape station_registry mints for a chest, fed to the same
+// lock primitives (Law 16), so a block with no window queues exactly like one with a window.
 function composterLockId(block) {
   const p = block.position;
   return `${p.x}|${p.y}|${p.z}`;
 }
 
-// findComposter(bot) → the nearest placed composter within COMPOST_SEARCH_RADIUS of the headframe, or null.
-// Searched in the WORLD rather than looked up in a registry, for the reason in the header: the block is its
-// own record. Anchored to the headframe so a bot deep in the shaft does not find one it happens to pass.
-function findComposter(bot) {
-  const centre = readBuildCenter('headframe');
-  if (!centre || typeof centre.x !== 'number') return null;
-  // Vec3, not the plain {x,y,z} readBuildCenter returns: mineflayer calls `.floored()` on `point`, so a
-  // bare object throws a TypeError from inside findBlocks — which surfaces as a signal dying OUTSIDE the
-  // judge, killing the bot on the first planning sweep. Same conversion job_board and surface_filter do
-  // at their own findBlock call sites.
+// The crew's home structure owns its composter (headframe for a homesteader, laydown_yard for a builder).
+function _home() { return require('@kernel/bot_mandate').homeBlueprint(); }
+
+// findComposters(bot) → every placed composter within COMPOST_SEARCH_RADIUS of the crew's home, nearest
+// the home first. Searches the world directly — the block is its own record, not a registry entry.
+function findComposters(bot) {
+  const centre = readTransposeOrigin(_home());
+  if (!centre || typeof centre.x !== 'number') return [];
+  // Vec3, not the plain {x,y,z} readTransposeOrigin returns: mineflayer calls `.floored()` on `point`,
+  // and a bare object throws a TypeError from inside findBlocks. Same conversion job_board and
+  // surface_filter use at their own findBlock call sites.
   const Vec3 = require('vec3');
-  const found = bot.findBlock({
+  return bot.findBlocks({
     matching: (b) => b && b.name === 'composter',
     point: new Vec3(centre.x, centre.y, centre.z),
     maxDistance: COMPOST_SEARCH_RADIUS,
-  });
-  return found || null;
+    count: 8,
+  }).map((p) => bot.blockAt(p)).filter(Boolean);
 }
 
-// WHY a null findComposter is reported as "not built yet" and not as "there is none": the headframe
-// blueprint DECLARES a composter, and the reason string has to say which of those two worlds we are in.
-// They call for opposite responses — a missing declaration is a blueprint defect for the Architect, an
-// unbuilt voxel is the build order working as designed and needs nothing from anyone.
-//
-// The build order is the whole explanation, and it is deliberate (see `anchor_order_note` in
-// building_blueprints.json): anchors 0-2 are the shell and carry the first two CHESTS, because a fleet
-// needs somewhere to share resources before nightfall; the composter is on anchor 3 with the other
-// stations, below that deadline, because station voxels depend on a mining chain that must not be allowed
-// to hold up walls. So on a fresh world there is a window — minutes, not seconds — in which a bot can
-// deposit to a chest and has nowhere to put a compostable, even though the two stand a few blocks apart
-// in the finished base. Holding the material through that window is correct and is what dumpExcess does.
-// It is self-resolving and happens once per world; a `composter_not_built_yet` line climbing after the
-// base is finished is the signal worth chasing, and it reads differently from this one.
-//
-// Derived from the blueprint rather than asserted, so moving the composter to another anchor — or out of
-// the blueprint entirely — changes this answer without anyone remembering to edit it (Law 25: the verdict
-// tracks the thing it reports on).
+// findComposter(bot) → the nearest placed composter to the crew's home, or null.
+function findComposter(bot) { return findComposters(bot)[0] || null; }
+
+// composterDeclaredAtAnchor() → the anchor index where the home blueprint declares a composter, or
+// null if it declares none — distinguishing a build not yet reached from a blueprint that never named
+// one, findComposter's two failure reasons. Derived from the blueprint, not asserted, so it tracks the
+// blueprint if the anchor moves (Law 25).
 function composterDeclaredAtAnchor() {
   const { tryGetBuilding } = require('@kernel/blueprint_registry');
   const { collectAllVoxels } = require('@perception/blueprint_survey');
-  const building = tryGetBuilding('headframe');
+  const building = tryGetBuilding(_home());
   if (!building) return null;
   for (const v of collectAllVoxels(building)) {
     if (Array.isArray(v.raw) && v.raw[3] === 'composter') return v.anchor_index;
@@ -173,16 +138,9 @@ function composterDeclaredAtAnchor() {
 
 async function reach(bot, block) {
   const locomotion = require('@locomotion/locomotion_dispatcher');
-  // The composter is a blueprint voxel (headframe anchor 3, contractor_house anchor 0), so its stance is
-  // authored: goToStationStance stands the body on the owning anchor. A bare coordinate would order the
-  // navigator to stand INSIDE the block and it would dig the composter out to comply; a raycast or radius
-  // goal would let it work the bin from outside the wall. No distance shortcut — one stance, always.
-  // BOTH ANSWERS ARE REQUIRED, AND THEY ARE DIFFERENT QUESTIONS (2026-09-10). This used to discard the
-  // navigation result and return on the block read alone — so a bin that could not be reached still
-  // answered `true`, because the composter is plainly VISIBLE from wherever the body gave up. That is
-  // the same defect that produced the craft regression one file over (`architect_bugsquashing.md` §11):
-  // "can I see it" standing in for "can I reach it". Arriving is asked of the navigator; the block still
-  // being a composter is asked of the world.
+  // The composter is a blueprint voxel, so its stance is authored: goToStationStance stands the body on
+  // the owning anchor. Arrival and "still a composter" are separate questions — one asked of the
+  // navigator, one asked of the world.
   const nav = await locomotion.goToStationStance({ x: block.position.x, y: block.position.y, z: block.position.z });
   if (!nav.arrived) {
     watcher.warn(TAG, `composter at (${block.position.x},${block.position.y},${block.position.z}) could not be `
@@ -194,30 +152,15 @@ async function reach(bot, block) {
 }
 
 // ── THE LEVEL DOES NOT ANSWER ON THE SAME TICK IT IS ASKED ────────────────────────────────────────────
-// `bot.blockAt` reads the CLIENT's world model, and that model only changes when the server's block-update
-// packet arrives. A re-sense fired immediately after activateBlock therefore returns the level from BEFORE
-// the click — reliably, not occasionally.
-//
-// A loop that trusts that stale read can report a harvest as missed when it did not: the block filled,
-// the harvest clicked, the bone meal came out, and a read of the stale level sees 8 unmoved — aborting the
-// visit and reporting a false zero (Law 25) even though the world did everything right. Worse than the
-// false report: a loop that cannot see level 8 keeps feeding a FULL composter, which silently refuses
-// every item — the waste this fragment's header warns of.
-//
-// SETTLE_MS is farm_executor's 100ms, reused rather than re-derived — it is the fleet's already-paid answer
-// to this exact trap on the hoe (`await sleep(100)` then `blockAt(...)?.name !== 'farmland'`). Do not
-// "optimise" it away: an attempt is not an outcome, and without the settle there is nothing to read but
-// the intent.
+// `bot.blockAt` reads the CLIENT's world model, which only changes when the server's block-update packet
+// arrives — a read fired immediately after activateBlock returns the level from before the click. A
+// settle before every level read is what makes that read mean anything (same trap farm_executor's
+// SETTLE_MS covers for the hoe).
 const SETTLE_MS = 100;
 
-// _harvest(bot, block) → true if a bone meal actually came out.
-// Empty hand is the harvest verb. The unequip is the whole difference between harvesting and doing
-// nothing: right-clicking with a compostable still held feeds a full block instead, which the server
-// silently ignores and a caller reads as a stuck level.
-//
-// RE-SENSE, never trust the packet. activateBlock cannot fail loudly — mineflayer sends it and the server
-// may silently drop it (farm_executor's header records the same trap for the hoe). A level that did NOT
-// fall is the only evidence the harvest missed.
+// _harvest(bot, block) → true if a bone meal actually came out. Empty hand is the harvest verb; a
+// compostable still held would feed the block instead. Re-senses after the click since activateBlock
+// cannot fail loudly — a level that did not fall is the only evidence the harvest missed.
 async function _harvest(bot, block) {
   await bot.unequip('hand');
   await bot.activateBlock(block);
@@ -227,22 +170,14 @@ async function _harvest(bot, block) {
 }
 
 // ── THE VISIT — the one place items go into a composter, and the one place they come out ───────────
-// THE VISIT EMPTIES THE POCKET, harvesting mid-way as often as it takes: the bot places items in the
-// composter, removes the bone meal when it fills, and keeps placing until the pocket is empty. A full
-// composter refuses further items SILENTLY, so a loop that merely stopped at level 8 would carry the rest
-// home and need another whole trip to shed it. Harvesting is a right-click with an empty hand and costs
-// one tick, so it belongs INSIDE the visit.
+// Empties the pocket, harvesting mid-visit whenever a full block blocks a feed, then sweeps once more at
+// the end so a visit whose last item tops off the bin still collects the bone meal.
 //
-// THE TAIL SWEEP IS THE OTHER HALF and it is why no collect job exists: mid-loop harvesting only fires
-// when a full block BLOCKS a feed, so a visit whose last item tops the bin off — say twenty items in with
-// fifteen filling it — would leave the bone meal sitting there, and the bot is still standing at the block
-// holding the lock, so the sweep is one more click rather than a dispatch.
-//
-// `want` is [{ name, count }] of CONCRETE item names — activateBlock feeds one real item at a time, so a
-// group token would have nothing to equip.
+// `want` is [{ name, count }] of CONCRETE item names — activateBlock feeds one real item at a time.
 async function _feedLoop(bot, block, want) {
   const before = composterLevel(block);
   let fed = 0, harvested = 0, blocked = false;
+  const book = require('@kernel/item_book');
 
   for (const entry of want) {
     for (let n = 0; n < entry.count; n++) {
@@ -251,7 +186,7 @@ async function _feedLoop(bot, block, want) {
       if (level == null) { blocked = true; break; }
 
       if (level >= COMPOSTER_READY_LEVEL) {
-        // Continuing to feed a block still reading 8 is the silent no-op loop this check exists to end.
+        // A block reading 8 is harvested before the next feed, never fed into.
         if (!(await _harvest(bot, live))) { blocked = true; break; }
         harvested++;
         live = bot.blockAt(block.position);
@@ -259,18 +194,19 @@ async function _feedLoop(bot, block, want) {
 
       const item = bot.inventory.items().find((i) => i && i.name === entry.name);
       if (!item) break;
+      // One feed is one act to the item book: the loop outlasts the book's idle reading.
+      await book.open();
       await bot.equip(item, 'hand');
       await bot.activateBlock(live);
-      // The settle is what makes the NEXT iteration's level read mean anything. Without it the loop runs
-      // blind and feeds straight through level 8 into a block that is refusing every item.
+      // Lets the next iteration's level read reflect this click.
       await sleep(SETTLE_MS);
+      await book.close('compost', 'composter');
       fed++;
     }
     if (blocked) break;
   }
 
-  // The tail sweep. A block that did not respond to a harvest mid-loop will not respond now, so `blocked`
-  // skips it rather than spending a second failed click on the way out.
+  // Tail sweep — skipped when already blocked, since an unresponsive block will not respond now either.
   if (!blocked) {
     const live = bot.blockAt(block.position);
     if (composterLevel(live) === COMPOSTER_READY_LEVEL && await _harvest(bot, live)) harvested++;
@@ -281,69 +217,106 @@ async function _feedLoop(bot, block, want) {
   return { fed, harvested, blocked, before, after };
 }
 
-// feedFromPocket(bot, want) → a Law 15 API for inventory_swapper.dumpExcess. Returns a result, NEVER
-// routes a signal and NEVER abandons its caller: the dump is called at the end of half a dozen executors
-// and a signal fired from in here would land in whichever one happened to be running (Law 4). Every
-// failure is reported back and the material stays in the pocket rather than being discarded or retried
-// from in here.
+// feedFromPocket(bot, want) → the one visit, called by receive below. Returns a result and never routes a
+// signal or retries on its own (Law 4) — failure is reported back and the material stays in the pocket.
 //
-// The lock/queue below is the chest queue, reused verbatim through the shared primitives: check the
-// holder, walk there and wait at the block (so travel is paid while the peer works), then acquire and
-// re-sense. Without it two bots right-click the same block on the same tick and both read a level the
-// other just moved — the composter has no window to serialise them the way a chest does, so it is the ONE
-// station where the lock is the only thing standing between the fleet and a miscounted level.
+// Reuses the chest queue's lock primitives verbatim: the composter has no window to serialise concurrent
+// bots the way a chest does, so the lock is what keeps two right-clicks on the same tick from reading a
+// level the other just moved.
+// ── EVERY VISIT STATES ITS WAIT ──────────────────────────────────────────────────────────────────────
+// Walk-and-queue time from the decision to feed until the body stands at the bin with the lock, stated on
+// the visit's one line in the chest writer's own words ("after Ns waiting to get in"), including a visit
+// that gave up — a wait that ended in nothing is still time the fleet paid.
+const _waited = (since) => ((Date.now() - since) / 1000).toFixed(1);
+function _gaveUp(since, result) {
+  watcher.summary(TAG, `${TAG}: fed 0 item(s) — gave up (${result.reason}) after ${_waited(since)}s waiting to get in.`);
+  return result;
+}
+
 async function feedFromPocket(bot, want) {
   if (!Array.isArray(want) || !want.length) return { ok: true, fed: 0, harvested: 0, reason: 'nothing_to_feed' };
 
-  let block = findComposter(bot);
-  if (!block) {
+  const bins = findComposters(bot);
+  if (!bins.length) {
     const anchor = composterDeclaredAtAnchor();
     return anchor == null
       ? { ok: false, fed: 0, harvested: 0, reason: 'no_composter_in_blueprint' }
       : { ok: false, fed: 0, harvested: 0, reason: 'composter_not_built_yet', anchor };
   }
 
+  const since = Date.now();
   const stationRegistry = require('@perception/station_registry');
-  const { waitUntilChestFree } = require('@utils/chest_lock_utils');
+
+  // A BUSY BIN IS NOT QUEUED FOR. The body takes the first bin no peer holds; when every bin is held,
+  // compostables ride along to the next drop-off at no cost and the body goes back to work.
+  let block = bins.find((b) => !stationRegistry.getLockHolder(composterLockId(b))) || null;
+  if (!block) {
+    const holders = bins.map((b) => stationRegistry.getLockHolder(composterLockId(b))).join('+');
+    return _gaveUp(since, { ok: false, fed: 0, harvested: 0, reason: `composter_busy_with_${holders}` });
+  }
   const lockId = composterLockId(block);
-  const deadline = Date.now() + COMPOST_LOCK_TIMEOUT_MS;
 
-  // Walk there BEFORE waiting, same as _queueAtChest: the queue is served at the block, so the travel is
-  // paid during the peer's turn rather than after it.
-  while (stationRegistry.getLockHolder(lockId)) {
-    const holder = stationRegistry.getLockHolder(lockId);
-    watcher.summary(TAG, `${TAG}: composter ${lockId} is in use by ${holder} — moving there to queue for release.`);
-    if (!(await reach(bot, block))) return { ok: false, fed: 0, harvested: 0, reason: 'cannot_reach_locked_composter' };
-    const wait = await waitUntilChestFree(lockId, { timeoutMs: deadline - Date.now() });
-    if (!wait.released) return { ok: false, fed: 0, harvested: 0, reason: `timeout_queueing_for_composter_held_by_${wait.holder || 'unknown'}` };
-    watcher.summary(TAG, `${TAG}: composter ${lockId} released after ${Math.round(wait.waitedMs / 1000)}s in queue — proceeding.`);
-    if (Date.now() > deadline) return { ok: false, fed: 0, harvested: 0, reason: 'timeout_queueing_for_composter' };
-  }
-
-  // First-come wins and a rival is never preempted, so a simultaneous double-grab makes BOTH back off.
-  // Reporting that as a plain failure is correct here rather than retrying: the caller holds the material
-  // and the next dump tries again, which is the retry — a loop in here would be a second one (Law 16).
+  // A lost race is reported as failure, not retried here — the caller's next dump is the retry (Law 16).
   if (!stationRegistry.acquireChestLock(lockId)) {
-    return { ok: false, fed: 0, harvested: 0, reason: 'composter_lock_lost_to_peer' };
+    return _gaveUp(since, { ok: false, fed: 0, harvested: 0, reason: 'composter_lock_lost_to_peer' });
   }
 
-  if (!(await reach(bot, block))) return { ok: false, fed: 0, harvested: 0, reason: 'composter_gone_on_arrival' };
+  // The lock is held from here to the end of the visit and dropped on every exit (station_registry.unlockChest).
+  const release = (why) => stationRegistry.unlockChest(lockId, undefined, why);
+  if (!(await reach(bot, block))) { release('composter unreachable'); return _gaveUp(since, { ok: false, fed: 0, harvested: 0, reason: 'composter_gone_on_arrival' }); }
   block = bot.blockAt(block.position);
-  if (composterLevel(block) == null) return { ok: false, fed: 0, harvested: 0, reason: 'composter_gone_on_arrival' };
+  if (composterLevel(block) == null) { release('composter gone'); return _gaveUp(since, { ok: false, fed: 0, harvested: 0, reason: 'composter_gone_on_arrival' }); }
+  const waitedSec = _waited(since);
 
   const r = await _feedLoop(bot, block, want);
-  // The verdict states what the WORLD did, not what was attempted (Law 25). Feeding 12 items for zero
-  // levels is an honest and entirely normal outcome at a 30% rate; reporting it as a level gain because
-  // the items left the pocket would make every future compost verdict unreadable.
+  release('composter visit done');
+  // States what the block did, not what was attempted (Law 25) — at a 30% rate, zero level gain from a
+  // full feed is an honest, ordinary outcome.
   watcher.summary(TAG, `${TAG}: fed ${r.fed} item(s) into the composter${r.harvested ? `, harvested ${r.harvested} bone_meal` : ''}, `
     + `level ${r.before} → ${r.after}`
-    + `${r.blocked ? ' (stopped early — the composter stopped responding)' : ''}`);
+    + `${r.blocked ? ' (stopped early — the composter stopped responding)' : ''}`
+    + ` after ${waitedSec}s waiting to get in.`);
   return { ok: true, fed: r.fed, harvested: r.harvested, blocked: r.blocked, reason: null };
 }
 
+function _route(success, reason, extra = {}) {
+  routeToJudge(TAG, { readable: `${TAG}: ${reason}`, [TAG]: { success, ...extra } });
+}
+
+// ── THE COMPOST JOB: barrels → composter → barrels ───────────────────────────────────────────────────
+// Withdraw every banked compostable, feed them in one visit, then bank the bone meal and anything the bin
+// would not take. retrieveItems routes its own abandon (undefined) and dropOffHaul flags one (`abandoned`);
+// either way this returns without routing again (Law 4).
+async function receive(signalType) {
+  if (signalType !== TAG) return;
+  const bot = global.bot;
+  const { retrieveItems, dropOffHaul } = require('@api/inventory_swapper');
+
+  if (!findComposters(bot).length) { _route(false, 'no composter standing to feed'); return; }
+
+  for (const { name, count } of bankedCompostables()) {
+    const got = await retrieveItems(bot, name, count);
+    if (got === undefined) return;
+  }
+
+  const held = {};
+  for (const it of bot.inventory.items()) {
+    if (surplusCompostable(it.name)) held[it.name] = (held[it.name] || 0) + it.count;
+  }
+  const want = Object.entries(held).map(([name, count]) => ({ name, count }));
+  if (!want.length) { _route(false, 'no compostable reached the pocket — a peer withdrew the batch first'); return; }
+
+  const r = await feedFromPocket(bot, want);
+  const drop = await dropOffHaul(bot);
+  if (drop?.abandoned) return;
+  _route(!!r.ok, r.ok ? `fed ${r.fed} compostable(s), harvested ${r.harvested} bone_meal` : `fed nothing — ${r.reason}`,
+    { fed: r.fed, harvested: r.harvested });
+}
+
 module.exports = {
+  receive: watcher.track(TAG, receive),
   composterLevel,
   isCompostable,
-  feedFromPocket,
+  bankedCompostables,
   findComposter,
 };

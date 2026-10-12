@@ -1,22 +1,14 @@
 // calculator: food_calculator — how many of a given food does this bot need to reach full?
 //
-// ── WHY A CALCULATOR AND NOT A CONSTANT ───────────────────────────────────────────────────────────────
-// A fixed item count is only correct for one food. Bread restores 5 hunger, so 3 loaves cover a 14-point
-// gap with one to spare. An apple restores 4, so the same three leave the bot two points short, forcing a
-// re-sense and a second trip to the chest. A carrot restores 3 and needs five. A single constant is really
-// one food's answer wearing every food's name — the count has to be computed per item.
+// A fixed item count is only correct for one food: bread restores 5 hunger, an apple 4, a carrot 3, so
+// the count has to be computed per item.
 //
-// THE NUMBERS ARE MINECRAFT'S, NOT A TUNING CHOICE. They are the vanilla hunger-restore values, and the
-// game is the only correct source for them; adjusting one is not tuning a policy, it is introducing an
-// error. That is also why an unknown food falls back to the LOWEST value on the table rather than an
-// average: under-estimating the restore over-estimates the count, which costs one extra item carried and
-// dumped, while over-estimating leaves the bot short at the must-eat floor (Law 13 — the safe direction is
-// the one that fails toward more food in hand, not less).
+// The numbers are Minecraft's vanilla hunger-restore values. An unknown food falls back to the lowest
+// value on the table: under-estimating the restore over-estimates the count, and the safe direction
+// fails toward more food in hand (Law 13).
 //
-// SATURATION IS DELIBERATELY IGNORED. Vanilla food carries a second hidden bar that decides how fast the
-// hunger bar drains again, and modelling it would change which food is *preferable*, never how many are
-// needed to fill the bar right now. This calculator answers only the second question — the one the
-// withdraw has to size — and a preference model is a design act, not an arithmetic one (Law 22 gate 2).
+// Saturation is left out: it decides how fast hunger drains again, not how many items fill the bar now,
+// and this calculator answers only the second question (Law 22 gate 2).
 
 'use strict';
 
@@ -40,12 +32,12 @@ const HUNGER_RESTORED = {
   dried_kelp: 1,
 };
 
-// The floor used for a food this table does not name. See the header: the safe direction is to
-// UNDER-state the restore, because that OVER-states the count and fails toward more food in hand.
+// Floor for a food this table does not name; under-stating the restore over-states the count, which
+// fails toward more food in hand (Law 13).
 const UNKNOWN_FOOD_RESTORES = 1;
 
-// hungerValue(itemName) → points one item restores. Never throws on an unknown name: this is called with
-// whatever a chest happens to hold, and a food nobody listed is an environmental fact, not a coding fault.
+// hungerValue(itemName) → points one item restores. Unknown names return UNKNOWN_FOOD_RESTORES; a chest
+// may hold food nobody listed.
 function hungerValue(itemName) {
   const v = HUNGER_RESTORED[itemName];
   return Number.isFinite(v) && v > 0 ? v : UNKNOWN_FOOD_RESTORES;
@@ -53,28 +45,23 @@ function hungerValue(itemName) {
 
 // portionsToFill(currentFood, fullAt, itemName) → how many of THIS item close the gap.
 //
-// Rounds UP, and the extra item is the point rather than a rounding artefact: a bot that withdraws exactly
-// enough to reach 19.6 has withdrawn enough to reach 19, and the manager's re-sense (Invariant B) then reads
-// it as still hungry and pays another round trip to the chest. Ceiling ends the meal in one visit.
+// Rounds up: withdrawing only enough to reach 19.6 reaches 19, and the manager's re-sense (Invariant B)
+// reads that as still hungry and pays another round trip to the chest. Ceiling ends the meal in one visit.
 //
-// Returns 0 when the bot is already at or above `fullAt` — never a negative, and never a "one anyway".
+// Returns 0 when the bot is already at or above `fullAt` — never a negative.
 function portionsToFill(currentFood, fullAt, itemName) {
   const gap = fullAt - currentFood;
   if (!(gap > 0)) return 0;
   return Math.ceil(gap / hungerValue(itemName));
 }
 
-// portionsFromStorage(currentFood, fullAt, available) → { want, byItem } for a MIXED larder.
+// portionsFromStorage(currentFood, fullAt, available) → { want, byItem, short } for a mixed larder.
 //
-// `available` is { itemName: count } as a chest actually holds it — the caller passes what is there, never
-// an assumption about what should be. Richest food first, because that is what minimises both the number
-// of items carried and the number of consume calls, and because the bot cannot eat past full: a stack of
-// cooked beef ahead of the apples means the apples are simply never withdrawn.
+// `available` is { itemName: count } as a chest actually holds it. Richest food first, since that
+// minimises items carried and consume calls, and a stack of cooked beef ahead of the apples means the
+// apples are simply never withdrawn.
 //
-// `want` is capped by what EXISTS. Asking for more than the larder holds and reporting the ask as the
-// requirement is the Law 25 fault this returns two fields to avoid — `want` is what will be pulled,
-// `short` is the honest remainder, and the caller is told rather than left to infer it from a count that
-// silently came back small ("if too low then it just eats what it can").
+// `want` is capped by what exists; `short` names the honest remainder still unmet (Law 25).
 function portionsFromStorage(currentFood, fullAt, available = {}) {
   let gap = fullAt - currentFood;
   const byItem = {};

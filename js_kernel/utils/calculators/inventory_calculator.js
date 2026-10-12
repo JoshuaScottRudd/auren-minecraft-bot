@@ -1,34 +1,23 @@
 /*
 inventory_calculator.js — how many of a token does the bot hold.
 
-Pure and stateless. The GROUP problem is why this exists as one place: a raw invCounts[token] reads 0
-for a group token ('planks', 'stairs') because inventory holds only concrete keys, so the miss is silent
-and looks like an empty bag. Every planner delegates here rather than indexing the map itself.
+Pure and stateless. A raw invCounts[token] reads 0 for a group token ('planks', 'stairs') since
+inventory holds only concrete keys, so the miss is silent and looks like an empty bag. Every planner
+delegates here.
 */
 
 'use strict';
 
-const { group_to_item } = require('@utils/fragment_utils');
+const { group_to_item, furnace_chain_items } = require('@utils/fragment_utils');
 
-// ── WHY A MALFORMED MAP THROWS RATHER THAN COUNTING ZERO (Law 13) ────────────────────────────────
+// assertCountMap validates the shape once per object (Law 13): zero is a legal answer here, so a caller
+// that hands the wrong object gets a confident "holds none", indistinguishable from an empty bag, and
+// the mistake surfaces only later as a phantom reorder several layers away. A wrapper around the map
+// ({ inventory: {...} }) or the raw item array (bot.inventory.items()) both index cleanly to undefined,
+// which this catches.
 //
-// Zero is a LEGAL ANSWER here, and that is what makes the wrong shape dangerous. A caller that hands
-// this the wrong object gets a confident "you hold none of that", which is indistinguishable from an
-// empty bag — so the planner above orders what the bot is already carrying, the manager reports the
-// order complete off the real pocket, and the board orders it again. The failure surfaces several
-// layers away as a loop, with nothing anywhere near the mistake to point at. Reading a count out of
-// the wrong object cannot happen in a correctly-written system, which is the whole test: it is a
-// coding violation, so it stops here instead of being smoothed into a number.
-//
-// THE TWO SHAPES THAT REACH THIS BY ACCIDENT, both indexing cleanly to `undefined`:
-//   - a wrapper around the map ({ inventory: {...} }) — a caller taking a context object but
-//     declaring the map, which no parser or module load can see, because the name IS bound
-//   - the raw item ARRAY (bot.inventory.items()) instead of the summed map
-//
-// VALIDATED ONCE PER OBJECT, so the guarantee is free on the hot path. Every producer builds a fresh
-// map per sweep and this runs per stock row, so a full re-check on each call would walk the same
-// object dozens of times to reach the same verdict. The memo is a WeakSet: it holds no object alive,
-// and a mutated map cannot become malformed because appending counts keeps every value a number.
+// Validated once per object via a WeakSet memo, since a fresh map is built per sweep and this runs per
+// stock row.
 const VALIDATED = new WeakSet();
 
 function assertCountMap(invCounts) {
@@ -47,20 +36,55 @@ function assertCountMap(invCounts) {
   VALIDATED.add(invCounts);
 }
 
-// THE single definition of "how many <token> do I hold", and every planner delegates here because a
-// raw invCounts[token] reads 0 for a GROUP token ('stairs', 'planks') — inventory holds only concrete
-// keys, so the miss is silent and looks like an empty inventory.
+// The single definition of how many of a token the bot holds: a raw invCounts[token] reads 0 for a
+// group token ('stairs', 'planks'), since inventory holds only concrete keys.
 function countInInventory(token, invCounts, groupMap = group_to_item) {
-  // A missing token is the caller's own bug and gets the same treatment for the same reason: the
-  // group branch below would answer 0 for it, which reads as "holds none" rather than "asked wrong".
+  // A missing token throws: the group branch below would otherwise read it as holding none (Law 13).
   if (!token) throw new Error(`countInInventory: token is required, got ${JSON.stringify(token)}`);
   assertCountMap(invCounts);
-  const members = groupMap && groupMap[token];
+  const members = !furnace_chain_items.has(token) && groupMap && groupMap[token];   // a smelted item is only itself
   return Array.isArray(members)
     ? members.reduce((sum, m) => sum + (invCounts[m] || 0), 0)
     : (invCounts[token] || 0);
 }
 
+// craftsAffordable — the same pile, counted in crafts, one variant at a time.
+//
+// countInInventory sums a group, which is correct for holding or placing: three planks are three planks
+// whatever tree they came from. It is wrong for "can I craft this": vanilla's wooden_axe accepts the
+// `#minecraft:planks` tag per slot, but prismarine-recipe expands that tag into one single-species
+// recipe per species, and `bot.craft` can only ever be handed one of them — so one craft spends one
+// variant, and the answer is per variant, floor-divided by what one craft costs, and summed.
+function craftsAffordable(token, perCraft, invCounts, groupMap = group_to_item) {
+  if (!token) throw new Error(`craftsAffordable: token is required, got ${JSON.stringify(token)}`);
+  if (!Number.isFinite(perCraft) || perCraft <= 0) {
+    throw new Error(`craftsAffordable: perCraft must be a positive number, got ${JSON.stringify(perCraft)} `
+      + `for "${token}" — a craft's cost is what makes this question answerable, and a caller that does `
+      + 'not know it is asking about holding (countInInventory), not about crafting.');
+  }
+  assertCountMap(invCounts);
+  const members = !furnace_chain_items.has(token) && groupMap && groupMap[token];   // a smelted item is only itself
+  const variants = Array.isArray(members) ? members : [token];
+  let crafts = 0;
+  for (const v of variants) crafts += Math.floor((invCounts[v] || 0) / perCraft);
+  return crafts;
+}
+
+// heldByVariant(token, invCounts) → [{ item, count }] for every member holding stock, richest first.
+// Reports the per-variant breakdown that a craftsAffordable refusal on a mixed pile needs to explain.
+function heldByVariant(token, invCounts, groupMap = group_to_item) {
+  if (!token) throw new Error(`heldByVariant: token is required, got ${JSON.stringify(token)}`);
+  assertCountMap(invCounts);
+  const members = !furnace_chain_items.has(token) && groupMap && groupMap[token];   // a smelted item is only itself
+  const variants = Array.isArray(members) ? members : [token];
+  return variants
+    .map(item => ({ item, count: invCounts[item] || 0 }))
+    .filter(row => row.count > 0)
+    .sort((a, b) => b.count - a.count);
+}
+
 module.exports = {
   countInInventory,
+  craftsAffordable,
+  heldByVariant,
 };

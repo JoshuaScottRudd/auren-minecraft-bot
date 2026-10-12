@@ -1,31 +1,16 @@
 'use strict';
 
 // ── narration_lens ────────────────────────────────────────────────────────────────────────────────
-// WHAT A SINGLE UNIT SAID, IN ORDER. The plainest possible lens over the trace, and it exists because
-// every other lens is a fold and none of them is a transcript.
+// A transcript lens: shows what one unit said, in order, unfolded — the other lenses here fold the
+// trace into counts. Any unit whose value is its own prose — a director narrating what it framed, a preflight narrating
+// what it verified — needs a reader that shows its words (Law 16, this directory's README pairing rule).
 //
-// WHY IT WAS MISSING FOR SO LONG, AND WHY THAT IS THE INTERESTING PART. Every lens here answers a
-// question ABOUT the run — which jobs ran (--jobs), what a fight cost (--combat), where the items went
-// (--inventory). Each of those is a reduction, and a reduction throws away everything it does not
-// measure. So a unit whose value IS its prose — a director narrating what it framed and why, a preflight
-// narrating what it verified — had no door at all: the merged view could COUNT its lines and nothing
-// could SHOW them. That gap is not specific to any one unit; it opens for every non-bot unit that will
-// ever post to this trace, which is why the fix is a lens rather than a flag on some other lens.
+// The trace segments on the foreman's `start` broadcast, the right window for a bot but not for a unit
+// that posts beforehand (a camera director's whole bring-up). Lines outside that window are counted and
+// reported on every render, never silently dropped (Law 25).
 //
-// THE RULE IT SERVES: if the monitor cannot answer the question, the monitor is what changes — a reader
-// built beside the record would be the raw-record habit wearing a CLI (Law 16, and the pairing rule in
-// this directory's README). Reading a watcher file by hand to recover a unit's own words is exactly the
-// act this door removes.
-//
-// THE WINDOW IS REPORTED, NEVER SILENTLY APPLIED. The trace is segmented on the foreman's `start`
-// broadcast, which is the right window for a bot (a bot has nothing to say before it is told to think)
-// and the WRONG one for anything that comes up beforehand — a camera director publishes its whole
-// bring-up before `start` is ever sent, so the latest segment would show none of it and would look
-// complete while doing so. So this counts what falls outside the window and says so on every render.
-// A lens that quietly shows a subset is a Law 25 failure wearing a clean exit.
-//
-// Machine-facing `reduceNarration` returns; human-facing `runNarration` renders; neither exits (a lens
-// that exited would kill any caller that imports it).
+// Machine-facing `reduceNarration` returns; human-facing `runNarration` renders; neither exits — an exit
+// here would kill any caller that imports it.
 
 const { afterMarker } = require('./trace_read');
 const out = require('./data_out');
@@ -38,9 +23,7 @@ function stamp(relSec) {
   return `${String(m).padStart(2, ' ')}m ${String(s).padStart(2, '0')}s`;
 }
 
-// The roster of units that actually posted, so `--narration` with no --bot answers "who is there" rather
-// than dumping every unit's transcript at once. Naming what can be asked for beats guessing which unit
-// the reader meant.
+// Units that posted, so `--narration` with no --bot can list who is available before one is picked.
 function unitsIn(lines) {
   const by = new Map();
   for (const l of lines) {
@@ -53,9 +36,8 @@ function unitsIn(lines) {
   return [...by.values()].sort((a, b) => b.total - a.total);
 }
 
-// LEVELS, NOT EVERY LINE. `infra` is the trace's own plumbing (segment markers, forwarding headers), not
-// anything a unit chose to say, so including it would bury the narration in the transport that carried
-// it. --all is the escape hatch for a reader who wants the raw stream.
+// `infra` lines are the trace's own plumbing (segment markers, forwarding headers), not a unit's own
+// words; verbose includes them for a reader who wants the raw stream.
 function reduceNarration({ seg, allLines, bot, verbose = false }) {
   const wanted = verbose
     ? new Set(['error', 'warn', 'summary', 'infra'])
@@ -82,10 +64,8 @@ function reduceNarration({ seg, allLines, bot, verbose = false }) {
 function runNarration({ seg, allLines, bot, traceName, verbose = false, full = false }) {
   const r = reduceNarration({ seg, allLines, bot, verbose });
 
-  // OUTPUT IS DATA (Architect 2026-09-16). The `text` column is the unit's OWN sentence, carried
-  // verbatim — a unit may interpret itself and this lens is the envelope, never the author. What left:
-  // the flag hints, and the sentence explaining why lines sit outside the window. `lines_outside_window`
-  // is the measurement that sentence was wrapped around, and it survives as a field.
+  // `text` carries the unit's own sentence verbatim; this lens is the envelope, not the author.
+  // `lines_outside_window` is the count of lines the window excluded (see header).
   out.kv('lens', 'narration');
   out.kv('record', traceName);
   out.kv('window', full ? 'whole_trace' : 'latest_run');

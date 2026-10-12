@@ -1,22 +1,28 @@
-// assessors/canopy — lifted verbatim out of job_board 2026-08-26. See assessor_registry.
+// assessors/canopy — proactive camera-framing clear for opted-in blueprints. See assessor_registry.
 
 'use strict';
 
 const Vec3 = require('vec3');
 const { guardExternalSync } = require('@utils/external_library_guard');
-const { readBuildCenter } = require('@utils/fragment_utils');
+const { readTransposeOrigin } = require('@utils/fragment_utils');
 
-// Architect-owned tables, imported never restated (Law 16 — one source).
+// Tunables imported from architect_config, never restated (Law 16 — one source).
 const {
     JOB_TYPE,
     TREE_CLEAR_RADIUS,
-    CANOPY_CLEAR_BLUEPRINTS,
 } = require('@thinking/architect_config');
+
+// OPT-IN: only blueprints named here get their ring cleared for the camera. The phase-1 farm is absent
+// deliberately — it is scattered riverbank plots, not one framed field, so per-blueprint clearing does
+// not apply to it.
+const CANOPY_CLEAR_BLUEPRINTS = [
+    'headframe',
+];
 
 const { TAG } = require('@thinking/assessors/shared');
 // ── SECTION 4d — Proactive canopy clearing (its own assessment, dispatched to canopy_clear_executor) ──
 // Camera-framing upkeep, distinct from log SUPPLY (harvest_executor's ladder).
-// For each OPTED-IN surface blueprint (CANOPY_CLEAR_BLUEPRINTS) whose build_center is located, post ONE
+// For each OPTED-IN surface blueprint (CANOPY_CLEAR_BLUEPRINTS) whose transpose_origin is located, post ONE
 // lowest-priority `clear_canopy` job while a wild tree still stands within TREE_CLEAR_RADIUS of the
 // center — and NOTHING once the ring is clear, so it never busy-loops. The gate uses the SAME square
 // (Chebyshev radius) the executor's canopyZone fells inside, so a posted job always has a tree the fell
@@ -31,9 +37,8 @@ function _treeInClearRadius(bot, center) {
             matching: (b) => !!(b && b.name && CANOPY_LOG_RE.test(b.name)),
             // Euclidean sweep must reach the Chebyshev SQUARE's corners (r·√2 ≈ 1.41r), not just its
             // edges — else the gate reports "clear" while corner trees still stand and clear_canopy stops
-            // posting early. The old fixed `+ 8` slack silently assumed a small radius (held at r=16:
-            // 16·√2≈22.6<24) and broke when TREE_CLEAR_RADIUS grew to 64 (64·√2≈90.5>72). Derive from r
-            // so it scales with any radius. Count raised for the ~1.6× wider area.
+            // posting early. Derived from r so it scales with any radius; count raised for the ~1.6×
+            // wider area.
             maxDistance: Math.ceil(TREE_CLEAR_RADIUS * Math.SQRT2) + 2,
             count: 64,
         }));
@@ -52,7 +57,7 @@ function assess() {
     if (!bot || !bot.findBlocks || !bot.blockAt) return { jobs };
 
     for (const blueprint of CANOPY_CLEAR_BLUEPRINTS) {
-        const center = readBuildCenter(blueprint);
+        const center = readTransposeOrigin(blueprint);
         if (!center) continue;                              // not sited yet — nothing to clear around
         if (!_treeInClearRadius(bot, center)) continue;     // ring already clear — post nothing
         jobs.push({ id: `clear_canopy_${blueprint}`, type: 'canopy', what: 'clear_trees', where: center,

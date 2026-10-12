@@ -1,38 +1,25 @@
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/sign_probe.js');
-// tool: sign_probe — the LIVE observation that settles whether a wooden sign can carry a human's order
-// into the fleet (control_program_plan.md §7 "Phase 0 — THE PROBE. Nothing is built before it passes").
-//
-// WHY IT EXISTS: the whole sign order desk (plan §5) was paper. The libraries being present and
-// version-correct for 1.21.5 is not the same fact as an observed packet, and the plan says so in its own
-// Law 25 section: "no sign has ever been read by this fleet." A probe is the only instrument that can
-// close that gap, because every question here is a WORLD-TRANSFORMATION — what does Minecraft DO — and
-// no harness may answer one by computing it (READ DON'T SIMULATE, `Auren_Workshop/README.md`: a harness
-// that decides what the world would have done is grading its own paper). So this is live, against the
-// real server, or it is nothing.
+// tool: sign_probe — a live probe against a running server settling whether a wooden sign can carry a
+// human's order into the fleet. Every question here is a WORLD-TRANSFORMATION, so the answer is always
+// observed off the server, never simulated (READ DON'T SIMULATE, `Auren_Workshop/README.md`).
 //
 // THE GOVERNING LINE (same as water_pillar_probe / ghost_probe): anything MINECRAFT decides is READ,
 // only the operator's choices are AUTHORED. RCON here is the OPERATOR at the server console (op-4)
-// issuing setblock/give/tp — it stands in for the human who would otherwise be standing in the world
-// with a sign in hand. Every verdict below is read back off the server or off the bot's own world model;
-// none is computed.
+// issuing setblock/give/tp, standing in for a human placing a sign in the world. Every verdict below is
+// read back off the server or off the bot's own world model; none is computed.
 //
-// WHY BOTH AUTHORING ROUTES ARE TESTED AND NEITHER IS ENOUGH ALONE. A sign's text can arrive two ways
-// and they are different code paths that can fail independently:
-//   - the CONSOLE route (`/setblock` with front_text NBT) writes the block entity directly. It proves
-//     the READ side and nothing about the write side.
-//   - the PLAYER route (place the sign, then the serverbound `update_sign` packet) is the only path a
-//     human — or a bot pretending to be one — actually travels, and vanilla guards it with an editor
-//     UUID that the console route never touches.
-// A probe that tested only the console route would report green and leave the fleet unable to write a
-// sign at all; one that tested only the player route would not know whether an operator can seed a
-// bench world. Both, or the verdict is partial (Law 25).
+// A sign's text arrives two independent ways that fail independently:
+//   - the CONSOLE route (`/setblock` with front_text NBT) writes the block entity directly, proving the
+//     READ side and nothing about the write side.
+//   - the PLAYER route (place the sign, then the serverbound `update_sign` packet) is the path a human —
+//     or a bot pretending to be one — actually travels, and vanilla guards it with an editor UUID that
+//     the console route never touches.
+// Both are probed, since either alone leaves half the desk unverified (Law 25).
 //
-// EVERY NEGATIVE CARRIES A CONTROL, and that is not thoroughness for its own sake. A "sign will not
-// attach to a chest" result is indistinguishable from "the probe got the facing convention backwards"
-// unless the identical placement is also run against a support block known to work. An uncontrolled
-// negative is a well-formed falsehood — the Law 26 failure the whole boundary exists to stop — and it
-// would send the order desk's geometry the wrong way with nothing downstream able to catch it.
+// EVERY NEGATIVE CARRIES A CONTROL: the identical placement is also run against a support block known to
+// work, so a negative geometry result can be told apart from a facing-convention bug in this probe
+// (Law 26).
 //
 // Run (server must be UP; bots need not be):
 //   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\sign_probe.js
@@ -43,10 +30,8 @@ const fs = require('fs');
 
 const paths = require('../workshop_paths');
 const moduleHomes = require(paths.bot('js_kernel/utils/node_module_homes'));
-// WHERE THE PACKAGES LIVE IS ASKED OF THE ONE FILE THAT ANSWERS IT. A private constant stood here
-// naming MinecraftServer/node_modules alone, so this probe ran on the workstation whose server happened
-// to carry mineflayer and refused everywhere else — one more copy of the question
-// `js_kernel/utils/node_module_homes` exists to end (its header records the first four).
+// Package location is asked of the one module that answers it, so this probe runs on any workstation
+// regardless of where that machine's node_modules happens to sit (Law 16).
 for (const d of moduleHomes.bootstrapModulePath()) module.paths.unshift(d);
 
 const mineflayer = moduleHomes.requireFromHomes('mineflayer');
@@ -55,7 +40,7 @@ const rconLink = require(paths.bot('js_kernel/utils/rcon_link'));
 
 const HOST = process.env.PROBE_HOST || 'localhost';
 const PORT = Number(process.env.PROBE_PORT || 25565);
-// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// Version READ from architect_config, never restated here — one authored answer (Law 16).
 // A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
 const VERSION = process.env.PROBE_VERSION
   || require(paths.bot('Thinking_fragments/architect_config.js')).SERVER_MINECRAFT_VERSION;
@@ -63,9 +48,9 @@ const NAME = process.env.PROBE_NAME || 'SignProbe';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// The findings ledger. Every question this probe was raised to answer posts its OBSERVED answer here,
-// never an expected one — the report is written off this array, so a question with no observation must
-// appear as an unanswered question rather than silently vanish (Law 25).
+// The findings ledger. Every question this probe answers posts its OBSERVED answer here, never an
+// expected one; the report is written off this array, so a question with no observation still appears
+// as an unanswered entry (Law 25).
 const findings = [];
 function record(id, question, observed, verdict) {
   findings.push({ id, question, observed, verdict });
@@ -74,8 +59,8 @@ function record(id, question, observed, verdict) {
   console.log(`   verdict : ${verdict}`);
 }
 
-// Raw packet capture. The plan asks what the SERVER SENDS, which is a different question from what
-// prismarine's accessor returns after parsing it — so the wire is tapped directly and both are reported.
+// Raw packet capture, tapped directly because what the server SENDS and what prismarine's accessor
+// returns after parsing it are different facts; both are reported.
 const wire = { tile_entity_data: [], open_sign_entity: [], block_change: [] };
 
 async function main() {
@@ -99,8 +84,7 @@ async function main() {
   console.log(`bot: spawned at ${bot.entity.position.floored()}`);
 
   // ── THE TEST BED ────────────────────────────────────────────────────────────────────────────────
-  // Authored deliberately rather than found: a probe that answers "can a sign attach to a chest" needs
-  // to know the answer is about the chest and not about whatever terrain happened to be underneath.
+  // A built platform isolates each geometry test from the terrain beneath it.
   const origin = bot.entity.position.floored();
   const BX = origin.x + 6, BY = origin.y, BZ = origin.z + 6;   // platform surface sits at BY-1
   const at = (dx, dy, dz) => `${BX + dx} ${BY + dy} ${BZ + dz}`;
@@ -124,11 +108,10 @@ async function main() {
   };
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────
-  // Q1 — CONSOLE AUTHORING: which SNBT shape yields the text the human actually meant?
-  // All three shapes are ACCEPTED by the command parser, so "did setblock succeed" is the wrong test —
-  // the question is what the bot READS BACK. 1.21.5 is the version that moved text components in NBT
-  // off JSON strings, so a shape that was correct on 1.20 now stores its own punctuation as literal
-  // sign text. That failure is silent in every log: the command says "Changed the block".
+  // Q1 — CONSOLE AUTHORING: which SNBT shape produces the text a human actually meant?
+  // The command parser accepts all three shapes, so acceptance is not the test; only what the bot READS
+  // BACK proves the text landed correctly. A shape that stores JSON punctuation as literal sign text
+  // still makes the server reply "Changed the block", so that reply alone cannot be trusted.
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   const WANT = ['ORDER', 'oak_log 64', 'cobblestone 128', ''];
   const shapes = [
@@ -160,7 +143,7 @@ async function main() {
     `{front_text:{messages:[{text:${JSON.stringify(l0)}},{text:${JSON.stringify(l1)}},{text:${JSON.stringify(l2)}},{text:${JSON.stringify(l3)}}]}}`;
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────
-  // Q2 — THE READ (the plan's print #1) and Q2b — what the wire actually carries.
+  // Q2 — THE READ, and Q2b — what the wire actually carries.
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   const signV = vec(0, 0, -6);
   await cmd(`setblock ${signV.x} ${signV.y} ${signV.z} minecraft:air`);
@@ -180,9 +163,8 @@ async function main() {
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   // Q3 — LIVE EDIT PROPAGATION. THE ONE THAT DECIDES WHETHER STANDING ORDERS WORK.
-  // Plan §5 makes orders standing, which means the bot must see a human EDIT a sign already in its
-  // loaded world. If text only ever arrives with the chunk, every order change needs a reconnect and
-  // the desk's whole design changes shape.
+  // Standing orders require the bot to see a human EDIT a sign already in its loaded world. If text
+  // only ever arrives with the chunk, every order change needs a reconnect.
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   const before = wire.tile_entity_data.length;
   await cmd(`data merge block ${signV.x} ${signV.y} ${signV.z} ${goodSnbt('ORDER', 'stone 32', 'EDITED LIVE', '')}`);
@@ -272,9 +254,8 @@ async function main() {
       ? 'YES — activateBlock re-opens the editor (1 packet) and the next updateSign lands. Re-writes cost one right-click each.'
       : 'NO — the right was not re-granted');
 
-  // Q4d — the BACK face, which plan §5 never allocated. Two faces means two independent 4-line
-  // surfaces on one block, and whether the bot can write the back decides if a sign can carry both a
-  // human's order and the bot's own status.
+  // Q4d — the BACK face. Two faces means two independent 4-line surfaces on one block, and whether the
+  // bot can write the back decides if a sign can carry both a human's order and the bot's own status.
   let backWrite = '(not attempted)';
   try {
     await bot.activateBlock(bot.blockAt(placeV));
@@ -302,23 +283,20 @@ async function main() {
   await sleep(600);
 
   // SURVIVAL IS READ OFF THE BLOCK STATE, NEVER OFF `data get block`. Every sign variant shares ONE
-  // block-entity id — `minecraft:sign` — so a block-entity dump can never tell an oak_wall_sign from an
-  // oak_sign, and a regex over it reports "popped off" for a sign that is standing right there. The
-  // first run of this probe made exactly that mistake and its own STONE control is what exposed it.
+  // block-entity id — `minecraft:sign` — so a block-entity dump cannot tell an oak_wall_sign from an
+  // oak_sign, and a regex over it can report a sign as gone when it is standing right there.
   const isBlock = async (v, id) => /Test passed/i.test(await cmd(`execute if block ${v.x} ${v.y} ${v.z} minecraft:${id}`));
 
-  // `setblock` WRITES A BLOCK STATE WITHOUT ASKING canSurvive — vanilla only evaluates support on a
-  // neighbour update, so a wall sign forced into thin air sits there indefinitely and a probe that just
-  // reads it back records a false YES. Every support test therefore POKES the sign afterwards (set a
-  // block beside it, then clear it) to force the survival check the game would have run anyway, and the
-  // AIR case is carried as a negative control: if a sign hanging on nothing "survives", the whole test
-  // is measuring nothing and must be declared inconclusive rather than reported.
-  // A wall sign re-checks its support ONLY when the neighbour it hangs on changes. A poke from any
-  // other side is ignored, so the support block itself is what must be rewritten — and it must be
-  // rewritten to a DIFFERENT STATE OF THE SAME BLOCK, or the test would be changing the very thing
-  // under test. Rewriting it to an identical state is refused by the command ("Could not set the
-  // block") and fires no update at all, which is the silent no-op an earlier revision of this probe
-  // mistook for a survival.
+  // `setblock` WRITES A BLOCK STATE WITHOUT RUNNING canSurvive — vanilla only evaluates support on a
+  // neighbour update, so a wall sign forced into thin air sits there indefinitely and a plain read-back
+  // records a false survival. Every support test therefore POKES the sign afterwards (set a block beside
+  // it, then clear it) to force the same check the game runs on a real neighbour update, carrying the
+  // AIR case as a negative control: a sign that "survives" hanging on nothing means the test is
+  // measuring nothing and the run must be declared inconclusive.
+  // A wall sign re-checks its support ONLY when the neighbour it hangs on changes, so the support block
+  // itself is what must be rewritten, to a DIFFERENT STATE OF THE SAME BLOCK to fire a real update.
+  // Rewriting it to an identical state is refused by the command ("Could not set the block") and fires
+  // no update at all.
   const probeWall = async (supportV, supportA, supportB, facing, offset, label) => {
     const w = supportV.offset(offset.x, offset.y, offset.z);
     await cmd(`setblock ${supportV.x} ${supportV.y} ${supportV.z} minecraft:${supportA}`);
@@ -353,8 +331,8 @@ async function main() {
         ? 'YES — a chest DOES support a wall sign. The controls separate cleanly (a torch drops it, stone holds it), so this is the chest\'s answer and not the probe\'s.'
         : 'NO — a chest is NOT valid support for a wall sign. The controls separate cleanly, so this is the chest\'s answer: the sign pops the moment anything updates it.');
 
-  // Q5-ctl — the /setblock validation question in its own right, because it governs how any bench or
-  // operator may seed a sign, and because it is what made the first two revisions of this probe lie.
+  // Q5-ctl — the /setblock validation question in its own right: it governs how any bench or operator
+  // may seed a sign geometry for a test.
   const voidV = vec(8, 0, 2), voidW = voidV.offset(0, 0, -1);
   await cmd(`setblock ${voidV.x} ${voidV.y} ${voidV.z} minecraft:air`);
   await cmd(`setblock ${voidW.x} ${voidW.y} ${voidW.z} minecraft:air`);
@@ -393,13 +371,12 @@ async function main() {
       : 'NO — a standing sign does not survive on a chest lid');
 
   // Q5c — the human's own route to that geometry. Right-clicking a chest OPENS it, so a player must
-  // sneak to place against it, and whether mineflayer models that decides if the bot can build its own
-  // desk. THE SERVER IS READ EVEN WHEN placeBlock THROWS: its throw is a timeout on mineflayer's own
-  // blockUpdate bookkeeping, which is a claim about the library, not about the world (Law 23).
-  // The chest is run against a STONE control at the identical offset. A chest's collision box is inset
-  // 1/16 on every side and 2/16 at the top, while mineflayer aims placeBlock at the geometric centre of
-  // the full block face — so a failure here could be the chest's shrunken hitbox rather than sneaking,
-  // and only the control can tell those apart.
+  // sneak to place against it; whether mineflayer models that decides if the bot can build its own desk.
+  // THE SERVER IS READ EVEN WHEN placeBlock THROWS: its throw is a timeout on mineflayer's own
+  // blockUpdate bookkeeping, a claim about the library, not about the world (Law 23).
+  // The chest placement is run against a STONE control at the identical offset. A chest's collision box
+  // is inset 1/16 on every side and 2/16 at the top, while placeBlock aims at the geometric centre of the
+  // full block face; the control separates that hitbox geometry from the sneak mechanic itself.
   const trySneakPlace = async (targetV, faceV, label) => {
     const resultV = targetV.offset(faceV.x, faceV.y, faceV.z);
     await cmd(`setblock ${resultV.x} ${resultV.y} ${resultV.z} minecraft:air`);
@@ -427,9 +404,8 @@ async function main() {
         : `INCONCLUSIVE — the stone control itself did not place (threw: ${stoneLid.threw || 'no'}), so this says nothing about the chest`);
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────
-  // Q6 — THE OWNERSHIP RADIUS (the plan's print #3: "do not pick that number by reasoning").
-  // Measured against the geometries that ACTUALLY SURVIVED above, not against every geometry
-  // imaginable — a radius sized for a placement the game rejects is a number covering nothing.
+  // Q6 — THE OWNERSHIP RADIUS, taken from the geometries that ACTUALLY SURVIVED above, so it covers
+  // real placements only.
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   const candidates = [
     { label: 'standing sign on the chest lid', v: chestV.offset(0, 1, 0), legal: topSurvived },
@@ -457,9 +433,9 @@ async function main() {
     'NO — the two distances are IDENTICAL, so nearest-chest has no answer here. Ownership needs a deterministic tie-break (the sign\'s facing is the only directional data the block carries) or the ambiguous case must be REFUSED and reported to the human (Law 13: no defaults).');
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────
-  // Q7 — A WAXED sign. Plan §5 forbids the bot to wax or edit a human's sign, but a HUMAN may wax
-  // their own to lock an order. Whether a waxed sign still READS decides whether that is safe, and
-  // whether a write to one FAILS SILENTLY decides whether the bot can detect it.
+  // Q7 — A WAXED sign. The bot may not wax or edit a human's sign, but a HUMAN may wax their own to
+  // lock an order. Whether a waxed sign still READS decides whether that stays safe, and whether a
+  // write to one FAILS SILENTLY decides whether the bot can detect it.
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   const waxV = vec(-6, 0, -2);
   await cmd(`setblock ${waxV.x} ${waxV.y} ${waxV.z} minecraft:air`);
@@ -475,10 +451,9 @@ async function main() {
       : 'NO — waxing broke the read');
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────
-  // Q8 — THE LINE BUDGET, which plan §5's `ITEM QTY` grammar rests on ("every real item name clears
-  // the 15-character budget"). Three DIFFERENT limits are in play and conflating them is how that
-  // claim gets mis-verified: what the console can store, what mineflayer's own guard permits, and
-  // what a human's sign editor will let them type. Only the first two are observable headlessly.
+  // Q8 — THE LINE BUDGET an `ITEM QTY` order grammar rests on. Three DIFFERENT limits are in play:
+  // what the console can store, what mineflayer's own guard permits, and what a human's sign editor
+  // lets them type. Only the first two are observable headlessly.
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   const longV = vec(6, 0, -6);
   await cmd(`setblock ${longV.x} ${longV.y} ${longV.z} minecraft:air`);
@@ -517,10 +492,8 @@ async function main() {
       : 'The write LANDED on a waxed sign — waxing does not protect a sign from this route');
 
   // ────────────────────────────────────────────────────────────────────────────────────────────────
-  // Q10 — IS THERE AN EVENT? A desk that must POLL every sign in the world is a different piece of
-  // machinery from one that WAKES on an edit, and the difference is a mineflayer emit that either
-  // exists or does not. The library's own handler for tile_entity_data writes the block entity into
-  // the column and returns, so this is expected to be silent — but "expected" is what a probe is for.
+  // Q10 — IS THERE AN EVENT? A desk that must POLL every sign in the world is different machinery from
+  // one that WAKES on an edit; the difference is whether mineflayer emits anything on a sign write.
   // ────────────────────────────────────────────────────────────────────────────────────────────────
   // Scoped to the SIGN's position only. A bare `blockUpdate` listener also catches every distant water
   // tick in the loaded world, and counting those as evidence would turn unrelated traffic into a YES.

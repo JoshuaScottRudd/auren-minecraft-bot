@@ -1,23 +1,12 @@
-// perception primitive: blueprint_survey
-// purpose: The domain-neutral voxel-vs-world engine. Given a blueprint + a locked world center,
-//          transpose the blueprint's voxels to world coordinates and diff each against the actual
-//          block, emitting the dig/place steps that would make the world match. It knows GEOMETRY
-//          (transpose, anchors, attach points, footprint) and BLOCK-MATCHING (group tokens, air
-//          clearance, concrete types, blueprint-declared external cells) — nothing about what the
-//          structure IS. "building" and "farm" are interpretations layered on top by the integrity
-//          nodes that wrap this (building_integrity, farming_integrity); this engine is agnostic.
+// The domain-neutral voxel-vs-world engine: given a blueprint and a locked world center, transposes
+// the blueprint's voxels to world coordinates and diffs each against the actual block, emitting the
+// dig/place steps that would make the world match. Knows GEOMETRY (transpose, anchors, attach points,
+// footprint) and BLOCK-MATCHING (group tokens, air clearance, external cells) — nothing about what the
+// structure IS; "building" and "farm" are interpretations the wrapping integrity nodes layer on top.
+// One engine, one definition of the structural diff (Law 16).
 //
-// WHY split out of building_integrity (Architect 2026-07-11): once farming reuses the same scan,
-//   the logic can no longer be named for one domain. So the SCAN became an API and each integrity
-//   node is a thin wrapper with its own reading of the result — building aggregates craft materials
-//   and never sees a field cell; farming folds in its till/plant/harvest census. One engine, one
-//   definition of the structural diff (Law 16); the domains diverge only in what they DO with it.
-//
-// Ownership model: the blueprint declares its own cells (external_voxel_types names the voxels a
-//   planting subsystem owns — crop/river/sapling), and the integrity node declares which blueprint
-//   it owns (by name, in code). Neither declares the other's job (Invariant D): the owned describes
-//   itself, the owner names what it owns. This engine only honors the blueprint's self-description —
-//   it skips declared-external voxels and reports the rest structurally.
+// Ownership model: the blueprint declares its own external cells, the integrity node declares which
+// blueprint it owns; neither declares the other's job (Invariant D).
 //
 // Pure observation (Law 1 perception exception — action fragments may call this directly).
 
@@ -28,11 +17,8 @@ const blueprintRegistry = require('@kernel/blueprint_registry');
 // than split by hand here — one addressing rule, one place (Law 16).
 const { roomKeyName } = require('@foreman/message_schema');
 
-// A PLAIN REQUIRE, BECAUSE THE GUARD DEFEATED THE ONE TEST THAT COVERS THIS. Wrapped, a failed import
-// left both bindings undefined and the module carried on with silent holes in its block-name handling —
-// and pass 1 of preflight, whose entire job is to catch a bad require, saw a file that loaded
-// fine. A guard that hides the failure from the instrument built to find it is strictly worse than the
-// failure (Law 16, Law 26 — the catch deleted the guarantee the loader provides).
+// Plain require: a guarded import would leave these bindings undefined on failure while preflight's
+// bad-require check still sees a file that loaded fine (Law 16, Law 26).
 const { group_to_item, normalizeBlockName } = require('@utils/fragment_utils');
 
 // building_blueprints.json stores "log" (singular) as its raw token for "place any log variant";
@@ -65,30 +51,20 @@ function isAir(name) {
   return name === null || name === undefined || name === 'air' || name === 'cave_air' || name === 'void_air';
 }
 
-// Diff the transposed voxel list against the real world. Returns null if everything matches (with no
-// unsensed voxels). pasted.external_types is the set of blueprint-declared non-structural voxel types
-// (crop/river/sapling cells) — a foreign subsystem owns them, so they are neither placed nor dug here.
-// classifyVoxel — the ONE definition of "does the world match the blueprint at this cell" (Law 16).
-// Extracted from scanBuilding's loop so the navigator's protected-block filter can ask the same
-// question the integrity scan asks, instead of a second opinion that drifts from it. Returns a verdict
-// only; the caller owns what to DO about it (scanBuilding builds dig/place steps, the protected filter
-// just keeps or drops the key).
+// classifyVoxel — the one definition of whether the world matches the blueprint at this cell (Law 16),
+// shared by scanBuilding's dig/place diff and the navigator's protected-block filter so the two never
+// drift into different opinions on the same cell. Returns a verdict only; callers decide what to do.
 //
-// 'unloaded' is its own verdict and is NOT air: bot.blockAt returns null for an unsensed chunk, and
-// folding that into air fabricates a confident diff over cells the bot never looked at (Invariant B /
-// Law 13 — never default a missing sensor reading).
+// 'unloaded' is its own verdict, not air: an unsensed chunk must not be read as a confident diff
+// (Invariant B / Law 13).
 function classifyVoxel(bot, x, y, z, rawExpType, externalTypes) {
   const expType = TYPE_ALIASES[rawExpType] || rawExpType;
 
-  // A blueprint-declared external voxel (the farm's crop/river cells, the tree farm's sapling cells) is
-  // owned by a foreign subsystem, not by this structure — never placed, never dug. The owning integrity
-  // node is the sole authority on the cell's contents. This is the ONLY domain-aware branch, and it
-  // carries no crop vocabulary — the blueprint names its own external types (Invariant D / Law 16).
+  // A blueprint-declared external voxel is owned by a foreign subsystem, never placed or dug here — the
+  // only domain-aware branch, and it carries no crop vocabulary of its own (Invariant D / Law 16).
   if (externalTypes && externalTypes.has(expType)) return { verdict: 'correct', expType, actName: null };
 
-  // Unguarded: blockAt ANSWERS null for an unloaded column rather than throwing, and null is already the
-  // 'unloaded' verdict one line down — the guard was catching nothing and could only have hidden our own
-  // arithmetic producing a bad coordinate (Law 13: a coding violation must travel).
+  // Unguarded: a bad coordinate must surface as a coding violation, not be swallowed (Law 13).
   const rawActName = bot.blockAt(new Vec3(x, y, z))?.name || null;
   if (rawActName === null) return { verdict: 'unloaded', expType, actName: null };
 
@@ -106,10 +82,15 @@ function classifyVoxel(bot, x, y, z, rawExpType, externalTypes) {
   return { verdict: actName === expType ? 'correct' : 'mismatch', expType, actName };
 }
 
-function scanBuilding(bot, pasted) {
+// Diffs the transposed voxel list against the real world; returns null when everything already matches
+// (no unsensed voxels). pasted.external_types are blueprint-declared non-structural cells, owned by a
+// foreign subsystem, so they are neither placed nor dug here.
+async function scanBuilding(bot, pasted) {
+  const pace = require('@utils/execution_yield').makeExecutionPacer();
   const expected = new Map();
   const externalTypes = pasted.external_types || new Set();
   for (const b of (pasted.voxels || [])) {
+    await pace();
     const k = `${b.x},${b.y},${b.z}`;
     if (!expected.has(k)) expected.set(k, { type: b.type, anchor_index: b.anchor_index ?? -1, state: b.state || null });
   }
@@ -117,23 +98,19 @@ function scanBuilding(bot, pasted) {
   let correct = 0, missing = 0, mismatched = 0, extraneous = 0, unloaded = 0;
   const placeSteps = [];
   const digSteps   = [];
-  // WHERE the unsensed cells are, not just how many (Architect 2026-08-13, the 2026-08-12 measurement
-  // defect). An unloaded voxel emits no step by design — there is nothing to do about a cell nobody has
-  // seen — but a consumer counting steps then reads "no work here" and cannot tell it apart from "built".
-  // That is a well-formed falsehood crossing a machine boundary (Law 26): the 2026-08-12 trace reported
-  // "26/167 structure placed" while both bots stood 158 blocks away and the site was bare ground. The
-  // count alone cannot be attributed to an anchor, so the coordinates travel with it and every consumer
-  // downstream can ask "is THIS anchor sensed" instead of inferring it from silence.
+  // WHERE the unsensed cells are, not just how many: an unloaded voxel emits no step, so a consumer
+  // counting steps alone cannot tell "no work here" from "built" (Law 26). Coordinates travel with the
+  // count so a downstream consumer can ask whether a given anchor was sensed.
   const unloadedCells = [];
 
   for (const [k, expRec] of expected.entries()) {
+    await pace();
     const ai        = expRec.anchor_index;
     const [x, y, z] = k.split(',').map(Number);
     const { verdict, expType, actName } = classifyVoxel(bot, x, y, z, expRec.type, externalTypes);
     const isGroupToken = !!(group_to_item && group_to_item[expType]);
-    // The wanted state rides on the PLACE step only: it is an instruction to the placer. Whether the cell
-    // is correct is still decided by block type alone, so a block standing with the wrong facing is not dug
-    // up and re-laid from the same stand, which would only repeat the same result (Law 27).
+    // The wanted state rides on the PLACE step only, as an instruction to the placer; correctness is
+    // still decided by block type alone (Law 27).
     const withState = expRec.state ? { state: expRec.state } : {};
 
     switch (verdict) {
@@ -194,79 +171,42 @@ function scanBuilding(bot, pasted) {
 
 // ── Geometry: blueprint-relative → world coordinates ──
 
-// rotateOffsetY — rotate a horizontal (dx, dz) offset by `quarterTurns` 90° clockwise steps about the
-// vertical (Y) axis. Only farmland's water-site search passes a non-zero value, so its water edge can
-// face the actual riverbank whichever way the river runs; every locked-building caller passes 0 = the
-// blueprint's literal facing. Y is never rotated — structures only ever spin about the vertical.
-function rotateOffsetY(dx, dz, quarterTurns) {
-  switch (((quarterTurns % 4) + 4) % 4) {
-    case 1:  return { dx: dz,  dz: -dx };
-    case 2:  return { dx: -dx, dz: -dz };
-    case 3:  return { dx: -dz, dz: dx  };
-    default: return { dx, dz };
-  }
-}
+// A blueprint is placed exactly the way it is authored — no rotation logic exists; a facing that
+// matters is a facing the operator states explicitly, never one derived by a site search.
 
-function transposeVoxel(buildCenter, blueprintCenter, v, quarterTurns = 0) {
-  const r = rotateOffsetY(v[0] - blueprintCenter.x, v[2] - blueprintCenter.z, quarterTurns);
-  const out = {
-    x: buildCenter.x + r.dx,
-    y: buildCenter.y + (v[1] - blueprintCenter.y),
-    z: buildCenter.z + r.dz,
+// ── transpose_origin: the common point every voxel offset is measured from ──
+// Not a centre and not a place in the world — wherever the blueprint's author put the anchor. One
+// point, one subtraction (Law 7):
+//
+//     world cell = transpose_origin + (voxel offset - the blueprint's own origin)
+
+function transposeVoxel(worldOrigin, blueprintOrigin, v) {
+  return {
+    x: worldOrigin.x + (v[0] - blueprintOrigin.x),
+    y: worldOrigin.y + (v[1] - blueprintOrigin.y),
+    z: worldOrigin.z + (v[2] - blueprintOrigin.z),
     type: v[3],
+    ...(v[4] ? { state: { ...v[4] } } : {}),
   };
-  if (v[4]) out.state = rotateState(v[4], quarterTurns);
-  return out;
 }
 
-// rotateState — a voxel's optional fifth element (the block state the cell must show) turned with the
-// building. A facing is a direction, so it goes through the SAME rotateOffsetY as the voxel's own offset
-// — one rotation rule, never a hand-written compass table beside it (the hand table is what put an axis
-// backwards in June, scratchpad §3.2). An axis swaps x and z on an odd turn. Every other key is carried
-// as written.
-const COMPASS_VECTORS = { north: [0, -1], south: [0, 1], east: [1, 0], west: [-1, 0] };
-function rotateState(state, quarterTurns) {
-  const out = { ...state };
-  if (COMPASS_VECTORS[state.facing]) {
-    const [vx, vz] = COMPASS_VECTORS[state.facing];
-    const r = rotateOffsetY(vx, vz, quarterTurns);
-    out.facing = Object.keys(COMPASS_VECTORS).find(k => COMPASS_VECTORS[k][0] === r.dx && COMPASS_VECTORS[k][1] === r.dz);
-  }
-  if ((state.axis === 'x' || state.axis === 'z') && (((quarterTurns % 4) + 4) % 4) % 2 === 1) {
-    out.axis = state.axis === 'x' ? 'z' : 'x';
-  }
-  return out;
-}
-
-// footprintExtent — the XZ ground area a blueprint actually occupies, expressed as OFFSETS from its
-// build_center and already rotated by the same quarterTurns transposeVoxel applies. The one definition
-// of "how far does this building reach in each compass direction" (Law 16): every caller that reserves
-// ground, checks flatness, or rejects an overlap asks here rather than deriving it.
-//
-// WHY OFFSETS AND NOT A WIDTH: a width can only describe a footprint that is SYMMETRIC about the
-// build_center, and nothing makes a blueprint symmetric — the build_center is wherever the author put
-// the anchor, which for a mine head is at the shaft and for a staircase is at the top step, both off to
-// one side of the mass. Reconstructing the box as `center ± floor(w/2)` silently slides it: the reach
-// that lands on the far side of the origin is never checked for flatness and never reserved against a
-// sibling, while an equal strip of untouched ground on the near side is checked and reserved for
-// nothing. The failure is invisible because the box is still the right SIZE — it is in the wrong PLACE.
-//
-// Derived, never authored: `dimensions` in the blueprint file says how big the thing is, and a
-// hand-written offset pair would be a second copy of a fact the voxels already carry, free to disagree
-// with them after any edit in the designer.
-function footprintExtent(building, quarterTurns = 0) {
+// footprintExtent — the XZ ground area a blueprint occupies, as OFFSETS from its transpose_origin (not
+// a width: the origin is not symmetric within the footprint). The one definition of a blueprint's reach
+// in each compass direction (Law 16); every caller that reserves ground, checks flatness, or rejects an
+// overlap asks here. Derived from the voxels, never authored separately.
+function footprintExtent(building) {
   const voxels = collectAllVoxels(building);
   if (voxels.length === 0) {
     throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${building?.name || 'unknown'}" has no voxels, so it has no footprint. footprintExtent requires a blueprint with geometry.`);
   }
-  const bc = building.build_center || { x: 0, y: 0, z: 0 };
+  const bc = building.transpose_origin || { x: 0, y: 0, z: 0 };
   let minDX = Infinity, maxDX = -Infinity, minDZ = Infinity, maxDZ = -Infinity;
   for (const { raw } of voxels) {
-    const r = rotateOffsetY(raw[0] - bc.x, raw[2] - bc.z, quarterTurns);
-    if (r.dx < minDX) minDX = r.dx;
-    if (r.dx > maxDX) maxDX = r.dx;
-    if (r.dz < minDZ) minDZ = r.dz;
-    if (r.dz > maxDZ) maxDZ = r.dz;
+    const dx = raw[0] - bc.x, dz = raw[2] - bc.z;
+    if (dx < minDX) minDX = dx;
+    if (dx > maxDX) maxDX = dx;
+    if (dz < minDZ) minDZ = dz;
+    if (dz > maxDZ) maxDZ = dz;
   }
   return {
     min_dx: minDX, max_dx: maxDX, min_dz: minDZ, max_dz: maxDZ,
@@ -275,66 +215,63 @@ function footprintExtent(building, quarterTurns = 0) {
   };
 }
 
-// Candidate-backed voxel transpose: transposes a building's FULL voxel list to world coordinates
-// against a GIVEN build center, before any set_buildspot chair exists. find_buildingspot's farmland
-// overlay needs to read voxel TYPES around a candidate center to judge a site, which the chair-backed
-// survey() can't do yet (no chair = no locked center). Reuses collectAllVoxels/transposeVoxel so there
-// is one voxel-transpose definition (Law 16). quarterTurns rotates the whole set about the center.
-function transposeVoxelsForCandidate(building, buildCenter, quarterTurns = 0) {
-  if (!buildCenter || typeof buildCenter.x !== 'number') {
-    throw new Error('[blueprint_survey] CODING VIOLATION: transposeVoxelsForCandidate requires a buildCenter {x,y,z}.');
+// Transposes a building's full voxel list to world coordinates against a GIVEN transpose origin, before
+// any set_buildspot chair exists — find_buildingspot's farmland overlay needs voxel types around a
+// candidate center to judge a site. Reuses collectAllVoxels/transposeVoxel (Law 16).
+function transposeVoxelsForCandidate(building, transposeOrigin) {
+  if (!transposeOrigin || typeof transposeOrigin.x !== 'number') {
+    throw new Error('[blueprint_survey] CODING VIOLATION: transposeVoxelsForCandidate requires a transposeOrigin {x,y,z}.');
   }
-  const blueprintCenter = building.build_center || { x: 0, y: 0, z: 0 };
+  const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
   return collectAllVoxels(building).map(({ raw, anchor_index }) => {
-    const v = transposeVoxel(buildCenter, blueprintCenter, raw, quarterTurns);
+    const v = transposeVoxel(transposeOrigin, blueprintCenter, raw);
     v.anchor_index = anchor_index;
     return v;
   });
 }
 
-// Transpose a blueprint's attach points to world coordinates against a GIVEN build center. Pure (no HQ
+// Transpose a blueprint's attach points to world coordinates against a GIVEN transpose origin. Pure (no HQ
 // read) so both the chair-backed resolver (getWorldAttachPoints) and candidate callers share ONE join
 // definition (Law 16). Returns { A:{x,y,z}, ... } keyed by attach-point id.
-function transposeAttachPoints(building, buildCenter) {
+function transposeAttachPoints(building, transposeOrigin) {
   if (!building || !Array.isArray(building.attach_points) || building.attach_points.length === 0) {
     throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${building?.name || 'unknown'}" has no attach_points array.`);
   }
-  if (!buildCenter || typeof buildCenter.x !== 'number') {
-    throw new Error('[blueprint_survey] CODING VIOLATION: transposeAttachPoints requires a buildCenter {x,y,z}.');
+  if (!transposeOrigin || typeof transposeOrigin.x !== 'number') {
+    throw new Error('[blueprint_survey] CODING VIOLATION: transposeAttachPoints requires a transposeOrigin {x,y,z}.');
   }
-  const blueprintCenter = building.build_center || { x: 0, y: 0, z: 0 };
+  const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
   const out = {};
   for (const ap of building.attach_points) {
     const p = ap.position;
     out[ap.id] = {
-      x: buildCenter.x + (p[0] - blueprintCenter.x),
-      y: buildCenter.y + (p[1] - blueprintCenter.y),
-      z: buildCenter.z + (p[2] - blueprintCenter.z),
+      x: transposeOrigin.x + (p[0] - blueprintCenter.x),
+      y: transposeOrigin.y + (p[1] - blueprintCenter.y),
+      z: transposeOrigin.z + (p[2] - blueprintCenter.z),
     };
   }
   return out;
 }
 
-// Candidate-time anchor transpose (no HQ read) — the anchor twin of transposeVoxelsForCandidate, so a
-// caller can locate the bot's STAND cells against a GIVEN center+rotation BEFORE a set_buildspot chair
-// exists. find_buildingspot's farmland gate needs this to refuse a site whose anchor lands on water (the
-// bot stands on its anchors; water there is the 47d half-pond livelock). getWorldAnchors is the chair-
-// backed caller; both share this one transpose (Law 16 — same math as transposeVoxel).
-function transposeAnchorsForCandidate(building, buildCenter, quarterTurns = 0) {
-  if (!buildCenter || typeof buildCenter.x !== 'number') {
-    throw new Error('[blueprint_survey] CODING VIOLATION: transposeAnchorsForCandidate requires a buildCenter {x,y,z}.');
+// Candidate-time anchor transpose — the anchor twin of transposeVoxelsForCandidate, so a caller can
+// locate the bot's STAND cells against a GIVEN center before a set_buildspot chair exists.
+// find_buildingspot's farmland gate uses this to refuse a site whose anchor lands on water.
+// getWorldAnchors is the chair-backed caller; both share this transpose (Law 16).
+function transposeAnchorsForCandidate(building, transposeOrigin) {
+  if (!transposeOrigin || typeof transposeOrigin.x !== 'number') {
+    throw new Error('[blueprint_survey] CODING VIOLATION: transposeAnchorsForCandidate requires a transposeOrigin {x,y,z}.');
   }
   if (!Array.isArray(building?.anchors) || building.anchors.length === 0) {
     throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${building?.name || 'unknown'}" has no anchors array.`);
   }
-  const blueprintCenter = building.build_center || { x: 0, y: 0, z: 0 };
+  const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
   return building.anchors.map(a => {
     const pos = a.position;
-    const r = rotateOffsetY(pos[0] - blueprintCenter.x, pos[2] - blueprintCenter.z, quarterTurns);
+    const r = { dx: pos[0] - blueprintCenter.x, dz: pos[2] - blueprintCenter.z };
     return {
-      x: buildCenter.x + r.dx,
-      y: buildCenter.y + (pos[1] - blueprintCenter.y),
-      z: buildCenter.z + r.dz,
+      x: transposeOrigin.x + r.dx,
+      y: transposeOrigin.y + (pos[1] - blueprintCenter.y),
+      z: transposeOrigin.z + r.dz,
     };
   });
 }
@@ -349,68 +286,52 @@ function getWorldAnchors(blueprintName, conferenceRoomKey) {
   }
 
   const setBuildspot = hq.readBuildingChair(conferenceRoomKey, 'set_buildspot');
-  if (!setBuildspot?.build_center || typeof setBuildspot.build_center.x !== 'number') {
-    throw new Error(`[blueprint_survey] CODING VIOLATION: No locked build_center for "${conferenceRoomKey}". set_buildspot must run before getWorldAnchors().`);
+  if (!setBuildspot?.transpose_origin || typeof setBuildspot.transpose_origin.x !== 'number') {
+    throw new Error(`[blueprint_survey] CODING VIOLATION: No locked transpose_origin for "${conferenceRoomKey}". set_buildspot must run before getWorldAnchors().`);
   }
-  return transposeAnchorsForCandidate(building, setBuildspot.build_center, setBuildspot.rotation || 0);
+  return transposeAnchorsForCandidate(building, setBuildspot.transpose_origin);
 }
 
-// Chair-backed attach-point resolver: reads the locked build_center from set_buildspot's chair and
+// Chair-backed attach-point resolver: reads the locked transpose_origin from set_buildspot's chair and
 // transposes the named building's attach points to world. Mirrors getWorldAnchors.
 function getWorldAttachPoints(blueprintName, conferenceRoomKey) {
   conferenceRoomKey = conferenceRoomKey || blueprintName;
   const building = blueprintRegistry.getBuilding(blueprintName, 'blueprint_survey');
   const setBuildspot = hq.readBuildingChair(conferenceRoomKey, 'set_buildspot');
-  if (!setBuildspot?.build_center || typeof setBuildspot.build_center.x !== 'number') {
-    throw new Error(`[blueprint_survey] CODING VIOLATION: No locked build_center for "${conferenceRoomKey}". set_buildspot must run before getWorldAttachPoints().`);
+  if (!setBuildspot?.transpose_origin || typeof setBuildspot.transpose_origin.x !== 'number') {
+    throw new Error(`[blueprint_survey] CODING VIOLATION: No locked transpose_origin for "${conferenceRoomKey}". set_buildspot must run before getWorldAttachPoints().`);
   }
-  return transposeAttachPoints(building, setBuildspot.build_center);
+  return transposeAttachPoints(building, setBuildspot.transpose_origin);
 }
 
 // One transpose→world-key-set pathway (Law 16), two callers with opposite air policies:
-//   getProtectedBlocks → SOLID voxels only (navigator's protected-block dig penalty must not touch
-//                        the blueprint's own blocks).
-//   getFootprintCells  → EVERY declared voxel incl. interior air (torch_integrity's overlap guard —
-//                        a torch inside a blueprint's air cell is still "inside the blueprint").
+//   getProtectedBlocks → SOLID voxels only (navigator's dig penalty must not touch the blueprint's own
+//                        blocks).
+//   getFootprintCells  → EVERY declared voxel incl. interior air (torch_integrity's overlap guard).
 // Returns null when the blueprint has no locked center yet.
-// `bot` (optional) turns this from a PLAN read into a SENSED read, and that distinction is the whole
-// point of it existing (Architect 2026-07-20: "for every max cost block it must be part of protected
-// voxels and in the correct configuration").
 //
-// WITHOUT bot: every solid voxel the blueprint DECLARES — including cells that hold nothing but virgin
-// terrain the bot has never touched. That is remembered intent, never re-sensed (Invariant B), and A*
-// priced all of it at PROTECTED_VOXEL_DETOUR_BUDGET. The bots were therefore charged a full-budget detour to dig raw rock
-// that merely happened to sit inside a future wall's footprint — which is how they sealed themselves
-// out of a building they had not built yet, and why a 2-block hop cost 140,315 nodes and 31.7 seconds.
+// `bot` (optional) turns this from a PLAN read into a SENSED read: without it, every solid voxel the
+// blueprint declares is protected, including virgin terrain never re-sensed (Invariant B); with it, only
+// cells the world already matches are protected, via classifyVoxel — the same verdict the integrity scan
+// uses (Law 16). An UNLOADED cell stays protected regardless (Law 13, default stopped).
 //
-// WITH bot: only cells the world ALREADY MATCHES. Digging a correctly-placed furnace is still PROTECTED_VOXEL_DETOUR_BUDGET
-// (it destroys finished work); digging rock that is in the way of a wall we have not built is an
-// ordinary COST_HIGH dig, because it damages nothing. The verdict comes from classifyVoxel — the same
-// one the integrity scan uses — so "correct" cannot mean two different things in two places (Law 16).
-//
-// A cell in an UNLOADED chunk stays protected: unsensed is not permission (Law 13, default stopped).
-// `chair` — AN ALREADY-READ set_buildspot, handed in by a caller walking the WHOLE room.
-//
-// IT EXISTS BECAUSE THE ROOM KEY CARRIES AN OWNER AND THIS FUNCTION CANNOT RE-ADDRESS ONE. readBuildingChair
-// forms the key for THIS process's owner, which is right for a caller naming a structure ('headframe') and
-// wrong for a caller iterating every owner's rooms — it would re-prefix a key that already carries somebody
-// else's name, and find nothing. The walkers below hold the entry already; passing it is both correct and
-// one lookup cheaper than asking for it back (Law 16 — one addressing rule, and the walker is outside it).
+// `chair` — an already-read set_buildspot, handed in by a caller walking the whole room, since
+// readBuildingChair addresses by this process's owner and cannot re-address a room key that already
+// carries a different owner.
 function worldVoxelKeys(blueprintName, conferenceRoomKey, { includeAir, bot = null, externalTypes = null, chair = null }) {
   const building = blueprintRegistry.tryGetBuilding(blueprintName);
   const allVoxels = building ? collectAllVoxels(building) : [];
   if (!building || allVoxels.length === 0) return null;
 
   const setBuildspot = chair || hq.readBuildingChair(conferenceRoomKey || blueprintName, 'set_buildspot');
-  if (!setBuildspot?.build_center || typeof setBuildspot.build_center.x !== 'number') return null;
+  if (!setBuildspot?.transpose_origin || typeof setBuildspot.transpose_origin.x !== 'number') return null;
 
-  const buildCenter     = setBuildspot.build_center;
-  const blueprintCenter = building.build_center || { x: 0, y: 0, z: 0 };
-  const rotation        = setBuildspot.rotation || 0;
+  const transposeOrigin     = setBuildspot.transpose_origin;
+  const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
 
   const set = new Set();
   for (const { raw } of allVoxels) {
-    const world = transposeVoxel(buildCenter, blueprintCenter, raw, rotation);
+    const world = transposeVoxel(transposeOrigin, blueprintCenter, raw);
     if (!includeAir && world.type === 'air') continue;
     if (bot) {
       const { verdict } = classifyVoxel(bot, world.x, world.y, world.z, world.type, externalTypes);
@@ -425,43 +346,21 @@ function getProtectedBlocks(blueprintName, bot = null) {
   return worldVoxelKeys(blueprintName, blueprintName, { includeAir: false, bot });
 }
 
-// getAllProtectedBlocks — every SOLID voxel of EVERY blueprint that has a locked build_center, as
-// one "x,y,z" key Set. The plural twin of getProtectedBlocks(name), and the one the navigator wants.
+// getAllProtectedBlocks — every SOLID voxel of EVERY blueprint with a locked transpose_origin, as one
+// "x,y,z" key Set. The plural twin of getProtectedBlocks(name); asking by name only protects the
+// blueprint named and leaves every other build a cheap doorway, so the navigator wants this instead.
 //
-// WHY plural is the only safe shape here (Architect 2026-07-15, round 36: "extend it to building and
-// other types of integrities. so every build block is protected"): asking by NAME protects the
-// blueprint you remembered to name and silently leaves every other build a cheap doorway. The
-// navigator asked for 'headframe' and nothing else, so `farmland_alternating_rows_fence` — locked at
-// (43,62,19) in the same conference room — was unprotected the whole time. A* prices digging or
-// COVERING an unprotected voxel at COST_HIGH/COST_PLACE instead of PROTECTED_VOXEL_DETOUR_BUDGET, and the navigator's
-// BUILD_PREFS start ['cobblestone','dirt','stone'] — which is the unexplained "10 stone, 5 dirt"
-// buried in Tessa's crop slots (round 35 open item #3: farm_executor "carries dirt:96 and no stone,
-// so it cannot have placed the 10 stone. Unproven mechanism"). It was never farm_executor.
-//
-// Enumeration is over the HQ ROOM (every LOCKED conference-room key), not the blueprint file. WHY the
-// source moved (Architect 2026-07-16, per-instance farms): a blueprint can now be locked under a key that
-// is NOT its file name — the 32 phase-1 wheat plots all share geometry `wheat_plot_pair` but instances 1+
-// are locked under `wheat_plot_pair#1`…`wheat_plot_pair#31`. Enumerating `Object.keys(buildings)` (the old
-// way) would find only the file names and leave every instanced plot UNPROTECTED — the exact "one voxel, a
-// cheap doorway" hole the round-36 note below warns about, reopened by instancing. The locked-chair set IS
-// the authority on what is built, so that is what we walk: each entry's `set_buildspot.build_center` proves
-// it is locked, and `blueprint_paster.building_name` names the geometry to transpose (falling back to the
-// key for the common key==name case). Mining's own blueprints (staircase, cell) still have no chair here
-// and fall out — mining_integrity/mining_cell_graph own those, and the navigator merges all three Sets.
-//
-// WHY protecting EVERY build matters (Architect 2026-07-15, round 36: "extend it to building and other
-// types of integrities. so every build block is protected"): asking by NAME protects the blueprint you
-// remembered to name and silently leaves every other build a cheap doorway. The navigator asked for
-// 'headframe' and nothing else, so `farmland_alternating_rows_fence` — locked in the same conference room —
-// was unprotected the whole time. A* prices digging or COVERING an unprotected voxel at COST_HIGH/COST_PLACE
-// instead of PROTECTED_VOXEL_DETOUR_BUDGET, and the navigator's BUILD_PREFS start ['cobblestone','dirt','stone'] — which was the
-// unexplained "10 stone, 5 dirt" buried in Tessa's crop slots (round 35). It was never farm_executor.
+// Enumerates the HQ ROOM (every LOCKED conference-room key), not the blueprint file, since a blueprint
+// may be locked under an instanced key that is not its file name (e.g. `wheat_plot_pair#7`). Each
+// entry's `set_buildspot.transpose_origin` proves it is locked; `blueprint_paster.building_name` names
+// the geometry to transpose. Mining's own blueprints have no chair here and fall out; the navigator
+// merges all three Sets.
 function getAllProtectedBlocks(bot = null) {
   const room = hq.readOffice('building_confrence_room', {});
   const set = new Set();
   for (const [roomKey, entry] of Object.entries(room || {})) {
     const sb = entry?.set_buildspot;
-    if (!sb?.build_center || typeof sb.build_center.x !== 'number') continue;   // not a locked instance
+    if (!sb?.transpose_origin || typeof sb.transpose_origin.x !== 'number') continue;   // not a locked instance
     const blueprintName = entry?.blueprint_paster?.building_name || roomKeyName(roomKey);   // geometry name (fallback strips the owner)
     const keys = worldVoxelKeys(blueprintName, roomKey, { includeAir: false, bot, chair: sb });
     if (keys) for (const k of keys) set.add(k);
@@ -473,46 +372,23 @@ function getFootprintCells(blueprintName, conferenceRoomKey) {
   return worldVoxelKeys(blueprintName, conferenceRoomKey, { includeAir: true });
 }
 
-// getAllFootprintCells — every DECLARED cell, interior air included, of EVERY blueprint that has a locked
-// build_center, as one "x,y,z" key Set. The plural twin of getFootprintCells, walking the same locked
-// conference-room keys getAllProtectedBlocks walks (Law 16 — one authority on what is locked, and an
-// instanced plot like `wheat_plot_pair#7` is reached by walking the room rather than the blueprint file).
+// getAllFootprintCells — every DECLARED cell, interior air included, of EVERY blueprint with a locked
+// transpose_origin, as one "x,y,z" key Set. The plural twin of getFootprintCells, walking the same
+// locked conference-room keys getAllProtectedBlocks walks (Law 16).
 //
-// IT IS DELIBERATELY THE PLANNED SET, AND THAT IS WHAT SEPARATES IT FROM getAllProtectedBlocks(bot).
-// The protected set answers "what would I destroy if I dug here" and is diffed against the world on
-// purpose: pricing unbuilt terrain as protected is what once turned a 2-block hop into a 140,315-node
-// search. This one answers a different question — "is this cell spoken for by a building" — and the
-// answer has to be yes BEFORE the building exists, because the whole point of asking is to keep a block
-// out of ground that is going to be built on later.
+// Answers a different question than getAllProtectedBlocks: whether a cell is spoken for by a building —
+// true even before the building exists — not whether digging there would destroy something. The two sets
+// mean opposite things and are never merged.
+
+// geometryOf — which blueprint geometry a locked instance is. The room key names the INSTANCE; the
+// chair names the GEOMETRY (`wheat_plot_pair#7` is an instance key, and set_buildspot stamps which
+// geometry is locked under it). For callers that hold only a key and no room-walk entry.
 //
-// SO IT MUST NEVER BE MERGED INTO loadProtectedBlocks. The two sets share a shape and mean opposite
-// things; unioning them reinstates the pathfinding regression with no line saying it happened.
+// Resolved through hq.readBuildingChair, not by indexing the room directly: the room is keyed with the
+// owner suffix while callers hold the bare instance key, so a direct lookup would miss.
 //
-// The one caller today is the bootstrap crafting table's placement search (craft_handler): a table left
-// standing permanently inside a footprint is a block the builder has to break before it can lay that
-// voxel, which is the digging this fleet no longer does.
-// geometryOf — WHICH blueprint geometry a locked instance is. The room key names the INSTANCE and the chair
-// names the GEOMETRY, and since 2026-07-16 those are two different things: `wheat_plot_pair#7` is an instance
-// key, and the geometry locked under it is whatever `set_buildspot` stamped.
-//
-// THE RESOLUTION WAS ALREADY WRITTEN FIVE TIMES before it was a function — four places in this file and one
-// in find_buildingspot, all spelling `entry?.blueprint_paster?.building_name || roomKeyName(roomKey)`. Those
-// five sit inside `Object.entries(room)` loops and already hold the entry, so they keep the inline form; this
-// exists for the callers that hold only a key. It replaced a worse thing than a copy: `farming_integrity`'s
-// survey and `farm_manager`'s tendPlot were passing the config CONSTANT, which is an assumption about what is
-// locked rather than a reading of it. Asking is the same cost and cannot go stale (Law 25).
-// THE KEY IS RESOLVED THROUGH hq.readBuildingChair, NOT BY INDEXING THE ROOM. Measured the hard way: the
-// room is keyed WITH the owner suffix (`wheat_plot_pair#1|homesteader`) and every farm caller holds the
-// bare instance key (`wheat_plot_pair#1`, from FARM_ROOM_KEYS), so a direct `room[roomKey]` misses, falls
-// back, and hands `getBuilding` an instance key that is not a blueprint — a live run died on
-// `Blueprint "wheat_plot_pair#1" not found`. readBuildingChair applies bot_mandate.buildingRoomKey, which is
-// the same owner resolution every other chair read uses (Law 16). The other five copies of this lookup are
-// inside `Object.entries(room)` loops, so they always held the full key and never met this.
-//
-// THE FALLBACK ALSO STRIPS THE INSTANCE SUFFIX, for the same reason: `roomKeyName` strips the OWNER and
-// nothing else, which is right for `headframe|homesteader` and wrong for an instanced key. Config builds
-// those as `${blueprintName}#${i}`, so cutting at the '#' recovers the geometry name by construction. The
-// fallback only fires for a chair written before the paster stamp existed; it must not fire into a throw.
+// The fallback strips the instance suffix at '#' (roomKeyName only strips the owner) to recover the
+// geometry name when a chair predates the paster stamp.
 function geometryOf(roomKey) {
   const stamped = hq.readBuildingChair(roomKey, 'blueprint_paster')?.building_name;
   if (stamped) return stamped;
@@ -526,7 +402,7 @@ function getAllFootprintCells() {
   const set = new Set();
   for (const [roomKey, entry] of Object.entries(room || {})) {
     const sb = entry?.set_buildspot;
-    if (!sb?.build_center || typeof sb.build_center.x !== 'number') continue;   // not a locked instance
+    if (!sb?.transpose_origin || typeof sb.transpose_origin.x !== 'number') continue;   // not a locked instance
     const blueprintName = entry?.blueprint_paster?.building_name || roomKeyName(roomKey);   // geometry name (fallback strips the owner)
     const keys = worldVoxelKeys(blueprintName, roomKey, { includeAir: true, chair: sb });
     if (keys) for (const k of keys) set.add(k);
@@ -534,40 +410,18 @@ function getAllFootprintCells() {
   return set.size > 0 ? set : null;
 }
 
-// ── resolveVoxelAnchor — "which anchor owns the block at this world cell?" ────────────────────────
+// ── resolveVoxelAnchor — which anchor owns the block at this world cell? ──
 //
-// THE STAND FOR USING A STATION, AND IT IS AUTHORED RATHER THAN SEARCHED (Architect 2026-08-31):
-//   *"since all chests and furnaces operate off of blueprints … instead of the LOS logic, remove all of
-//   that and instead walk the blueprint and stand at the anchor the station is placed on … the anchor is
-//   a designated building point and is a pre approved location to stand and reach every block within its
-//   domain so reuse it instead of making some non deterministic way to stand."*
+// The authored stand for using a station: the anchor is the cell build_executor stands on to build that
+// group of voxels, and every voxel in its domain is within reach from it (Law 16) — a reused value, never
+// searched for fresh.
 //
-// WHY A SEARCHED STANCE WAS WRONG, twice over, and both failures were watched live. A raycast vantage is
-// satisfied from anywhere inside BLOCK_REACH with a clear line — across a room, through a doorway — so a
-// bot reported ARRIVED without moving and then retried a chest window it could not reach, forever. The
-// radius goal that replaced it for one day fixed the reach and kept the real defect: a radius admits many
-// cells, the search takes whichever is cheapest from where the body happens to be, and "cheapest" from
-// outside a building is a cell OUTSIDE THE WALL. That is a bot opening a chest through masonry in front of
-// other players, and it is a shared-world rule this fleet does not get to break for convenience.
+// Returns the ANCHOR BLOCK, never the stand cell; the "+1 to stand on it" conversion belongs solely to
+// locomotion.goToStand. Null means no blueprint claims this cell (the one legitimate exception is a
+// temporary bootstrap crafting table); callers must not improvise a stance from null.
 //
-// The anchor is already the answer. It is the cell build_executor stands on to BUILD that group of voxels,
-// chosen when the blueprint was authored, and its whole contract is that every voxel in its domain is
-// within reach from it. Verified across the entire blueprint set the day this landed: every station voxel
-// in `headframe` (anchors 0 and 3), `contractor_house` (anchor 0) and `temp_construction_chest` sits
-// between 1.00 and 1.73 from its own anchor's stand cell, and no station is an unassigned voxel. So this
-// is not a new stance to validate — it is the one the fleet already trusts, reused (Law 16).
-//
-// RETURNS the ANCHOR BLOCK, never the stand cell: the "+1 to stand on top of it" conversion has exactly
-// one home and it is `locomotion.goToStand`. Two places doing that arithmetic is how they come to disagree.
-//
-// Null means NO blueprint claims this cell. The Architect named the one legitimate case himself — *"with
-// the only exception being a temporary crafting table to boostrap the bot"* — a table a bot sets down
-// beside itself and picks back up. Callers must treat null as "this station has no authored stance",
-// never as permission to improvise one.
-//
-// Enumeration matches getAllProtectedBlocks: every LOCKED conference-room key, because a blueprint may be
-// locked under a key that is not its file name (the instanced wheat plots). Keys are walked SORTED so two
-// blueprints overlapping one cell resolve to the same anchor on every machine and every run (Law 19).
+// Enumeration matches getAllProtectedBlocks, walking every LOCKED conference-room key SORTED so two
+// overlapping blueprints resolve to the same anchor on every run (Law 19).
 function resolveVoxelAnchor(pos) {
   if (!pos || typeof pos.x !== 'number') {
     throw new Error(`[blueprint_survey] CODING VIOLATION: resolveVoxelAnchor needs a {x,y,z}. Got: ${require('util').inspect(pos)}`);
@@ -577,37 +431,117 @@ function resolveVoxelAnchor(pos) {
   for (const roomKey of Object.keys(room || {}).sort()) {
     const entry = room[roomKey];
     const sb = entry?.set_buildspot;
-    if (!sb?.build_center || typeof sb.build_center.x !== 'number') continue;   // not a locked instance
+    if (!sb?.transpose_origin || typeof sb.transpose_origin.x !== 'number') continue;   // not a locked instance
     const blueprintName = entry?.blueprint_paster?.building_name || roomKeyName(roomKey);   // geometry name (fallback strips the owner)
     const building = blueprintRegistry.tryGetBuilding(blueprintName);
     if (!building) continue;
     const allVoxels = collectAllVoxels(building);
     if (allVoxels.length === 0) continue;
-    const blueprintCenter = building.build_center || { x: 0, y: 0, z: 0 };
-    const rotation = sb.rotation || 0;
+    const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
     for (const { raw, anchor_index } of allVoxels) {
-      const world = transposeVoxel(sb.build_center, blueprintCenter, raw, rotation);
+      const world = transposeVoxel(sb.transpose_origin, blueprintCenter, raw);
       if (`${world.x},${world.y},${world.z}` !== wantKey) continue;
-      // An UNASSIGNED voxel belongs to the blueprint but to no anchor, so there is no authored stance for
-      // it. Reported with the owner named rather than as a bare null, because "no blueprint has this cell"
-      // and "this blueprint has it but filed it outside every anchor" are different facts and only the
-      // second is a blueprint that wants editing (Law 25).
+      // An UNASSIGNED voxel belongs to the blueprint but no anchor; reported with the owner named, since
+      // no-blueprint-here and unassigned-within-this-blueprint are different facts (Law 25).
       if (anchor_index < 0) {
         return { blueprint: blueprintName, roomKey, anchorIndex: -1, anchor: null, type: world.type, reason: 'unassigned_voxel' };
       }
-      const anchors = transposeAnchorsForCandidate(building, sb.build_center, rotation);
+      const anchors = transposeAnchorsForCandidate(building, sb.transpose_origin);
       return { blueprint: blueprintName, roomKey, anchorIndex: anchor_index, anchor: anchors[anchor_index], type: world.type };
     }
   }
   return null;
 }
 
+// ── LANES — A ONE-WAY ROUTE THROUGH A BLUEPRINT, AUTHORED ON THE BLUEPRINT ──────────────────────────
+//
+// A blueprint may declare `lane`: the attach point a body enters by, the attach point it leaves by, the
+// `interior` box of feet cells between the two, and the `closed` boxes no route stands in (its fixtures
+// and the air above them). An attach point follows the anchor convention — the block the feet rest ON.
+// A blueprint with no `lane` has none, and every walk to it is a plain walk.
+
+const inBox = (b, p) => p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.y && p.y <= b.max.y
+  && p.z >= b.min.z && p.z <= b.max.z;
+
+function transposeLaneBox(building, transposeOrigin, box, what) {
+  const corner = c => Array.isArray(c) && c.length === 3 && c.every(n => Number.isFinite(n));
+  if (!box || !corner(box.min) || !corner(box.max) || box.min.some((n, i) => n > box.max[i])) {
+    throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${building.name}" lane ${what} must be {min:[x,y,z], max:[x,y,z]} with min <= max. Got: ${JSON.stringify(box)}`);
+  }
+  const bc = building.transpose_origin || { x: 0, y: 0, z: 0 };
+  const at = c => ({ x: transposeOrigin.x + (c[0] - bc.x), y: transposeOrigin.y + (c[1] - bc.y), z: transposeOrigin.z + (c[2] - bc.z) });
+  return { min: at(box.min), max: at(box.max) };
+}
+
+// getWorldLanes — every lane of every LOCKED blueprint, in world coordinates:
+//   [{ blueprint, roomKey, entry, exit, interior:{min,max}, closed:[{min,max}] }]
+// Walks the same locked conference-room keys resolveVoxelAnchor walks, sorted (Law 16, Law 19).
+function getWorldLanes() {
+  const room = hq.readOffice('building_confrence_room', {});
+  const lanes = [];
+  for (const roomKey of Object.keys(room || {}).sort()) {
+    const entry = room[roomKey];
+    const sb = entry?.set_buildspot;
+    if (!sb?.transpose_origin || typeof sb.transpose_origin.x !== 'number') continue;   // not a locked instance
+    const blueprintName = entry?.blueprint_paster?.building_name || roomKeyName(roomKey);
+    const building = blueprintRegistry.tryGetBuilding(blueprintName);
+    if (!building || !building.lane) continue;
+    const lane = building.lane;
+    const points = transposeAttachPoints(building, sb.transpose_origin);
+    if (!points[lane.entry] || !points[lane.exit] || lane.entry === lane.exit) {
+      throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${blueprintName}" lane names entry "${lane.entry}" and exit "${lane.exit}", which must be two different ids in its attach_points.`);
+    }
+    if (!Array.isArray(lane.closed)) {
+      throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${blueprintName}" lane.closed must be an array of boxes.`);
+    }
+    const interior = transposeLaneBox(building, sb.transpose_origin, lane.interior, 'interior');
+    // A mouth inside the interior would be closed to the very walk sent to it.
+    for (const id of [lane.entry, lane.exit]) {
+      const stand = { x: points[id].x, y: points[id].y + 1, z: points[id].z };
+      if (inBox(interior, stand)) {
+        throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${blueprintName}" lane attach point "${id}" stands inside the lane's own interior box.`);
+      }
+    }
+    lanes.push({
+      blueprint: blueprintName, roomKey,
+      entry: points[lane.entry], exit: points[lane.exit], interior,
+      closed: lane.closed.map((b, i) => transposeLaneBox(building, sb.transpose_origin, b, `closed[${i}]`)),
+    });
+  }
+  return lanes;
+}
+
+// laneLegs — the lane mouths a walk passes before its own goal, in order: out by the exit of a lane
+// the body stands in and is leaving, then in by the entry of a lane the goal lies in. `toFeet` is null
+// for a walk with no single goal cell. Returns [{ point:'exit'|'entry', blueprint, anchor }].
+function laneLegs(lanes, fromFeet, toFeet) {
+  const legs = [];
+  for (const lane of lanes) {
+    const from = inBox(lane.interior, fromFeet), to = !!toFeet && inBox(lane.interior, toFeet);
+    if (from && !to) legs.unshift({ point: 'exit', blueprint: lane.blueprint, anchor: lane.exit });
+    if (to && !from) legs.push({ point: 'entry', blueprint: lane.blueprint, anchor: lane.entry });
+  }
+  return legs;
+}
+
+// laneClosedBoxes — the lane boxes closed to one route search: every lane's `closed` boxes always, and
+// its interior unless the search's goal cell lies in it. A closed box still lets a body inside it walk
+// out (pathfinding_utils' closed-box rule), which is how a walk leaves by the exit.
+function laneClosedBoxes(lanes, goalFeet) {
+  const boxes = [];
+  for (const lane of lanes) {
+    boxes.push(...lane.closed);
+    if (!(goalFeet && inBox(lane.interior, goalFeet))) boxes.push(lane.interior);
+  }
+  return boxes;
+}
+
 // survey(bot, blueprintName, conferenceRoomKey, opts) — the neutral scan. Loads the blueprint + the
-// locked build_center from set_buildspot's chair, transposes every voxel to world, and diffs against
+// locked transpose_origin from set_buildspot's chair, transposes every voxel to world, and diffs against
 // reality. Returns the RAW structural verdict; craft-material aggregation, anchor status, and logging
 // are the wrapping integrity node's concern, not this engine's.
-//   { all_complete, steps, stats, summary, voxels (world), footprint, build_center, anchor_count }
-function survey(bot, blueprintName, conferenceRoomKey, opts) {
+//   { all_complete, steps, stats, summary, voxels (world), footprint, transpose_origin, anchor_count }
+async function survey(bot, blueprintName, conferenceRoomKey, opts) {
   conferenceRoomKey = conferenceRoomKey || blueprintName;
   if (!bot || !bot.blockAt) {
     throw new Error('[blueprint_survey] CODING VIOLATION: bot must be initialized before survey(). Check caller.');
@@ -623,15 +557,14 @@ function survey(bot, blueprintName, conferenceRoomKey, opts) {
   }
 
   const setBuildspot = hq.readBuildingChair(conferenceRoomKey, 'set_buildspot');
-  if (!setBuildspot?.build_center || typeof setBuildspot.build_center.x !== 'number') {
-    throw new Error(`[blueprint_survey] CODING VIOLATION: No locked build_center for "${conferenceRoomKey}". set_buildspot must run before survey().`);
+  if (!setBuildspot?.transpose_origin || typeof setBuildspot.transpose_origin.x !== 'number') {
+    throw new Error(`[blueprint_survey] CODING VIOLATION: No locked transpose_origin for "${conferenceRoomKey}". set_buildspot must run before survey().`);
   }
-  const buildCenter     = setBuildspot.build_center;
-  const blueprintCenter = building.build_center || { x: 0, y: 0, z: 0 };
-  const rotation        = setBuildspot.rotation || 0;
+  const transposeOrigin     = setBuildspot.transpose_origin;
+  const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
 
   const voxels = allVoxels.map(({ raw, anchor_index }) => {
-    const v = transposeVoxel(buildCenter, blueprintCenter, raw, rotation);
+    const v = transposeVoxel(transposeOrigin, blueprintCenter, raw);
     v.anchor_index = anchor_index;
     return v;
   });
@@ -650,14 +583,11 @@ function survey(bot, blueprintName, conferenceRoomKey, opts) {
   const pasted = { building_name: blueprintName, voxels, voxel_count: voxels.length, external_types: externalTypes };
 
   const scanStart = Date.now();
-  // NO CATCH (r33/F2). This used to `catch → result = null` — the SAME value scanBuilding returns as
-  // its legitimate "nothing left to do" sentinel (:149). So `all_complete: result === null` below
-  // reported a CRASHED SCAN AS A COMPLETED BUILDING, with steps: [] and summary "all voxels match
-  // world state", and the judge acted on that verdict. Never reuse a success sentinel for an error.
-  // A throw here is a coding violation, not an environmental outcome: the one genuine world condition
-  // (unloaded chunks) is handled by RETURN at :149, never by throwing. So let it crash for inspection
-  // (Law 13) rather than launder itself into a false completion.
-  const result = scanBuilding(bot, pasted);
+  // No catch: a caught failure here would collapse to the same null scanBuilding returns for "nothing
+  // left to do", reporting a crashed scan as a completed build. A throw is a coding violation, not an
+  // environmental outcome — the one genuine world condition (unloaded chunks) returns, never throws
+  // (Law 13).
+  const result = await scanBuilding(bot, pasted);
   const scanMs = Date.now() - scanStart;
 
   return {
@@ -670,7 +600,7 @@ function survey(bot, blueprintName, conferenceRoomKey, opts) {
     summary:          result ? result.summary : 'all voxels match world state',
     voxels,
     footprint,
-    build_center:     buildCenter,
+    transpose_origin:     transposeOrigin,
     anchor_count:     Array.isArray(building.anchors) ? building.anchors.length : 0,
   };
 }
@@ -678,11 +608,10 @@ function survey(bot, blueprintName, conferenceRoomKey, opts) {
 module.exports = {
   survey,
   scanBuilding,
-  classifyVoxel,   // the one definition of "does the world match the blueprint here" (mining_integrity reuses it)
+  classifyVoxel,   // the one definition of whether the world matches the blueprint here (mining_integrity reuses it)
   collectAllVoxels,
   isAir,
-  rotateOffsetY,
-  footprintExtent,   // the one definition of a blueprint's XZ reach, as offsets from its build_center
+  footprintExtent,   // the one definition of a blueprint's XZ reach, as offsets from its transpose_origin
   transposeVoxel,
   transposeVoxelsForCandidate,
   transposeAnchorsForCandidate,
@@ -693,6 +622,7 @@ module.exports = {
   getAllProtectedBlocks,
   getFootprintCells,
   getAllFootprintCells,
-  geometryOf,        // the one answer to "which blueprint is locked under this instance key"
+  geometryOf,        // the one answer to which blueprint is locked under a given instance key
   resolveVoxelAnchor,
+  getWorldLanes, laneLegs, laneClosedBoxes,   // a blueprint's one-way lane: its mouths, and the boxes a route search closes for it
 };

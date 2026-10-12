@@ -10,7 +10,7 @@
 //
 // Shared-state note: the target publishes to the 'biome_seeker' chair in exploration_confrence_room as
 // the inspectable "biome being sought" record (Law 6). It is NOT a gate feed — find_buildingspot gates
-// build centers on the ACCEPTABLE_BIOMES set directly (one settle-able set, Law 16), not on whatever
+// transpose origins on the ACCEPTABLE_BIOMES set directly (one settle-able set, Law 16), not on whatever
 // this cycle happened to head toward. The chair remains for observability of exploration's intent.
 
 const watcher = require('@kernel/watcher');

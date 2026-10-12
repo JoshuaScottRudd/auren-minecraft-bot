@@ -1,21 +1,17 @@
 'use strict';
-// site_chairs — the two conference-room chairs that say "a base is established here", built from one sited row.
+// site_chairs — the two conference-room chairs that record an established base, built from one sited row.
 //
-// ── ONLY THE FOREMAN SETS A POINT (Architect 2026-09-18) ────────────────────────────────────────────
-// *"Continue combining and law 16. Bots can't set their own points now"*
-//
+// ── ONLY THE FOREMAN SETS A POINT (Law 16) ───────────────────────────────────
 // This file BUILDS the chairs and writes nothing. The one writer of a location is the foreman's hub
 // (`foreman/foreman_hub.js` `lockSite`), which puts these chairs into the fleet's memory before any body is
 // spawned; bots receive them in their first broadcast and read them from then on. A bot has no function
 // that writes `set_buildspot` — `corporate_headquarters.writeBuildingChair` refuses it — and the hub drops
 // any location a bot sends.
 //
-// It is a pure function rather than a method of the hub for one caller outside the fleet:
-// `Auren_Workshop/tools/build_bench.js`, which runs one body with no foreman and AUTHORS its test site the way
-// a bench authors every scenario. It builds the same chairs here, so the bench and the fleet cannot come to
+// It is a pure function, not a method of the hub, for one caller outside the fleet:
+// `Auren_Workshop/tools/build_bench.js`, which runs one body with no foreman and authors its test site the
+// way a bench authors every scenario. It builds the same chairs here, so the bench and the fleet cannot
 // disagree about what a site row looks like (Law 16).
-//
-// Replaces `action_fragments.js/set_buildspot.js` `lock()`, deleted 2026-09-18 with the bot-side write.
 
 const blueprintRegistry = require('@kernel/blueprint_registry');
 
@@ -34,15 +30,15 @@ function collectAllVoxels(building) {
 // siteChairs(row, writer) → { set_buildspot, blueprint_paster }
 //
 // `row` is the shape the desk's survey hands (`lock_all_buildspots.siteRow`):
-//   { blueprint, roomKey, candidate: { build_center:{x,y,z}, footprint, staircase, rotation } }
+//   { blueprint, roomKey, candidate: { transpose_origin:{x,y,z}, footprint, staircase } }
 //
-// ROTATION IS CARRIED, NOT DEFAULTED AWAY: every reader that rebuilds world coordinates from this chair
-// (scan, getProtectedBlocks, getWorldAnchors, farmland_site) must apply the rotation the candidate was proven
-// safe at, or it rebuilds against a footprint nobody validated.
+// NO ROTATION FIELD: a blueprint has exactly one facing (blueprint_survey's header), so a reader that
+// rebuilds world coordinates from this chair (scan, getProtectedBlocks, getWorldAnchors, farmland_site)
+// transposes from transpose_origin alone and can only ever land on the footprint the candidate was proven at.
 function siteChairs(row, writer) {
-  const bc = row && row.candidate && row.candidate.build_center;
+  const bc = row && row.candidate && row.candidate.transpose_origin;
   if (!bc || ![bc.x, bc.y, bc.z].every(Number.isFinite)) {
-    throw new Error(`[site_chairs] CODING VIOLATION (Law 13): a site row needs candidate.build_center {x,y,z}, got ${JSON.stringify(row)}.`);
+    throw new Error(`[site_chairs] CODING VIOLATION (Law 13): a site row needs candidate.transpose_origin {x,y,z}, got ${JSON.stringify(row)}.`);
   }
   if (typeof row.blueprint !== 'string' || !row.blueprint) {
     throw new Error(`[site_chairs] CODING VIOLATION (Law 13): a site row needs its blueprint name, got ${JSON.stringify(row)}.`);
@@ -50,25 +46,28 @@ function siteChairs(row, writer) {
   if (typeof writer !== 'string' || !writer) {
     throw new Error('[site_chairs] CODING VIOLATION (Law 13): a site is written by someone — name the writer.');
   }
-  const voxels = collectAllVoxels(blueprintRegistry.getBuilding(row.blueprint, 'site_chairs'));
-  if (voxels.length === 0) {
-    throw new Error(`[site_chairs] CODING VIOLATION: blueprint "${row.blueprint}" has no voxels.`);
+  // A HAND-AUTHORED blueprint is counted from the registry. A downloaded one is not in that registry —
+  // downloads never share a file with hand-authored blueprints — so its row carries its own size.
+  const hand = blueprintRegistry.tryGetBuilding(row.blueprint);
+  const total = hand ? collectAllVoxels(hand).length : row.total_voxels;
+  if (!Number.isInteger(total) || total <= 0) {
+    throw new Error(`[site_chairs] CODING VIOLATION: blueprint "${row.blueprint}" has no voxels`
+      + (hand ? '.' : ' — it is not a hand-authored blueprint and its site row carries no total_voxels.'));
   }
   const now = new Date().toISOString();
   const c = row.candidate;
   return {
     set_buildspot: {
-      build_center: { x: bc.x, y: bc.y, z: bc.z },
+      transpose_origin: { x: bc.x, y: bc.y, z: bc.z },
       footprint: c.footprint || null,
       staircase: c.staircase || null,
-      rotation: c.rotation ?? 0,
       locked_at: now,
       writer,
     },
     blueprint_paster: {
       building_name: row.blueprint,
       confirmed_at: now,
-      total_voxels: voxels.length,
+      total_voxels: total,
       writer,
     },
   };

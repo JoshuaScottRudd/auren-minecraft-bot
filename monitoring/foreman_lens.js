@@ -1,30 +1,22 @@
 // Auren_Bot/monitoring/foreman_lens.js
 // THE DESK'S RUN, READ BACK — who spoke to the foreman, what they were told, and what crossed on their word.
 //
-// ── THE QUESTION THIS ANSWERS, AND WHY NO EXISTING LENS COULD ────────────────────────────────────────
-// Every other lens here reads the fleet reasoning about the world. This one reads the fleet's only
-// conversation with a party it does not control. The questions are not the fleet's questions: did this
-// person get what they asked for, what were they refused and how many times, did they give up, and did
-// anything cross into the fleet that should not have. Stretching a fleet lens to answer those would give
-// it two verbs (Law 0); the fleet lenses would also be reading a stream they are not meant to see.
+// Reads the fleet's only conversation with a party it does not control: did a person get what they requested, what were they refused and how many times, did they give up, and did anything cross into the
+// fleet that should not have. A fleet lens answering these would carry two verbs (Law 0) and would also
+// be reading a stream it is not meant to see.
 //
-// ── THE UNIT IS A PERSON'S SESSION, NOT A RUN ───────────────────────────────────────────────────────
-// A tally says the desk refused eleven things. It cannot say that ONE person was refused eleven times,
-// which is the finding that matters — a person meeting the same refusal repeatedly is the desk failing to
-// guide, and that failure is invisible in any aggregate. So the fold groups by speaker and keeps every
-// turn in order: the record's whole claim is that a session is RECONSTRUCTABLE, and a reconstruction that
-// only reported totals would not be one.
+// THE UNIT IS A PERSON'S SESSION, NOT A RUN. A tally cannot say that ONE person was refused eleven
+// times — a person meeting the same refusal repeatedly is the desk failing to guide, and that failure is
+// invisible in any aggregate. The fold groups by speaker and keeps every turn in order, so a session
+// stays RECONSTRUCTABLE.
 //
-// ── THE RECORD IT READS AND THE ONE WAY IT MAY READ IT ─────────────────────────────────────────────
-// The desk's own trace in the records room, decoded through `custom_api/crew_log.parseAll` — the SAME module the
-// desk emits through — and the verbatim text through `foreman/foreman_record.decodeText`, the same file
-// that encoded it. No regex of its own for either: a second copy of a grammar drifts the first time a
-// field is added, and a second copy of an escape table drifts sooner (Law 26 — both ends of the
-// interface, or neither; Law 16 — one implementation).
+// Reads the desk's own trace in the records room, decoded through `custom_api/crew_log.parseAll` — the
+// SAME module the desk emits through — and the verbatim text through `foreman/foreman_record.decodeText`,
+// the same file that encoded it. No regex of its own for either (Law 26 — both ends of the interface, or
+// neither; Law 16 — one implementation).
 //
-// The desk's file holds exactly one session because every run start flushes `watcher_*.jsonl` wholesale,
-// so there is no run boundary to segment on and inventing one would be this lens deciding something the
-// record already answers. (Same reasoning as camera_lens, same reason.)
+// The desk's file holds exactly one session: every run start flushes `watcher_*.jsonl` wholesale, so
+// there is no run boundary to segment on.
 //
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --foreman [--bot=PlayerName] [--all]
 //           --bot   narrow to one speaker (the flag is the monitor's, and here it names a PERSON)
@@ -34,21 +26,17 @@
 
 const path = require('path');
 
-// THE ALIAS MAP IS ASKED OF THE WORKSHOP'S ONE ANSWER (Law 16). It reads the bot's own package.json
-// and is idempotent, so it is safe whether or not a caller registered first — which is what the block
-// that stood here was hand-rolling with `addAliases` and a comment explaining why
-// `require('module-alias')(base)` could not be used. The reason that form is unsafe has not changed and
-// is now recorded once, in monitoring/lens_paths.js, instead of in five lenses.
+// Registers @-aliased require paths through the workshop's one answer (Law 16); idempotent, so safe
+// whether or not a caller already registered them.
 const paths = require('./lens_paths');
 paths.registerAliases();
 const crewLog = require('@api/crew_log');
 
 const { readForemanView } = require('./trace_read');
 const { ABSENT } = require('./report_formatting');
-// THE ONE WRITER TO STDOUT (Architect 2026-09-16). `padRight`/`padLeft` left this file with the prose
-// they were padding: data_out owns every space and every column width now.
+// The one writer to stdout: data_out owns every space and every column width.
 const out = require('./data_out');
-// The DECODER FROM THE ENCODER'S OWN FILE. Requiring the desk's module from the monitoring side is the
+// The decoder from the encoder's own file. Requiring the desk's module from the monitoring side is the
 // dependency running the legal direction — a reader may read the thing it reads; the desk must never
 // require a lens (monitoring/README's one-way rule).
 const { decodeText, TAG } = require(paths.bot('foreman/foreman_record'));
@@ -58,9 +46,9 @@ const recordHomes = require(paths.bot('js_kernel/utils/record_homes'));
 const TRACE_DIR = recordHomes.TRACE_DIR;
 
 // ── READING ──────────────────────────────────────────────────────────────────────────────────────
-// deskEvents(lines) → [{ at, verb, fields }]. A line without a readable stamp is SKIPPED rather than
-// defaulted: every ordering below is on that clock, and a zero would sort a real turn to the head of the
-// session and put words in the wrong person's mouth (Law 13 — never default a missing field).
+// deskEvents(lines) → [{ at, verb, fields }]. A line without a readable stamp is SKIPPED, not defaulted:
+// every ordering below is on that clock, and a zero would sort a real turn to the head of the session and
+// put words in the wrong person's mouth (Law 13 — never default a missing field).
 function deskEvents(lines) {
   const out = [];
   for (const l of lines) {
@@ -86,8 +74,8 @@ function readForemanTrace(dir) {
 //
 // A TURN OPENS ON `heard` AND NOTHING ELSE. Everything the desk does is downstream of somebody speaking,
 // so any event arriving before the first `heard` for a person belongs to no turn — it is recorded as
-// `orphans` rather than folded into the next one, because attaching it to a turn it did not belong to
-// would fabricate a cause-and-effect the record does not contain (Law 25).
+// `orphans`, never folded into the next one: attaching it to a turn it did not belong to would fabricate
+// a cause-and-effect the record does not contain (Law 25).
 function reduceForeman(lines, opts = {}) {
   const events = deskEvents(lines);
   const people = new Map();
@@ -136,11 +124,11 @@ function reduceForeman(lines, opts = {}) {
       case 'fleet_said': {
         // Attached to the crossing it answers — the LAST one still unanswered, because the desk awaits
         // each door call before making the next. A verdict with no crossing above it is a coding fault in
-        // the desk's own wiring rather than something to hide, so it is kept where a reader will see it.
+        // the desk's own wiring, kept where a reader will see it.
         const open = [...turn.crossings].reverse().find(c => c.answer === null);
         if (open) open.answer = { ok: e.fields.ok === 'yes', reason: e.fields.reason || null };
         // The action token is snake_case because it is PRINTED in the `crossings` table: a three-word
-        // phrase in a value cell is the lens narrating again (2026-09-16). The fold is otherwise
+        // phrase in a value cell is the lens narrating again. The fold is otherwise
         // untouched — same branch, same placement, same fields.
         else turn.crossings.push({ door: ABSENT, action: 'answer_with_no_crossing', detail: '', answer: { ok: e.fields.ok === 'yes', reason: e.fields.reason || null } });
         break;
@@ -163,17 +151,10 @@ function reduceForeman(lines, opts = {}) {
 const clock = (ms) => new Date(ms).toISOString().slice(11, 19);
 const mins = (a, b) => (!a || !b ? ABSENT : `${((b - a) / 60000).toFixed(1)}m`);
 
-// ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ─────────────────────────────────────────────
+// ── OUTPUT IS DATA, NOT PROSE ─────────────────────────────────────────────
 // The person's words and the desk's words are VALUES — copied verbatim out of the record into a cell,
-// never summarised. The glyph grammar that used to carry them is gone: `«`, `»`, `✂ crossed`,
-// `⛔ REFUSED`, `→ fleet: NO ANSWER RECORDED` and `crossed the veil` were this lens narrating a
-// conversation it was not part of. What is DELETED rather than given a field name: the `══ FOREMAN DESK`
-// banner rules, the `No record — the desk trace holds zero readable lines` sentence, the
-// `never spoke to the desk` / `nobody spoke to it` sentences, the `(same refusal code, same speaker,
-// more than once)` gloss under repeated refusals, the `belonged to no turn or carried an undeclared
-// verb` sentence, and the `--all` pointer. Every COUNT they carried survives as a field below. The
-// non-verbose preview of the desk's first reply line is gone with them — `replies` counts the lines and
-// `--all` prints them, so no figure was lost, only a sentence fragment.
+// never summarised. Every fact is a field below: turns, refused, crossings, replies. `replies` counts
+// the lines and `--all` prints them.
 
 // One row per turn: the spine of decisions. `said` is the person's own text, copied.
 function turnRow(t) {
@@ -184,10 +165,8 @@ function turnRow(t) {
 function runForeman(opts = {}) {
   const full = !!opts.verbose;
   const lines = readForemanTrace(opts.dir);
-  // The header NAMES ITS SOURCE, and asks for it rather than spelling it. The spelled version was false
-  // within one edit of being written — it pointed readers at a directory the writer had left, which is
-  // the exact failure the records-home module exists to end: one fact, one place, every caller asking
-  // (Law 16).
+  // The header NAMES ITS SOURCE, asked of the one module that answers it — never spelled here: one fact,
+  // one place, every caller asking (Law 16).
   const source = path.relative(recordHomes.BOT_DIR, recordHomes.traceFile('foreman')).replace(/\\/g, '/');
   out.kv('lens', 'foreman');
   out.kv('record', source);
@@ -229,7 +208,7 @@ function runForeman(opts = {}) {
     }
 
     // A crossing with no verdict recorded is `fleet_ok` ABSENT — an unanswered door call, kept visible
-    // as a missing value rather than described.
+    // as a missing value.
     const crossRows = [];
     for (const t of p.turns) {
       for (const c of t.crossings) {

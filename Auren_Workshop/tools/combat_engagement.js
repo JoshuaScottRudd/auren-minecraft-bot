@@ -1,87 +1,60 @@
-// combat_engagement — the OBSERVER's answer to "is a fight happening, between whom, right now".
+// combat_engagement — the OBSERVER's answer to whether a fight is happening, between whom, right now.
 //
 // ── WHY THE OBSERVER OWNS THIS AND NOT battle_stations ──────────────────────────────────────────────
-// A subject does not get to decide when it is audited — that defeats the purpose of auditing it.
+// The detector belongs to the auditor, not the subject it audits: a bot that decides when its own
+// performance gets recorded cannot record the fight it failed to notice (Law 26).
 //
-// The shortcut ruled out was letting battle_stations emit a signal that starts the recording. Trigger
-// control is evidence control: a bot that decides when its own performance gets recorded cannot record
-// the fight it failed to notice. A bot-signalled trigger produces no observation at all for exactly the
-// fights most worth observing — the ones the bot's own loop never noticed it was in (Law 26).
-//
-// So this file is the auditor's own detector. It reaches into nothing: a snapshot in, a line-of-sight
-// function in, engagement events out. It decides nothing in any SPA loop and takes no action.
+// Reaches into nothing: a snapshot in, a line-of-sight function in, engagement events out. Decides
+// nothing in any SPA loop and takes no action.
 //
 // ── THE ESCALATING PULSE ─────────────────────────────────────────────────────────────────────────────
 // Entities are tracked at a low pulse to see whether they are within aggro range — one check of
 // entities every second. Once something is inside aggro range, raycasting escalates to roughly twice a
 // second, and once the raycast confirms line of sight the pair counts as an engagement.
 //
-// Two tiers, because the two questions cost different amounts. Proximity is arithmetic over a snapshot
-// the observer already holds; a raycast walks blocks and is the expensive one. So: scan everything
-// cheaply at 1 Hz, and pay for the ray ONLY on pairs already inside aggro range — the same order
-// threat_scanner uses inside the construct, which likewise skips the ray for any mob too far to be
-// aggroed regardless.
+// Proximity is arithmetic over a snapshot the observer already holds; a raycast walks blocks and is the
+// expensive one, so it is paid for only on pairs already inside aggro range — the same order
+// threat_scanner uses inside the construct.
 //
-// The escalation is exposed as nextTickMs() rather than owned by an internal timer: the caller drives
-// the clock, this file only says how soon it wants to be asked again. That keeps it pure enough to test
-// against an authored sequence with no world and no wall clock.
+// nextTickMs() exposes the escalation as data: the caller drives the clock, this file only says how soon
+// it wants to be asked again, which keeps it testable against an authored sequence with no world and no
+// wall clock.
 //
-// ── THE SAME CRITERION, DELIBERATELY NOT THE SAME CODE ──────────────────────────────────────────────
-// Same raycast criterion as battlestations, for consistency — but not the same code. Same CRITERION:
-// yes, and that is already built — camera_scout.aggroLineOfSight is a faithful transcription of
-// terrain_predicates.hasLineOfSight, eye height, block centre and range clamp copied exactly, with its
-// own header listing the three details that silently break the assertion if they drift.
+// ── THE SAME CRITERION, A SEPARATE COPY ──────────────────────────────────────────────────────────────
+// Same raycast criterion as battle_stations: camera_scout.aggroLineOfSight is a faithful transcription
+// of terrain_predicates.hasLineOfSight, eye height, block centre and range clamp copied exactly, with
+// its own header listing the three details that would silently break the assertion if they drift.
 //
-// Same CODE: no. Importing the construct's predicate would make the auditor evaluate the fight with the
-// subject's own ruler — any bug in the construct's sightline becomes invisible, because the thing
-// checking agrees by construction. That is the trigger argument one layer down (Law 26: the check must
-// not inherit the thing it checks). Two copies of one criterion is the correct shape here and the only
-// place in the fleet where it is.
+// A separate copy of that one criterion: the auditor must not evaluate the fight with the subject's own
+// ruler (Law 26), and importing the construct's predicate would make any bug in its sightline invisible
+// to the thing checking it.
 //
 // ── WHAT IT CANNOT KNOW, STATED UP FRONT (Law 25) ───────────────────────────────────────────────────
 // It cannot read a mob's AI target. No vanilla packet carries it — threat_scanner notes the same gap in
 // its own header and uses the same proxy this does: inside AGGRO_RANGE with a clear line. So when three
 // hostiles are engaging two bots, what this reports is every (bot, hostile) PAIR that passes the test,
-// with its distance and line verdict. Which bot a mob
-// is "really" attacking is an INFERENCE the reducer may draw from those pairs; it is never recorded here
-// as a fact, because the observer does not have it.
+// with its distance and line verdict. Which bot a mob is "really" attacking is an INFERENCE the reducer
+// may draw from those pairs; it is never recorded here as a fact, because the observer does not have it.
 
 'use strict';
 
-// Transcribed from Thinking_fragments/architect_config, NOT chosen. The fleet already owns these two
-// numbers and an observer carrying its own opinion of aggro range would report engagements the construct
-// never had, or miss ones it did (Law 16 — the bench must not carry a second opinion). Same transcription
-// lanista_shared already makes, and for the same reason.
-//
-// WRONG TURN, already taken: an earlier version of this detector used one flat number for EVERY mob,
-// picked from generic Minecraft knowledge about hostile acquisition range rather than read off the
-// fleet's own table. A detector wider than the construct's gate manufactures engagements the bot was
-// never obliged to notice, and they read as the bot missing them. The rule that survived is "transcribe
-// the fleet's table", never a single fixed number — the fleet's table itself later stopped being one
-// number, which the per-species table below now carries.
+// Transcribed from Thinking_fragments/architect_config: the fleet's own aggro range (Law 16 — the bench
+// must not carry a second opinion). Same transcription lanista_shared makes, for the same reason.
 const AGGRO_RANGE = 15;
 
-// Transcribed from architect_config's MOB_AGGRO_RANGE — skeletons and their kin get their own aggro
-// range rather than the flat fallback. The construct honours the wider range for the skeleton family, so
-// a detector still holding the flat fallback would report every skeleton engagement opened in the gap
-// between the two ranges as a fight the bot failed to notice — an instrument manufacturing the exact
-// defect it exists to detect (Law 25).
+// Transcribed from architect_config's MOB_AGGRO_RANGE: skeletons and their kin get their own aggro range,
+// matching the wider range the construct honours for the skeleton family (Law 25).
 //
-// STILL A TRANSCRIPTION AND NOT AN IMPORT, for the reason this file's header gives: the observer must not
-// inherit the thing it checks (Law 26). Keeping it in sync is a maintenance cost paid on purpose; the
-// alternative is a bench that agrees with the fleet by construction and can never disagree with it.
+// A transcription, not an import: the observer must not inherit the thing it checks (Law 26). Keeping it
+// in sync is a maintenance cost paid on purpose.
 const MOB_AGGRO_RANGE = { skeleton: 18, stray: 18, bogged: 18, wither_skeleton: 18 };
 const aggroRangeOf = (name, fallback) =>
   (name && MOB_AGGRO_RANGE[String(name).toLowerCase()]) || fallback;
 // The construct's gate is a CYLINDER, not a sphere: the radius above is HORIZONTAL and altitude is
-// judged on its own budget. Transcribed with the same discipline as the table — an observer still
-// measuring a 3-D distance would call a mob far across but only just above "out of band" while the
-// construct was already fighting it, and report the fight as one the bot imagined.
+// judged on its own budget, transcribed with the same discipline as the table.
 const AGGRO_VERTICAL_RANGE = 8;   // tracks architect_config's own vertical range
-// > AGGRO_RANGE on purpose: the fleet's own two-sided disengage. A fight is not over the instant the mob
-// steps past 15 — it is over when the pair has separated past the range at which either could re-acquire.
-// Using one number for both edges would split a single fight into a burst of starts and ends every time
-// a knockback landed.
+// Wider than AGGRO_RANGE: the fleet's own two-sided disengage. A fight ends when the pair has separated
+// past the range at which either could re-acquire, not the instant the mob steps past AGGRO_RANGE.
 const DISENGAGE_RANGE = 20;
 
 // The two tiers. SCAN is the resting rate; CONFIRM is what it escalates to once anything is inside the
@@ -101,9 +74,8 @@ const round2 = n => (n == null ? null : Math.round(n * 100) / 100);
 // losFn(fromFeet, toBlock, maxDist) -> { known, clear, blockedBy }   — camera_scout.aggroLineOfSight's
 // exact signature, so the live wiring is a pass-through and the test can author verdicts directly.
 //
-// botNames: the fleet's own players. Anything else with a username is a HUMAN. Passed in rather than
-// derived, because "is this player one of ours" is a fact about the fleet roster and an observer that
-// guessed it from a name pattern would silently reclassify a human who picked a bot-like name.
+// botNames: the fleet's own players. Anything else with a username is a HUMAN. Passed in, not derived:
+// whether a player is one of ours is a fact about the fleet roster, not a name pattern.
 function createEngagementDetector({
   losFn,
   botNames = [],
@@ -139,12 +111,10 @@ function createEngagementDetector({
 
     // Every pair with something inside the aggro band RIGHT NOW, confirmed or not.
     //
-    // This is the RECORDING trigger and it is deliberately looser than `engagements()`: tracking runs
-    // continuously, but writing only starts once something is within aggro range. Waiting for the
-    // raycast to confirm would start the record after the interesting part: the approach into the band
-    // is where "when did the bot notice, and when should it have" lives, and a fight whose line never
-    // confirms — a mob closing behind a wall — is still a fight the bot is standing in.
-    // Proximity opens the tape; the ray decides what gets called an engagement on it.
+    // The RECORDING trigger, looser than `engagements()`: writing starts once something is within aggro
+    // range, before the raycast confirms — the approach into the band is when the bot should first notice
+    // a threat, and a fight whose line never confirms (a mob closing behind a wall) is still a fight the
+    // bot is standing in. Proximity opens the tape; the ray decides what gets called an engagement on it.
     candidates: () => [...pairs.values()].filter(p => p.inBand).map(p => ({
       subject: p.subject, subjectKind: p.subjectKind, otherId: p.otherId, otherName: p.otherName,
       otherKind: p.otherKind, distance: round2(p.distance), engaged: p.engaged,
@@ -220,18 +190,15 @@ function createEngagementDetector({
               p.lastLosAt = t;
               p.los = losFn(s.position, o.position, range);
             }
-            // Law 23: an unknown line is not a clear one. An unloaded endpoint leaves the pair exactly
-            // where it was rather than opening a fight nobody sensed.
-            // RANGE + LINE IS THE HOSTILE PROXY ONLY. It is the construct's own aggro test, and it works
-            // for a mob because a mob inside that band with a clear line IS committed — that is what
-            // aggro means. It says nothing about two PLAYERS: a human standing beside a bot passes range
-            // and line indefinitely and is not fighting anybody, so opening on proximity would leave an
-            // engagement open for as long as they stand there and file it as combat data.
+            // Law 23: an unknown line is not a clear one, so an unloaded endpoint leaves the pair exactly
+            // where it was.
             //
-            // A player pair opens on a BLOW instead — noteCombatEvent, fed from the observed-packet
-            // channel (a swing or a hurt the server announced). Until that arrives the pair is tracked
-            // and idle, which is the honest state: we can see them near each other and we have no
-            // evidence they are fighting.
+            // Range plus line is the hostile proxy only: it is the construct's own aggro test, and a mob
+            // inside that band with a clear line IS committed, which is what aggro means. It says nothing
+            // about two PLAYERS: a human standing beside a bot passes range and line indefinitely without
+            // fighting anybody. A player pair opens only on a BLOW (noteCombatEvent, fed from the
+            // observed-packet channel of a swing or hurt the server announced). Until a blow arrives, the
+            // pair is tracked and idle: seen near each other with no evidence they are fighting.
             if (p.los && p.los.known && p.los.clear && !p.engaged && !playerPair) {
               p.engaged = true;
               p.engagedAt = t;
@@ -252,11 +219,9 @@ function createEngagementDetector({
       // loop above only ever sees pairs that are still present, so absence is unrepresentable inside it.
       for (const [k, p] of pairs) {
         const gone = t - p.lastSeenAt;
-        // `separated` is the load-bearing one and it subsumes `gone`: a pair can only be near if it was
-        // also seen, so lastNearAt <= lastSeenAt and separated >= gone always. Testing them jointly with
-        // a min() — which an earlier version did — meant a mob standing in plain sight twenty blocks away
-        // never closed its fight, because it was still visible and gone stayed at zero. The two are read
-        // apart only to name the REASON below.
+        // `separated` is the load-bearing test and subsumes `gone`: a pair can only be near if it was
+        // also seen, so lastNearAt <= lastSeenAt and separated >= gone always. The two are read apart
+        // only to name the REASON below.
         const separated = t - p.lastNearAt;
         if (p.engaged && separated >= clearMs) {
           p.engaged = false;
@@ -282,14 +247,13 @@ function createEngagementDetector({
 
     // noteCombatEvent(subjectName, otherId, t) -> event | null
     //
-    // The player-pair opener. Fed from the server's own swing/hurt announcements rather than from
-    // geometry, because between two players a blow is the only thing that distinguishes a fight from
-    // standing next to someone. Returns the start event if this opened one, so the caller records it on
-    // the same channel as every hostile engagement.
+    // The player-pair opener, fed from the server's own swing/hurt announcements: between two players a
+    // blow is the only thing that distinguishes a fight from standing next to someone. Returns the start
+    // event if this opened one, so the caller records it on the same channel as every hostile engagement.
     //
-    // It does NOT create a pair from nothing: the two must already be inside the tracked band this pass.
-    // An event about entities the observer cannot see is a claim about a fight it has no record of, and
-    // opening on it would put a fight in the file with no samples behind it (Law 23).
+    // Does not create a pair from nothing: the two must already be inside the tracked band this pass, so
+    // an event about entities the observer cannot see never puts a fight in the file with no samples
+    // behind it (Law 23).
     noteCombatEvent(subjectName, otherId, t) {
       const p = pairs.get(key(subjectName, otherId));
       if (!p || p.engaged) return null;

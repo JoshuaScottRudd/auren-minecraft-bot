@@ -1,39 +1,31 @@
 // Auren_Bot/js_kernel/utils/calculators/stack_split_calculator.js
-// HOW TO MOVE EXACTLY N ITEMS OUT OF A STACK IN AS FEW CLICKS AS POSSIBLE.
+// How to move exactly N items out of a stack in as few clicks as possible.
 //
 // Placing items one at a time scales linearly with the amount moved and stalls the bot at the
-// destination for the duration; planning bulk moves first removes that scaling instead of tolerating it.
+// destination for the duration; planning bulk moves first removes that scaling.
 //
-// ── WHY THIS IS ARITHMETIC AND NOT A CLICK LOOP ─────────────────────────────────────────────────────
-// The cost is COUNT, not latency: `_moveExactDeposit` placed the remainder one item at a time, so a
-// deposit's click count scales linearly with the amount moved, and a multi-stack deposit multiplies it.
-// The mechanics offer two bulk moves that the old path never used:
-//   left-click a stack with an empty hand  → pick up ALL of it        (1 click, any size)
-//   right-click a stack with an empty hand → pick up ceil(n/2)        (1 click, half)
-//   left-click a destination while holding → drop the ENTIRE held stack (1 click, any size)
-// So a chunk of any size costs the same as a chunk of one. The only thing that costs per-item is the
-// right-click-to-place-one, and this calculator's whole job is to shrink what is left to that path.
+// The cost is click count, not latency. The mechanics offer two bulk moves:
+//   left-click a stack, empty hand    → pick up ALL of it          (1 click, any size)
+//   right-click a stack, empty hand   → pick up ceil(n/2)          (1 click, half)
+//   left-click a destination, holding → drop the ENTIRE held stack (1 click, any size)
+// A chunk of any size costs the same as a chunk of one; only placing one item at a time costs per-item,
+// and this calculator's job is to shrink what is left to that path.
 //
-// ── WHY IT RETURNS A PLAN INSTEAD OF CLICKING ───────────────────────────────────────────────────────
-// Law 26: this is the deterministic half. It takes two integers and returns a plan, so it can be checked
-// by running it — no window, no bot, no world. The caller owns the clicking, and a caller that ignores
-// the plan is wrong in a way this file can never be. `preflight` loads it, so the throws below
-// run on every change for free.
+// Pure (Law 26): takes two integers and returns a plan, so it can be checked by running it — no window,
+// no bot, no world. The caller owns the clicking. `preflight` loads it, so the throws below run on every
+// change for free.
 //
-// ── THE TWO STRATEGIES, AND WHY BOTH ARE NEEDED ─────────────────────────────────────────────────────
-// HALVE-DOWN: take ceil(source/2) while that half still fits inside what is left to move, dropping each
-//   chunk whole. Each halving is 2 clicks (take + drop) and removes up to half the outstanding need.
-// OVERSHOOT-AND-RETURN: shift-click the WHOLE stack across (1 click) and hand back the difference. When
-//   the need is most of the stack — 60 of 64 — returning 4 beats halving down through 32/16/8/4.
-// Neither dominates: at need=42/64 halve-down wins, at need=60/64 overshoot wins. The calculator costs
-// both in clicks and returns the cheaper, which is the only reason it can be trusted to be a speedup
-// rather than a different shape of slow.
+// Two strategies, both needed:
+// HALVE-DOWN takes ceil(source/2) while that half still fits inside what is left to move, dropping each
+//   chunk whole (2 clicks per chunk: take + drop).
+// OVERSHOOT-AND-RETURN shift-clicks the WHOLE stack across (1 click) and hands back the difference.
+// Neither dominates — at need=42/64 halve-down wins, at need=60/64 overshoot wins — so the calculator
+// costs both in clicks and returns the cheaper.
 
 'use strict';
 
 // What a single right-click-to-place-one costs relative to a bulk click. Both are one clickWindow call,
-// so this is 1 — the asymmetry is entirely in HOW MANY of them, never in the price of one. Named anyway
-// so the cost model is visible rather than implied by counting lines.
+// so this is 1 — the asymmetry is entirely in how many of them, never in the price of one.
 const CLICK_COST = 1;
 
 /**
@@ -86,9 +78,9 @@ function planStackSplit(have, need) {
 }
 
 /**
- * What the OLD path cost for the same move, so a caller can log the saving instead of asserting one.
- * The old `_moveExactDeposit` picked the stack up, placed `need` items one at a time, and put the
- * remainder back: 2 bulk clicks plus one click per item.
+ * What the pre-existing path would have cost for the same move, so a caller can log the saving. That
+ * path picked the stack up, placed `need` items one at a time, and put the remainder back: 2 bulk
+ * clicks plus one click per item.
  */
 function naiveClickCost(need) {
     if (!Number.isInteger(need) || need < 0) {

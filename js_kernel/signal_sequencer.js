@@ -4,27 +4,25 @@
 //          Routes nothing, receives nothing, decides nothing about the work (Law 3 was the whole reason
 //          this moved out of signal_bus).
 //
-// WHY IT EXISTS: two live signals in one bot's loop is a coding violation (Law 4), and it cannot be
-// caught where it used to be checked. The guard used to live in signal_bus, which compared (source,
-// target) against the last pair it routed. That is two faults in one line: a router that refuses is
-// deciding (Law 3), and comparing the SOURCE means two different fragments routing to recursive_judge
-// are never duplicates to it — the most common real duplicate shape (two independent fragments
-// abandoning the same stalled work) sails straight through.
+// WHY IT EXISTS: two live signals in one bot's loop is a coding violation (Law 4). A guard comparing
+// (source, target) against the last routed pair fails on two counts: a router that refuses is deciding
+// (Law 3), and comparing the SOURCE means two different fragments routing to recursive_judge are never
+// duplicates to it — the most common real duplicate shape (two independent fragments abandoning the
+// same stalled work) sails straight through.
 //
 // WHY recursive_judge AND NOWHERE ELSE: every call site across the fleet routes to it, and every lap of
-// the main loop passes through it exactly once. It is the only choke point that exists. Chosen as ONE
-// GLOBAL CHECK rather than one guard per scope: immediate detection is not the requirement, detection
-// WITHOUT FAIL is — two signals routing concurrently will eventually race regardless of where the check
-// sits, so one check that nothing can bypass beats many checks that could each be skipped.
+// the main loop passes through it exactly once — the only choke point that exists. ONE GLOBAL CHECK:
+// immediate detection is not the requirement, detection WITHOUT FAIL is — two signals routing
+// concurrently will eventually race regardless of where the check sits, so one check that nothing can
+// bypass beats many checks that could each be skipped.
 //
-// THE ONE SHAPE THIS CANNOT SEE, recorded so a successor does not assume coverage it does not have: a
-// stall where ZERO signals route. An arrival-checker cannot detect an absence of arrivals — nothing here
-// fires when the bot simply goes quiet, and no flag added to this file would change that.
+// THE ONE SHAPE THIS CANNOT SEE: a stall where ZERO signals route. An arrival-checker cannot detect an
+// absence of arrivals — nothing here fires when the bot simply goes quiet, and no flag added to this
+// file would change that.
 //
 // A nested Law 15 sub-loop invocation (an abandoned call followed by a second, legitimate one) is
-// survivable: the bus refuses nothing since the guard moved here, so the second invocation completes and
-// the caller's tail routes a fresh chain. A run that goes quiet with no arrivals is still invisible to
-// this instrument.
+// survivable: the bus refuses nothing, so the second invocation completes and the caller's tail routes a
+// fresh chain. A run that goes quiet with no arrivals is still invisible to this instrument.
 
 'use strict';
 
@@ -47,10 +45,9 @@ let liveTrail = [];
 // instrument exists to prevent — even after the offending signal has been killed and a halt reported.
 //
 // So detection sets a latch and signal_bus refuses EVERY route while it is set. Nothing clears it but a
-// process restart (Law 13: default stopped — prove safe to continue, never prove unsafe to stop). This is
-// not the guard moving back into the bus: the bus computes nothing and compares nothing, it reads one
-// boolean owned by the fragment whose whole verb is deciding it (Law 3 — obeying a kill switch is not
-// deciding; the old `_lastSignal` slot was the bus deriving a verdict of its own).
+// process restart (Law 13: default stopped — prove safe to continue, never prove unsafe to stop). The
+// bus computes nothing and compares nothing; it reads one boolean owned by the fragment whose whole verb
+// is deciding it (Law 3 — obeying a kill switch is not deciding).
 let tripped = null;   // null = live; otherwise { reason, at }
 
 function isTripped() { return tripped; }
@@ -60,8 +57,8 @@ function isTripped() { return tripped; }
 // the fleet runs (job_board → manager → executor → judge), so a divergence is still inside the window.
 const TRAIL_LIMIT = 24;
 
-// Appends one hop. Called from signal_utils' envelope builder, which is the single place every routed
-// payload is constructed — so the trail is structural rather than something 39 call sites remember.
+// Appends one hop. Called from signal_utils' envelope builder, the single place every routed payload is
+// constructed, so the trail is structural and no call site has to remember it.
 function appendTrail(trail, from) {
   const next = Array.isArray(trail) ? trail.concat(from) : [from];
   return next.length > TRAIL_LIMIT ? next.slice(next.length - TRAIL_LIMIT) : next;
@@ -90,10 +87,9 @@ function divergence(a, b) {
 //   anything else          → a chain that was stamped before the live one returned while a newer chain
 //                            is out. TWO SIGNALS.
 //
-// Throws rather than routing. Two reasons, and the second is the one that matters: two live signals is
-// a coding violation, not an environmental failure, so Law 13 says throw and dump. And a checker that
-// routed on detection would itself become a signal source — the exact Law 3 fault that moved this out
-// of signal_bus, rebuilt in a new building.
+// Throws instead of routing: two live signals is a coding violation, not an environmental failure, so
+// Law 13 says throw and dump. A checker that routed on detection would itself become a signal source —
+// the Law 3 fault this file exists to avoid.
 function examine(payload) {
   const incoming = payload ? payload.signal_id : undefined;
   const arrivingTrail = (payload && payload.signal_trail) || [];
@@ -102,18 +98,16 @@ function examine(payload) {
   if (incoming === undefined || incoming === null) {
     // ── AN INJECTOR ON TOP OF A LIVE CHAIN IS TWO SIGNALS ──────────────────────────────────────────
     // A no-id arrival is normally a Law 15 abandonment: the fragment that WAS executing the live chain
-    // gives up and originates a fresh one, so exactly one line of work survives. That is legal and
-    // frequent, and it must stay legal.
+    // gives up and originates a fresh one, so exactly one line of work survives. That stays legal.
     //
-    // An INJECTOR is the opposite act. It originates a chain from OUTSIDE the loop — nothing was
-    // abandoned, so the chain already running keeps running and now there are two. Distinguished by
-    // name because that is what the name is for (Law 7): a fragment called `*_injector` injects, and
-    // injecting into a loop that is already turning is the duplicate. `issued === 0` is the run's own
-    // first start and is the one time it is correct.
+    // An INJECTOR is the opposite act: it originates a chain from OUTSIDE the loop, so the chain already
+    // running keeps running and now there are two. Distinguished by name (Law 7): a fragment called
+    // `*_injector` injects, and injecting into a loop that is already turning is the duplicate.
+    // `issued === 0` is the run's own first start and is the one time it is correct.
     //
-    // This rule exists because without it, repeated external starts rebase indefinitely and never trip:
-    // each one looks like the run's legitimate first start, so the counter just advances while two
-    // chains end up reaching for the same resource, undetected.
+    // Without this check, repeated external starts would rebase indefinitely and never trip: each one
+    // looks like the run's legitimate first start, so the counter just advances while two chains end up
+    // reaching for the same resource, undetected.
     if (/_injector$/.test(from) && issued > 0) {
       return trip(payload,
         `'${from}' opened a NEW chain while #${issued} is still live. An injector originates from ` +
@@ -166,8 +160,8 @@ function trip(payload, why, arrivingTrail) {
   throw new Error(`signal_sequencer: two live signals from '${from}' — ${why} ALL ROUTING STOPPED (Law 4 violation)`);
 }
 
-// The payload as evidence. Values are shortened rather than dropped — the field NAMES are usually enough
-// to identify which chain this was, and a capsule can be megabytes.
+// The payload as evidence. Values are shortened, not dropped: the field NAMES are usually enough to
+// identify which chain this was, and a capsule can be megabytes.
 function capture(payload) {
   if (!payload || typeof payload !== 'object') return String(payload);
   const parts = [];

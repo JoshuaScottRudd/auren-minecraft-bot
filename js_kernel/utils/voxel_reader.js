@@ -1,30 +1,25 @@
-// voxel_reader — the ONE way to read voxels in bulk. A caller declares WHAT IT NEEDS TO KNOW and gets
+// voxel_reader — the one way to read voxels in bulk. A caller declares what it needs to know and gets
 // back the cheapest reader that honestly answers it (Law 16: one pathway, correctly parameterized).
 //
-// ── WHY DECLARING NEEDS IS THE WHOLE DESIGN ────────────────────────────────────────────────────────
-// Minecraft stores a NUMBER at every position; that number identifies one block. `bot.blockAt` answers
+// Minecraft stores a number at every position; that number identifies one block. `bot.blockAt` answers
 // "what number is here" and then builds a ~20-field description around it — light, sky light, biome,
-// hardness, harvest tools, drops, collision shapes, metadata — on EVERY call. That per-call cost is
-// paid needlessly at scale: a wide sweep or a large search calls it far more times than there are
-// distinct kinds of block to describe.
+// hardness, harvest tools, drops, collision shapes, metadata — on every call, a cost a wide sweep or a
+// large search pays far more times than there are distinct kinds of block to describe.
 //
 // Almost every scan in the fleet reads only `name` and `boundingBox`. Those are functions of the number
-// alone, so they can be computed ONCE per number and looked up forever after. The per-position fields
-// cannot. Declaring needs is what lets one API serve both without guessing: ask for TYPE and you get the
-// fast path; ask for light and you get the full read, because that is the only honest way to answer.
+// alone, so they can be computed once per number and looked up forever after; the per-position fields
+// cannot. Declaring needs is what lets one API serve both without guessing: ask for type and you get the
+// fast path; ask for light and you get the full read, the only honest way to answer.
 //
-// ── WHAT NEVER GETS CACHED, AND WHY THE STALENESS WORRY DOES NOT APPLY ─────────────────────────────
-// Changing a block changes only the number at its position; there are two tables here and only one is
-// memoized:
-//     position -> number      changes constantly. NEVER cached. Read live on every single call.
+// Two tables live here and only one is memoized:
+//     position -> number      changes constantly. Never cached. Read live on every single call.
 //     number   -> what it is  never changes. It is a fact about Minecraft, not about the world.
-// Mine a block and that position returns a different number on the very next read, with no invalidation
-// step, because nothing position-keyed was ever stored.
+// Mining a block changes only the number at its position, so the next read there returns the new number
+// with no invalidation step, because nothing position-keyed was ever stored.
 //
-// ── THE FALLBACK IS LOUD, NOT SILENT (Law 25) ──────────────────────────────────────────────────────
-// A need this module cannot serve from the number returns the FULL reader, and says so via `.fast`.
-// It must never quietly answer a light-level question from the type table — that would be a well-formed
-// falsehood, the exact failure Law 26 names. Callers that care can assert on `.fast`.
+// A need this module cannot serve from the number returns the full reader, and says so via `.fast` (Law
+// 25) — it must never quietly answer a light-level question from the type table, the well-formed
+// falsehood Law 26 names. Callers that care can assert on `.fast`.
 
 'use strict';
 
@@ -40,14 +35,12 @@ const { guardExternalSync } = require('@utils/external_library_guard');
 // 'type' is the umbrella most scans want: name + boundingBox + diggable + shapes.
 // 'water' earns its place here because water level is encoded in the state id itself: source vs.
 // flowing water differ by state id, not by any per-position field, so "is this a source block" is a
-// pure function of the number. Without it the wheat scanner would have had to keep a full read for its
-// one water question, which is most of its scan.
+// pure function of the number.
 const TYPE_DERIVABLE = new Set(['type', 'name', 'boundingBox', 'diggable', 'shapes', 'walkable', 'passable', 'solid', 'water']);
 
-// ── The per-number table. Verdicts are produced by CALLING the real predicates, never by copying the
-// block-name lists behind them. A copied membership set is the failure pathfinding_utils' own
-// SCAFFOLD_BLOCKS comment records — "what is a placeable block" defined in five places, one canonical —
-// and here the drift would not throw, it would route a body through a wall. Derive, never transcribe.
+// The per-number table. Verdicts are produced by calling the real predicates, never by copying the
+// block-name lists behind them — a copied membership set is a second definition of the same question
+// that can drift silently, here into routing a body through a wall. Derive, never transcribe.
 const F = {
     WALKABLE: 1 << 0, PASSABLE: 1 << 1, SOLID: 1 << 2, FULL_HEIGHT: 1 << 3,
     LEAF: 1 << 4, DOOR: 1 << 5, SCAFFOLD: 1 << 6, STATION: 1 << 7, KNOWN: 1 << 8,
@@ -64,23 +57,23 @@ const UNLOADED = -1;
 // every move as well — so this only matters for a reader that sits still through a `/setworldspawn`.
 const MASK_RECHECK_READS = 4096;
 
-// THE SPAWN MASK, HELD AS FOUR NUMBERS PER READER (Law 16 — the rule is spawn_protection's; only the
+// The spawn mask, held as four numbers per reader (Law 16 — the rule is spawn_protection's; only the
 // arithmetic is copied here, and only because of where it is asked).
 //
 // This is the read path: one A* search asks it hundreds of thousands of times against a 0.25s deadline, so
-// a module call per read is not affordable and an ALLOCATION per read is fatal — the first live run after
-// the mask went in had every one of 677 route searches give up. The square changes at most twice in a run
-// (the packet, and a `/setworldspawn`), so the bounds are cached and re-read only when spawn_protection's
-// integer latch version moves. Lazily required: this is a leaf utility and spawn_protection pulls in the
-// watcher and the config, which would close a load-time cycle through pathfinding_utils.
+// a module call per read is not affordable and an allocation per read is fatal. The square changes at most
+// twice in a run (the packet, and a `/setworldspawn`), so the bounds are cached and re-read only when
+// spawn_protection's integer latch version moves. Lazily required: this is a leaf utility and
+// spawn_protection pulls in the watcher and the config, which would close a load-time cycle through
+// pathfinding_utils.
 //
-// AND IT FOLLOWS THE DOOR, NOT THE PROCESS. `spawn_protection.maskWorldReads(bot)` is the one place a body
-// is enrolled, and this path must answer to that same enrolment — a mask keyed only on the latch masks
-// every reader in the process, including bodies that never asked. Two bodies arm the latch without being
-// masked: the Architect's own proxy, which is a person and must see the real world, and any bench holding a
-// body to measure one. `_spawnMaskInstalled` is the flag `maskWorldReads` sets, so the two doors open and
-// close together (Law 16). It is re-read on the same schedule as the bounds, because enrolment happens at
-// login and a reader built before it must not cache "unmasked" for the rest of the run.
+// It follows the door, not the process: `spawn_protection.maskWorldReads(bot)` is the one place a body is
+// enrolled, and this path answers to that same enrolment — a mask keyed only on the latch would mask every
+// reader in the process, including bodies that never asked. Two bodies arm the latch without being masked:
+// the operator's own proxy, a person who must see the real world, and any bench holding a body to measure
+// one. `_spawnMaskInstalled` is the flag `maskWorldReads` sets, so the two doors open and close together
+// (Law 16), re-read on the same schedule as the bounds, since enrolment happens at login and a reader
+// built before it must not cache "unmasked" for the rest of the run.
 let _spawnProtection = null;
 function makeMask(bot) {
     const m = { version: -1, enrolled: false, on: false, minX: 0, maxX: 0, minZ: 0, maxZ: 0, stateId: -1 };
@@ -99,7 +92,7 @@ function makeMask(bot) {
     return m;
 }
 
-let _tables = null;   // per mc version; the fleet runs one, but keyed anyway rather than assumed
+let _tables = null;   // keyed per mc version, though the fleet runs one
 function tableFor(version) {
     if (!_tables) _tables = new Map();
     let t = _tables.get(version);
@@ -122,11 +115,11 @@ function tableFor(version) {
             if (pf.isDoorBlock(b))               f |= F.DOOR;
             if (pf.isScaffoldBlock(b.name))      f |= F.SCAFFOLD;
             if (STATION_TYPES.has(b.name))       f |= F.STATION;
-            // Derived by CALLING gravity_utils' own predicate against the prototype, same rule as every
+            // Derived by calling gravity_utils' own predicate against the prototype, same rule as every
             // flag above. It takes a bot and reads for itself, so it is handed a bot that answers with
-            // this one block — that keeps the source-vs-flowing distinction owned by gravity_utils
-            // rather than re-encoded here as "state id 86", which is exactly the transcription that
-            // would silently drift when a version renumbers the palette.
+            // this one block — that keeps the source-vs-flowing distinction owned by gravity_utils, not
+            // re-encoded here as a bare state id that could silently drift when a version renumbers the
+            // palette.
             if (isWaterSource({ blockAt: () => b }, 0, 0, 0)) f |= F.WATER_SOURCE;
             flags[stateId] = f;
             return f;
@@ -155,14 +148,18 @@ function tableFor(version) {
 // drops into any existing scan. `.fast` reports which path it took — true = type table, false = full read.
 function makeVoxelReader(bot, opts = {}) {
     const needs = opts.needs || ['type'];
-    const version = opts.version || bot?.version || require('@thinking/architect_config').SERVER_MINECRAFT_VERSION;
+    // One authored answer: `master_core` creates the bot with `version: SERVER_MINECRAFT_VERSION`, so
+    // mineflayer never negotiates and `bot.version` is that same constant arriving by a second path — a
+    // value that decides how every voxel in the world is decoded needs exactly one source (Invariant B).
+    // `opts.version` stays as a genuine authored override — the benches pass `--version` to read a
+    // snapshot taken under a different build.
+    const version = opts.version || require('@thinking/architect_config').SERVER_MINECRAFT_VERSION;
     const unmet = needs.filter(n => !TYPE_DERIVABLE.has(n));
     const stats = { reads: 0, unloaded: 0, columnHits: 0, columnMisses: 0 };
     // A caller may hand us something that is not a live mineflayer bot — the virtual playground's bot, a
     // bench adapter, lanista's four-field stub. Those answer blockAt and nothing else, so the number
-    // table has no column to read FROM. This is checked at CONSTRUCTION rather than left to blow up on
-    // the first read: a reader that reports `fast` and then throws would fail far from its cause, and a
-    // scan that works live but dies headless is the exact defect the bench exists to catch first.
+    // table has no column to read from. Checked here, at construction: a reader that reports `fast` and
+    // then throws on its first read would fail far from its cause.
     const hasWorld = typeof bot?.world?.getColumnAt === 'function';
 
     // ── SLOW PATH. Chosen, not fallen into: some field the number cannot answer was asked for (or there
@@ -192,29 +189,23 @@ function makeVoxelReader(bot, opts = {}) {
     // never seen this chunk" into "this is open sky".
     const table = tableFor(version);
 
-    // ── THE HELD COLUMN ──────────────────────────────────────────────────────────────────────────────
-    // `col` is NOT a copy of anything: it is mineflayer's own ChunkColumn — the object the server's
-    // block updates are written INTO — so holding it cannot produce a stale block. What is held is the
-    // HANDLE, never a verdict about a cell. Caching a derived verdict per cell instead does not pay:
-    // once the read itself is this cheap, the read stops being what costs, so pre-computing verdicts
-    // does not measurably speed anything up.
-    //
-    // A search or a sweep asks about the same 16x16 column many times running, so holding the column
-    // handle across those repeated lookups replaces a string key plus a Map hash plus two Vec3
+    // `col` is not a copy: it is mineflayer's own ChunkColumn, the object the server's block updates are
+    // written into, so holding it cannot produce a stale block. What is held is the handle, never a
+    // verdict about a cell — a search or a sweep asks about the same 16x16 column many times running, so
+    // holding the handle across those lookups replaces a string key plus a Map hash plus two Vec3
     // allocations with a single integer comparison.
     let cx = 0x7fffffff, cz = 0x7fffffff, col = null;
 
-    // One scratch vector per reader, mutated in place. Safe because ChunkColumn.getBlockStateId reads
-    // x/y/z, converts them to a section index and an integer offset, and retains no reference. Per-reader
-    // rather than per-module so two bots in one process cannot interleave into each other's scratch.
+    // One scratch vector per reader, mutated in place — safe because ChunkColumn.getBlockStateId reads
+    // x/y/z, converts them to a section index and an integer offset, and retains no reference. Kept
+    // per-reader so two bots in one process cannot interleave into each other's scratch.
     const scratch = new Vec3(0, 0, 0);
 
-    // THE ONE WAY A HELD HANDLE CAN GO BAD, and it is not staleness of block data (impossible — the
-    // object is live). It is IDENTITY: on unload mineflayer drops the column from the world, and a reader
-    // still holding it would answer from a region the bot can no longer see — reporting never-sensed
-    // space as solid terrain, the verdict Law 23 forbids most. It matters concretely because computeAStar
-    // YIELDS to the cooperative pacer mid-search, so an unload genuinely can land between two reads of
-    // one search.
+    // A held handle goes bad on identity, not staleness of block data (impossible — the object is live):
+    // on unload mineflayer drops the column from the world, and a reader still holding it would report
+    // never-sensed space as solid terrain, the verdict Law 23 forbids most. computeAStar yields to the
+    // cooperative pacer mid-search, so an unload can land between two reads of one search.
+    //
     // The mask's bounds ride along with the held column: both are per-reader state that a move can
     // invalidate, and a chunk edge is the cheapest moment in the run to re-read a latch that changes twice.
     // The read counter below is the backstop for a reader that never crosses one.
@@ -303,17 +294,13 @@ function derived(r) {
             return clear >= 3 ? 'jumpable' : clear >= 2 ? 'walkable' : null;
         },
         // classifyFloorAt — the same verdict as classifyFloor, plus the one thing that makes it worth a
-        // second entry point: the caller passes the floor cell's OWN already-read state id. A* always
-        // holds it (it read the block to get here), so re-reading that cell would add one read per call
-        // and make the flags path cost more than the block path it replaces. Omit it and the floor is
-        // read normally.
+        // second entry point: the caller passes the floor cell's own already-read state id, so A* (which
+        // always holds it) need not spend a second read on that cell. Omit it and the floor is read
+        // normally.
         //
-        // It answers identically to pathfinding_utils.classifyFloorInline by DERIVATION, not by copying:
-        // isFloorSafe IS terrain_predicates.isWalkableSurface (the WALKABLE bit) and the clearance test IS
+        // Answers identically to pathfinding_utils.classifyFloorInline by derivation, not by copying:
+        // isFloorSafe is terrain_predicates.isWalkableSurface (the WALKABLE bit) and the clearance test is
         // isBlockPassable (the PASSABLE bit) — the same two predicates the flag table calls to build them.
-        // A drift here does not throw — it plans a different route, silently. Nothing currently enforces
-        // this agreement automatically; a load-time throw sampling a handful of known state ids through
-        // both paths would.
         classifyFloorAt(x, y, z, floorStateId) {
             const ff = floorStateId === undefined ? r.flagsAt(x, y, z)
                 : (floorStateId < 0 ? UNLOADED : tableFor(r._version).flags(floorStateId));

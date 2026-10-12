@@ -1,22 +1,17 @@
 // perception node: health_integrity
-// purpose: The self-preservation counterpart to building_integrity / farming_integrity / torch_integrity —
-//          ONE node that reads the bot's OWN vital internals and hands the brain a single verdict. Today it
-//          covers HUNGER (food) and HEALTH (hp); it is named 'health', not 'hunger', because it is the
-//          expansion point for every self-state check to come (armor, potion effects, drowning, fall
-//          exposure). For now: hunger and health only. assessors/hunger gates the `eat`
-//          job on needs_to_eat; the health read rides along for inspectability and future action.
+// The self-preservation counterpart to building_integrity / farming_integrity / torch_integrity — the one
+// node that reads the bot's own vital internals and hands the brain a single verdict. Covers hunger (food)
+// and health (hp), and is the expansion point for every self-state check to come (armor, potion effects,
+// drowning, fall exposure). assessors/hunger gates the `eat` job on needs_to_eat; the health read rides
+// along for inspectability and future action.
 //
-// WHY it logs its state EVERY scan: building/mining/farming integrity each print a
-// full status line every time they are scanned — that heartbeat is how the watcher SHOWS what each
-// subsystem senses. Hunger used to dedup its log (print only on a food-state transition), so on a steady
-// food level it went silent and the health subsystem was invisible in the stream. Now it prints one health
-// line per scan, exactly like its siblings, so "health integrity" reads in the trace beside building and
-// farming. Re-sensing every sweep is also the verification that closes the eat loop (Invariant B): after a
-// bot eats, the next sweep reads fresh food; full → no job posts; still low → re-posts.
+// Logs its state every scan, exactly like its siblings, so the heartbeat shows the subsystem is being
+// sensed even on a steady food level. Re-sensing every sweep is also the verification that closes the eat
+// loop (Invariant B): after a bot eats, the next sweep reads fresh food; full means no job posts; still low
+// means it re-posts.
 //
-// DORMANT ON PEACEFUL for ACTION: bot.food never drains with no hunger mechanic, so needs_to_eat stays
-// false and no eat job ever posts — but the heartbeat still prints (food 20/20 · healthy), so the subsystem
-// is visible even when idle, same as a fully-built structure still logging its all-correct status.
+// On peaceful, bot.food never drains, so needs_to_eat stays false and no eat job ever posts — the heartbeat
+// still prints (food 20/20 · healthy), keeping the subsystem visible even when idle.
 //
 // Pure observation (Law 1 perception exception — action fragments may call this directly). Reads only the
 // bot's own faculties (bot.food/bot.health), so it needs no located base and never throws pre-home.
@@ -28,8 +23,8 @@ const { HUNGER_EAT_THRESHOLD, HUNGER_MUST_EAT_THRESHOLD, HUNGER_FULL } = require
 
 const TAG = 'health_integrity';
 
-// Minecraft: natural health regen requires food ≥ 18 (and stops below). The eat threshold sits AT 18 so a
-// bot that eats on time never loses regen — reporting it makes the "why 18" legible in the trace.
+// Minecraft health regen requires food ≥ 18. The eat threshold sits at 18 so a bot that eats on time keeps
+// regen active.
 const REGEN_FLOOR = 18;
 
 let _lastScan = null;
@@ -69,9 +64,9 @@ function scan(bot) {
   return verdict;
 }
 
-// One health heartbeat per scan (Law 5), same as building/farming integrity — keeps the
-// subsystem visible in the trace, not only on a state change. Concise: food, hp, regen state, and the one
-// actionable verdict (eat due / full / ok).
+// One health heartbeat per scan (Law 5), same as building/farming integrity, keeping the subsystem visible
+// in the trace on every sweep. Reports food, hp, regen state, and the one actionable verdict (eat due /
+// full / ok).
 function _log(v) {
   const hp = v.health != null ? `${v.health}/20` : 'n/a';
   const regen = v.regen_ok ? 'regen alive' : `regen STALLED (food<${REGEN_FLOOR})`;

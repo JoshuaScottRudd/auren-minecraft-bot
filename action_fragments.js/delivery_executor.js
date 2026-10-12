@@ -36,27 +36,20 @@ module.exports = {
         // undefined = the swapper already abandoned this line to recursive_judge
         // (Law 15 — chest unreachable, lock-queue timeout, open failed). The
         // failure signal is in flight; throwing or routing here would raise a
-        // SECOND report for the same failure (Law 4/16) — this crashed the
-        // wheat_seeds deliver on 2026-07-05. Die quietly.
+        // second report for the same failure (Law 4/16). Die quietly.
         if (result === undefined) return;
 
-        // ── A RACE BETWEEN TWO BOTS IS NOT A CODING VIOLATION (Architect 2026-09-12) ──────────────
-        // *"a code 13 violation should be a true coding violation… double check that theres no
-        // enviomental throws."*
+        // ── A RACE BETWEEN TWO BOTS IS NOT A CODING VIOLATION ──────────────
+        // Stale registry data is a world fact, not a miscoding, and in a fleet of two or more bots it is
+        // expected: the plan is made from a scan of what a chest held, and by the time this body opens
+        // that chest a peer may have taken the last of it, or filled the slot a deposit was sized for.
+        // Nothing in the dispatcher can close that gap, because the gap is the travel time between sensing
+        // and arriving (Invariant B — re-sense, never remember; the re-sense is this call, returning what
+        // it found).
         //
-        // THIS THREW UNTIL TODAY, AND ITS OWN MESSAGE NAMED THE REASON IT SHOULD NOT HAVE: it told the
-        // reader to check `station_registry` **for stale data**. Stale registry data is a world fact, not
-        // a miscoding — and in a fleet of two or more bots it is the EXPECTED one. The plan is made from a
-        // scan of what a chest held; by the time this body opens that chest a peer may have taken the last
-        // of it, or filled the slot a deposit was sized for. Nothing in the dispatcher can close that gap,
-        // because the gap is the travel time between sensing and arriving (Invariant B — re-sense, never
-        // remember; the re-sense IS this call, and this is it returning what it found).
-        //
-        // A user's chest being emptied by their own second bot should not stop that bot. So the shortfall
-        // is REPORTED with `success:false` — a real counted fault the judge and the manager can act on,
-        // naming the station and the item — and the loop re-plans against what the world now holds. The
-        // trace still says a transfer moved nothing; what it no longer does is kill the signal chain
-        // outside the judge and leave the body sitting there looking alive (Law 25).
+        // The shortfall is reported with `success:false` — a real counted fault the judge and the manager
+        // can act on, naming the station and the item — and the loop re-plans against what the world now
+        // holds (Law 25).
         if (!result.success) {
             const shortfall = `${action} moved nothing for ${item} at station ${stationId} — the station could not fulfill it. `
                 + `Most likely a peer took or filled it between the plan and the arrival; re-sensing and re-planning.`;

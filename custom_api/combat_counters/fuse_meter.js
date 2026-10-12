@@ -1,95 +1,66 @@
 'use strict';
-// fuse_meter — the creeper's OWN fuse state, read off the server instead of modelled.
+// fuse_meter — reads the creeper's own server-synched swell_dir field instead of modelling the fuse.
 //
-// Swell is an actual server-synched state, VERIFIED against the installed stack rather than assumed
-// (Law 23): minecraft-data names the creeper's synched entity data as
+// minecraft-data names the creeper's synched entity data as
 //
 //     [… mob_flags, swell_dir, is_powered, is_ignited]
 //
-// so `swell_dir` is a real, named, SERVER-SYNCHED field that arrives in `entity_metadata` and that
-// mineflayer merges into `entity.metadata` by index. The bot can watch it. Nothing here is inferred
-// from damage numbers, which is what every creeper reading in this fleet has been until now.
+// `swell_dir` is a real, server-synched field that arrives in `entity_metadata`; mineflayer merges it
+// into `entity.metadata` by index, so the bot can watch it directly (Law 23).
 //
-// ── WHAT IS SYNCHED IS THE DIRECTION, NOT THE COUNTER — and that is the more useful half ────────────
-// Java syncs `swellDir` (−1 or +1), never the `swell` int itself; the vanilla CLIENT reconstructs the
-// counter by integrating that sign each tick. So a successor looking for a "fuse: 17/30" field will not
-// find one and must not conclude the state is unreadable.
+// ── SYNCHED IS THE DIRECTION, NOT THE COUNTER ───────────────────────────────────────────────────────
+// Java syncs `swellDir` (−1 or +1), never the `swell` int itself; the vanilla client reconstructs the
+// counter by integrating that sign each tick, so this meter answers by direction, not a "fuse: 17/30"
+// field.
 //
-// The direction is what the open question actually needs. `CreeperSwellGoal` is asymmetric — it IGNITES
-// on `distanceToSqr < 9` (3.0 b) but only sets `swellDir = -1` on `distanceToSqr > 49` (7.0 b) or a
-// broken line of sight. **The gap at the moment the sign flips to −1 IS the boundary**, so this meter
-// answers by measurement a question inference alone could not settle. The constant lives below, in
-// this file, because this is the module that owns the swell; the reconstructed fuse clock below is a
-// by-product of that measurement.
+// `CreeperSwellGoal` is asymmetric — it ignites on `distanceToSqr < 9` (3.0 b) but only sets
+// `swellDir = -1` on `distanceToSqr > 49` (7.0 b) or a broken line of sight. The gap at the moment the
+// sign flips to −1 is the boundary this meter measures; SWELL_RESET_DISTANCE below is that boundary, and
+// the reconstructed fuse clock is a by-product of the same measurement.
 //
-// ── THE INVISIBILITY RULE, AND WHAT IT COST TO LEARN ───────────────────────────────────────────────
-// battle_stations owns the voice — this module has no watcher of its own (Invariant D) — and the reading
-// is taken from passes the arm was going to run anyway, so it costs the tactic nothing. That rule is not caution — a meter that sleeps to take its own measurement spends real
-// distance of a creeper's escape per reading, and can cost a live wave its hold distance over it. A fuse
-// instrument that costs fuse is the one thing this file may never become.
+// ── NO WATCHER OF ITS OWN (Invariant D) ─────────────────────────────────────────────────────────────
+// battle_stations owns the voice. The reading is taken from passes the arm runs anyway, so sensing the
+// fuse spends no extra distance against a live creeper's escape.
 //
-// The metadata INDEX is resolved from the live registry rather than hardcoded to 16, for the reason
-// `archer_calculator.bowDrawState` gives at length: the index is a per-version, per-entity fact
-// mineflayer already carries, and a literal would go silently wrong on the next protocol bump — wrong in
-// the direction that reads as "the creeper never swelled", which is indistinguishable from good news.
-// That decode is duplicated in shape here rather than shared because `archer_calculator` is about
-// archers; a successor should read this as the established pattern, not as a new one.
+// The metadata index is resolved from the live registry, the same pattern `archer_calculator.bowDrawState`
+// uses: the index is a per-version, per-entity fact mineflayer already carries, so a protocol change
+// cannot silently read as a creeper that never swelled.
 
-// ── THREE STATES AND NOT A BOOLEAN, for bowDrawState's exact reason ────────────────────────────────
-// An unreadable metadata array is not the same fact as "not swelling", and collapsing them makes a
-// sensing failure look identical to a calm creeper — the run would report a perfect record of fuses that
-// never lit (Law 25: "could not tell" is one of the answers, and it is the one that indicts the
-// instrument instead of exonerating the tactic). Unread passes are counted and reported.
+// ── THREE STATES, NOT A BOOLEAN, for bowDrawState's exact reason ───────────────────────────────────
+// An unreadable metadata array is not the same fact as "not swelling"; collapsing them would make a
+// sensing failure look identical to a calm creeper (Law 25 — "could not tell" is its own answer). Unread
+// passes are counted and reported.
 //
 // UNDEFINED IS NOT −1, even though −1 is the vanilla default. 1.21.5 sends synched data only for fields
-// that differ from their default, so a creeper that has never swelled carries NO index 16 at all. Reading
-// that absence as "winding down" would be a claim about the world derived from the protocol's silence,
-// and it would manufacture a −1 → +1 "ignition" out of the first packet that ever arrives.
+// that differ from their default, so a creeper that has never swelled carries no index 16 at all; that
+// absence means "never swelled", not "winding down".
 const { livingHealth } = require('@utils/calculators/archer_calculator');
-// ── THE RUN CLOCK, NOT THE WALL CLOCK ──────────────────────────────────────────────────────────────
-// Every timestamp this meter produces is a millisecond offset from when the process started, never an
-// epoch. It was `combat_runClock()` until that record was deleted (2026-08-22) and the reason it was
-// exported holds without it: a bench or a reader that takes a relative number for an absolute one is off
-// by ~1.8e12 ms, and that is a silent mis-read rather than a loud failure — the number still looks like
-// a time. Keeping ONE clock in this file means no line has to be checked for which kind it used.
-//
-// Module load IS process start for anything that measures, so there is no arming step to forget: a
-// baseline set at first use would make the first fuse of a run read as time zero.
+// Every timestamp this meter produces is a millisecond offset from process start, never an epoch, so one
+// clock answers every line in this file the same way. Module load is process start, so there is no
+// arming step to forget.
 const BOOT = Date.now();
 const runClock = () => Date.now() - BOOT;
 
 const UP = 1;
 const DOWN = -1;
 
-// ── THE ONE SURVIVING CREEPER CONSTANT IN THE FLEET ─────────────────────────────────────────────────
-// Where Java's CreeperSwellGoal actually flips the sign back to −1: `distanceToSqr > 49`, so 7.0 b. Every
-// other movement-based creeper model (a fuse clock, an ignite boundary, an escape-angle cone, a
-// hits-per-fuse model) was deleted; this number is the only piece that was never a movement model.
+// ── SWELL_RESET_DISTANCE: THE UNWIND BOUNDARY ───────────────────────────────────────────────────────
+// Where Java's CreeperSwellGoal flips the sign back to −1: `distanceToSqr > 49`, so 7.0 b. This module
+// owns the swell: the meter measures where the sign flips, and this constant is what the measurement is
+// graded against.
 //
-// IT LIVES HERE BECAUSE THIS MODULE OWNS THE SWELL. The meter measures where the sign flips; the
-// constant is what the measurement is graded against. Keeping them apart is what let the fleet carry two
-// contradicting values — a modelled 3.0 and a source-read 7.0 — with nothing to reconcile them.
-//
-// It drives NO behaviour, and it must not start: the shield answers the swell now, and a distance gate
-// beside it would be a second opinion about the same fact. Its only consumer was the `fuse` row
-// battle_stations stamped it into (Law 23 — the claim stored beside its check), so with that record
-// deleted it is read by the meter's own reporting and nothing else.
+// It drives no behaviour — the shield answers the swell from the live reading, not a distance gate — and
+// is read only by this meter's own reporting.
 const SWELL_RESET_DISTANCE = 7.0;
 
-// ── HOW LONG A SWELL LASTS, AND WHY THIS NUMBER IS WEAKER THAN THE ONE ABOVE ───────────────────────
+// ── SWELL_TO_BLAST_MS: THE DETONATION DEADLINE ──────────────────────────────────────────────────────
 // Java's Creeper sets `maxSwell = 30` ticks and detonates when the counter reaches it, so an unbroken
-// swell is 1500 ms. THIS IS READ FROM THE SOURCE, NOT MEASURED HERE, and the distinction matters because
-// SWELL_RESET_DISTANCE above WAS measured and this fleet has been burned by treating the two kinds of
-// number alike.
+// swell is 1500 ms. This is read from the source, not measured here.
 //
-// `maxWoundMs`, this file's own measured record, is expected to sit BELOW this constant rather than
-// contradict it — every swell that gets interrupted (the creeper dying, or the bot leaving the ignite
-// radius) is timed short of a full run, and a swell that ran to term detonated, so the bot does not get
-// to time that one.
-//
-// It exists because the shield needs a DEADLINE to count back from (gunner.shieldOrder). If a run ever
-// records a `maxWoundMs` above this, that is the number being wrong and it is loud — a fuse longer than
-// its own maximum is a form error, not a tuning miss.
+// `maxWoundMs`, this file's own measured record, is expected to sit at or below this constant: a swell
+// interrupted (the creeper dying, or the bot leaving the ignite radius) times short of a full run, and a
+// swell that runs to term detonates instead of being timed. gunner.shieldOrder counts back from this
+// deadline; a recorded `maxWoundMs` above it marks the number itself as wrong.
 const SWELL_TO_BLAST_MS = 1500;
 
 function swellDir(bot, entity) {
@@ -128,21 +99,19 @@ function state(mobId) {
   return st;
 }
 
-// sample(bot, mobId, entity, gap) — call on every pass, for every live mob. Non-creepers simply never
-// resolve a `swell_dir` key and fall out as unread, so the caller does not have to filter by species
-// (and must not: a filter on `entity.name` in the caller is a second place that knows which mobs have
-// fuses, which is the Law 16 shape this fleet keeps deleting).
+// sample(bot, mobId, entity, gap) — call on every pass, for every live mob. Non-creepers never resolve a
+// `swell_dir` key and fall out as unread, so the caller does not filter by species (Law 16: one place
+// knows which mobs have fuses).
 //
-// `gap` is the bot→mob distance THIS pass, taken from the value the loop already computed. It is stored
-// against the transition rather than re-derived, because the transition is the only moment it means
-// anything and a distance re-read later is a different number.
+// `gap` is the bot→mob distance this pass, taken from the value the loop already computed and stored
+// against the transition, since the transition is the only moment it means anything.
 function sample(bot, mobId, entity, gap) {
   const st = state(mobId);
   const now = runClock();
   const dir = swellDir(bot, entity);
-  // The poll interval this reading closes. Carried onto the transition because it BOUNDS the distance's
-  // truth: the sign flipped somewhere inside this window, and a creeper under knockback covers real ground
-  // in it. A reader must be able to see the resolution rather than trust the decimal (Law 25).
+  // The poll interval this reading closes, carried onto the transition: the sign flipped somewhere
+  // inside this window, and a creeper under knockback covers real ground in it, so the resolution bounds
+  // how precise the distance is (Law 25).
   const resolutionMs = st.lastAt ? now - st.lastAt : 0;
   st.lastAt = now;
   // Health is carried on EVERY pass, including unreadable ones, because it is not part of the swell
@@ -187,27 +156,21 @@ function sample(bot, mobId, entity, gap) {
 
 // vanished(mobId, lastGap) — the mob left the world.
 //
-// A CREEPER THAT VANISHES WHILE SWELLING HAS NOT NECESSARILY DETONATED, and this file will not say that it
-// has. A bot that kills a creeper mid-swell produces the identical signature: entity gone, last sign +1.
-// The two are told apart by pairing this with whether the bot took blast damage, which battle_stations and
-// the damage lens already record — so the honest field name is what was observed (`gone while winding up`)
-// and the verdict is left to the reader who has both halves (Law 25: state the true result, not the
-// convenient one).
+// A creeper that vanishes while swelling has not necessarily detonated: a bot that kills a creeper
+// mid-swell produces the identical signature, entity gone with the last sign +1. The two are told apart
+// by pairing this with whether the bot took blast damage, so the field name states only what was
+// observed (`gone while winding up`) and the verdict is left to the reader holding both halves (Law 25).
 //
-// ── WHY "MID-SWELL KILL" IS THE EXPECTED CASE, NOT THE EXOTIC ONE ───────────────────────────────────
-// Worth stating because the ambiguity above reads as if the two were equally likely, and they are not.
-// Every swing this fleet lands on a creeper happens inside BOT_STRIKE_REACH (3.0 b), which is the SAME
-// number as the ignite boundary — so the fuse is running for every hit the bot ever throws, including
-// the killing one. A creeper killed by this bot is ALWAYS killed mid-swell. The signature is the norm.
+// Every swing this fleet lands on a creeper happens inside BOT_STRIKE_REACH (3.0 b), the same distance as
+// the ignite boundary, so a creeper killed by this bot is always killed mid-swell — the ambiguous
+// signature is the norm.
 //
-// ── THE TWO FIELDS THAT DECIDE IT ──────────────────────────────────────────────────────────────────
-// `goneHealth` is the server's last health for this mob. It cannot be conclusive alone — the killing
-// blow's health packet may never arrive before the entity is removed, so a genuine kill can read as
-// "vanished with 5 hp left" — which is why it travels WITH `goneAt` rather than instead of it. The
-// timestamp is what lets a reader ask the only question that separates the two cleanly: did the BOT
-// bleed at that same instant? A detonation close enough to kill a creeper's own body is close enough
-// to be felt; a sword is not. The lens owns that join (`combat_lens.fuseFromRows`), because pairing two
-// records is a reducer's job and this file records one thing.
+// `goneHealth` is the server's last health for this mob; the killing blow's health packet may never
+// arrive before the entity is removed, so a genuine kill can read as a few hp left, which is why it
+// travels with `goneAt`. The timestamp lets a reader ask whether the bot bled at the same instant — a
+// detonation close enough to kill the creeper's own body is close enough to be felt, and a sword is not.
+// The lens owns that join (`combat_lens.fuseFromRows`), since pairing two records is a reducer's job and
+// this file records one thing.
 function vanished(mobId, lastGap, lastHealth) {
   const st = _mobs.get(mobId);
   if (!st) return;
@@ -237,12 +200,11 @@ function band(values) {
   return { n: xs.length, mean: round2(mean), median: round2(median), min: xs[0], max: xs[xs.length - 1] };
 }
 
-// summary() → the one line, or null when there is nothing to say. Returns rather than logs (Invariant D).
+// summary() → the one line, or null when there is nothing to say. Returns the text instead of printing
+// it, so the caller decides whether and where it appears (Invariant D).
 //
-// THE UNWIND BAND LEADS, because it is the number the whole instrument was built to get and the one the
-// two rival models disagree about. The two constants travel beside it named, so the line is legible to a
-// reader who does not already know the dispute — a summary that printed "unwind at 5.1b" without saying
-// what 5.1 refutes would need this file open to be worth anything (Law 24).
+// The unwind band leads the line, with the measured and modelled constants named beside it, so the line
+// is legible to a reader who does not have this file open (Law 24).
 function summary() {
   const all = [..._mobs.values()];
   const readable = all.filter((s) => s.reads > 0);
@@ -282,21 +244,11 @@ function summary() {
       `are bounded by it, not exact)` : ''}.`;
 }
 
-// ── calibration() IS GONE (2026-08-22), AND WHAT IT FED WENT FIRST ─────────────────────────────────
-// It returned one structured row per readable mob — every unwind and ignite gap, the wound clock, the
-// unread count — and battle_stations banked those rows into `fleet_logs/combat_journal/` so a boundary
-// could be established from the SPREAD of many fights rather than voted on by one. That record was
-// deleted, so the rows had nowhere to go and the function had no caller.
-//
-// The measurement itself is unaffected: `summary()` still states this fight's crossings, and it is the
-// half a reader acts on. What is retired is the cross-run population — a boundary re-derived from many
-// fights is no longer available, and SWELL_RESET_DISTANCE stands on its source read alone.
-
 function reset() {
   _mobs = new Map();
 }
 
-// Read-only view for the tests and for anything that wants numbers rather than a sentence.
+// Read-only view of state, as numbers, for tests and other structured readers.
 function stats() {
   return {
     mobs: [..._mobs.entries()].map(([mob, s]) => Object.assign({ mob }, s)),

@@ -1,44 +1,35 @@
 // perception node: mining_blueprinter (staircase generation)
 //
-// PURPOSE (Law 14 -- clear English summary):
-//   Generates the underground mining descent as a diagonal STAIRCASE, by tiling the
-//   `architect_staircase_final` blueprint downward via ATTACH POINTS (not a hardcoded
-//   offset, and not the old shaft/highway/branch model). Uses the already-proven-safe
-//   headframe site locked in corporate_headquarters.json
-//   (building_confrence_room.headframe.set_buildspot). Returns the segment plan in
-//   memory -- mining_integrity calls generateStaircase() on each scan, so the segment plan is
-//   always regenerated from the CURRENT blueprint set rather than a cached plan file.
-//   That set is the boot snapshot held by @kernel/blueprint_registry, NOT the file on disk:
-//   an edit to building_blueprints.json applies at the next start, never mid-run. Treating it
-//   as live instead of a snapshot risks crashing on a delete-then-upload or silently
-//   re-planning a shaft mid-build from a half-written file.
+// Generates the underground mining descent as a diagonal staircase, by tiling the
+// `architect_staircase_final` blueprint downward via attach points. Uses the headframe site locked in
+// corporate_headquarters.json (building_confrence_room.headframe.set_buildspot). Returns the segment plan
+// in memory — mining_integrity calls generateStaircase() on each scan, so the segment plan is always
+// regenerated from the current blueprint set. That set is the boot snapshot held by
+// @kernel/blueprint_registry, not the file on disk: an edit to building_blueprints.json applies at the
+// next start, never mid-run.
 //
-// ATTACH-POINT TILING MODEL (replaces the old offset + rotation machinery):
-//   Every blueprint declares lettered attach points (A, B, ...) relative to its build
-//   center. Connection is expressed as "this point meets that point" -- the child's point
-//   is placed on the parent's point. No offset arithmetic, no rotation table.
-//     - Convention here: attach 'A' = INBOUND (top) joint, 'B' = OUTBOUND (bottom) joint.
-//     - The first staircase copy's A lands on the headframe's attach A (one block below
-//       the headframe build center: headframe A = (0,-1,0)).
-//     - Each subsequent copy's A lands on the previous copy's B. That reduces to a pure
-//       per-copy translation of (B - A) = (3,-3,0) for the current staircase -- the step
-//       falls out of the attach points, so a redesigned staircase re-derives its own step.
-//   Heading is fixed east (Law 19 determinism), so tiling is
-//   pure translation: no rotation. Attach points carry position only; if a future piece
-//   must attach rotated, they will need an orientation field (deferred).
+// Attach-point tiling: every blueprint declares lettered attach points (A, B, ...) relative to its build
+// center. Connection is expressed as one point meeting another — the child's point is placed on the
+// parent's point. No offset arithmetic, no rotation table.
+//   - Convention here: attach 'A' = inbound (top) joint, 'B' = outbound (bottom) joint.
+//   - The first staircase copy's A lands on the headframe's attach A (one block below the headframe
+//     transpose origin: headframe A = (0,-1,0)).
+//   - Each subsequent copy's A lands on the previous copy's B, a per-copy translation of (B - A) =
+//     (3,-3,0) for the current staircase; the step is derived from the attach points, so a redesigned
+//     staircase derives its own step.
+//   Heading is fixed east (Law 19 determinism), so tiling is pure translation: no rotation. Attach points
+//   carry position only; a piece that must attach rotated needs an orientation field.
 //
-// OVERLAP-AGREEMENT RULE (Law 13 / Law 16):
-//   Where two copies meet, the cell under one copy's attach point is the SAME world voxel
-//   as the cell under the other's. Both sides must AGREE on that voxel or the maintenance
-//   diff oscillates (one says air, the other a block -> dig, place, dig, place forever).
-//   Resolution: identical block, OR dominant/submissive (one defines it, the other leaves
-//   it undefined). This module ENFORCES it: two copies writing the same world cell with
-//   DIFFERENT types is a coding violation -> throw. It never silently picks a winner
-//   (that would hide the oscillation bug).
+// Overlap-agreement rule (Law 13 / Law 16): where two copies meet, the cell under one copy's attach point
+// is the same world voxel as the cell under the other's. Both sides must agree on that voxel or the
+// maintenance diff oscillates (one says air, the other a block: dig, place, dig, place forever).
+// Resolution: identical block, or dominant/submissive (one defines it, the other leaves it undefined).
+// This module enforces it: two copies writing the same world cell with different types is a coding
+// violation, and throws. It never silently picks a winner.
 //
-// Pure computation: no bot, no world reads, no signal bus (Law 1 perception exception --
-// this consumes an already-written scan result, the same way blueprint_paster consumes
-// set_buildspot's locked build_center).
+// Pure computation: no bot, no world reads, no signal bus (Law 1 perception exception — this consumes an
+// already-written scan result, the same way blueprint_paster consumes set_buildspot's locked
+// transpose_origin).
 
 const blueprintRegistry = require('@kernel/blueprint_registry');
 const hq = require('@kernel/corporate_headquarters');
@@ -75,7 +66,7 @@ function loadBuildings() {
 }
 
 // Look up a blueprint's attach point by letter. Returns its [x,y,z] relative to the
-// build center. A missing attach point is a coding violation -- tiling cannot proceed.
+// transpose origin. A missing attach point is a coding violation -- tiling cannot proceed.
 function attachPoint(building, id) {
   const list = building.attach_points || [];
   const ap = list.find(p => p.id === id);
@@ -85,7 +76,7 @@ function attachPoint(building, id) {
   return ap.position;
 }
 
-// Flat [x,y,z,type,facing?] voxels relative to the blueprint's build center.
+// Flat [x,y,z,type,facing?] voxels relative to the blueprint's transpose origin.
 function blueprintVoxels(building) {
   const collected = collectAllVoxels(building);
   if (collected.length === 0) {
@@ -112,18 +103,41 @@ function placeVoxelsAt(building, origin) {
 // ----------------------------------------------------------------------------
 // loadSite: read the headframe's locked site from corporate_headquarters.json
 // (building_confrence_room.headframe.set_buildspot), written by the foreman's hub (foreman_hub.lockSite).
-// Carries the build_center find_buildingspot proved a safe diagonal staircase can descend
+// Carries the transpose_origin find_buildingspot proved a safe diagonal staircase can descend
 // from (.staircase), plus the proven-safe depth. Law 13: a missing chair or missing
 // .staircase is a coding violation -- the descent cannot be generated for a site never
 // proven safe and locked.
 // ----------------------------------------------------------------------------
+// ── WHICH SITE THE SHAFT HANGS FROM (architect_config.SHAFT_HEAD) ─────────────────────────────────────
+// A homestead's shaft descends from the headframe's attach A; a builder's is its own `mineshaft` site,
+// whose transpose_origin is the top joint directly, with no headframe attach point involved.
+// Every reader of "where is the mine" asks these three, so the two shapes are one question (Law 16).
+function shaftStructure() {
+  return require('@thinking/architect_config').SHAFT_HEAD[require('@kernel/bot_mandate').currentMode()];
+}
+// shaftChair() → the locked site chair carrying the shaft, or null while none is locked.
+function shaftChair() {
+  const site = hq.readBuildingChair(shaftStructure(), 'set_buildspot');
+  return (site?.transpose_origin && site?.staircase) ? site : null;
+}
+// shaftTop(site) → the world cell the first staircase copy's inbound joint lands on.
+function shaftTop(site) {
+  if (shaftStructure() !== HEADFRAME_BLUEPRINT) return site.transpose_origin;
+  const headframe = loadBuildings()[HEADFRAME_BLUEPRINT];
+  if (!headframe) throw new Error(`[mining_blueprinter] CODING VIOLATION: "${HEADFRAME_BLUEPRINT}" not found in building_blueprints.json.`);
+  const a = transposeAttachPoints(headframe, site.transpose_origin)[INBOUND_ID];
+  if (!a) throw new Error(`[mining_blueprinter] CODING VIOLATION: headframe has no attach point "${INBOUND_ID}".`);
+  return a;
+}
+
 function loadSite() {
-  const site = hq.readBuildingChair('headframe', 'set_buildspot');
-  if (!site?.build_center || !site?.staircase) {
-    throw new Error('[mining_blueprinter] CODING VIOLATION: building_confrence_room.headframe.set_buildspot has no locked build_center + staircase data -- run find_buildingspot (require_shaft) and set_buildspot before generating the staircase.');
+  const site = shaftChair();
+  if (!site) {
+    throw new Error(`[mining_blueprinter] CODING VIOLATION: building_confrence_room.${shaftStructure()}.set_buildspot has no locked transpose_origin + staircase data -- the foreman sites the shaft before generating the staircase.`);
   }
   return {
-    buildCenter: site.build_center,        // {x,y,z} -- headframe origin in the world
+    transposeOrigin: site.transpose_origin,        // {x,y,z} -- the shaft's site origin in the world
+    headAWorld:  shaftTop(site),
     surfaceY:    site.staircase.surfaceY,
     lowestSafeY: site.staircase.lowestSafeY,
   };
@@ -189,7 +203,7 @@ function projectStaircase({ headAWorld, lowestSafeY }) {
     throw new Error(`[mining_blueprinter] CODING VIOLATION: staircase attach B is not below attach A (step.y=${step.y}); the descent must go down.`);
   }
 
-  // Anchor stand-spots (relative to build center), transposed per copy below. Missing anchors
+  // Anchor stand-spots (relative to transpose origin), transposed per copy below. Missing anchors
   // is a coding violation -- the anchored stationary builder needs stand spots.
   const stairAnchors = Array.isArray(stair.anchors) ? stair.anchors.map(a => a.position) : [];
   if (stairAnchors.length === 0) {
@@ -199,7 +213,7 @@ function projectStaircase({ headAWorld, lowestSafeY }) {
   const stairVox = blueprintVoxels(stair);
   const minVoxY = Math.min(...stairVox.map(v => v[1]));
 
-  // Copy n origin = the world point where copy n's build center sits. Copy 0's inbound (A)
+  // Copy n origin = the world point where copy n's transpose origin sits. Copy 0's inbound (A)
   // lands on headAWorld, so copy 0 origin = headAWorld - stairIn; each further copy adds step.
   const originFor = (n) => ({
     x: headAWorld.x - stairIn[0] + n * step.x,
@@ -269,18 +283,10 @@ function projectStaircase({ headAWorld, lowestSafeY }) {
 // ----------------------------------------------------------------------------
 function generateStaircase() {
   const site = loadSite();
-  const buildings = loadBuildings();
-  const headframe = buildings[HEADFRAME_BLUEPRINT];
-  if (!headframe) throw new Error(`[mining_blueprinter] CODING VIOLATION: "${HEADFRAME_BLUEPRINT}" not found in building_blueprints.json.`);
-
-  // World position of the headframe's attach A, via the shared attach-point resolver so the
-  // headframe↔staircase join has ONE definition (Law 16). find_buildingspot resolves the same
-  // join for a candidate site through transposeAttachPoints with a candidate build center.
-  const bc = site.buildCenter;
-  const headAWorld = transposeAttachPoints(headframe, bc)[INBOUND_ID];
-  if (!headAWorld) {
-    throw new Error(`[mining_blueprinter] CODING VIOLATION: headframe has no attach point "${INBOUND_ID}".`);
-  }
+  // The top joint comes from shaftTop — the headframe's attach A through the shared attach-point resolver, or a
+  // standalone shaft's own site — so the join has ONE definition (Law 16).
+  const bc = site.transposeOrigin;
+  const headAWorld = site.headAWorld;
 
   const { segments, step, bottomY } = projectStaircase({ headAWorld, lowestSafeY: site.lowestSafeY });
   if (segments.length < 1) {
@@ -312,6 +318,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  shaftStructure, shaftChair, shaftTop,
   makeSegmentId, comparePriority, loadBuildings,
   attachPoint, blueprintVoxels, placeVoxelsAt,
   projectStaircase, generateStaircase, staircaseSideAttaches,

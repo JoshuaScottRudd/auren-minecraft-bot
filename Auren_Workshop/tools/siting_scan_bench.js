@@ -1,17 +1,14 @@
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/siting_scan_bench.js');
-// tool: siting_scan_bench — how long does finding a blueprint location actually take, before and after?
-// Architect 2026-08-04: "especially test the setting a blueprint location. normally it takes 30 seconds
-// or more to set the intial blueprint locations. id like to see how much time we save."
+// tool: siting_scan_bench — measures how much of a blueprint-siting sweep's cost is the voxel reader.
 //
 // Drives the REAL siting sweep — site_geometry.ringScan + evaluateOpenBox, the same functions
 // find_buildingspot.locate composes — over the SAME cells, three times, differing in one thing: the reader.
-//   A (before) a blockAt-per-cell reader, exactly what find_buildingspot carried until 2026-08-04
-//   B (after)  the declared-needs reader it carries now, needs:['type']
-//   C (v2)     the 2026-08-04 prototype: column memo, no per-read allocation, borrowed shell
-// Arm C was added when the Architect asked why the bot cannot keep a live map instead of re-finding the
-// world on every read. It does keep one — a held reference to mineflayer's own live chunk column — and
-// this is the sweep that says what that is worth on the fleet's most expensive scan.
+//   A  a blockAt-per-cell reader: one allocation per read, the baseline cost
+//   B  the declared-needs reader the fleet uses today, needs:['type']
+//   C  the v2 prototype: column memo, no per-read allocation, borrowed shell
+// Arm C holds a reference to mineflayer's own live chunk column instead of re-finding it on every read;
+// this sweep reports what that is worth on the fleet's most expensive scan.
 //
 // VERDICT AGREEMENT IS THE GATE. Every candidate cell's accept/reject AND its rejection reason are
 // compared. A faster sweep that sites the base somewhere else has not saved 20 seconds, it has moved the
@@ -19,10 +16,9 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/siti
 // (Law 25). One divergence voids the run.
 //
 // WHAT IT CANNOT PROVE (Law 25): this measures the SCAN. `locate` also loads blueprint dims, reads HQ,
-// checks spacing against existing footprints and writes the result; none of that is here, so the
-// fleet-visible "30 seconds" includes work this bench does not touch. The pacer is also disabled in
-// both arms (`pace: null`) — with it on, both arms would be dominated by identical yields and the
-// comparison would measure the throttle rather than the reader. Real elapsed time in a live run is
+// checks spacing against existing footprints and writes the result; none of that is here, so a
+// fleet-visible siting pause includes work this bench does not touch. The pacer is disabled in both arms
+// (`pace: null`) so identical yields cannot dominate the comparison. Real elapsed time in a live run is
 // therefore LONGER than either number here; the RATIO is the finding.
 //
 // Usage (server must be running):
@@ -55,11 +51,11 @@ async function sweep(reader, origin) {
     const t0 = process.hrtime.bigint();
     const res = await siteGeometry.ringScan(reader, {
         origin, step: STEP, minRadius: 0, maxRadius: RADIUS,
-        pace: null,           // see header — the throttle would dominate both arms identically
+        pace: null,           // disabled so no throttle can dominate the timing (see header)
         all: true,
     }, (cx, cz) => {
-        // ringScan's contract is evaluate(x, z) — it does NOT pass the reader through, so the arm under
-        // test comes from this closure. Verdict field is `valid` (ringScan itself branches on it).
+        // ringScan's evaluate(x, z) contract carries no reader argument, so the arm under test is
+        // supplied by this closure. Verdict field is `valid` (ringScan itself branches on it).
         const v = siteGeometry.evaluateOpenBox(reader, cx, cz, origin.y, { size: SIZE, height: HEIGHT });
         verdicts.push(`${cx},${cz}:${v && v.valid ? 'OK' : `no(${v && v.reason})`}`);
         return v;
@@ -79,23 +75,22 @@ async function main() {
     const origin = bot.entity.position.floored();
     log('boot', `origin (${origin.x},${origin.y},${origin.z})  footprint ${SIZE}x${SIZE}x${HEIGHT}  radius ${RADIUS} step ${STEP}`);
 
-    // ARM A — what find_buildingspot's readerFor was before today: a blockAt per cell.
+    // ARM A — a blockAt call per cell: one allocation per read, the baseline cost.
     let aReads = 0;
     const before = {
         stats: { get reads() { return aReads; }, set reads(v) { aReads = v; } },
         blockAt: (x, y, z) => { aReads++; return bot.blockAt(new Vec3(x, y, z)); },
     };
-    // ARM B — what it is now.
+    // ARM B — the declared-needs reader the fleet uses today, needs:['type'].
     const after = makeVoxelReader(bot, { needs: ['type'] });
     log('boot', `arm B reader fast=${after.fast}` + (after.fast ? '' : ` (UNMET: ${after.unmetNeeds}) — the comparison is void`));
     if (!after.fast) process.exit(1);
 
-    // ARM C — the v2 prototype (2026-08-04): column memo, no per-read allocation, borrowed shell.
-    // BORROWED IS LEGAL HERE AND ILLEGAL IN A*, and the difference is worth stating where it is used:
-    // site_geometry reads `.name`/`.boundingBox` off the block immediately and retains only strings
-    // (`{ y, name: b.name }`), so a shell that is only valid until the next read is a true answer for the
-    // whole time this caller looks at it. A* keeps `floorBlock.position` across three further reads and
-    // would have it rewritten underneath — which is why borrowing is opt-in per caller, never a default.
+    // ARM C — the v2 prototype: column memo, no per-read allocation, borrowed shell.
+    // A borrowed shell is only valid until the next read. site_geometry reads `.name`/`.boundingBox`
+    // immediately and retains only strings (`{ y, name: b.name }`), so it is a true answer for the whole
+    // time this caller looks at it — the condition borrowing requires (Law 16, same as astar_reader_v2's
+    // fresh-vs-borrowed split).
     const proto = makeVoxelReaderV2(bot, { version: bot.version });
     if (!proto.fast) { log('boot', 'arm C fell to its slow path — the comparison is void'); process.exit(1); }
     const armC = { stats: proto.stats, blockAt: (x, y, z) => proto.borrowBlockAt(x, y, z), resetStats: () => proto.resetStats() };

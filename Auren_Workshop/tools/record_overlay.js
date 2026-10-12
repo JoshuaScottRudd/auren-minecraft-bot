@@ -1,94 +1,40 @@
 // Auren_Workshop/tools/record_overlay.js
-// THE FILMING OVERLAY — one word added to any conducted run turns it into a filmed one, and one command
-// closes it. It holds the ORDER of raising a film crew and reaping it, and nothing else.
+// THE FILMING OVERLAY — attaches optional cameras and recording to any conducted run, closed with one
+// command, attached to a rung: the rung decides what happens in the world, the overlay decides only
+// whether there are lenses on it (Law 16).
 //
-// ── WHY AN OVERLAY AND NOT MORE RUNGS ───────────────────────────────────────────────────────────────
-// Filming is orthogonal to what a run IS. `standard`, `continue` and every lanista scenario each have a
-// definition worth keeping intact, and "the same run, filmed" must not become a second copy of that
-// definition free to drift from the first. So the overlay attaches to a rung rather than replacing it:
-// the rung decides what happens in the world, the overlay decides only whether there are lenses on it.
-// A rung × overlay table is N + 2 declarations; a rung-per-combination is 2N, and the second copy is the
-// one that ages (Law 16).
+//   run_config.js  run.record: 'film'                a run with cameras + a recorder writing files
+//   run_config.js  run.record: 'cameras'              cameras only, nothing written — what a download has
+//   node tools/lanista_conductor.js ladder record     the combat bench, same overlay
+//   node tools/record_overlay.js    stop              THE closer, whichever caller raised it
 //
-//   run_config.js  run.record: 'film'                      a run with cameras + a recorder writing files
-//   run_config.js  run.record: 'cameras'                    cameras only, nothing written — what a download has
-//   node tools/lanista_conductor.js ladder record          the combat bench, which still takes the word
-//   node tools/record_overlay.js    stop                   THE closer, whichever caller raised it
+// ORDER (every step an existing owner): start_cameras.ps1 -Framing raises the cameras + director +
+// titler; waits on camera_rig_ready.json for every client confirmed standing; recorder.raise ('record'
+// only) binds a capture per window and starts writing. Reaped in the mirrored order. Sits AFTER the
+// bring-up, BEFORE the work starts — conductors bring their fleet up IDLE when armed and send the
+// opening verb themselves, so the tape includes every run's opening.
 //
-// The two `test_conductor.js record|watch` lines that stood here named a script deleted on 2026-09-10;
-// filming is a field on the run page now, not a verb (2026-09-11).
+// The recorder is not in this copy's code: `record` reaches it through ONE hook,
+// `workstation.findRecorder()`, answering only on a machine whose workstation file names one. Elsewhere
+// `record` refuses and points at `cameras` — the same crew with nothing written, each window titled
+// Cam_<Bot> so any screen recorder can bind it.
 //
-// ── WHAT IT ADDS TO A RUN, IN THIS ORDER (every step an existing owner) ─────────────────────────────
-//   start_cameras.ps1 -Framing              N bot cameras + director + titler (+ the eye on --architect)
-//   wait on camera_rig_ready.json           every client CONFIRMED standing in the world, not just spawned
-//   recorder.raise                          ('record' only) bind a capture per window and start writing
-// and reaps it in the mirrored order: recording finalised, clients killed, and only then does the
-// conductor take the fleet down. The ordering is the entire value and it is not guessable — a capture
-// binds nothing if the windows do not exist yet, and a client killed before the recording is stopped
-// leaves a file no muxer ever closed. One step out of order yields footage that looks fine and is black,
-// which is the expensive failure because it is only discovered after the run.
+// THE OPERATOR'S EYE, off unless asked for: a spectator client, launched like a bot camera, that the
+// director arms and never commands — a human flies it. Defaults off (Law 13; camera_configure holds the
+// governing setting). `--architect` turns it on for that run (Law 26). Parsed here once (OVERLAY_FLAGS),
+// not by each conductor, so the launcher and the recorder see the same value (Law 16); the host seat the same.
 //
-// ── THE RECORDER IS NOT IN THIS COPY'S CODE, AND THAT IS THE DESIGN (Architect 2026-09-14) ─────────────
-// *"i want obs removed at best they should be able to watch."* The camera crew ships so anybody can watch a
-// run through it; recording those windows is the Architect's equipment. So `record` reaches its recorder
-// through ONE hook, `workstation.findRecorder()`, which answers only on a machine whose workstation file
-// names one. Everywhere else `record` refuses before it raises anything and points at `cameras`, which is
-// the same crew with nothing written — each window is titled Cam_<Bot>, so any screen recorder can bind it.
+// THE CLOSER is one command, two behaviours (Invariant D — one lifecycle owner). `stop` never reaps a
+// run with a live conductor: it REQUESTS, by writing a sentinel the conductor reads between soak
+// slices, and reaps directly only when no live conductor stands behind the session (Law 25).
 //
-// ── WHERE IT SITS IN THE RUN, AND WHY THERE ───────────────────────────────────────────────────────
-// AFTER the bring-up, BEFORE the work starts. That is one insertion point for every rung, which is what
-// keeps the overlay from needing to know what a rung does. The conductors therefore bring their fleet up
-// IDLE when an overlay is armed and send the opening verb themselves afterwards — otherwise the lenses
-// arrive after the thing worth filming has already begun, and the opening of every run is missing from
-// the tape. Cameras need a live server, so earlier is not available.
-//
-// ── THE ARCHITECT'S EYE — OFF UNLESS ASKED FOR ─────────────────────────────────────────────────────
-// One more spectator client, built and launched exactly like a bot camera, that the director arms
-// (spectator + night vision) and then never commands — it is absent from the rig's shot list, so a
-// human flies it. On a recorded run it gets its own capture and its own file, so what he chooses to look at is on
-// disk beside what the directed cameras chose. Its name is declared once, in camera_configure.
-//
-// It is the ONLY seat in the crew that produces nothing unless a human flies it for the entire run,
-// which is why it defaults off (Law 13; the reasoning lives once, in camera_configure). `--architect`
-// on either conductor turns it on for that run — a launch-time input, not a config edit (Law 26).
-//
-// WHY THIS FILE OWNS THE FLAG RATHER THAN THE CONDUCTORS. Both conductors `require` this module and run
-// it in their own process, so the flag is parsed here, once, and each conductor only has to ADMIT the
-// name into its accepted set (OVERLAY_FLAGS). Two parses would be two answers to one question the
-// moment either drifted (Law 16), and the eye belongs to the overlay — it exists only on a filmed run.
-//
-// THE SAME VALUE GOES TO BOTH RAISERS. The launcher builds the window, the recorder binds the capture,
-// and a disagreement is silent in both directions — an unbound window records nothing, and a capture
-// bound to a client that never launched reports a clean start over a black file. Neither throws, and
-// both are only discovered after the run.
-//
-// ── THE CLOSER, AND WHY IT IS ONE COMMAND WITH TWO BEHAVIOURS ──────────────────────────────────────
-// A conductor holding a filmed run open is inside a soak, and something has to be able to end that from
-// another terminal — the operator is flying a camera in a game window, not watching a console. But two
-// processes tearing the same stack down is two owners of one lifecycle (Invariant D), and that is the
-// race this must not become. So `stop` never reaps a run that has a live conductor: it REQUESTS, by
-// writing a sentinel the conductor reads between soak slices, and the conductor remains the only reaper.
-// It reaps directly only when the session on record has no live conductor behind it — a run raised by
-// `fleet_control test record`, or a conductor that died. Both cases are stated, never silently merged.
-//
-// LAW 25 ON THE STOP REPORT: "requested" and "torn down" are different outcomes and are printed as
-// different outcomes. A stop that hands a sentinel to a conductor has not stopped anything yet, and
-// saying so is the difference between a closer the operator can trust and one he has to go and check.
-//
-// ── THE FILES, AND WHO OWNS EACH (Law 6, Law 9) ────────────────────────────────────────────────────
+// THE FILES, each with one owner (Law 6, Law 9):
 //   js_kernel/record_overlay_session.json   written by raise, refreshed by the conductor's heartbeat,
-//                                           deleted by reap. What is filming, and whether anyone is
-//                                           still driving it.
+//                                           deleted by reap.
 //   js_kernel/record_overlay_stop.json      written by `stop`, deleted by reap. A request, not a state.
-//   js_kernel/machine_load_sampler.json     written and deleted by the sampler itself; this file only
-//                                           starts and stops it (Law 9 — one owner per file).
-//   js_kernel/camera_rig_ready.json         WRITTEN BY camera_rig, never here. This file clears it before
-//                                           a raise and deletes it at reap, and only ever reads it in
-//                                           between — the crew's presence is the rig's fact to state.
-// No unit both writes and deletes the same file: raise writes the session and clears any stale stop,
-// stop writes the stop, reap deletes both and writes neither (Law 9). The stale-stop clear at raise is
-// load-bearing rather than tidy — a stop request left behind by a previous run would otherwise close the
-// next one within a minute of it starting, and the operator would be told a run ended that never began.
+//   js_kernel/machine_load_sampler.json     written and deleted by the sampler itself.
+//   js_kernel/camera_rig_ready.json         WRITTEN BY camera_rig, never here; cleared before a raise
+//                                           and deleted at reap, read only in between.
 
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/record_overlay.js');
@@ -97,10 +43,9 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync, spawn } = require('child_process');
 
-// THE SPLIT RUNS THROUGH THIS BLOCK. What used to be one `BOT_DIR` is now two places: the WORKSHOP holds
-// fleet_control, the scripts, the lenses, the camera and the playground; the shipped BOT holds js_kernel,
-// foreman and Thinking_fragments. Both are asked of workshop_paths by name, because a single constant
-// covering both is the assumption the split just falsified (Law 7).
+// Two roots: the WORKSHOP holds fleet_control, the scripts, the lenses, the camera and the playground;
+// the shipped BOT holds js_kernel, foreman and Thinking_fragments. Each is asked of workshop_paths by
+// name (Law 7).
 const paths     = require('../workshop_paths');
 const TOOLS_DIR = __dirname;
 const REPO_ROOT = paths.REPO_ROOT;
@@ -110,7 +55,7 @@ const KERNEL    = paths.bot('js_kernel');
 const workstation = require(paths.bot('js_kernel', 'utils', 'workstation.js'));
 
 // recorder() → the recorder module, or null on a machine that has none. Asked when a recording step is
-// reached rather than at load, so `cameras`, `stop` and `status` never touch it on a copy without one.
+// reached, so `cameras`, `stop` and `status` never touch it on a copy without one.
 function recorder() {
   const file = workstation.findRecorder();
   return file ? require(file) : null;
@@ -118,28 +63,21 @@ function recorder() {
 
 const SESSION_FILE = path.join(KERNEL, 'record_overlay_session.json');
 const STOP_FILE    = path.join(KERNEL, 'record_overlay_stop.json');
-// Written by camera_rig, read and cleared here. Never written by this unit (Law 9).
+// Written by camera_rig, never by this unit (Law 9).
 const CREW_READY_FILE = path.join(KERNEL, 'camera_rig_ready.json');
 
-// How long the crew is given to finish joining before the raise is called a failure. Generous on purpose:
-// the cost of over-waiting is a slower start, the cost of under-waiting is a run whose first minutes are
-// filmed by clients still streaming chunks — and the ceiling only ever fires when something is genuinely
-// wrong, because the normal path returns the moment the rig publishes.
+// Ceiling before the crew's absence is called a raise failure. The normal path returns the moment the
+// rig publishes, so this only ever fires when something is genuinely wrong.
 const CREW_READY_TIMEOUT_MS = 240000;
 const CREW_READY_POLL_MS = 2000;
 
-// How often a conductor holding a filmed run comes up for air. It bounds two things at once: how long
-// after `stop` the run actually closes, and how coarse the soak's own arming becomes. A minute is short
-// enough that a stop feels immediate and long enough that re-reading the trace 45 times over a 45-minute
-// run costs nothing measurable.
+// How often a conductor holding a filmed run checks in; bounds how soon after `stop` the run closes.
 const SLICE_SECONDS = 60;
-// A conductor is presumed gone after three missed heartbeats. Presuming it gone too early is the harmful
-// direction — that is what would put a second reaper on a live run — so the threshold is generous.
+// A conductor is presumed gone after three missed heartbeats.
 const STALE_MS = SLICE_SECONDS * 3 * 1000 + 20000;
 
 // ── The declared overlays ────────────────────────────────────────────────────────────────────────
-// DATA, so "what does a record run add" is answerable without reading what it does, and so the two
-// differ in exactly one field rather than in two code paths.
+// DATA: what a record run adds over a watch run, held in one field.
 const OVERLAYS = {
   record: {
     records: true,
@@ -151,29 +89,16 @@ const OVERLAYS = {
   },
 };
 
-// Flags the overlay owns, for a conductor to union into its own accepted set. A conductor refuses an
-// unknown flag before touching anything (Law 25), so a name the overlay reads and the conductor has
-// never heard of would be rejected on the way in — the run would refuse rather than film wrong, but it
-// would refuse. Exported rather than duplicated: one list, two admissions.
+// Flags the overlay owns, for a conductor to union into its own accepted set (Law 25).
 const OVERLAY_FLAGS = ['architect', 'host'];
 
-// Present → on. `--architect=off` forces it off over a config that says true, so a caller can state
-// either intent rather than only the loud one. Read from this process's argv because both conductors
-// run the overlay in-process; absent, camera_configure decides (Law 16 — one declaration).
+// The operator's eye — a spectator seat, off unless asked for.
 function architectEye() { return seatSwitch('architect', c => c.architect); }
 
-// THE HOST SEAT — the client a human PLAYS, and the only file in a take that carries a microphone.
-// Read here, once, exactly as the eye is and for the same reason: both conductors and `fleet_control
-// run` run this overlay in their own process, so one parse serves every caller and the same value is
-// handed to BOTH raisers. That last part is the whole hazard. The launcher builds the window and
-// the recorder binds the capture and routes the voice into its file; if only one of them hears the
-// switch, nothing throws — an unbound window records nothing, and a capture bound to a client that
-// never launched reports a clean start over a black file, with the presenter's commentary nowhere.
+// THE HOST SEAT — the client a human PLAYS, the only file in a take that carries a microphone.
 function hostSeat() { return seatSwitch('host', c => c.host); }
 
-// One reader for both, because they are the same question asked of two seats: a flag on this call
-// wins, `=off` forces it off over a config that says true, and absent means camera_configure decides
-// (Law 16 — one declaration, and the flag is an input authored while the machine is stopped).
+// One reader for both seats: a flag wins, `=off` forces it off, absent defers to camera_configure (Law 16).
 function seatSwitch(name, pick) {
   const hit = process.argv.slice(2).find(a => a === `--${name}` || a.startsWith(`--${name}=`));
   if (hit === undefined) {
@@ -210,16 +135,15 @@ function writeSession(session) {
     fs.writeFileSync(SESSION_FILE, JSON.stringify(session, null, 2));
     return true;
   } catch (e) {
-    // Not fatal to the filming, and saying so matters: the crew is up either way, but the stop command
-    // has nothing to read, so the operator must know he is closing it by hand (Law 25).
+    // Not fatal: the crew is up either way, but `stop` has nothing to read without this file (Law 25).
     console.error(`${stamp()} ⚠ could not record the overlay session (${e.message}) — ` +
       `\`record_overlay.js stop\` will not find this run. Close it with --force.`);
     return false;
   }
 }
 
-// heartbeat: the conductor saying "I am still here and still the reaper". It is the ONLY thing that
-// makes `stop` request rather than reap, so it is deliberately cheap enough to call every slice.
+// Marks the conductor as still live. While this timestamp is current, `stop` only requests a close
+// through the session file; once it goes stale, `stop` reaps directly.
 function heartbeat() {
   const s = readSession();
   if (!s) return;
@@ -233,23 +157,17 @@ function conductorIsLive(session) {
 }
 
 // ── The stop request ─────────────────────────────────────────────────────────────────────────────
-// A REQUEST, read by the conductor between soak slices. It carries its reason so the run's own summary
-// can say why it ended rather than reporting a soak that merely finished early.
+// A request, read by the conductor between soak slices; carries its reason for the run's own summary.
 function stopRequested() {
   const s = readJson(STOP_FILE);
   return s ? { at: s.at, why: s.why || 'the operator asked for it' } : null;
 }
 
 // ── The machine-load sampler ─────────────────────────────────────────────────────────────────────
-// A filmed run is the run that puts the most load on the box — N game clients rendering beside the server,
-// the bots and a recorder — so it is the run whose machine cost is worth a record, and the overlay is the
-// one place that knows a filmed run is happening. Raised and reaped here for that reason alone; it observes
-// the machine and joins no pathway of the work (Law 22 scope — the instrument operates ON the run, not IN
-// it), so nothing downstream can behave differently because it is running.
-//
-// DETACHED and given no pipes, deliberately: it outlives the spawnSync-driven steps that follow it in the
-// raise, and a pipe nobody drains would block it the moment its output filled the buffer. Its record is on
-// disk; this process has no reason to read its console.
+// A filmed run is the heaviest load this box carries; raised and reaped here, the one place that
+// knows a filmed run is happening. Observes the machine only (Law 22 scope). DETACHED with no pipes:
+// it outlives the spawnSync steps around it, and an undrained pipe would block it once its output
+// filled the buffer.
 function raiseSampler(label) {
   const safeLabel = String(label || 'run').replace(/[^A-Za-z0-9_-]+/g, '_');
   try {
@@ -262,8 +180,7 @@ ${stamp()} OVERLAY → machine-load sampler up (label '${safeLabel}') — ` +
       `read it after the run with: node Auren_Bot/monitoring/trace_monitor.js --machine-load`);
     return true;
   } catch (e) {
-    // NOT fatal to the filming and said out loud: the run is still worth having without its load record,
-    // but a missing record must never be discovered later as a silent gap (Law 25).
+    // Not fatal: the run is still worth having without its load record, and the gap is reported (Law 25).
     console.error(`${stamp()} ⚠ the machine-load sampler did not start (${e.message}) — ` +
       `this run will have no machine-load record.`);
     return false;
@@ -276,20 +193,14 @@ function stopSampler() {
   return r.status === 0;
 }
 
-// Block this process without spinning a core. `raise` is synchronous top to bottom — every step is a
-// spawnSync — so the wait below is a plain blocking pause rather than a promise; Atomics.wait on a
-// throwaway buffer is the only sleep that actually yields the thread in synchronous code.
+// Blocking sleep for synchronous code — `raise` runs top to bottom as spawnSync steps, so there is no
+// promise to await; Atomics.wait on a throwaway buffer yields the thread instead.
 function pauseSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
-// Wait for camera_rig to publish that every client it expects is standing in the world.
-//
-// TIMING OUT IS A FAILURE, NOT A SHRUG (Law 25): the honest report is that the crew never arrived, so the
-// raise fails and the conductor tears the run down instead of filming an empty set. The tempting wrong
-// turn is to continue after the ceiling "since the clients are probably up by now" — that turns the gate
-// into a delay, which is exactly the state this replaced.
-// How many game clients this script's launcher has standing right now. SENSED, and matched by the same
-// command-line discriminator every teardown in this system uses — Prism writes the instance path into
-// the java command line with FORWARD slashes even on Windows, so no separator may be assumed.
+// Waits for camera_rig to publish that every expected client is standing in the world; timing out is
+// a failure (Law 25), not a shrug.
+// Count of live camera-client processes, matched by command line — Prism writes the instance path
+// with forward slashes even on Windows.
 function liveClients() {
   const r = spawnSync('powershell', ['-NoProfile', '-Command',
     "@(Get-CimInstance Win32_Process -Filter \"Name LIKE 'java%'\" -ErrorAction SilentlyContinue | " +
@@ -297,21 +208,9 @@ function liveClients() {
   return parseInt(String(r.stdout || '0').trim(), 10) || 0;
 }
 
-// A BRAND-NEW PRISM INSTANCE LOSES ITS FIRST LAUNCH TO ITS OWN DOWNLOAD, and that is measured rather
-// than supposed (2026-09-06, the first live let's play bring-up). The instance is created in the same
-// pass that launches it, so Prism is still resolving components while the game starts: its log reached
-// `Setting user: KaptainKrispyjr` and stopped there, one line before `Backend library: LWJGL`, with no
-// crash report and no clean exit — `org.lwjgl3` was being fetched during that very launch. The
-// identical command run afterwards worked first time and joined in seven seconds, because by then
-// everything was cached. So the raise sat out the full 240s ceiling waiting for a process that had
-// been dead for three minutes, and reported a crew that never arrived.
-//
-// ONE RELAUNCH, ON A SENSED FACT, NOT A TIMER AND NOT A RETRY LOOP. The trigger is that the launcher
-// returned and NO client process is alive — a fact about the world, not an inference from slowness
-// (Invariant B). It fires at most once and says so; a client that is merely slow keeps its full
-// ceiling, because a live process is never relaunched. That is what keeps this from being the
-// catch-and-retry Law 13 forbids: there is no uncertainty being papered over, there is a dead process
-// being observed, and the second attempt is convergent (`-Add` relaunches only what is missing).
+// Grace period before a client with no live process is read as dead — long enough that a brand-new Prism
+// instance losing its first launch to its own component download is not mistaken for merely slow.
+// Triggers one relaunch, on the sensed fact (Invariant B); a live-but-slow client keeps its full ceiling.
 const CLIENT_DEATH_GRACE_MS = 30000;
 
 function waitForCrew(expected, relaunch) {
@@ -334,9 +233,8 @@ function waitForCrew(expected, relaunch) {
       relaunch();
     }
     if (Date.now() >= deadline) {
-      // The ceiling says only that the crew never arrived. WHICH failure it was — clients that died,
-      // or clients still alive and stuck loading — is a different repair each way, and it is a fact
-      // that can be sensed right here rather than left for the reader to go and find (Law 25).
+      // Distinguishes which failure it was — died vs. stuck loading — since each has a different
+      // repair (Law 25).
       const alive = liveClients();
       const why = `only some of the ${expected} camera client(s) ever joined the world ` +
         `(${Math.round(CREW_READY_TIMEOUT_MS / 1000)}s ceiling) — camera_rig never published a ready crew · ` +
@@ -353,40 +251,30 @@ function waitForCrew(expected, relaunch) {
 }
 
 // ── Raise ────────────────────────────────────────────────────────────────────────────────────────
-// Every step gated on the last: a camera crew that did not come up must never reach `up`, because a recorder
-// that binds nothing records black and reports a clean start (Law 13 — default stopped).
-// `host` is the RUN's answer when the caller has one, and undefined when it does not — the conductors
-// have no `host` field to read and pass nothing, so the flag-then-config order below still decides for
-// them. An explicit boolean from a run profile outranks both, because a run that declares itself a
-// let's play has already answered the question and a config default reaching past it would be a second
-// answer (Law 16). Resolution order, stated once: the run's field, then a --host flag on this process,
-// then camera_configure.
-function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
+// Every step gated on the last (Law 13). `host` resolution order: the run's own field, then a --host
+// flag on this process, then camera_configure (Law 16 — one declaration).
+function raise({ overlay, count, fill, test, conductorPid, host: hostOpt }) {
+  // `fill` is whether a bot that stands up later is given a camera. A crew hired in chat needs it, since
+  // how many bots there will be is not knowable at raise time; a run that asks for a fixed number of bot
+  // seats has already stated the whole answer, so filling would overrule the run's own sentence. Absent
+  // means on, which is the crew-in-chat reading every existing caller relies on.
+  const fillLater = fill === undefined ? true : !!fill;
   const decl = OVERLAYS[overlay];
   if (!decl) return { ok: false, why: `'${overlay}' is not a declared overlay` };
 
-  // A RUN THAT WRITES FILES NEEDS SOMETHING TO WRITE THEM, and that is known before a single window opens.
-  // Refused here, first, so a copy without a recorder never raises a crew it would then have to reap
-  // (Law 13 — default stopped). The refusal names what this copy CAN do, which is the same run watched.
+  // A run that writes files needs a recorder, checked before any window opens (Law 13 — default stopped).
   const rec = decl.records ? recorder() : null;
   if (decl.records && !rec) {
     return {
       ok: false,
       why: `'${overlay}' writes every camera to a file, and this copy has no recorder — the camera crew ` +
-        `ships for watching. Set record: 'cameras' in run_config.js to watch the same run through the same ` +
+        `ships for watching. Set record: 'cameras' in foreman_config.js to watch the same run through the same ` +
         `windows; each is titled Cam_<Bot>, so your own screen recorder can capture any of them.`,
     };
   }
 
-  // ── THE CAMERAS ARE HARDWIRED TO THIS BOX, SO THE FLEET HAD BETTER BE TOO ─────────────────────
-  // Every camera client is launched `--server 127.0.0.1:25565`; the FLEET goes wherever
-  // AUREN_SERVER_HOST points, and `launch()` hands children the whole environment. A shell that was
-  // aimed at the public proxy earlier therefore produces a filmed run in which the crew is in one
-  // world and every lens is in another — and nothing throws. The windows open, the director's RCON
-  // answers (it reads the local server.properties), and the take is N spectators standing alone in an
-  // empty world. Refused rather than forced, unlike `fleet_control local`: that verb's own NAME
-  // settles which machine it means, and this one does not — filming is orthogonal to which world a run
-  // is on, so the overlay has no standing to redirect the fleet (Law 25: escalate, don't reinterpret).
+  // Every camera client joins 127.0.0.1; refused when the fleet is aimed elsewhere — filming has no
+  // standing to pick the fleet's target (Law 25).
   const aimedAt = process.env.AUREN_SERVER_HOST;
   if (aimedAt && aimedAt !== 'localhost' && aimedAt !== '127.0.0.1') {
     return {
@@ -397,30 +285,20 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
     };
   }
 
-  // Clear a stop request left behind by an earlier run BEFORE anything is raised. Without this a stale
-  // sentinel closes the run that is starting, within one slice, and reports it as an operator stop.
+  // Clears a stale stop request before anything is raised, so it cannot close the run that is starting.
   try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch (e) { /* nothing to release */ }
 
-  // The sampler goes up FIRST, before the cameras, and that ordering is the measurement rather than a
-  // preference: launching N game clients is when chunks stream in, and chunk streaming is the load being
-  // hunted. A sampler started after the windows exist has already missed the worst minute of the run.
+  // The sampler goes up first, before the cameras, so it is running before chunk-streaming load peaks.
   raiseSampler(test || overlay);
 
-  // Clear the previous run's readiness BEFORE launching, for the same reason the stop sentinel is cleared
-  // above: a file left by the last run would answer the wait instantly and the crew would be declared
-  // present on the strength of a record about clients that are gone (Invariant B — re-sense, never trust
-  // what was remembered).
+  // Clears the previous run's readiness, so the wait cannot be answered by a stale record (Invariant B).
   try { if (fs.existsSync(CREW_READY_FILE)) fs.unlinkSync(CREW_READY_FILE); } catch (e) { /* nothing to clear */ }
 
   const eye = architectEye();
   const host = typeof hostOpt === 'boolean' ? hostOpt : hostSeat();
 
-  // ── THE CAMERA SET IS NAMED WHENEVER IT IS KNOWN, AND COUNTED ONLY WHEN IT IS NOT ──────────────
-  // `-Count 0` means "the whole roster" to the launcher, which is the right reading of an unstated
-  // count and the wrong reading of a run that genuinely has NO bots yet. A contractor run is exactly
-  // that: the world comes up empty and the crew is hired in chat later, so the honest instruction is
-  // an explicitly empty NAMED set, not a count of zero. The launcher tells the two apart by whether
-  // the parameter was passed at all.
+  // `-Count 0` means "the whole roster" to the launcher, the wrong reading for a run that starts with
+  // no bots; `named` distinguishes an explicitly empty set from an unstated count.
   const named = count === 0;
   const camArgs = [
     ...(named ? ['-Bots', ''] : ['-Count', String(count)]),
@@ -429,7 +307,7 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
     ...(host ? ['-HostSeat'] : []),
   ];
   const crewWords = [
-    named ? 'no bot cameras yet (they arrive with the crew)' : `${count} bot camera(s)`,
+    named ? (fillLater ? 'no bot cameras yet (they arrive with the crew)' : 'no bot cameras') : `${count} bot camera(s)`,
     ...(eye ? ["the Architect's eye"] : []),
     ...(host ? ['the HOST SEAT'] : []),
   ].join(' + ');
@@ -437,9 +315,8 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
     return { ok: false, why: 'the camera crew did not come up' };
   }
 
-  // Recorded the moment the crew is up, whether or not the recording follows: the clients and the director
-  // are already ours to reap from here, and a session file written only on full success would strand them
-  // if the recorder failed (Law 8 — what is raised is reaped, and the record is how the closer finds it).
+  // Recorded the moment the crew is up: the clients are already ours to reap, and a session written
+  // only on full success would strand them if the recorder failed (Law 8).
   writeSession({
     overlay, test: test || null, count, records: decl.records, architect: eye, host,
     conductor_pid: conductorPid || null,
@@ -447,66 +324,44 @@ function raise({ overlay, count, test, conductorPid, host: hostOpt }) {
     alive_at: conductorPid ? Date.now() : null,
   });
 
-  // THE STEP THAT MAKES "EVERYTHING IS UP" TRUE RATHER THAN LIKELY.
-  //
-  // Launching a game client and having one standing in the world are separated by tens of seconds of
-  // loading, and the launcher owns only the first — it returns when the process starts. Every step after
-  // this one is void without the wait: a capture binds by WINDOW, so binding before the windows finish loading
-  // captures a loading screen and reports a clean start, and the fleet's opening minute is filmed by
-  // cameras that are not there yet. Both failures report success, which is the only kind worth a gate
-  // (Law 13 — prove it is safe to continue).
-  //
-  // The wait is on the RIG'S published fact, not on a probe of our own: the rig arms each client only
-  // after the server answered `data get entity` for it, so it already holds this answer and a second
-  // implementation of the question here would be the redundant route Law 16 forbids.
-  // The bot cameras, plus the Architect's eye only when it was actually launched. Counting a seat that
-  // was never raised turns the gate into a guaranteed timeout, which reads as "the crew never arrived"
-  // on a crew that is standing complete (Law 25 — the criterion has to be the one that was asked for).
-  // The host seat is counted here too. It is not a camera, but it IS a window a recorder must bind, and the
-  // rig confirms it standing on its `--present` list for exactly this gate — the one window carrying
-  // the presenter and his voice must not be the one window nobody proved had finished loading.
-  // The one repair the wait is allowed to make, and it is handed in rather than reached for: the same
-  // launch that just ran, plus `-Add`, which senses what is already standing and launches only what is
-  // missing. Convergent by construction, so a client that came up between the check and this call is
-  // left alone rather than doubled.
+  // Gates on the RIG'S published fact (Law 16), counting only the seats actually launched (Law 25).
+  // The repair, if it stalls, is the same launch plus `-Add`.
   const crew = waitForCrew(count + (eye ? 1 : 0) + (host ? 1 : 0),
     () => runScript('start_cameras.ps1', [...camArgs, '-Add'], 'camera crew — relaunching what died on its first start'));
   if (!crew.ok) return { ok: false, why: crew.why };
 
   if (!decl.records) {
     console.log(`\n${stamp()} OVERLAY   '${overlay}': cameras only — nothing is being recorded, by definition.`);
-    if (!raiseWarden(overlay, count, eye, host)) return { ok: false, why: 'the camera warden did not start' };
+    if (!raiseWarden(overlay, count, eye, host, fillLater)) return { ok: false, why: 'the camera warden did not start' };
     return { ok: true, records: false };
   }
 
-  // The same set the launcher was given, in the same form — an explicitly empty `--bots=` where the
-  // launcher got an explicitly empty `-Bots`, so the two raisers cannot disagree about whether "none"
-  // meant none or meant everything.
+  // Mirrors the launcher's own set exactly, so the two raisers cannot disagree about what "none" meant.
   const setArgs = count === 0 ? ['--bots='] : [`--count=${count}`];
   const seatArgs = [`--architect=${eye ? 'on' : 'off'}`, `--host=${host ? 'on' : 'off'}`];
   const started = rec.raise({ setArgs, seatArgs });
   if (!started.ok) return { ok: false, why: started.why };
 
-  // THE WARDEN GOES UP LAST, AFTER THE RECORDING IS PROVEN. It attaches a camera to every bot that
-  // appears for the rest of the run, and each attach ends by proving the new file is really writing —
-  // a check that can only be made against a live output. Raised before the recording starts, its first
-  // attach would have nothing true to verify.
-  if (!raiseWarden(overlay, count, eye, host)) return { ok: false, why: 'the camera warden did not start' };
+  // The warden goes up last, after the recording is proven: each attach proves the new file is really
+  // writing, which needs a live output to check against.
+  if (!raiseWarden(overlay, count, eye, host, fillLater)) return { ok: false, why: 'the camera warden did not start' };
   return { ok: true, records: true };
 }
 
 // ── The warden ───────────────────────────────────────────────────────────────────────────────────
-// Raised here because filming is this file's business and the fleet's is not: the warden watches the
-// foreman's registry and gives a camera to any bot that appears, which is the missing half of "one
-// camera per bot" on a run whose bots are hired in chat after the take has started. See its own
-// header for why it senses the world rather than hooking the launcher.
-//
-// DETACHED with no pipes, exactly like the machine-load sampler and for the same reason: it outlives
-// every spawnSync step around it, and a pipe nobody drains blocks it the moment its output fills the
-// buffer. Its account goes to this run's terminal through its own window.
-//
-// `seeded` is the crew that already has cameras, so the first pass is not a needless full converge.
-function raiseWarden(overlay, count, eye, host) {
+// Watches the foreman's registry and gives a camera to any bot that appears after the take has started
+// — the missing half of "one camera per bot" on a crew hired in chat. DETACHED with no pipes, like the
+// machine-load sampler, so an undrained pipe cannot block it. `seeded` is the crew that already has
+// cameras, so the first pass is not a needless full converge.
+function raiseWarden(overlay, count, eye, host, fillLater) {
+  // A run that asked for no bot cameras gets no warden: the whole warden is "give the next bot a camera",
+  // and there is nothing for it to do that the run did not already refuse. Said as a success, because the
+  // absence is the run's own answer rather than a step that failed to happen.
+  if (!fillLater) {
+    console.log(`\n${stamp()} OVERLAY   no camera warden — this run asked for no bot cameras, so a bot ` +
+      `standing up is not given one.`);
+    return true;
+  }
   const roster = spawnSync(process.execPath, [paths.workshop('fleet_control.js'), 'roster'],
     { encoding: 'utf8', cwd: REPO_ROOT });
   const all = String(roster.stdout || '').trim().split('\n').pop().trim().split(',').filter(Boolean);
@@ -522,9 +377,8 @@ function raiseWarden(overlay, count, eye, host) {
       `camera${overlay === 'record' ? ' that records' : ''}. Say "foreman get" in game.`);
     return true;
   } catch (e) {
-    // FATAL TO THE RAISE, unlike the sampler, and the difference is what each one costs. A missing
-    // load record leaves a good take; a missing warden leaves a let's play in which the crew the
-    // episode is about is never filmed at all, discovered when the footage is cut (Law 25).
+    // Fatal to the raise, unlike the sampler: a missing warden means the crew the episode is about is
+    // never filmed at all (Law 25).
     console.error(`${stamp()} ✗ the camera warden did not start (${e.message}) — contractors would not ` +
       `be filmed, which is the whole point of this run.`);
     return false;
@@ -532,61 +386,41 @@ function raiseWarden(overlay, count, eye, host) {
 }
 
 // ── Reap ─────────────────────────────────────────────────────────────────────────────────────────
-// The mirror of raise, and it does NOT take the fleet down: the fleet was raised by the conductor and is
-// the conductor's to reap (Law 8 — each owner reaps what it raised, and only that). Ordering: the
-// recording is finalised before anything it is recording can disappear.
-//
-// Every step runs even if an earlier one failed. A stop that abandoned the remaining steps on the first
-// error would leave exactly the zombies this exists to prevent, and the failure is reported instead.
+// The mirror of raise. Does not take the fleet down — the fleet is the conductor's to reap (Law 8).
+// Recording is finalised before anything it is recording can disappear. Every step runs even if an
+// earlier one failed, so a failure never leaves the zombies an early return would.
 function reap(why) {
   const session = readSession();
 
   console.log(`\n${'─'.repeat(96)}\n${stamp()} OVERLAY TEARDOWN — ${why}\n${'─'.repeat(96)}`);
   const failed = [];
 
-  // THE WARDEN GOES FIRST, BEFORE ANYTHING IT COULD REACT TO MOVES. It is a loop that raises camera
-  // clients and restarts the director whenever the registry changes, and a teardown is exactly when the
-  // registry changes fastest — every bot leaving at once. Left running it would answer the fleet coming
-  // down by launching Minecraft instances at it. Reaped by COMMAND LINE rather than by the pid it wrote:
-  // a process killed hard leaves that file behind, and a stale pid reaped by number can only ever be
-  // wrong (Law 23 — sense what is running, never trust a record of it). Unconditional, like the crew
-  // teardown below, because a raise that failed halfway still raised one.
+  // The warden goes first, before the registry it watches moves fastest. Reaped by command line rather
+  // than its pid file: a hard kill leaves the file behind and a stale pid can only be wrong (Law 23).
   if (!stopWarden()) failed.push('camera warden stop');
-  // NO SESSION still reaps the clients. A missing session means the raise did not get far enough to
-  // record one — which is precisely the case where a partial crew may be standing, so returning early
-  // here would strand exactly what a failed raise produces. `-Down` reports finding nothing when there
-  // is nothing, so the cost of asking is a line of output (Law 8: reap what was raised, and a raise that
-  // failed halfway still raised something).
-  // The recording half is skipped without a session, because the recorder is only ever raised AFTER the
-  // session is recorded — asking a machine that was never started to stop is a step that can only report
-  // noise. It runs before any window disappears, so every file is finalised while its source still exists.
+  // A missing session still gets its clients reaped, since a failed raise may have stranded a partial
+  // crew before it wrote one (Law 8). Runs before any window disappears, so every file is finalised
+  // while its source still exists.
   const rec = session && session.records ? recorder() : null;
   if (session && session.records) {
     if (rec) failed.push(...rec.finalise(false));
     else failed.push('finalise the recording (this session recorded, and no recorder is on this machine now)');
   }
-  // Unconditional, like the crew teardown below and for the same reason: the sampler is raised before the
-  // session is recorded, so a raise that failed early leaves one running with nothing on record naming it.
+  // Unconditional: the sampler is raised before the session is written, so a failed early raise can
+  // leave one running with nothing on record naming it.
   if (!stopSampler()) failed.push('machine-load sampler stop');
   if (!runScript('start_cameras.ps1', ['-Down'],
       `camera crew down (clients + director)${session ? '' : ' — no session on record, so this is a partial raise being cleaned up'}`)) {
     failed.push('camera crew down');
   }
 
-  // WRAPPING THE TAKE — the last debt a filmed run owes, and the only one whose deadline is the NEXT run:
-  // every bot's trace is overwritten when the fleet is raised again, and footage nobody can index is
-  // footage nobody can cut. It belongs in the teardown rather than in an operator's memory because the run
-  // raised the lifecycle and is therefore what closes it (Law 8). Only a run that RECORDED has anything to
-  // pair — a `watch` overlay wrote no footage. ORDER: after the files are finalised and after the sampler
-  // has stopped (its record is otherwise still being written while it is copied).
+  // Pairs footage to trace before the next run overwrites every bot's trace (Law 8), after the files
+  // are finalised and the sampler stopped.
   if (rec && !rec.wrapTake()) failed.push('wrap the take');
 
-  // Deleted, never rewritten: the session and the request both die with the run they describe, so a
-  // later `stop` cannot find a session that no longer exists and reap a stack it never raised.
+  // Deleted, never rewritten, so a later `stop` cannot find a session describing a run already gone.
   try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch (e) { /* already gone */ }
   try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch (e) { /* already gone */ }
-  // The crew's readiness describes clients that no longer exist once they are reaped, so it dies here with
-  // the run that produced it rather than surviving to answer the next run's wait.
   try { if (fs.existsSync(CREW_READY_FILE)) fs.unlinkSync(CREW_READY_FILE); } catch (e) { /* already gone */ }
 
   if (failed.length) {
@@ -596,10 +430,8 @@ function reap(why) {
   return { ok: failed.length === 0, reaped: true, failed };
 }
 
-// Matched the way start_cameras.ps1 matches its own director: by what is on the command line, which is
-// the one discriminator that survives a process being killed, restarted or losing its record. Reports
-// what it actually found, never a bare success — a stop that matched nothing must not read the same as
-// one that stopped a running warden (Law 25).
+// Matched by command line, the one discriminator that survives a kill or a lost record. Reports what it
+// actually found, so a no-op cannot read the same as a real stop (Law 25).
 function stopWarden() {
   const ps =
     "$n=0; foreach ($p in @(Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%camera_warden.js%'\" " +
@@ -609,9 +441,7 @@ function stopWarden() {
   const r = spawnSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8' });
   const said = String(r.stdout || '').trim();
   console.log(`${stamp()} OVERLAY   camera warden → ${said || 'could not be asked about'}`);
-  // The pid file is the warden's own and it deletes it on a clean exit; a hard kill leaves it, and a
-  // stale one would have a later reader believe a warden is up. Cleared here because this is what
-  // ended it (Law 8 — the ender closes the lifecycle).
+  // A hard kill leaves the pid file behind; cleared here since this is what ended the warden (Law 8).
   try {
     const pidFile = path.join(KERNEL, 'camera_warden.json');
     if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
@@ -620,20 +450,10 @@ function stopWarden() {
 }
 
 // ── The `stop` command ───────────────────────────────────────────────────────────────────────────
-//
-// THREE EXIT CODES, and the third exists so `fleet_control down` can fold this command into itself
-// without ever putting two reapers on one stack (Architect 2026-09-07: *"instead of 2 commands one to
-// stop the recording and another to bring it down. its all under down"*).
-//
-//   0   done, or there was nothing to do — either is a closed run from the caller's point of view
-//   1   a teardown was attempted and did not report clean
-//   10  STOP REQUESTED ONLY. A live conductor holds this run and will close it, including the fleet.
-//
-// 10 is the one a wrapper must branch on. `down` calls this first, and on 10 it stops dead: the
-// conductor is about to take the same fleet down from its own terminal, and racing it would kill the
-// bots out from under a teardown that is mid-flight — which is precisely the half-wrapped take this
-// whole file exists to prevent. There is no programmatic caller other than `down`; the code is a
-// contract between exactly two files and is named at both ends.
+// Three exit codes, so `fleet_control down` folds this command in without ever putting two reapers on
+// one stack: 0 done or nothing to do, 1 a teardown was attempted and did not report clean, 10 STOP
+// REQUESTED ONLY — a live conductor holds this run and will close it, including the fleet. `down` calls
+// this first and stops dead on 10, since the conductor is about to take the fleet down itself.
 const REQUESTED_NOT_REAPED = 10;
 
 function stopCommand(force, why) {
@@ -648,9 +468,7 @@ function stopCommand(force, why) {
   }
 
   if (conductorIsLive(session)) {
-    // REQUEST, never reap: the conductor is holding this run and is its one reaper. Writing the sentinel
-    // is the whole of this branch's work, and the report says exactly that (Law 25 — a request that
-    // reported itself as a teardown would be a success flag nobody earned).
+    // Requests, never reaps: the conductor holds this run and is its one reaper (Law 25).
     try {
       fs.writeFileSync(STOP_FILE, JSON.stringify({ at: Date.now(), why: why || 'the operator asked for it' }, null, 2));
     } catch (e) {
@@ -679,9 +497,8 @@ function stopCommand(force, why) {
     const rec = recorder();
     console.log(`\nrecord_overlay: --force with no session on record — reaping the film crew blind. ` +
       `This stops ${rec ? 'any recording and ' : ''}any camera client it finds and reports what it actually found.`);
-    // With no session there is nothing to read, so every half this machine has is attempted and each
-    // reports for itself. The recording is asked to stop first for the same ordering reason the recorded
-    // path uses — and the warden before either, so nothing is launching cameras into a teardown.
+    // With no session to read, every half this machine has is attempted, warden first so nothing
+    // launches cameras into the teardown, and each reports for itself.
     stopWarden();
     if (rec) rec.finalise(true);
     const ok = runScript('start_cameras.ps1', ['-Down'], 'camera crew down (blind)');
@@ -703,13 +520,10 @@ function usage() {
   console.log(`\nrecord_overlay — the filming overlay: raised by a run that asks for it, one command to close it.\n`);
   console.log(`  THE OVERLAYS:`);
   for (const [k, v] of Object.entries(OVERLAYS)) console.log(`    ${k.padEnd(8)} ${v.blurb}`);
-  console.log(`\n  START one (the overlay is never invoked directly — a run asks for it):`);
-  console.log(`  A RUN RAISES THIS OVERLAY BY BEING CONFIGURED TO. Set it on the one page and run it:`);
-  console.log(`    Auren_Workshop/run_config.js   record: 'cameras'   cameras only, nothing written`);
-  console.log(`    Auren_Workshop/run_config.js   record: 'film'      cameras and a recorder writing files (a machine with a recorder)`);
-  console.log(`    then:  node Auren_Workshop/run.js`);
-  console.log(`       …which run is filmed is a FIELD now, not a word typed after the name. Set film on any`);
-  console.log(`       run in Auren_Bot/Thinking_fragments/architect_fleetrunbook_config.js.`);
+  console.log(`\n  START one — a run raises it by being configured to (the foreman does, 2026-09-18):`);
+  console.log(`    Auren_Bot/foreman_config.js    record: 'cameras'   cameras only, nothing written`);
+  console.log(`    Auren_Bot/foreman_config.js    record: 'film'      cameras and a recorder writing files (a machine with a recorder)`);
+  console.log(`    then:  node start_auren.js     (the foreman runs: record_overlay.js raise --overlay=watch|record --count=N)`);
   console.log(`    node Auren_Workshop/tools/lanista_conductor.js ladder record    (the combat bench still takes the word)`);
   console.log(`\n  CLOSE one, whichever conductor raised it:`);
   console.log(`    node Auren_Workshop/tools/record_overlay.js stop`);
@@ -726,14 +540,9 @@ function statusCommand() {
   console.log(`  run       : ${session.test || 'unnamed'}`);
   console.log(`  cameras   : ${session.count === 0 ? 'on order — a camera per contractor as it stands up' : `${session.count} bot camera(s)`}` +
     `${session.architect ? " + the Architect's eye" : ''}${session.host ? ' + the HOST SEAT (yours to play, mic on its file)' : ''}`);
-  // SENSED, never read off the declaration — the same discipline the warden line below already uses,
-  // and it is here because the declaration was WRONG in exactly the case a reader most needs this line.
-  // The session is written the moment the camera crew comes up, which is BEFORE the crew-ready gate and
-  // therefore before the recorder is raised at all: a raise that failed at that gate left the recording
-  // flag on disk, and this line reported "YES — writing one file per camera" over a run that recorded
-  // nothing and had said so in its own terminal minutes earlier (Law 25 — a success flag nobody earned).
-  // What is sensed is that the recorder's process EXISTS, which is not the same as bytes reaching a file —
-  // so the line says which of the two it knows, and the assay for the other is printed at the end.
+  // Sensed, not read off the declaration: the session is written before the recorder is raised, so a
+  // raise that failed at the crew-ready gate would leave the flag claiming a recording that never
+  // started (Law 25). What is sensed is that the process exists, not that bytes reach a file.
   const rec = session.records ? recorder() : null;
   if (session.records) {
     const up = rec && rec.isRunning();
@@ -744,8 +553,7 @@ function statusCommand() {
   } else {
     console.log('  recording : no (watch overlay)');
   }
-  // Read from the process table, not from the session: the session says a warden was RAISED, and the
-  // question a reader has during a take is whether one is still running (Law 23).
+  // Read from the process table, not the session, since the question is whether one is still up (Law 23).
   {
     const r = spawnSync('powershell', ['-NoProfile', '-Command',
       "(Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%camera_warden.js%'\" -ErrorAction SilentlyContinue | Measure-Object).Count"],
@@ -754,17 +562,14 @@ function statusCommand() {
     console.log(`  warden    : ${n > 0 ? 'UP — new bots get a camera as they stand up' : 'NOT RUNNING — a contractor hired now would not be filmed'}`);
   }
   console.log(`  raised    : ${Math.round((Date.now() - session.raised_at) / 60000)} min ago`);
-  // States the EVIDENCE, not a verdict about the process: what is known here is when the heartbeat was
-  // last written, and a fresh one is not proof a process is healthy — only that it was, that recently
-  // (Law 23 — report what was sensed). The consequence is what the reader actually needs anyway.
+  // States the evidence: a fresh heartbeat proves the process was healthy that recently (Law 23).
   console.log(`  conductor : ${session.conductor_pid
     ? `pid ${session.conductor_pid}, last heard ${session.alive_at ? Math.round((Date.now() - session.alive_at) / 1000) + 's ago' : 'never'} — ` +
       `${live ? '`stop` will REQUEST and let it close itself' : 'past the stale mark, so `stop` will reap here'}`
     : 'none behind this session — `stop` will reap here'}`);
   const req = stopRequested();
   if (req) console.log(`  stop      : REQUESTED ${Math.round((Date.now() - req.at) / 1000)}s ago (${req.why})`);
-  // What the recorder is really doing is the recorder's to state, and it has its own reader. Pointing at
-  // it beats restating a claim this file cannot verify (Law 23).
+  // The recorder's own state is the recorder's to report (Law 23).
   if (rec) console.log(`\n  Is it really writing bytes?  ${rec.STATUS_COMMAND}\n`);
   return 0;
 }
@@ -774,7 +579,18 @@ if (require.main === module) {
   const cmd = argv.find(a => !a.startsWith('--'));
   const why = (argv.find(a => a.startsWith('--why=')) || '').split('=').slice(1).join('=') || null;
   let code = 1;
-  if (cmd === 'stop') code = stopCommand(argv.includes('--force'), why);
+  // `raise` is the foreman's door in — run as a process since bot code may not require this file.
+  const val = (name) => (argv.find(a => a.startsWith(`--${name}=`)) || '').split('=').slice(1).join('=') || null;
+  if (cmd === 'raise') {
+    const r = raise({
+      overlay: val('overlay'),
+      count: parseInt(val('count') || '2', 10),
+      fill: val('fill') !== 'off',
+      test: 'foreman',
+    });
+    if (!r.ok) console.error(`record_overlay: not raised — ${r.why}`);
+    code = r.ok ? 0 : 1;
+  } else if (cmd === 'stop') code = stopCommand(argv.includes('--force'), why);
   else if (cmd === 'status') code = statusCommand();
   else { usage(); code = cmd ? 1 : 0; }
   process.exit(code);
@@ -784,9 +600,7 @@ module.exports = {
   OVERLAYS, OVERLAY_FLAGS, SLICE_SECONDS, architectEye,
   raise, reap, heartbeat, stopRequested, readSession, conductorIsLive,
   SESSION_FILE, STOP_FILE,
-  // Exported 2026-09-10. The header above says this code "is named at both ends" and it was not: the
-  // other end, `fleet_control.stopAnyRecording()`, referenced a bare `RECORD_OVERLAY_REQUESTED_NOT_REAPED`
-  // that was never declared anywhere, so `down` threw a ReferenceError instead of branching. A number
-  // written twice would have run and been wrong later; this way there is still one source for it.
+  // The stop-request exit code, exported so `fleet_control.stopAnyRecording()` reads the same value
+  // (Law 16).
   REQUESTED_NOT_REAPED,
 };

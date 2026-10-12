@@ -96,6 +96,7 @@ folder a new file goes in, and it no longer decides who is allowed to see it.
 
 | file | reads | reports |
 |---|---|---|
+| `run_outcome_lens.js` | the foreman's `run_outcome.json` | the recorded verdict, failed checks and run timestamps through `--outcome`; the shared reader supplies bounds for `--machine-load --run-only` |
 | `trace_monitor.js` | `fleet_logs/traces/watcher_*.jsonl` | **the triage CLI** — signatures, digest, wake policy, watch, query, story, progress. Owns the flags; reads the trace once and hands the run down to the lenses below |
 | `trace_read.js` | — | **the substrate.** Parse a line, read a trace, split it into runs, group lines into job episodes. Judges nothing. |
 | `combat_lens.js` | `fleet_logs/traces/watcher_*.jsonl` | **the fight's beats off the bot's own trace** — who is armed, who is engaged, which battles closed and whether the bot ever connected. Has no CLI door of its own: it exists for MACHINE callers (`watchState()` for `lanista`, `completedBattlesSince()`, `crewEvents()` for `combat_witness_lens`) and for the cutting room's fight spans. It was 1,998 lines reading a separate combat journal until 2026-08-22 |
@@ -105,6 +106,11 @@ folder a new file goes in, and it no longer decides who is allowed to see it.
 | `farm_lens.js` | a run's lines | the wheat field as one structure — `--farm`, and the farm block `--milestones` ends with. Its own file because the farm is sixteen row sites making one structure, tended as well as built, measured off lines no building writes (farming_integrity's census, farm_executor's per-row tend line, seed trips) |
 | `job_timeline_lens.js` | a run's lines | **the run as a sequence of jobs** — every claim in order with its duration, the gaps between them, and where the run's time went by job type (`--jobs`). Added nothing to the watcher: both ends of a job were already summary lines, so it extended `buildEpisodes` and did the arithmetic. Exports `reduceJobTimeline()` for machine callers beside the rendered `runJobTimeline()` |
 | `locomotion_lenses.js` | a run's lines | what walking cost — `--pathfinding`, `--route-cost`, `--jumps` |
+| `walking_lens.js` | a run's lines | commuting against working, by job and by destination — `--walking` |
+| `tree_search_lens.js` | a run's lines | every tree search — the ring a tree was taken in, what reading the world cost, how the search ended — `--trees`. Reads `tree_feller`'s `tree_search` ledger line, one per search |
+| `planning_gate_lens.js` | a run's lines | the planning gate — every entry the foreman issued and the exit that closed it, time inside, the line, and whether two entries were ever open at once — `--gate`. Reads the foreman brain's `ENTRY #n` / `EXIT #n` lines |
+| `step_failure_lens.js` | a run's lines | every step a body planned and did not complete — what stopped it, on which move, at which cell, and what stood around that cell — `--steps`. Reads the navigator's `step_fail` ledger line, one per failed step, written before any recovery moves the body |
+| `server_lag_lens.js` | the server's console, Java's flight record, a run's lines | every time the server fell behind and what its main thread was waiting on while it did — `--lag`. Decodes `fleet_logs/server.jfr` with the JDK's own `jfr print`, found beside the Java the fleet runs on |
 | `hunger_lens.js` | a run's lines | **what the run cost in FOOD** — `--hunger`. Prices the run in Minecraft exhaustion (blocks broken, jumps pressed, metres swum, damage taken, health regenerated) and converts the rate into loaves of bread and wheat plots. Its own file because the unit is neither time nor distance: hunger is charged per ACT, walking is free, and one jump costs ten block-breaks — so no clock any other lens keeps can be converted into a food bill. It counts only the acts nothing else counts, and reuses `motion_classifier` for moving-vs-doing, `job_timeline_lens` for the job clock and `engagement_lens` for strikes. Exports `reduceHunger()` beside the rendered `runHunger()` |
 | `narration_lens.js` | a run's lines | **what one unit SAID, in order** (`--narration --bot=<unit>`; no `--bot` lists who posted). The only lens here that is not a fold — every other one measures something and discards the rest, so a unit whose output is prose rather than events (a director narrating its cuts, a preflight narrating what it verified) could be *counted* by the merged view and *shown* by nothing. **It states its window instead of applying it silently:** the trace segments on the foreman's `start` broadcast, so anything that comes up before the fleet thinks has its whole bring-up in an earlier segment — the render reports how many lines fall outside and `--full` includes them (Law 25 — a subset presented as the whole is a false verdict with a clean exit) |
 
@@ -202,7 +208,7 @@ value)`, `out.section(field)`, `out.table(fields, rows)`, `out.list(field, value
 **Exempt, named here and nowhere else:** `data_out.js` and `report_formatting.js` are the formatting layer
 and own every space, which is exactly why no other file needs one. `throw` text and `console.error` are a
 crash and an IO failure, not an answer about a run. **Comments are exempt by construction** and that is the
-intent — a comment's audience is the next developer, who is owed the whole why (Law 14).
+intent — a comment's audience is the next developer, who is owed the code's purpose (Law 14).
 
 ### Why the first attempt was the wrong shape, kept because the mistake is instructive
 
@@ -277,8 +283,7 @@ obtain two functions about combat journals. *(Both that module and those journal
 
 `trace_monitor.js` was **3,185 lines carrying seventeen verbs**. The audit that preceded this split found
 the comments were *not* the problem — 29% density, zero duplicates, zero TODOs, zero status-rotted lines —
-so nothing was compacted (Law 14: *"size is a review prompt, never a cut mandate; a long file of
-all-necessary WHY may stay long"*). The size was the lens count.
+so nothing was compacted. The size was the lens count.
 
 Three cuts, ranked by what they bought:
 

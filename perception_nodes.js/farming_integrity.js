@@ -1,31 +1,7 @@
-// perception node: farming_integrity
-// purpose: The farm's answer to building_integrity / mining_integrity — ONE node that reads the
-//          whole farm situation and hands back a single verdict the job_board gates dispatch on,
-//          the same way mining and building integrity gate their own boards. It composes,
-//          it does not re-implement (Law 16):
-//            - STRUCTURE (damage & repair) → blueprint_survey.survey on the farm blueprint.
-//              The blueprint declares its water/crop cells external, so the survey skips them and the
-//              steps describe pure structure — a broken plot resurfaces as an incomplete structure
-//              exactly like a creeper hole in the headframe.
-//            - FIELD (till/plant/harvest census) → farmland_site.getFarmState.
-//            - MATERIALS (seeds + structure blocks + hoe) measured across the accessible pool (pocket +
-//              every registered chest — the pool land_prep pulls from).
-//          From those it derives the current PHASE and whether the materials that phase needs are
-//          on hand, so job_board stays thin: read the verdict, post the phase's job when ready.
-//
-// WHY a farm-specific integrity node and not more logic bolted onto job_board: farming is a
-//   self-contained triad (farm_manager → land_prep → farm_executor). Its "can we start yet?"
-//   question spans several material sources (structure blocks, seeds, a hoe) across two pools, and its
-//   completion is repair-aware (a damaged plot must be rebuilt). That is exactly the shape of an
-//   integrity node, and keeping it beside its siblings means the board treats every kind of work
-//   the same way. The numbers are blueprint-DERIVED, not configured: the seed count IS the crop-voxel
-//   count and the material bill IS the remaining place-steps decomposed to raw — no second source to
-//   drift (Law 16). The one tunable that lives elsewhere (the seed row floor) is a different concept
-//   (fleet stock to keep) and deliberately not reused here.
-//
-// Pure observation (Law 1 perception exception — action fragments may call this directly). Guards
-// on `located` before touching the structure/field sensors so it never throws pre-lock: a farming
-// job dispatched before set_buildspot is job_board's gate to prevent, not this node's to crash on.
+// perception node: farming_integrity — reads the whole farm situation and hands back the verdict
+// job_board dispatches on (Law 16). Composes STRUCTURE (blueprint_survey.survey), FIELD
+// (farmland_site.getFarmState) and MATERIALS (pocket + registered chests) into a PHASE and readiness.
+// Pure observation (Law 1). Guards on `located` so it never throws pre-lock.
 
 'use strict';
 
@@ -35,84 +11,54 @@ const hq      = require('@kernel/corporate_headquarters');
 const blueprintSurvey = require('@perception/blueprint_survey');
 const { getFarmState } = require('@perception/farmland_site');
 const { blueprintToRawMaterials } = require('@utils/calculators/build_material_calculator');
-const { hasHomeChest, readBuildCenter, getBotInventory } = require('@utils/fragment_utils');
+const { hasHomeChest, readTransposeOrigin, getBotInventory } = require('@utils/fragment_utils');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const inventoryLens = require('@kernel/inventory_lens');
 
 const TAG = 'farming_integrity';
 
 // ── CONFIG: the wheat-farm instances this subsystem owns ───────────────────────────────────────
-// ONE plot DESIGN, ONE geometry (FARM_BLUEPRINT), N sited instances each under a distinct conference-room key
-// (FARM_ROOM_KEYS, from architect_config — the single source, Invariant D). scan(bot, roomKey) returns ONE
-// instance's verdict; job_board loops FARM_ROOM_KEYS and posts one job per instance — per-instance keys
-// over duplicate-named blueprints, reusing the mining-cell instance pattern (Law 16). Grow the farm count
-// by editing FARM_ROOM_KEYS in config, never here. The blueprint-derived needs below (SEED_NEED/HOE_LOGS)
-// are per-DESIGN, so they are identical across instances — computed once.
-const { FARM_BLUEPRINT_NAME: FARM_BLUEPRINT, FARM_ROOM_KEYS, FARM_DIRT_MIN_GATHER } = require('@thinking/architect_config');
+// ONE plot DESIGN (FARM_BLUEPRINT), N sited instances keyed by FARM_ROOM_KEYS (architect_config,
+// Invariant D). scan(bot, roomKey) returns one instance's verdict; job_board loops the keys (Law 16).
+const { FARM_BLUEPRINT_NAME: FARM_BLUEPRINT, FARM_ROW_DESIGN, FARM_ROOM_KEYS } = require('@thinking/architect_config');
+
+// Smallest dirt order worth a trip — a FLOOR, never a cap: a gap larger than this is ordered in full.
+const FARM_DIRT_MIN_GATHER = 15;
+if (!Number.isInteger(FARM_DIRT_MIN_GATHER) || FARM_DIRT_MIN_GATHER < 1) {
+    throw new Error(`CODING VIOLATION (Law 13): FARM_DIRT_MIN_GATHER must be a positive whole number of blocks, got ${FARM_DIRT_MIN_GATHER}.`);
+}
 
 let _lastScan = null;
 
-// THE SOIL A ROW IS BUILT FROM COMES OUT OF THE POCKET (Architect 2026-09-15). A tine row is three dirt blocks
-// placed into water, and the bot carries them there — nothing pulls dirt from a chest for the farm. So dirt is
-// not gated against the fleet pool per plot (a chest full of dirt would clear a build the bot cannot lay); it
-// is funded at the cluster from the bot's own pocket, after seeds, and what a seed-funded row is short of
-// becomes the farm's dirt order (assessors/farming).
+// Dirt for a row is funded from the bot's own pocket, not the fleet pool — funded at the cluster level,
+// after seeds; what a seed-funded row is still short of becomes the farm's dirt order (assessors/farming).
 const POCKET_SOIL = 'dirt';
 
 // ── Blueprint-derived needs (the farm is one fixed design → compute once at load) ──
-//   SEED_NEED = one seed per crop cell = the 'growing' voxel count (a full planting).
-//   HOE_LOGS  = raw logs a wooden_hoe costs — the fallback wood when no hoe is on hand.
-// Both track the blueprint automatically: redraw the plot and the seed gate follows.
-//
-// THE STRUCTURE'S OWN MATERIALS ARE NOT COMPUTED HERE, and the difference is the whole reason this block
-// is short. A per-design constant can only price what the WHOLE blueprint costs, which is the right
-// answer exactly once — before anything is built. The plot is repair-aware and sited dynamically, so what
-// it needs is whatever the survey still has outstanding; that is _structureMaterialsRemaining's job, from
-// the live diff. Two axes survive as constants because they are genuinely per-design and survey-invisible:
-// seeds (the crop cells are declared external, so the survey never emits them) and the hoe (a tool, not a
-// voxel). Anything the survey CAN see must be priced from the survey (Law 16 — one answer per question).
-//   DIRT_PER_ROW = the 'dirt' voxels one instance places — a whole row, priced for a row not yet standable.
-//   STRUCT_PER_ROW = the structural voxels one row owns (every voxel that is not air and not a declared external
-//                    type) — the denominator of the farm census's "placed" count, the farm's equivalent of
-//                    building_integrity's structure total.
+//   SEED_NEED = seeds for a full planting. HOE_LOGS = logs a wooden_hoe costs, when none is on hand.
+//   DIRT_PER_ROW = 'dirt' voxels one instance places. STRUCT_PER_ROW = its structural voxel count.
+// getBuilding throws on a missing/malformed blueprint, never pricing the farm at zero (Law 13).
 const { SEED_NEED, HOE_LOGS, DIRT_PER_ROW, STRUCT_PER_ROW } = (() => {
-  // tryGetBuilding answers a missing blueprint with null, which is the only condition the removed guard
-  // named — everything below is arithmetic over our own registry, so a throw there is a malformed
-  // blueprint and must stop the load rather than start the run on a zero seed need (Law 13).
-  const fallback = { SEED_NEED: 0, HOE_LOGS: 2, DIRT_PER_ROW: 0, STRUCT_PER_ROW: 0 };
-  {
-    const b = blueprintRegistry.tryGetBuilding(FARM_BLUEPRINT);
-    if (!b) return fallback;
-    const voxels = blueprintSurvey.collectAllVoxels(b);
-    const external = new Set(b.external_voxel_types || []);
-    const seeds  = voxels.filter(v => v.raw && v.raw[3] === 'growing').length;
-    const dirt   = voxels.filter(v => v.raw && v.raw[3] === POCKET_SOIL).length;
-    const struct = voxels.filter(v => v.raw && v.raw[3] !== 'air' && !external.has(v.raw[3])).length;
-    const hoeLogs = blueprintToRawMaterials({ wooden_hoe: 1 }).logs || 2;
-    return { SEED_NEED: seeds, HOE_LOGS: hoeLogs, DIRT_PER_ROW: dirt, STRUCT_PER_ROW: struct };
+  // FARM_ROW_DESIGN, not FARM_BLUEPRINT — the latter is the room-key prefix and resolves to no blueprint.
+  // Any one of the four direction rows gives these counts; all four carry the same blocks.
+  const b = blueprintRegistry.getBuilding(FARM_ROW_DESIGN, TAG);
+  const voxels = blueprintSurvey.collectAllVoxels(b);
+  const external = new Set(b.external_voxel_types || []);
+  const seeds  = voxels.filter(v => v.raw && v.raw[3] === 'growing').length;
+  const dirt   = voxels.filter(v => v.raw && v.raw[3] === POCKET_SOIL).length;
+  const struct = voxels.filter(v => v.raw && v.raw[3] !== 'air' && !external.has(v.raw[3])).length;
+  // Thrown, not defaulted, for the same reason as the blueprint check above (Law 13).
+  const hoeLogs = blueprintToRawMaterials({ wooden_hoe: 1 }).logs;
+  if (typeof hoeLogs !== 'number' || hoeLogs <= 0) {
+    throw new Error(`[${TAG}] CODING VIOLATION: the recipe walk for wooden_hoe yielded no logs `
+      + `(got ${JSON.stringify(hoeLogs)}). A hoe is made of logs, so this is a malformed recipe book — `
+      + 'fix the recipe rather than assuming a cost here.');
   }
+  return { SEED_NEED: seeds, HOE_LOGS: hoeLogs, DIRT_PER_ROW: dirt, STRUCT_PER_ROW: struct };
 })();
 
-// EVERY remaining structural place step, priced to raw materials — repair-aware, so it is a full plot
-// before the build or one block's worth after a break. Group tokens ('planks') decompose through the
-// recipe walk exactly as concrete ones pass through it, so the cost is species-independent whatever
-// variant the bot ends up placing.
-//
-// A NAMED SUBSET OF THE MATERIALS IS A FALSE GATE, AND IT KILLS RUNS. When the shortfall list holds only
-// the materials it happens to name, while the repairer that fulfils the job requires every block in the
-// remaining diff, the two disagree the moment the blueprint contains anything the list forgot. A plot
-// whose one missing voxel is unlisted passes the gate as "materials ready", is dispatched, and comes back
-// worked=0 material_short every cycle until the judge kills the signal. Two faults in one line: the gate
-// and its fulfiller answer "can this run" from different lists (Law 16), and the verdict the gate emits
-// is false measured against the criteria of the party relying on it (Law 25).
-//
-// THE FIX IS THE SET, NOT THE ITEM. Adding the one missing name closes today's shortfall and leaves every
-// other voxel type free to reopen it the day a blueprint changes — and this blueprint changes, because the
-// plot is sited dynamically against terrain rather than stamped as a fixed enclosure. The gate must price
-// what the SURVEY found, never a list kept beside it.
-//
-// 'growing' is the one exclusion: that is the seed axis, already counted as wheat_seeds by the phase
-// above, and pricing it here would report one shortfall twice under two names.
+// Every remaining structural place step, priced to raw materials, off the live survey diff (Law 16,
+// Law 25). 'growing' is excluded — that is the seed axis, counted separately as wheat_seeds.
 function _structureMaterialsRemaining(structure) {
   const byType = {};
   const steps = Array.isArray(structure?.steps) ? structure.steps : [];
@@ -123,12 +69,10 @@ function _structureMaterialsRemaining(structure) {
   return blueprintToRawMaterials(byType);
 }
 
-// Every material question here is FLEET-WIDE (pocket + chests, land_prep's reach) because the answer
-// funds a TRIP, not a craft — inventory_lens.reachableByFleet is the one door to it. The home gate is
-// likewise a shared primitive (hasHomeChest in fragment_utils): Law 16, one implementation,
-// not a duplicate per node.
+// Every material question here is FLEET-WIDE (pocket + chests) — funds a TRIP, not a craft (Law 16).
 
-// scan(bot) → the farm verdict. Fields job_board reads:
+// scan(bot, roomKey) → one farm instance's verdict. roomKey is the instance's conference-room key
+// (defaults to instance 0). Fields job_board reads:
 //   home                supply source exists
 //   located             set_buildspot locked a center
 //   structure_complete  structure matches (repair-aware; false until located)
@@ -138,34 +82,19 @@ function _structureMaterialsRemaining(structure) {
 //   materials_missing   shortfall of the above after crediting the accessible pool
 //   materials_ready     nothing missing → job_board may dispatch this phase
 //   structure_steps     blueprint_survey structural steps (damage handling / inspectability)
-// Harvest and idle need no materials, so materials_ready is trivially true for harvest (post it)
-// and the phase is idle mid-growth (post nothing). Planting is seed-gated; locate/build gate on
-// seeds + structure blocks + a hoe — the full build+plant pipeline cannot run without them.
-// scan(bot, roomKey) → ONE farm instance's verdict. roomKey is the instance's conference-room key
-// (defaults to instance 0 for single-farm callers); geometry is THIS instance's, READ from its chair by
-// blueprintSurvey.geometryOf rather than named from config — the same string today, but a reading and not an
-// assumption about what was locked (Law 25). FARM_BLUEPRINT below is the DESIGN, used only for the
-// per-design needs (seed count, hoe cost) that any variant would share by construction.
-function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
+async function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   if (!bot || !bot.blockAt) {
     throw new Error('[farming_integrity] CODING VIOLATION: bot must be initialized before scan(). Check caller.');
   }
 
   const home = hasHomeChest();
 
-  const center = readBuildCenter(roomKey);
+  const center = readTransposeOrigin(roomKey);
   const located = !!center;
 
-  // Stand-standability gate. A farm row's stand is a single block the bot must
-  // stand ON to tend the adjacent crop. Dynamic water can flood that block AFTER siting; the bot
-  // then bobs where it should stand, battle_stations yanks it to land, the manager re-dispatches,
-  // and it livelocks until recursive_judge halts it. Re-validate the locked stand EVERY scan
-  // (Invariant B — sited-once is not standable-forever): if neither it nor
-  // any dry lip within reach can service the plot, the plot is STRANDED → non-actionable, so the manager
-  // never dispatches into the loop. A reachable alternate keeps it actionable (farm_executor tends from
-  // that alternate via the same resolveStandableAnchor helper, Law 16). Lazy require — anchored_repair
-  // pulls in locomotion, and this perception node is required early by the job board.
-  // The blueprint says whether a nearby lip may stand in for its stand (wheat_tine_row: no — see its description).
+  // A farm row's stand is re-validated every scan (Invariant B) since dynamic water can flood it after
+  // siting. No standable stand or dry lip within reach → STRANDED, non-actionable. Lazy require:
+  // anchored_repair pulls in locomotion, and this node is required early by the job board.
   let stranded = false;
   if (located) {
     const fallback = blueprintRegistry.getBuilding(blueprintSurvey.geometryOf(roomKey), TAG).stand_fallback !== false;
@@ -175,24 +104,17 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   let structure = null, field = null;
   let structureComplete = false, structureSteps = [];
   if (located) {
-    // The neutral survey returns the raw structural diff (no craft aggregation, no logging) — farming
-    // does its own material gating below, so it wraps the survey directly, never building_integrity.
-    // GEOMETRY IS READ, NOT ASSUMED (2026-09-11). blueprintSurvey.geometryOf returns what set_buildspot
-    // actually stamped into this instance's chair. It matches the config constant today; the constant was
-    // still the wrong way to get it, because surveying a plot against a geometry it was not locked under
-    // projects the dirt voxel somewhere it is not and reports the cell missing forever (Law 16, Law 25).
-    structure = blueprintSurvey.survey(bot, blueprintSurvey.geometryOf(roomKey), roomKey);
+    // Wraps the neutral survey directly (never building_integrity) since farming does its own material
+    // gating below. Geometry is read from this instance's chair, never assumed from config (Law 25).
+    structure = await blueprintSurvey.survey(bot, blueprintSurvey.geometryOf(roomKey), roomKey);
     structureComplete = structure.all_complete === true;
     structureSteps = Array.isArray(structure.steps) ? structure.steps : [];
     field = getFarmState(bot, roomKey);
   }
 
   // ── Phase + the material needs that phase carries ──
-  // `structureRaw` is the BUILD phase's own answer and is priced off the live survey. `locate` prices no
-  // structure at all, and that asymmetry is deliberate: the plot is sited dynamically against a waterbank,
-  // so before a center is locked there is no diff to price and any whole-blueprint estimate would be a
-  // guess at terrain not yet read. Locate gates on the two survey-invisible axes only (seeds, hoe) — what
-  // the structure costs becomes knowable at the moment siting makes it real.
+  // `structureRaw` prices off the live survey. `locate` prices no structure (no center, no diff yet) —
+  // it gates on the two survey-invisible axes only (seeds, hoe).
   let phase, seedsNeeded = 0, structureRaw = {};
   if (!located) {
     phase = 'locate';   seedsNeeded = SEED_NEED;
@@ -201,43 +123,23 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   } else if (!structureComplete) {
     phase = 'build';    seedsNeeded = SEED_NEED; structureRaw = _structureMaterialsRemaining(structure);
   } else if (field.needsPrep) {
-    // Prep before harvest so seeds gate whenever any cell needs planting, even alongside ripe crops
-    // the same pass harvests for free (harvest-any, so both can be true at once).
+    // Prep before harvest — both can be true at once (harvest-any harvests ripe crops for free).
     phase = 'plant';    seedsNeeded = field.untilled + field.emptyTilled;
   } else if (field.harvestReady) {
     phase = 'harvest';  // consumes nothing — never gated
   } else if (field.growing > 0 && inventoryLens.reachableByFleet('bone_meal') > 0) {
-    // ── BONE MEAL MAKES MID-GROWTH ACTIONABLE ─────────────────────────────────────────────────────
-    // The APPLICATION (farm_executor.bonemealReachable) was unreachable in practice: it only ever
-    // ran as a side effect of a visit made for some other reason — and the only two reasons were
-    // `plant` (nothing has grown yet) and `harvest` (stage 7, which BONE_MEAL_MAX_CROP_STAGE correctly
-    // refuses as waste). A field mid-growth fell to `idle`, `actionable` went false, no job posted,
-    // and the bone meal sat unused. Holding the item never created the errand — this phase is that
-    // pull, the same shape as every other phase here: a condition the world satisfies, not a flag
-    // anyone sets.
-    //
-    // THE FLEET READER IS CORRECT HERE, and the pocket reader is the plausible wrong turn: the consumer
-    // does apply from the hand, so gating on the pocket looks like the matching question. It is not,
-    // because this phase funds a TRIP like every other one in this file — land_prep's bone-meal branch
-    // pulls from the storage chest into the pocket before the tend loop runs, so chest stock is exactly
-    // what makes the errand fillable. Narrowing this to the pocket would make land_prep's pull
-    // unreachable: the phase could only fire when the bot already held bone meal, which is the state that
-    // pull exists to create.
+    // Fleet-wide, not pocket-only — this phase funds the TRIP that lets land_prep pull bone meal in.
     phase = 'bonemeal';
   } else {
     phase = 'idle';     // mid-growth with nothing to spend on it — nothing actionable this sweep
   }
 
-  // A hoe is needed to till (build precedes planting, plant tills) — fold in its wood when the
-  // pool holds no hoe of any tier. Harvest/idle need no hoe.
+  // A hoe is needed to till — fold in its wood when the pool holds no hoe of any tier.
   const hoeAvailable = inventoryLens.reachableByFleet('hoe') > 0;
   const needsHoe = phase === 'locate' || phase === 'build' || phase === 'plant';
   const hoeLogs = (needsHoe && !hoeAvailable) ? HOE_LOGS : 0;
 
-  // The structural diff leads, then the two needs that are NOT voxels — the hoe's wood and the seed the
-  // plot will be sown with — are added onto it rather than replacing it. Additive because a tool and a
-  // structural block can price to the same raw token (a wooden hoe and a plank floor are both logs);
-  // assignment would have one silently overwrite the other and under-report the shortfall (Law 25).
+  // Hoe wood and seeds are ADDED onto the structural diff, not assigned — both can price to logs (Law 25).
   const materialsNeeded = { ...structureRaw };
   if (hoeLogs > 0)     materialsNeeded.logs = (materialsNeeded.logs || 0) + hoeLogs;
   if (seedsNeeded > 0) materialsNeeded.wheat_seeds = (materialsNeeded.wheat_seeds || 0) + seedsNeeded;
@@ -257,8 +159,7 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
     located,
     structure_complete: structureComplete,
     structure_steps: structureSteps,
-    // Placed = the row's structural voxels less the ones the survey still has a place step for. Null until
-    // sited: an unsited row has no cells to count, and a zero would read as "sited, nothing placed" (Law 25).
+    // Placed = structural voxels less pending place steps. Null until sited (Law 25).
     structure_placed: located ? Math.max(0, STRUCT_PER_ROW - structureSteps.filter(s => s.action === 'place').length) : null,
     structure_digs_left: located ? structureSteps.filter(s => s.action === 'dig').length : null,
     field,
@@ -274,25 +175,18 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   };
   _lastScan = verdict;
 
-  // Post the verdict for inspectability (Law 6) — its own chair beside THIS instance's build chairs
-  // (keyed by roomKey so two farms never clobber one verdict).
+  // Post the verdict for inspectability (Law 6), keyed by roomKey so two farms never clobber one verdict.
   hq.writeBuildingChair(roomKey, TAG, {
     phase, materials_needed: materialsNeeded, materials_missing: materialsMissing,
     materials_ready: materialsReady, structure_complete: structureComplete,
     generated_at: verdict.generated_at, writer: TAG,
   });
 
-  // scanCluster calls this per-instance across the whole 32-plot field; one summary line PER PLOT would be
-  // 32 lines of noise every plan cycle (Law 5 — one aggregated line per phase of work). Quiet mode keeps
-  // the per-instance chair write above (each plot stays individually inspectable, Law 6) but defers the
-  // human-facing line to the cluster caller's single aggregated summary.
+  // scanCluster calls this per-instance across the whole field; quiet mode skips the human-facing summary
+  // line (32 of them would be noise, Law 5) but keeps the chair write above (Law 6).
   if (opts.quiet) return verdict;
 
-  // Post the verdict EVERY scan (matches building_integrity / mining_integrity). De-duping on a
-  // transition key left whole plan cycles with no farming line — no way to see WHY the farm stalled
-  // from the trace. Law 5: one aggregated line per phase of work, every cycle it runs. Headline =
-  // the phase verdict; detail line (when sited) = the diagnostic datum so a single cycle shows where
-  // the field stands and what gates it.
+  // Posted every scan, not de-duped (Law 5) — headline is the phase verdict, detail is the diagnostic datum.
   const missStr = Object.entries(materialsMissing).map(([k, v]) => `${k}:${v}`).join(', ') || 'none';
   let headline;
   if (!home) {
@@ -311,13 +205,8 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
     const structStr = structureComplete ? 'complete' : `${structureSteps.length} repair step(s)`;
     const fieldStr = field ? `field ${field.growing}/${field.total} growing, prep=${field.needsPrep}, harvest=${field.harvestReady}` : 'field —';
     watcher.summary(TAG, `  struct=${structStr} | ${fieldStr} | hoe=${hoeAvailable} | materials ${materialsReady ? 'ready' : `short ${missStr}`}`);
-    // Name each structural repair CELL (coord + expected block + what's actually there). "1 repair
-    // step" alone couldn't answer the load-bearing question when the farm repairs every harvest cycle:
-    // is it the SAME cell each time — one spot being re-damaged (a bot routing across the plot, a
-    // trampled floor) or a place that never satisfies (a livelock) — or SCATTERED cells (caves)? Only
-    // the coordinate separates those, and the trace monitor can only show what the trace carries, so
-    // the coord has to be emitted HERE, at the source. structureSteps already carries place/type/actual
-    // from blueprint_survey, so this surfaces computed data, invents no logging (Law 5/14).
+    // Names each structural repair cell (coord + expected + actual) — data blueprint_survey already
+    // computed, no new logging invented (Law 5/14).
     if (!structureComplete && structureSteps.length) {
       const detail = structureSteps.slice(0, 6).map(s => {
         const at = `(${s.place.x},${s.place.y},${s.place.z})`;
@@ -331,26 +220,12 @@ function scan(bot, roomKey = FARM_ROOM_KEYS[0], opts = {}) {
   return verdict;
 }
 
-// scanCluster(bot) → the whole wheat field as ONE serviceable cluster. The 32 (FARM_PLOT_COUNT) plots
-// stay SEPARATE instances — terrain-fitted, each its own locked center — but this view aggregates them
-// so the manager can service the whole cluster in ONE committed visit, instead of the fleet claiming 32
-// independent farm jobs and re-travelling per plot. One giant blueprint with an anchor, serviced
-// individually: anchor = the first located plot's center (the approach reference); plots[] = each
-// instance's phase + actionability; the manager loops the actionable ones. Reuses
-// scan(bot, roomKey, {quiet}) per instance (Law 16 — no second census), so every plot's chair stays
-// individually inspectable while the trace shows ONE aggregated cluster line, not 32.
-//
-// materials_ready is GENEROUS by design: true when ANY actionable plot is individually ready. A seed
-// shortage must NOT stall the cluster — the bot works what it can (harvest is free; planting runs until
-// seeds run out) and the unplanted plots stay actionable to re-post next cycle. Strict aggregate gating
-// (all 32 seeds before dispatch) would freeze farming whenever partial planting was possible — the exact
-// opposite of the skip-and-continue the cluster visit is built on.
-// THE ONE EXCEPTION: a plot in phase BUILD is actionable only if its own materials are ready AND the
-// shared seed pool still has a share left to fund it (THE SEED BUDGET, below — the per-plot half alone
-// let one seed clear all 32). Generosity is right for work that can stop halfway and leave the field no
-// worse; laying a plot the fleet cannot seed leaves tilled ground that needs a second visit, which is
-// the two-pass farm this rule prevents.
-function scanCluster(bot) {
+// scanCluster(bot) → the whole wheat field as one serviceable cluster, aggregating the separate sited
+// instances into one visit. anchor = the first located plot's center; plots[] = each instance's phase
+// + actionability. Reuses scan(bot, roomKey, {quiet}) — no second census (Law 16).
+// materials_ready is GENEROUS: true when ANY actionable plot is ready, so a seed shortage does not
+// stall the cluster. Phase BUILD is the exception, gated by the shared seed pool (THE SEED BUDGET below).
+async function scanCluster(bot) {
   if (!bot || !bot.blockAt) {
     throw new Error('[farming_integrity] CODING VIOLATION: bot must be initialized before scanCluster().');
   }
@@ -359,29 +234,15 @@ function scanCluster(bot) {
   const missingAgg = {};
   const buildQueue = [];              // build plots that passed their OWN check — funded against the pool below
   for (const roomKey of FARM_ROOM_KEYS) {
-    const center = readBuildCenter(roomKey);
+    const center = readTransposeOrigin(roomKey);
     if (!center) continue;              // an unfilled instance (the field fell short of the target) — never located, idle
     anyLocated = true;
     if (!anchor) anchor = center;       // cluster anchor = the first located plot (instance 0's stand)
-    // Unguarded: scan() is OUR code, and every mineflayer call beneath it is guarded at its own boundary,
-    // so anything that escapes here is a defect and must travel (Law 13). It was caught-and-`continue`d
-    // before, which is the sharpest form of "a default is not a measurement" in this file — a skipped plot
-    // leaves no gap in the aggregate, so the loop below reads an empty queue as "nothing to farm" instead
-    // of "the scan never ran", and farming goes inert while the fleet reports itself healthy (Law 25).
-    const v = scan(bot, roomKey, { quiet: true });
-    // BUILD IS COUPLED TO PLANTING: a farm plot must not be laid unless it can also be seeded — no
-    // pass that tills ground and a separate pass that plants it. scan() already folds SEED_NEED into
-    // a build-phase plot's materials_needed, so the per-plot verdict was correct — the leak was HERE:
-    // build was actionable unconditionally, and the cluster's generous materials_ready (ANY ready plot
-    // clears the whole visit) let a harvest-ready plot greenlight a trip that then tilled seedless
-    // ground. That is the two-pass farm: one visit lays the plot, a later one plants it. A build plot
-    // now carries its own seeds or it is not actionable at all. plant/harvest keep the generous rule —
-    // planting until the seeds run out and harvesting for free are the skip-and-continue the cluster
-    // visit is built on; it is only the STRUCTURE that must not be laid on credit.
-    // `bonemeal` joins plant/harvest as self-funding: like harvest it lays no new ground and opens no
-    // return visit, and its one material was already proven present by the phase test itself. It is
-    // deliberately NOT added to the seed budget below — bone meal spends no seeds, so a bonemeal plot
-    // can never compete with a plant plot for the thing that is actually scarce.
+    // Unguarded deliberately: scan() is our code and every mineflayer call beneath it is guarded at its
+    // own boundary, so anything that escapes here is a defect that must travel (Law 13, Law 25).
+    const v = await scan(bot, roomKey, { quiet: true });
+    // A build plot must carry its own seeds to be actionable. plant/harvest/bonemeal lay no new
+    // ground, so they stay generously actionable regardless of supply.
     const actionable = v.phase === 'plant' || v.phase === 'harvest' || v.phase === 'bonemeal';
     for (const [k, n] of Object.entries(v.materials_missing || {})) missingAgg[k] = (missingAgg[k] || 0) + n;
     const plot = {
@@ -396,55 +257,22 @@ function scanCluster(bot) {
   }
 
   // ── THE SEED BUDGET: ONE POOL, COUNTED ONCE ────────────────────────────────────────────────────
-  // The coupling rule above closed the leak at the plot and left one open at the cluster. scan()
-  // judges each plot ALONE against the SHARED pool, so with SEED_NEED = 1 a single wheat_seeds in the
-  // chest makes all 32 plots individually ready — and 32 verdicts that are each true produce a
-  // cluster verdict that is false: the pool cannot actually fund all of them at once.
-  //
-  // So the pool is spent here, once, in FARM_ROOM_KEYS order (deterministic, Law 19 — same stock, same
-  // plots funded, every cycle). Planting is paid FIRST: it finishes ground already broken, while a
-  // build plot opens new ground that then needs a return visit — the exact cost the coupling forbids.
-  // Remaining seeds fund build plots one at a time; the rest stay non-actionable and re-post next
-  // cycle when supply arrives.
-  //
-  // This is a BUDGET, not an all-or-nothing gate: strict aggregate gating ("all 32 before dispatch")
-  // freezes the field whenever partial work is possible. Laying as many plots as the fleet can actually
-  // seed keeps that generosity everywhere it was ever right and removes it only where a plot would be
-  // laid on credit.
+  // Spent once here, in FARM_ROOM_KEYS order (deterministic, Law 19): planting first, then remaining
+  // seeds fund build plots one at a time; the rest stay non-actionable to re-post next cycle.
   const plantDemand = plots.reduce((n, p) => n + (p.phase === 'plant' ? p.seeds_needed : 0), 0);
   let seedBudget = inventoryLens.reachableByFleet('wheat_seeds') - plantDemand;
   let unfundedBuilds = 0;
-  // ── THE DIRT BUDGET: the pocket, after the seeds ── A seed-funded row is laid only if the pocket holds its
-  // dirt too. Rows go in key order, which is anchor order, so a short pocket holds back the OUTER rows and
-  // never leaves a gap behind a row it did fund. `dirtGap` is what the held-back seed-funded rows still need:
-  // the farm's dirt order, sized to what the seeds can actually plant (never the whole field).
-  // The ORDER is sized over every row the seeds can plant, not only the rows buildable this instant: a row
-  // further out is stranded until the row behind lays its stand, so counting only today's buildable rows would
-  // fetch one row of dirt per trip. A stranded row the seeds reach is priced at a whole row (DIRT_PER_ROW).
+  // ── THE DIRT BUDGET: the pocket, after the seeds ── A seed-funded row is laid only if the pocket also
+  // holds its dirt; rows go in key order, so a short pocket holds back the outer rows. `dirtGap` sizes
+  // the order over every row the seeds CAN plant, so one trip covers the whole chain.
   const pocketDirt = countInInventory(POCKET_SOIL, getBotInventory());
   let dirtBudget = pocketDirt;
   let dirtShortBuilds = 0;
   const seedsForBuilding = seedBudget;
 
-  // ── ONE ROW AT A TIME, AND IT IS ALWAYS THE LOWEST UNLAID ONE (Architect 2026-09-15) ──────────────
-  // *"it should work like building… it should only be able to do the lowest unbuilt anchor. thats how
-  // building works."* A tine row is laid by a body STANDING ON THE ROW BEHIND IT — one of the voxels this
-  // row places is the next row's stand, like overlapping scales. So the row order is not a preference, it
-  // is the only way any row past the bank can be reached at all, and offering row k+2 while k+1 is unlaid
-  // offers a cell with no floor to work from.
-  //
-  // WHY THE BUDGET ALONE DID NOT ENFORCE THIS, which is the bug this closes. A row is `stranded` only when
-  // `resolveStandableAnchor` finds no standable block AT its own anchor — a LOCAL test. A row whose land
-  // block exists but which sits across open water reads `build`, passes its own materials check, and gets
-  // funded; the body then walks out, finds nothing to stand on, and tries to pillar off a water source.
-  // The 2026-09-15 run: 1,724 warnings on one bot against 18 on the other, every one of them
-  // `pillarStep fail reason=no_solid_support support=water`, repeating for thirteen minutes.
-  // **Standable is not reachable, and only the chain makes it so** — from the row behind, the next anchor is
-  // one block away and cannot fail to be reached.
-  //
-  // The manager re-senses every iteration, so this is not a throttle: lay the lowest row, and the next scan
-  // hands back the one after it. That IS the fast build loop — manager asks, executor lays one row, manager
-  // asks again — and it costs the visit nothing, because the body is already standing on the row it just laid.
+  // ── ONE ROW AT A TIME, AND IT IS ALWAYS THE LOWEST UNLAID ONE ──────────────
+  // A tine row is laid by a body standing ON the row behind it, so only the chain makes a row reachable.
+  // The manager re-senses every iteration: lay the lowest row, the next scan hands back the one after it.
   const lowestUnlaid = plots.find(p => p.phase === 'build' || p.phase === 'stranded') || null;
   const buildable = buildQueue.filter(p => p === lowestUnlaid);
   const chainHeld = buildQueue.length - buildable.length;
@@ -464,18 +292,12 @@ function scanCluster(bot) {
     seedsLeft -= seeds;
     dirtPlanned += p.phase === 'build' ? p.dirt_needed : DIRT_PER_ROW;
   }
-  // THE POCKET IS SPENT FIRST AND IT IS SPENT HERE — `dirtPlanned - pocketDirt` is what the body cannot
-  // already lay from what it carries, so a pocket that covers the plan orders NOTHING. Only once it does not
-  // is the order floored at FARM_DIRT_MIN_GATHER, so the fleet makes one trip worth making instead of
-  // fetching three blocks at a time (architect_config carries the measurement that set the number). The
-  // chest is the next claimant and needs nothing here: supply_manager withdraws against a pocket order
-  // before it digs, so a floored order is served from a stocked chest without a gather at all.
+  // Pocket dirt is spent first: `dirtPlanned - pocketDirt` is the remainder, floored at
+  // FARM_DIRT_MIN_GATHER; a stocked chest can serve it via supply_manager without a gather.
   const dirtGap = dirtPlanned > pocketDirt ? Math.max(FARM_DIRT_MIN_GATHER, dirtPlanned - pocketDirt) : 0;
 
-  // ── THE FARM'S SEED ORDER AND ITS "BUILT" VERDICT (Architect 2026-09-15) ── The field asks for exactly the seeds
-  // it cannot yet sow — every plant cell waiting plus every row not yet laid — less what the fleet already reaches.
-  // Built = sited and no row left to lay; the setup gate reads it (architect_config SETUP_ORDER). Tending a built
-  // field is upkeep, not construction, so replanting never un-builds it — a broken row does, until it is relaid.
+  // ── THE FARM'S SEED ORDER AND ITS "BUILT" VERDICT ── Order = every seed still unsown, less what the
+  // fleet reaches. Built = sited with no row left to lay; job_board's built gate reads it.
   const unbuiltRows = plots.filter(p => p.phase === 'build' || p.phase === 'stranded');
   const seedDemand = plantDemand + unbuiltRows.reduce((n, p) => n + (p.phase === 'build' ? p.seeds_needed : SEED_NEED), 0);
   const seedsReachable = inventoryLens.reachableByFleet('wheat_seeds');
@@ -486,27 +308,25 @@ function scanCluster(bot) {
   const anyActionable = actionablePlots.length > 0;
   const materialsReady = actionablePlots.some(p => p.materials_ready);
 
-  // ONE aggregated cluster line (Law 5) with a phase breakdown — the 32 per-plot summaries are suppressed
-  // (quiet), so the trace shows the cluster's state instead of 32 lines of it.
+  // One aggregated cluster line (Law 5) with a phase breakdown; per-plot summaries stay suppressed (quiet).
   const byPhase = plots.reduce((m, p) => (m[p.phase] = (m[p.phase] || 0) + 1, m), {});
   const phaseStr = Object.entries(byPhase).map(([k, n]) => `${k}:${n}`).join(' ') || 'none';
-  // The seed budget is reported wherever it BIT, because a plot held back by it is otherwise
-  // indistinguishable in the trace from a plot with nothing to do (Law 6) — and those two want
-  // opposite responses: one is waiting on supply, the other on growth.
+  // The seed budget is reported wherever it bit, distinguishable from a plot with nothing to do (Law 6).
   const seedStr = (unfundedBuilds ? ` — ${unfundedBuilds} build plot(s) unseeded, held back` : '')
-    // Said out loud, because a row held by the CHAIN and a row held by SUPPLY look identical from outside
-    // and want opposite responses (Law 6): one is waiting on the row behind it, the other on a delivery.
+    // A row held by the CHAIN and a row held by SUPPLY look identical from outside; named separately (Law 6).
     + (chainHeld ? ` — ${chainHeld} row(s) ready but held behind ${lowestUnlaid ? _rowLabel(lowestUnlaid.roomKey) : 'the unlaid row'} (laid lowest-first, each stood on the one before)` : '')
     + (dirtShortBuilds ? ` — ${dirtShortBuilds} seeded row(s) waiting on pocket dirt` : '')
-    // Says WHICH number produced the order, because with a floor in play the shortfall and the order size
-    // are no longer the same figure, and a reader who saw only "15 ordered" against "3 to plant" would read
-    // it as a bug rather than as one trip instead of five (Law 25).
+    // Names which number produced the order — with a floor in play, shortfall and order size differ (Law 25).
     + (dirtGap ? ` — ${dirtGap} dirt ordered (${dirtPlanned} for the rows the seeds can plant, ${pocketDirt} held`
         + (dirtGap > dirtPlanned - pocketDirt ? `, short ${dirtPlanned - pocketDirt} but floored at the ${FARM_DIRT_MIN_GATHER}-block minimum trip` : '') + ')' : '')
     + (seedGap ? ` — ${seedGap} seeds ordered (${seedDemand} to sow, ${seedsReachable} reachable)` : '')
     + (anyLocated ? (built ? ' — farm BUILT' : ` — farm not built (${unbuiltRows.length} row(s) to lay)`) : '');
   if (!anyLocated) {
-    watcher.summary(TAG, 'cluster: no plots located yet — base-layout lock pending.');
+    // Silent for a species whose ladder has no farm at all. Reads the same table every other site
+    // reads (Law 16), so a species that gains a farm starts reporting with no edit here.
+    const farms = require('@thinking/requested_work').activeBuildingRequirements()
+      .some(req => req.field === FARM_STRUCTURE);
+    if (farms) watcher.summary(TAG, 'cluster: no plots located yet — base-layout lock pending.');
   } else if (!anyActionable) {
     watcher.summary(TAG, `cluster: ${plots.length} plots, none actionable (${phaseStr})${seedStr || ' — nothing to tend'}.`);
   } else {
@@ -532,21 +352,17 @@ function scanCluster(bot) {
     seed_gap: seedGap,
     seeds_reachable: seedsReachable,
     built,
-    // Seeds one visit can sow: every plant cell waiting, plus every row the seeds reach — rows further out only
-    // become buildable DURING the visit (each is stood on the row before it), so prep must pull for them too.
+    // Seeds one visit can sow: every plant cell waiting, plus every row the seeds reach this visit.
     seeds_for_visit: Math.max(0, plantDemand) + (seedsForBuilding - seedsLeft),
   };
 }
 
 // ── THE FARM CENSUS — the farm's building_integrity scan line ───────────────────────────────────────────────
-// The cluster line above answers "what can be dispatched"; nothing answered "how much of the farm stands", so the
-// milestones lens could time the headframe block by block and the farm not at all. These two lines are that
-// reading, taken off the same per-row scan the cluster verdict already ran (no second census, Law 16), every sweep
-// like building_integrity (Law 5), and shaped for monitoring/farm_lens.js to parse:
+// Answers how much of the farm stands, off the same per-row scan the cluster verdict already ran
+// (Law 16), every sweep (Law 5), shaped for monitoring/farm_lens.js to parse:
 //   farm census "wheat_farm" — L/S row(s) laid of N · structure P/T placed, D to dig · crop cells C: G growing, M mature, E tilled unsown, U untilled, B blocked
 //     rows: #0=harvest 3/3 g2 m0 | #1=build 1/3 | …
-// A row counts as LAID when its phase is past build (not build, not stranded) — the same test the built verdict uses.
-// `#k` is the row's index in FARM_ROOM_KEYS ('wheat_tine_row' is #0, 'wheat_tine_row#3' is #3).
+// A row counts as LAID when its phase is past build. `#k` is the row's index in FARM_ROOM_KEYS.
 const { FARM_STRUCTURE } = require('@thinking/architect_config');
 function _rowLabel(roomKey) {
   const i = FARM_ROOM_KEYS.indexOf(roomKey);

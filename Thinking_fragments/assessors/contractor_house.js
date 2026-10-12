@@ -1,30 +1,17 @@
 // assessors/contractor_house — the shelter and kit a contractor builds for itself.
 //
-// WHY THIS IS ITS OWN ASSESSOR AND NOT A ROW IN BUILDING_REQUIREMENTS. That table is walked as ONE
-// ordered list and posts only its FIRST unsatisfied requirement, so it can carry exactly one building's
-// worth of live work for the whole fleet. Both placements of this building inside it are broken, and in
-// opposite directions:
-//   - BELOW the headframe: the headframe's structure step stays unsatisfied for a long time and is
-//     therefore always the first unsatisfied one, so the list never reaches this building at all. The
-//     job posted instead sits in the `blueprint` band, which the contractor's magnet passes over — a
-//     contractor would idle forever beside a house it is never offered.
-//   - ABOVE the headframe: this building becomes the first unsatisfied requirement for EVERY body,
-//     and a reader whose magnet does not attract it takes nothing while the list refuses to advance
-//     past it — the headframe would never post.
-// A single first-unsatisfied cursor cannot express "two buildings, different readers". A second
-// assessor can, because the board assembles every assessor's jobs and the MAGNET decides who may hold
-// each one — which is the design's own answer (one board, filtered at the reader). The farm is the
-// standing precedent: it is a building with its own assessor for the same structural reason.
+// Its own assessor, mirroring the farm: a single first-unsatisfied cursor cannot serve two buildings
+// with different readers. The board assembles every assessor's jobs and the MAGNET decides who may
+// hold each one, filtered at the reader.
 //
 // THIS FILE COMPUTES NOTHING OF ITS OWN. The integrity scan, the pool, the shortfall walk and the
 // supply-job constructor are the same ones the other build path calls (Law 16) — what is written here
 // is only WHICH building is being asked about and WHERE its shortfall is routed.
 //
-// SINGLE-ANCHOR, AND THAT IS WHY THIS STAYS SHORT. The multi-anchor deadline machinery in the other
-// build assessor exists because one blueprint's shell must stand before nightfall while its interior
-// waits on ore. This blueprint declares one anchor, so there is no anchor to choose between and no
-// per-anchor gate to state; the "next blocking anchor" walk below is kept anyway because it is what
-// decides that only OPTIONAL work remains, which is a different question from "is it complete".
+// SINGLE-ANCHOR, AND THAT IS WHY THIS STAYS SHORT. This blueprint declares one anchor, so there is no
+// anchor to choose between and no per-anchor gate to state; the "next blocking anchor" walk below is
+// kept anyway because it decides that only OPTIONAL work remains, a different question from "is it
+// complete".
 
 'use strict';
 
@@ -35,37 +22,40 @@ const { blocksCompletion, remainingRawForBuild } = require('@utils/calculators/b
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const {
     getBotInventory,
-    readBuildCenter,
+    readTransposeOrigin,
     underground_items: UNDERGROUND_ITEMS,
 } = require('@utils/fragment_utils');
 
-// Architect-owned tables, imported never restated (Law 16 — one source).
+// Tunables imported from architect_config, never restated (Law 16 — one source).
 const {
     JOB_TYPE,
     TYPE_STRUCTURE_COMPLETE,
-    OPTIONAL_BUILD_MATERIALS,
 } = require('@thinking/architect_config');
 
 const { TAG, supplyJob } = require('@thinking/assessors/shared');
+const jobExclusions = require('@thinking/job_exclusions');
 
 // The blueprint name IS the conference-room key. A building with one instance has no reason to hold two
 // names, and the pair only diverges where a blueprint is instanced (the farm's `#N` keys).
 const BLUEPRINT = 'contractor_house';
 
-function assess() {
+async function assess({ excluded } = {}) {
+    // job_board's measured exclusion list, the same set assessors/building measures against — see there.
+    const optional = new Set(jobExclusions.names(excluded));
     const jobs = [];
     const bot = global.bot;
     if (!bot || !bot.blockAt) return { jobs };
 
     // SITING IS NOT THIS ASSESSOR'S WORK AND MUST NOT BECOME IT. The base-layout batch locks every
-    // build_center in one pass, and it is the only thing holding the whole layout's non-overlap picture
+    // transpose_origin in one pass, and it is the only thing holding the whole layout's non-overlap picture
     // at once — a locate call from here would see the locked buildings but not the ones that batch is
     // still surveying. Unsited is therefore an ordinary early state, not a fault: ask, and post nothing.
-    // `built` is this structure's verdict for the setup gate (architect_config SETUP_ORDER). Unsited is not built.
-    const center = readBuildCenter(BLUEPRINT);
+    // `built` is this structure's own verdict, read by job_board's built-change announcement and by the
+    // built gate that refuses a job for a finished structure. Unsited is not built.
+    const center = readTransposeOrigin(BLUEPRINT);
     if (!center) return { jobs, built: { [BLUEPRINT]: false } };
 
-    const result = buildingIntegrity.scan(bot, BLUEPRINT, BLUEPRINT);
+    const result = await buildingIntegrity.scan(bot, BLUEPRINT, BLUEPRINT);
     if (result.all_complete === true) return { jobs, built: { [BLUEPRINT]: true } };
 
     // ONE credited pool for the gate and the order alike — the same set preconstruction withdraws from
@@ -75,13 +65,13 @@ function assess() {
 
     // The next anchor owing work that BLOCKS completion. An optional material (a torch) the pool does
     // not hold does not block: the shell stands without it and it is placed once it exists. `unloaded_count`
-    // keeps an unsensed anchor live so the bot goes and looks rather than believing a scan it never took
-    // (Invariant B).
+    // keeps an unsensed anchor live so the bot goes and looks, since a scan it never took cannot be
+    // trusted (Invariant B).
     const anchors = Array.isArray(result.anchor_status) ? result.anchor_status : [];
     const nextAnchor = anchors.find(a =>
         a.dig_count > 0 || a.unloaded_count > 0 ||
         Object.entries(a.materials_needed || {}).some(([k, c]) =>
-            c > 0 && blocksCompletion(k, c, OPTIONAL_BUILD_MATERIALS, isAvailable))
+            c > 0 && blocksCompletion(k, c, optional, isAvailable))
     ) || null;
 
     // Anchors exist and none of them blocks: every remaining voxel is optional, so the buildable work is
@@ -91,7 +81,7 @@ function assess() {
     const materialsNeeded = nextAnchor ? (nextAnchor.materials_needed || {}) : (result.materials_needed || {});
     const remaining = Object.fromEntries(
         Object.entries(materialsNeeded).filter(([k, c]) =>
-            typeof c === 'number' && c > 0 && !OPTIONAL_BUILD_MATERIALS.has(k))
+            typeof c === 'number' && c > 0 && !optional.has(k))
     );
     const shortRaw = Object.keys(remaining).length > 0 ? remainingRawForBuild(remaining, pool) : {};
 
@@ -117,10 +107,19 @@ function assess() {
                 id: `contractor_house_supply_${raw}`, what: raw, need: gap,
                 where: null,
                 structure: BLUEPRINT,
-                job_type: JOB_TYPE.resource_baseline,
+                // THE BAND IS THE HOUSE'S, NOT THE BODY'S: the destination is routing, the ASKER is the
+                // band, and the asker is the house being built (same distinction assessors/building
+                // draws for its own bill).
+                job_type: JOB_TYPE.building_contractor_house_supply,
                 claimed_by: null,
                 hold_goal: countInInventory(raw, inventory) + gap,
                 at_destination: countInInventory(raw, inventory),
+                // Same pocket-destination sum as the other two build bills: what the body holds now plus
+                // what the house still needs. Both terms named so the total stays traceable.
+                parts: [
+                    { who: `bot:pocket_carried_${raw}`, amount: countInInventory(raw, inventory) },
+                    { who: `contractor:${BLUEPRINT}`, amount: gap },
+                ],
                 category: 'resource', scope: 'local',
             }));
             ordered.push(`${raw}:${gap} [→pocket]`);
@@ -131,7 +130,8 @@ function assess() {
             `— order (short): ${ordered.join(', ')}`);
         // buildClaim: material this build has spoken for, so the storage layer above does not count it
         // twice. It is the SHORTFALL and not the requirement — what the build already holds is in the pool.
-        return { jobs, pullNeeded, buildClaim: { ...pullNeeded, ...shortRaw }, built: { [BLUEPRINT]: false }, claim_structure: BLUEPRINT };
+        return { jobs, pullNeeded, pullAsker: { job_type: JOB_TYPE.building_contractor_house_supply, structure: BLUEPRINT },
+            buildClaim: { ...pullNeeded, ...shortRaw }, built: { [BLUEPRINT]: false } };
     }
 
     // ── FULLY STAGED — POST THE BUILD ──────────────────────────────────────────────────────────────

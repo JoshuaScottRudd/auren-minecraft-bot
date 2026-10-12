@@ -42,6 +42,8 @@ fleet_logs/
 
 # Which processes are alive right now, by process id. True for minutes, on one machine.
 fleet_control_runtime.json
+# Which run is up right now (start_auren's lock) — the same kind of fact.
+run_lock.json
 # Which terminals the fleet has open (console_window's ledger) — the same kind of fact, for the same reason.
 console_windows.json
 console_windows.json.*.tmp
@@ -63,6 +65,8 @@ Auren_Workshop/voxel_snapshots/
 # (`building_blueprints.json`, `crafting_blueprints.json`, `monster_tactics.json`) is authored
 # rather than sensed, and stays tracked — the patterns below are narrow so they cannot reach it.
 js_kernel/corporate_headquarters*.json
+# The same memory mid-write: a body that dies between the write and the rename leaves this behind.
+js_kernel/corporate_headquarters*.json.tmp
 js_kernel/find_buildingspot*.json
 
 # ── OTHER PEOPLE'S DATA — the one entry here that is about privacy rather than noise ────────────

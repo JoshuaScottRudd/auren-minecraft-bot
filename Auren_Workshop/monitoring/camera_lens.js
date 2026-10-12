@@ -1,33 +1,21 @@
 // Auren_Workshop/monitoring/camera_lens.js
 // THE CAMERA'S RUN, READ BACK — what it scanned, where it decided to stand, and why it moved.
 //
-// ── THE RULING THAT BUILT THIS (Architect 2026-08-22) ────────────────────────────────────────────────
-//   "i want a watcher log for everything the scout camera does on par with the bot watcher system. i want
-//    to know what it scanned, how it decided where to put the cameras and when, and why it moved them.
-//    everything the scout camera does needs to go on a parallel watcher trace besides the fleet one for
-//    the bots."
+// A bot trace is read to find what went WRONG in a run; a camera trace is read to find why the FOOTAGE
+// looks the way it does — why a shot sat in leaves, why the lens cut four times in ten, why a mining leg
+// was filmed through rock. The fleet's lenses cannot answer that, so this one reads a separate view.
 //
-// Three questions, and they are not the fleet's three. A bot trace is read to find what went WRONG in a
-// run; a camera trace is read to find why the FOOTAGE looks the way it does — why a shot sat in leaves for
-// forty seconds, why the lens jumped four times in ten, why a mining leg was filmed through rock. The
-// existing lenses cannot answer any of that, and stretching one of them to try would give it two verbs.
+// The director re-solves a vantage about once a second for as long as a shot holds, far more lines per
+// hour than the fleet's bots write, so merging the two streams would bury the fleet's own story and skew
+// every downstream fleet lens. `trace_read.readCameraView` merges the camera streams and nothing else;
+// one record, one reader.
 //
-// ── WHY THE CAMERA GETS ITS OWN VIEW AND NOT A FILTER ON THE FLEET'S ────────────────────────────────
-// The director re-solves a vantage about once a second for as long as a shot holds, which puts more lines
-// into an hour than four bots do. Merged, the fleet's own story is buried in camera work and every
-// downstream fleet lens — signatures, wake policy, the digest — measures a run it did not mean to. So
-// `trace_read.readCameraView` merges the camera streams and NOTHING else, and this lens reads that view.
-// Same pairing rule as every other record here: one record, one reader.
+// Reads `fleet_logs/traces/watcher_camera_*.jsonl`, decoded through `custom_api/crew_log.parseAll` — the
+// same module the rig emits through (Law 26, Law 16).
 //
-// ── THE RECORD IT READS AND THE ONE WAY IT MAY READ IT ──────────────────────────────────────────────
-// `fleet_logs/traces/watcher_camera_*.jsonl`, decoded through `custom_api/crew_log.parseAll` — the SAME module
-// the rig emits through. It carries no regexes of its own for those lines: a second copy of the grammar
-// drifts the first time a field is added (Law 26 — one interface, both ends importing it; Law 16).
-//
-// The camera trace carries no run boundary to segment on. The foreman's `start` broadcast is what splits
-// a bot trace into runs, and no camera process hears it — but every start flushes `watcher_*.jsonl`
-// wholesale, so a camera file already holds exactly one session. Inventing a boundary here would be this
-// lens deciding something the record already answers.
+// The camera trace carries no run boundary to segment on: no camera process hears the foreman's `start`
+// broadcast, but every start flushes `watcher_*.jsonl` wholesale, so a camera file already holds exactly
+// one session.
 //
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --camera [--bot=AurenBot] [--all]
 
@@ -35,11 +23,8 @@
 
 const path = require('path');
 
-// THE ALIAS MAP IS ASKED OF THE WORKSHOP'S ONE ANSWER (Law 16). It reads the bot's own package.json
-// and is idempotent, so it is safe whether or not a caller registered first — which is what the block
-// that stood here was hand-rolling with `addAliases` and a comment explaining why
-// `require('module-alias')(base)` could not be used. The reason that form is unsafe has not changed and
-// is now recorded once, in workshop_paths.js, instead of in five lenses.
+// The alias map is asked of the workshop's one answer (Law 16): reads the bot's own package.json and is
+// idempotent, so it is safe whether or not a caller registered first.
 const paths = require('../workshop_paths');
 paths.registerAliases();
 const crewLog = require('@api/crew_log');
@@ -50,15 +35,14 @@ const { stat, oneDecimal, percent, padRight, padLeft, ABSENT } = require('../../
 const KERNEL_DIR = require(paths.bot('js_kernel/utils/record_homes')).TRACE_DIR;
 
 // The rig tags one stream per bot as `cam_<botname>` and speaks for its two clients under `scout` and
-// `gimbal`. Splitting on the prefix rather than on a list is what lets a fifth bot appear in the roster
-// without this file being edited — the discovery rule is the whole reason it can shift with the codebase.
+// `gimbal`. Splitting on the prefix lets a fifth bot appear in the roster without this file being edited.
 const isRigTag = (tag) => tag.startsWith('cam_');
 const botOfTag = (tag) => tag.slice('cam_'.length);
 
 // ── READING ──────────────────────────────────────────────────────────────────────────────────────
-// cameraEvents(lines) → [{ at, tag, verb, fields }]. `at` is the line's absolute ISO in milliseconds;
-// a line the watcher wrote without one is skipped rather than defaulted, because every ordering below
-// is on that clock and a zero would sort a real decision to the head of the run (Law 13).
+// cameraEvents(lines) → [{ at, tag, verb, fields }]. `at` is the line's absolute ISO in milliseconds; a
+// line the watcher wrote without one is skipped, never defaulted — a zero would sort a real decision to
+// the head of the run (Law 13).
 function cameraEvents(lines) {
   const out = [];
   for (const l of lines) {
@@ -133,10 +117,9 @@ function reduceCamera(lines, opts = {}) {
   return { rigs: [...rigs.values()], eyes, span, events: events.length, lines: lines.length };
 }
 
-// A cut's HELD field is the life of the shot it replaced, so the shot lengths of a run are the held
-// values of its cuts — with the last shot missing, because nothing replaced it. Stated rather than
-// silently dropped: a run of four long shots and a run of four long shots plus a two-minute final hold
-// are different footage (Law 25 — a subset presented as the whole is a false verdict with a clean exit).
+// A cut's HELD field is the life of the shot it replaced, so a run's shot lengths are its cuts' held
+// values, missing only the last shot (nothing replaced it) — an omission worth naming, since it changes
+// what the footage measures (Law 25).
 function shotLengths(cuts) {
   return stat(cuts.map(c => num(c.fields, 'held')).filter(v => v != null && v > 0));
 }
@@ -203,10 +186,9 @@ function runCamera(opts = {}) {
 
     // HOW IT DECIDED WHERE. `clear` = a direction passed the air box and the lens box; `forced` = none did
     // and the seeker took the furthest-reaching one anyway; the rest are not placements at all.
-    // SUBJECT VISIBILITY LEADS, ABOVE THE VERDICT, and the ordering is the correction it exists to make: a
-    // verdict says what the SEARCH found, and a reader arrives asking whether you could see the bot. Those
-    // came apart badly once — a frame-purity score was read as shot quality and the report inverted — so
-    // the fact that answers the reader's question is printed first and the verdict beneath it.
+    //
+    // Subject visibility prints above the verdict: a verdict says what the SEARCH found, but a reader
+    // arrives asking whether the bot could be seen — that fact answers the reader's question first.
     const seen = r.sites.filter(s => s.fields.subject === 'yes').length;
     const unseen = r.sites.filter(s => s.fields.subject === 'no').length;
     if (seen + unseen) {
@@ -219,10 +201,9 @@ function runCamera(opts = {}) {
       `  ← where the search LANDED, not how the shot looks`);
     const airbox = r.sites.reduce((s, e) => s + (num(e.fields, 'airbox') || 0), 0);
     const lensbox = r.sites.reduce((s, e) => s + (num(e.fields, 'lensbox') || 0), 0);
-    // THE BOXES ARE THE ONLY QUALITY BAR THE SEEKER HAS LEFT, so their rejection count is the one figure
-    // that says whether it is set right for this terrain. A run where `forced` dominates while the boxes
-    // reject in the thousands is a bar the world cannot meet — which is a tuning fault, not a report that
-    // the shots were bad. Read the two together or neither means anything.
+    // THE BOXES ARE THE QUALITY BAR THE SEEKER HAS LEFT, so their rejection count says whether it is set
+    // right for this terrain. `forced` dominating while boxes reject in the thousands names a tuning
+    // fault, read together, never separately.
     if (airbox + lensbox > 0) {
       console.log(`  boxes:  ${airbox} air-box and ${lensbox} lens-box rejection(s) before a direction was taken` +
         `${forced ? ` — and ${forced} siting(s) took one anyway (nothing cleared)` : ''}`);
@@ -245,8 +226,8 @@ function runCamera(opts = {}) {
         ` (${Math.round(depths.min)}–${Math.round(depths.max)}) — enclosed is decided by depth alone, so this is the whole test.`);
     }
 
-    // WHAT IT SCANNED. Last, because it is the cost rather than the decision — but it is the number that
-    // says whether the seeker is actually running or quietly returning blind shots.
+    // WHAT IT SCANNED — the cost behind the decision above, and the number that says whether the seeker
+    // is actually running or quietly returning blind shots.
     const scanMs = stat(r.scans.map(s => num(s.fields, 'ms')));
     const open = stat(r.scans.map(s => num(s.fields, 'open')));
     const roomy = stat(r.scans.map(s => num(s.fields, 'roomy')));

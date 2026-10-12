@@ -28,46 +28,33 @@
   START A RUN
 ================================================================================
 
-  1. Edit    Auren_Bot\Auren_Workshop\run_config.js
-  2. Run     node Auren_Workshop/host_and_run.js
+  1. Edit    Auren_Bot\foreman_config.js              THE RUN, as one sentence
+  2. Run     node start_auren.js
 
-  That is the whole thing. There are no flags, no profiles and no second script.
-  Everything a run can be told is on that page, read once before anything moves.
-
---------------------------------------------------------------------------------
-  THE TWO COMMANDS, AND WHICH ONE YOU WANT
---------------------------------------------------------------------------------
-  node Auren_Workshop/host_and_run.js     starts the world, runs it, stops the world
-  node Auren_Workshop/run.js              runs it on a world that is ALREADY up
-
-  host_and_run is yours because this machine holds the server folder. It rolls the
-  world back to the snapshot, starts it, then runs run.js UNCHANGED — the same file
-  a stranger runs — and stops the world afterwards.
-
-  Use run.js on its own when the world is already up and you want to leave it up.
+  That is the whole thing. There is no second script. The foreman refuses to
+  start while a terminal from an earlier run is open, starts (or joins) the
+  world, puts it back to its clean copy on a standard start, sets the clock,
+  raises the cameras, brings in the crew, watches for errors and deaths, ends
+  it when the soak is up, stops a world it started, and says PASS or FAIL
+  (written to fleet_logs\run_outcome.json).
 
 --------------------------------------------------------------------------------
-  THE PAGE — Auren_Bot\Auren_Workshop\run_config.js
+  THE RUN — Auren_Bot\foreman_config.js (the foreman reads it; so does a stranger's)
 --------------------------------------------------------------------------------
-  run:                                  the run itself; everybody's, including yours
-    memory     clear | keep             do the bots remember the last run
+    where      local | remote           the foreman starts your server / joins one
+    start      standard | continue      bots know nothing + clean world / carry on
+    soak       minutes                  how long once the crew works (0 = until stopped)
+    crew       homesteader | builder | contractor
+    builder    { build }                builder only: overgrown_survival_castle
     clock      dawn | day | held        sunrise / pinned midday / leave it
-    person     a name                   who joins and asks for the crew
-    standing   biome | spawn | "x y z"  where they stand = where the base gets built
-    crew       homesteader | contractor answers to nobody / hears you in chat
-    soak       minutes                  how long it works before teardown
-    watch      true | false             end the run the moment something errors
-    wake       error, halt, death       what is allowed to wake the watch
-    stream     fragment tags            live commentary, [] for silence
     record     off | cameras | film     cameras to watch; film needs a recorder
-    teardown   down | leave-up          reap the fleet / leave it for you to poke at
+    watch      true | false             end the run the moment something errors
+    wake       error, death             what is allowed to wake the watch
 
-  hosting:                              only host_and_run.js reads this
-    world      fresh | continue         roll the world back / carry it forward
-    snapshot   a snapshot name          what fresh rolls back to
-    worldName  the world folder         what it restores INTO
+  A standard start puts a local world back to
+      <server folder>\world_snapshots\<world>\<world>_fresh_start
+  when that copy exists. Make one with world_rollback.ps1 (SNAPSHOTS, below).
 
-  WHERE YOUR SERVER IS:  Auren_Bot\foreman_config.js   (address, port, console)
 
 
 ================================================================================
@@ -87,11 +74,9 @@
 ================================================================================
 
   node Auren_Workshop/fleet_control.js status
-  node Auren_Workshop/fleet_control.js server-start
-  node Auren_Workshop/fleet_control.js server-stop
+  node Auren_Workshop/fleet_control.js verb shutdown   # the foreman ends its run: bots home, world saved
   node Auren_Workshop/fleet_control.js memory-wipe
   node Auren_Workshop/fleet_control.js verb respawn
-  node Auren_Workshop/fleet_control.js repair
 
 
 ================================================================================
@@ -124,8 +109,8 @@
   THE LOCAL WORLD
 ================================================================================
 
-  node Auren_Workshop/fleet_control.js local          # world + desk, no bots
-  node Auren_Workshop/fleet_control.js bots-up        # ...plus the roster
+  node start_auren.js --start continue --crew contractor --soak 0   # world + foreman, no bots
+  node Auren_Workshop/fleet_control.js down                             # ...and everything off
 
   Join at localhost, Java Edition 26.1.
 

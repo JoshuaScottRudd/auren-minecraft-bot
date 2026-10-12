@@ -1,47 +1,27 @@
 // fragment: surface_filter (perception)
-// purpose: find, on the SURFACE, exposed blocks matching a filter and return them nearest-first.
-// invariants:
-//  - Surface-centered, not bot-centered: the search is anchored to the surface column at the bot's
-//    XZ, so a bot underground still finds surface grass/trees (the surface above it is a loaded
-//    chunk). The result reports where it scanned (onSurface / surfaceY) so the caller can react —
-//    finding a target is not reaching it; navigation/exploration owns the trek up.
-//  - Only air-exposed blocks are returned (a buried target is unreachable and not worth digging to).
-//  - Nearest-first relative to the bot's real position (what it actually has to walk to).
-// WHY: Pure perception — a synchronous, on-demand scanner called directly by action fragments
-// (seed_picker, harvest_executor, tree_feller) per Law 1's perception exception. It makes no
-// decisions and routes no signals; it reports what's out there.
+// Finds, on the surface, exposed (air-adjacent) blocks matching a filter and returns them nearest-first
+// to the bot. Anchored to the surface column at the bot's XZ, not the bot's own Y, so a bot underground
+// still finds surface targets; reports where it scanned (onSurface/surfaceY) so the caller can react.
+// A synchronous, on-demand scanner called by action fragments per Law 1's perception exception.
 //
-// HOW it queries: the server keeps NO index of blocks by type — chunk data lives in the client's
-// loaded columns, so any "where is X" is a client-side read. mineflayer's bot.findBlocks is the fast,
-// idiomatic form of that: it walks the section/palette storage (skipping empty sections), matches
-// block ids directly, and returns positions nearest-first — replacing the old ~1M-read brute-force
-// cubic blockAt loop. Exposure is applied as a cheap post-filter on the (few) matches, not on every
-// cell.
-//
+// openRings(bot, filter) → { next() } — the world read one 16-block ring at a time, for an asker that
+//   checks each ring's answer before it asks for the next (the tree feller, the punch path).
+// offer(bot, filter, objectives, resolved, how) — what such an asker hands the navigator from a ring.
 // scan(bot, filter) → { summary: { target, filtered, onSurface, surfaceY, ... }, objectives: [{name, position}] }
-// filter.exclude (optional) — (position) => true to rule a cell OUT. It is applied inside the query,
-// not to the result, which is the difference between "nothing is available" and "nothing was looked at".
+//   the same rings, gathered into one list for an asker that wants the list (a census, a material).
+// filter.exclude (optional) — (position) => true to rule a cell OUT, applied inside the read rather
+// than to the result (an excluded caller then gets "nothing available", not "nothing was looked at").
 // Last scan stays in memory (getLastScan) — consumers (e.g. the navigator's candidates_ref) read it.
 
-const Vec3 = require('vec3');
 const watcher = require('@kernel/watcher');
 const { group_to_item } = require('@utils/fragment_utils');
 const { makeVoxelReader } = require('@utils/voxel_reader');
 
 let _lastScan = null;
 
-// THE READER HALF OF THE FRONT DOOR, WITHOUT THE PACER — and that split is the point. Pacing and
-// reading are two different needs. The note at MAX_DISTANCE below already settled that this
-// node must NOT pace (it makes one synchronous findBlocks call; there is no per-cell loop to yield in,
-// and manufacturing one would restore the ~1M-read sweep findBlocks replaced). But findBlocks is not the
-// whole scan: surfaceYAt walks a column, isExposedToAir probes six neighbours per match, and
-// collapseToTrunkBases walks each trunk down — hundreds to thousands of reads, every one of them asking
-// only `name` and `boundingBox`. Those go through the declared-needs reader. So this node takes the half
-// it needs and declines the half it does not, which is what declaring needs is FOR.
-//
-// One reader per bot, not per scan: the number table is memoized inside it, and rebuilding it per call
-// would pay the classification cost on every scan instead of once. WeakMap so a disconnected bot's
-// reader is collected with it (Law 8 — nothing outlives its owner).
+// Declares only the read need this node has (`type`), backing the hundreds of `name`/`boundingBox`
+// reads surfaceYAt, isExposedToAir and collapseToTrunkBases make per scan.
+// One reader per bot, memoized. WeakMap so a disconnected bot's reader is collected with it (Law 8).
 const _readers = new WeakMap();
 function readerFor(bot) {
   let r = _readers.get(bot);
@@ -49,111 +29,21 @@ function readerFor(bot) {
   return r;
 }
 
-// Bounded by COUNT, not distance. findBlocks iterates OUTWARD from the point (nearest-first) and
-// stops as soon as it has MAX_MATCHES hits — so a common target (grass, logs) stops almost
-// immediately regardless of the ceiling, and a rare one is bounded by the loaded-chunk horizon. This
-// is why the old tight 32-radius (there to cap the brute-force loop's compute) is no longer needed: a
-// direct type query self-limits by count. MAX_DISTANCE is just a ceiling ~ the loaded-chunk horizon.
-//
-// THE TRAP THAT PROPERTY SETS, and why `exclude` exists (read this before removing it). "Stops almost
-// immediately" means the budget for a COMMON block is spent inside ~6 blocks — mineflayer's findBlocks
-// breaks the moment a completed chunk-section layer holds `count` hits, then sorts by distance and
-// slices to the nearest `count`. That is a performance virtue and a correctness trap: a caller that
-// filters the RESULT against an exclusion zone WIDER than the budget's reach can only ever get the
-// empty set, because every block the query ever saw was inside the zone — indistinguishable from the
-// world genuinely being empty, though the scan simply never looked far enough.
-// So an exclusion belongs INSIDE the query, never after it: `exclude` rides in findBlocks' own
-// useExtraInfo hook, which runs per candidate BEFORE the block is counted against the budget, so the
-// search walks outward until it has `count` blocks the caller can actually use. Filter first, budget
-// second — the reverse is a guaranteed empty answer wearing the face of an honest one.
-// UNCAPPED to the loaded frontier: findBlocks can only ever see LOADED chunks, so the loaded horizon —
-// the server's view-distance (10 chunks ≈ 160 blocks) — is the real ceiling; this constant only needs
-// to exceed it so the frontier, not an arbitrary number, is the bound. A cap sitting INSIDE the
-// view-distance frontier fences off already-loaded terrain: a target beyond the cap but inside a
-// loaded chunk is reported "none found" though it was reachable. 256 clears a 16-chunk view-distance
-// with margin; raise it if the server's view-distance is ever set higher.
-//
-// WHY NOT voxel_scan_throttle here — the mechanism does not fit. That pacer yields between iterations
-// of a MANUAL cell loop (find_buildingspot's ring sweep, the wheat scanner).
-// surface_filter makes ONE synchronous bot.findBlocks call — the palette sweep that REPLACED the old
-// brute-force voxel loop (see the budget note above). There is no per-cell loop to insert `await pace()`
-// into, and re-introducing one to make the throttle applicable would restore the ~1M-read cost findBlocks
-// was adopted to kill (Law 16). Uncapping is safe without it: findBlocks self-limits at `count` for a
-// common target (grass/dirt stop within a few blocks), and the only full-horizon sweep is a scarce/absent
-// target — a single optimised pass bounded by the loaded chunks, not a fleet-stalling loop.
-const MAX_DISTANCE = 256;
-const MAX_MATCHES = 100;         // return up to this many nearest matches; navigator multi-targets them
+// A material scan ends at the ring that brings it to MAX_MATCHES reachable blocks, because the
+// navigator multi-targets the whole answer. `exclude` and the open-to-air test both run inside the
+// read, before a block is counted, so buried blocks and a wide exclusion zone never fill the count.
+const MAX_MATCHES = 100;
 const SURFACE_SCAN_TOP = 160;    // highest Y a natural overworld surface realistically reaches
 
-// ── EXPANDING RINGS, BECAUSE THE PARAGRAPH ABOVE IS ONLY TRUE FOR COMMON TARGETS ────────────────────
-// MEASURED with twelve bots on one world: a single log scan took **10.4 SECONDS**, and
-// the bots ran them back to back, forever. That one number explains most of what the fleet had been
-// blamed for — bots taking 23-33s to make their first move, bots burning a whole CPU core, and bots
-// dropped by the server for failing to answer a keep-alive inside 30s.
-//
-// WHY THE ORIGINAL REASONING MISSED IT, and it is a good miss to understand. The note above is right
-// that findBlocks "stops almost immediately" for a common target: it breaks as soon as a completed
-// section layer holds `count` hits. The unstated premise is that `count` gets FILLED. For a SCARCE
-// target it never does, so there is no early break and the call sweeps every loaded section out to
-// MAX_DISTANCE — and a log request asks for 800 blocks (MAX_MATCHES x LOG_BLOCKS_PER_TRUNK), which a
-// deforested base will never supply. The header predicted this exact case and judged it acceptable as
-// "a single optimised pass". It is not a single pass: the caller that gets an unusable answer scans
-// again, and 10 seconds every 10 seconds is a busy loop wearing the face of perception.
-//
-// THE FIX IS THE SEARCH ORDER, NOT THE SEARCH. Ask the near volume first and stop as soon as the answer
-// is usable. Volume is cubic, so the first ring is ~0.7% of the full horizon's cells: when a tree is
-// anywhere nearby — the overwhelmingly common case — the scan gets ~150x cheaper for an identical
-// result, because nearest-first ordering means the near ring already holds the blocks the caller would
-// have picked out of the far one.
-//
-// MEASURED RING COSTS, live server, 12-bot world, logs, 2026-09-04 — the numbers the tuning is built on
-// rather than reasoned toward, because the volume argument above got the SHAPE right and the DECISION
-// wrong on its first attempt:
-//
-//     ring  48   ~200 ms     0-4 trees
-//     ring 112  ~1500 ms     4-5 trees
-//     ring 256 ~10500 ms     5-6 trees      <- 50x the cost of ring 112 for ONE more tree
-//
-// The full horizon is not "the expensive tail of a search", it IS the search cost, and what it buys is
-// almost nothing. Everything worth having is inside 112 blocks — which makes sense the moment you look
-// at the server: `view-distance=8` means the loaded frontier is ~128 blocks, so most of ring 256 is
-// scanning chunks that are not there.
-//
-// WHAT IT COSTS WHEN THE TARGET IS GENUINELY ABSENT: three sweeps instead of one, ~1.1x, because the
-// two inner rings are nearly free next to the outer. That case is then handled by the negative memo
-// below rather than by making the rings cleverer.
-//
-// SATISFACTION IS MEASURED AFTER THE COLLAPSE, NOT ON RAW HITS. A ring is only "enough" if it yields
-// enough USABLE candidates — exposure-filtered and collapsed to trunk bases — because raw log blocks
-// are not trees, and stopping on raw hits would hand the feller a fistful of canopy branches and send
-// it straight back for another scan. Cheap to do: the post-filters run on the few matches, never on the
-// volume.
-//
-// TIER_SATISFIED IS THE SURVEY DEFAULT, AND A HOT CALLER MUST OVERRIDE IT WITH `filter.enough`.
-// THIS NUMBER MADE THE RINGS ACTIVELY WORSE on their first outing and the failure is worth keeping:
-// with a fixed 8, a base ringed by 5 trees could never be satisfied by a near ring, so every scan paid
-// 48 AND 112 AND 256 — three sweeps where the old single-call code paid one — while the caller that
-// triggered it had asked for ONE log. Rings only pay off when something can stop them, and a perception
-// node has no way to know what "enough" means for a caller it cannot see. 8 stays as the default because
-// the callers that DON'T override it are surveys (set_wood_preference counts trunks per species to
-// choose one), and a survey genuinely wants the horizon.
-const SCAN_TIERS = [48, 112, MAX_DISTANCE];
-const TIER_SATISFIED = 8;        // SURVEY default only — a caller with a smaller need passes `enough`
+// A section whose whole Y range sits well below the local surface cannot hold an exposed surface
+// target. Loose because `surfaceY` is measured at the bot's column and terrain far away may differ.
+const BAND_BELOW = 40;
+const BAND_ABOVE = 48;
 
 // ── THE NEGATIVE MEMO ───────────────────────────────────────────────────────────────────────────────
-// Rings fix the case where the thing EXISTS. This fixes the case where it does not: a bot standing in a
-// deforested base asking "any logs within 256 blocks?" gets the same answer every ten seconds, and pays
-// the full horizon for it every time. Six bots doing that is a permanently busy machine.
-//
-// DELIBERATELY NARROW, because a perception node returning a remembered answer is exactly the kind of
-// shortcut that goes wrong quietly. It only ever suppresses a repeat of a question already answered
-// with NOTHING, at the FULL horizon, from ~the same place, within a few seconds:
-//   - only a full-horizon sweep that found ZERO usable candidates is memoized; any success clears it
-//   - keyed by the target set AND a 16-block-quantised position, so walking a chunk away re-asks
-//   - 30s TTL, against a caller that re-asks every ~10s
-//   - per bot (WeakMap), so it dies with the bot (Law 8)
-// Nothing that FOUND something is ever cached, so a memo can never substitute a stale answer for a real
-// one — the only thing it can do is decline to re-run a sweep that just came back empty.
+// Suppresses a repeat of a question already answered with nothing from ~the same place within a few
+// seconds: only a zero-candidate scan is memoized (any success clears it), keyed by target set + a
+// 16-block-quantised position, 30s TTL, per bot (WeakMap, Law 8).
 const NEGATIVE_MEMO_MS = 30000;
 const MEMO_CELL = 16;
 const _negativeMemo = new WeakMap();
@@ -164,21 +54,13 @@ function memoKey(filter, center) {
   return `${names}@${q(center.x)},${q(center.y)},${q(center.z)}`;
 }
 
-// Log scans budget in the WRONG UNIT unless corrected: findBlocks counts log BLOCKS, but
-// collapseToTrunkBases folds each whole trunk column into ONE base, so a block-sized budget spent on
-// multi-block trunks surfaces far fewer trees than the budget number implies — the tree horizon is
-// pinned low no matter how many trees stand around it. Ask for enough blocks that ~MAX_MATCHES TRUNKS
-// survive the collapse. Only logs collapse, so only logs pay the larger scan.
-const LOG_BLOCKS_PER_TRUNK = 8;  // conservative blocks-per-tree (trunk + branches) for the budget
-
-// Group-token expansion for scan-target matching (e.g. 'stone' -> stone+andesite+diorite+granite,
-// 'logs' -> every log species). Sourced from the canonical group_to_item so a scan for a group means
-// the same block set everywhere. 'stone' deliberately excludes cobblestone (a drop product, not a
-// terrain block), so this never targets player-placed cobblestone.
+// Group-token expansion (e.g. 'stone' -> stone+andesite+diorite+granite). Sourced from the canonical
+// group_to_item so a scan for a group means the same block set everywhere; 'stone' excludes cobblestone.
 const OBJECT_GROUPS = group_to_item;
 
-const LEAF_RE = /(.*_)?leaves$/;
-const LOG_RE  = /(.*_)?(log|stem|wood|hyphae)$/;
+// What counts as a tree lives in @perception/trunk_bases — one definition shared with the assessors
+// (Law 16); the regexes come back with it so a species test here can't drift from the collapse's.
+const { collapseToTrunkBases, LEAF_RE, LOG_RE } = require('@perception/trunk_bases');
 
 // WHY exposure: adjacency to air approximates visibility / minimal digging — a buried target is both
 // unreachable and would mean tunnelling, so it is not a candidate.
@@ -208,9 +90,7 @@ function targetIds(bot, targets) {
 }
 
 // The surface Y at a column: the topmost solid, non-tree block scanning down from the build ceiling.
-// Tree logs/leaves are skipped so a tree doesn't report as the surface. Falls back to the bot's own
-// Y if nothing solid is found (unloaded column) — the scan then behaves bot-centered, no worse than
-// before. One column of blockAt reads, cheap.
+// Falls back to the bot's own Y if nothing solid is found (unloaded column).
 function surfaceYAt(bot, reader, x, z) {
   const bottom = Math.floor(bot.entity.position.y) - 8;
   for (let y = SURFACE_SCAN_TOP; y >= bottom; y--) {
@@ -220,44 +100,14 @@ function surfaceYAt(bot, reader, x, z) {
   return Math.floor(bot.entity.position.y);
 }
 
-// Group dominance: among matched blocks, keep only the single most-common type. WHY: a group scan
-// ('stone') should commit the approach to ONE material rather than interleaving andesite/diorite/etc,
-// which keeps the locomotion target set coherent. Returns { blocks, resolved }.
+// Group dominance: among matched blocks, keep only the single most-common type, so a group scan
+// commits the approach to one material and never interleaves andesite/diorite/etc.
 function dominantMatch(scanned) {
   const freq = {};
   for (const b of scanned) freq[b.name] = (freq[b.name] || 0) + 1;
   const dominant = Object.entries(freq).sort((a, b) => b[1] - a[1])[0]?.[0];
   if (!dominant) return { blocks: [], resolved: null };
   return { blocks: scanned.filter(b => b.name === dominant), resolved: dominant };
-}
-
-// collapseToTrunkBases: group log blocks by XZ column, keep the lowest Y per column, then walk down
-// through contiguous same-type blocks (a direct world read, ignoring exposure) to the true trunk
-// base — the bottom log is wedged air-tight so it never shows as "exposed". A column counts as a real
-// trunk only if its base rests on solid, non-tree ground; a branchy canopy log juts sideways and its
-// XZ column bottoms out on air/leaves, so those phantom high-Y "trees" are dropped here (Law 16: this
-// node alone decides what is a tree, so the feller never routes up to a branch and stalls).
-function collapseToTrunkBases(reader, blocks) {
-  const byXZ = new Map();
-  for (const block of blocks) {
-    const key = `${block.position.x},${block.position.z}`;
-    const existing = byXZ.get(key);
-    if (!existing || block.position.y < existing.position.y) byXZ.set(key, block);
-  }
-  const bases = [];
-  for (const block of byXZ.values()) {
-    let { x, y, z } = block.position;
-    while (true) {
-      const below = reader.blockAt(x, y - 1, z);
-      if (below && below.name === block.name) y -= 1; else break;
-    }
-    const below = reader.blockAt(x, y - 1, z);
-    const groundSupported = below && below.boundingBox === 'block'
-      && !LEAF_RE.test(below.name) && !LOG_RE.test(below.name);
-    if (!groundSupported) continue;   // branch/canopy log, not a trunk — drop it
-    bases.push(y === block.position.y ? block : { name: block.name, position: { x, y, z } });
-  }
-  return bases;
 }
 
 function dist2(p, c) {
@@ -284,14 +134,132 @@ function finalize(filter, blocks, resolved, center, surface, how) {
   _lastScan = output;
 
   const where = surface ? (surface.onSurface ? 'at surface' : `surface y=${surface.surfaceY} (scanned from below)`) : 'coordinates';
-  // `how` reports WHICH RING answered, or that a remembered empty did. Without it the expensive case
-  // and the cheap case print the same line, and the 10-second sweep this file was rebuilt to kill was
-  // invisible in the trace for exactly that reason.
+  // `how` carries what the walk cost, or that a remembered empty answered instead of a walk.
   watcher.summary('surface_filter', `Scan complete: ${out.length} ${resolved || 'unknown'} found (${where}, filter=${filter?.type || 'none'}${how ? `, ${how}` : ''})`);
   return output;
 }
 
-function scan(bot, filter) {
+// ── openRings — THE WORLD READ ONE RING AT A TIME ───────────────────────────────────────────────────
+// A ring is RING_BLOCKS wide, measured flat from the centre: ring 0 is 0–16 blocks out, ring 1 is 16–32.
+// `next()` reads only the chunk sections the next ring needs and hands back that ring's targets, nearest
+// first; a ring holding none is passed over, so every answer has something in it. It returns null when
+// the rings have reached the edge of what the body has loaded, or `filter.reach` blocks out.
+// Nothing is read twice: a section is read when the first ring touching its chunk asks, and what it
+// held farther out waits for the ring it belongs to.
+//
+// filter.center {x,z}  where the rings are centred; the body when omitted.
+// filter.reach         blocks from the centre past which no ring is opened.
+// filter.exclude       (position) => true rules a cell out before it is counted.
+// `cost()` is what the rings opened so far have cost: { rings, read, skipped, ms, raw }.
+const RING_BLOCKS = 16;
+
+function openRings(bot, filter) {
+  const reader = readerFor(bot);
+  const here = bot.entity.position.floored();
+  const given = filter?.center;
+  const cx = given && Number.isFinite(given.x) ? Math.floor(given.x) : here.x;
+  const cz = given && Number.isFinite(given.z) ? Math.floor(given.z) : here.z;
+  const reach = Number.isFinite(filter?.reach) ? filter.reach : Infinity;
+  const names = targetNames(filter?.targets);
+  const ids = new Set(targetIds(bot, filter?.targets));
+  const LOGS = new Set(OBJECT_GROUPS.logs || []);
+  const wantsTrunks = [...names].some(n => LOGS.has(n));
+  const exclude = filter && typeof filter.exclude === 'function' ? filter.exclude : null;
+  const surfaceY = surfaceYAt(bot, reader, here.x, here.z);
+
+  const Block = require('prismarine-block')(bot.registry);
+  // A section with no palette is on the global palette and cannot be ruled out, so it is read.
+  const paletteHolds = (section) => {
+    if (!section.palette) return true;
+    for (const stateId of section.palette) {
+      const b = Block.fromStateId(stateId, 0);
+      if (b && ids.has(b.type)) return true;
+    }
+    return false;
+  };
+
+  // Every loaded section in the surface band, nearest chunk first. `d` is the flat distance from the
+  // centre to the chunk's nearest cell, so no block in the chunk is nearer than `d`.
+  const minY = bot.game?.minY ?? -64;
+  const totalSections = (bot.game?.height ?? 384) >> 4;
+  const bandLow = surfaceY - BAND_BELOW, bandHigh = surfaceY + BAND_ABOVE;
+  const jobs = [];
+  if (ids.size) {
+    for (const entry of (bot.world?.getColumns?.() || [])) {
+      const col = entry?.column;
+      if (!col || !Array.isArray(col.sections)) continue;
+      const bx = Number(entry.chunkX) * 16, bz = Number(entry.chunkZ) * 16;
+      const dx = cx < bx ? bx - cx : (cx > bx + 15 ? cx - (bx + 15) : 0);
+      const dz = cz < bz ? bz - cz : (cz > bz + 15 ? cz - (bz + 15) : 0);
+      const d = Math.sqrt(dx * dx + dz * dz);
+      for (let s = 0; s < totalSections; s++) {
+        const y0 = minY + s * 16;
+        if (y0 + 15 < bandLow || y0 > bandHigh) continue;
+        if (!col.sections[s]) continue;
+        jobs.push({ bx, bz, y0, d, section: col.sections[s] });
+      }
+    }
+    jobs.sort((a, b) => a.d - b.d || a.y0 - b.y0);
+  }
+
+  const { makeExecutionPacer } = require('@utils/execution_yield');
+  // The pacer's combat gate is armed with the body: a real engagement leaves the awaited promise
+  // unresolved and this search is discarded mid-read.
+  const pace = makeExecutionPacer({ bot, source: 'surface_filter.rings' });
+
+  const waiting = new Map();   // ring index -> targets read already that lie in that ring
+  const cost = { rings: 0, read: 0, skipped: 0, ms: 0, raw: 0 };
+  let cursor = 0, k = 0;
+
+  const readSection = (j) => {
+    for (let x = j.bx; x < j.bx + 16; x++) {
+      for (let y = j.y0; y < j.y0 + 16; y++) {
+        for (let z = j.bz; z < j.bz + 16; z++) {
+          const b = reader.blockAt(x, y, z);
+          if (!b || !names.has(b.name)) continue;
+          const p = { x, y, z };
+          if (exclude && exclude(p)) continue;
+          cost.raw++;
+          if (!isExposedToAir(reader, p)) continue;   // buried = unreachable, never a target
+          const ring = Math.floor(Math.hypot(x - cx, z - cz) / RING_BLOCKS);
+          const held = waiting.get(ring);
+          if (held) held.push({ name: b.name, position: p }); else waiting.set(ring, [{ name: b.name, position: p }]);
+        }
+      }
+    }
+  };
+
+  async function next() {
+    for (;;) {
+      const inner = k * RING_BLOCKS, outer = inner + RING_BLOCKS;
+      if (inner > reach) return null;
+      if (cursor >= jobs.length && waiting.size === 0) return null;
+      const t0 = Date.now();
+      while (cursor < jobs.length && jobs[cursor].d < outer) {
+        const j = jobs[cursor++];
+        if (!paletteHolds(j.section)) { cost.skipped++; continue; }
+        readSection(j);
+        cost.read++;
+        await pace();
+      }
+      cost.ms += Date.now() - t0;
+      const hits = waiting.get(k) || [];
+      waiting.delete(k);
+      const index = k++;
+      cost.rings = k;
+      // A trunk is one column, so every log of it lies in one ring and collapses to its base here.
+      const objectives = wantsTrunks ? await collapseToTrunkBases(reader, hits) : hits;
+      if (!objectives.length) continue;
+      const flat2 = (o) => (o.position.x - cx) ** 2 + (o.position.z - cz) ** 2;
+      objectives.sort((a, b) => flat2(a) - flat2(b));
+      return { index, inner, outer, objectives };
+    }
+  }
+
+  return { next, cost: () => ({ ...cost }), wantsTrunks, loadedSections: jobs.length };
+}
+
+async function scan(bot, filter) {
   const center = bot.entity.position.floored();
   const reader = readerFor(bot);
 
@@ -304,99 +272,45 @@ function scan(bot, filter) {
     return finalize(filter, matches, 'coordinates', center, null);
   }
 
-  // Type mode ('object_group_or_direct'): anchor the search on the surface column at the bot's XZ so
-  // surface targets are found regardless of the bot's depth, then query by id via findBlocks.
-  const ids = targetIds(bot, filter?.targets);
+  // Type mode ('object_group_or_direct'): the rings, opened one after another. Trees are gathered out
+  // to the loaded frontier (a census); a material stops at the ring that brings it to MAX_MATCHES.
   const surfaceY  = surfaceYAt(bot, reader, center.x, center.z);
-  const onSurface = Math.abs(center.y - surfaceY) <= 2;
-  const surface   = { surfaceY, onSurface };
+  const surface   = { surfaceY, onSurface: Math.abs(center.y - surfaceY) <= 2 };
 
-  // Trunk-aware budget: a log request is collapsed to one base per column downstream, so spend the
-  // block budget in trunks (see LOG_BLOCKS_PER_TRUNK). Same log test as the collapse trigger below.
-  const LOGS = new Set(OBJECT_GROUPS.logs || []);
-  const wantsTrunks = [...targetNames(filter?.targets)].some(n => LOGS.has(n));
-  const blockBudget = wantsTrunks ? MAX_MATCHES * LOG_BLOCKS_PER_TRUNK : MAX_MATCHES;
-
-  // `exclude(position) -> true` marks a cell the CALLER cannot use. Handed to findBlocks as
-  // useExtraInfo (a per-candidate predicate it evaluates before counting the hit) rather than applied
-  // to the returned array — see the budget note at the top of this file for the livelock that ordering
-  // caused. Passing it also keeps the palette-based section skip, because `matching` stays an id list.
-  const callerExclude = filter && typeof filter.exclude === 'function' ? filter.exclude : null;
-  const exclude = callerExclude;
-
-  // The full pipeline for ONE ring. Kept as a closure rather than inlined three times so the tiers
-  // cannot drift apart in what they mean by "a usable candidate" (Law 16).
-  const sweep = (radius) => {
-    let scanned = [];
-    if (ids.length) {
-      const positions = bot.findBlocks({
-        point: new Vec3(center.x, surfaceY, center.z),
-        matching: ids,
-        maxDistance: radius,
-        count: blockBudget,
-        ...(exclude ? { useExtraInfo: b => !!b && !exclude(b.position) } : {}),
-      });
-      for (const p of positions) {
-        if (!isExposedToAir(reader, p)) continue;   // buried = unreachable, skip
-        const b = reader.blockAt(p.x, p.y, p.z);
-        if (b) scanned.push({ name: b.name, position: { x: p.x, y: p.y, z: p.z } });
-      }
-    }
-
-    // Logs are felled by DISTANCE, every species equal — no per-scan species preference. So a log scan
-    // collapses ALL matched species to trunk bases and returns them together; the nearest-first sort in
-    // finalize() then does the ordering. Non-log groups (e.g. 'stone') still commit to one dominant
-    // material — there the coherence is wanted (mine one stone type); for logs species-uniformity is
-    // not. Reuses wantsTrunks (the same log test that sized the block budget) so "is this a log scan"
-    // is decided in exactly one place (Law 16).
-    if (wantsTrunks) return { blocks: collapseToTrunkBases(reader, scanned), resolved: 'logs' };
-    const match = dominantMatch(scanned);
-    return { blocks: match.blocks, resolved: match.resolved };
-  };
-
-  // A repeat of a question that just came back empty at the full horizon — see NEGATIVE_MEMO_MS. The
-  // memo is consulted BEFORE any sweep, which is the whole point: the cost being avoided is the sweep.
+  // A repeat of a question already answered empty (NEGATIVE_MEMO_MS).
   const key = memoKey(filter, center);
   const memo = _negativeMemo.get(bot);
   if (memo && memo.key === key && Date.now() - memo.at < NEGATIVE_MEMO_MS) {
     return finalize(filter, [], memo.resolved, center, surface, 'memo');
   }
 
-  // ENOUGH IS THE CALLER'S NUMBER, NOT THE NODE'S. The first version of this loop used a fixed
-  // TIER_SATISFIED=8 and it made the rings WORSE, not better: a base with 5 trees around it never
-  // reached 8, so every scan paid ring 48 AND ring 112 AND the full horizon — three sweeps where the
-  // original code paid one. The caller had asked for ONE tree. A perception node cannot know what
-  // "enough" means; only the fragment with the need does (Law 25 — the asker owns the criterion), so
-  // `filter.enough` carries it and TIER_SATISFIED is only the default for a caller that says nothing.
-  const enough = Number.isFinite(filter?.enough) && filter.enough > 0 ? filter.enough : TIER_SATISFIED;
-
-  let result = { blocks: [], resolved: null };
-  let tierUsed = null;
-  // Per-ring cost and yield, reported in the trace. MEASURED, NOT ASSUMED: this file has now been
-  // wrong twice about which ring is expensive, both times from reasoning about volume instead of
-  // timing the call. The numbers cost one Date.now() per ring and they are the only thing that makes
-  // the next tuning decision an observation rather than a third guess.
-  const tierTrace = [];
-  for (const radius of SCAN_TIERS) {
-    const t0 = Date.now();
-    result = sweep(radius);
-    tierUsed = radius;
-    tierTrace.push(`${radius}:${result.blocks.length}/${Date.now() - t0}ms`);
-    // Stop at the first ring that can actually answer the caller. The last ring always ends the loop,
-    // so an absent target still gets the honest full-horizon "nothing".
-    if (result.blocks.length >= enough) break;
+  const rings = openRings(bot, filter);
+  const found = [];
+  for (let ring = await rings.next(); ring; ring = await rings.next()) {
+    for (const o of ring.objectives) found.push(o);
+    if (!rings.wantsTrunks && found.length >= MAX_MATCHES) break;
   }
+  // Logs are felled by distance with no species preference, so every species stays; a material group
+  // (e.g. 'stone') commits to its one dominant block, nearest MAX_MATCHES of it.
+  const match = rings.wantsTrunks ? { blocks: found, resolved: 'logs' } : dominantMatch(found);
+  const blocks = rings.wantsTrunks ? match.blocks : match.blocks.slice(0, MAX_MATCHES);
 
-  if (tierUsed === MAX_DISTANCE && result.blocks.length === 0) {
-    _negativeMemo.set(bot, { key, at: Date.now(), resolved: result.resolved });
-  } else if (result.blocks.length > 0) {
-    _negativeMemo.delete(bot);   // anything found retires the memo immediately
-  }
+  if (blocks.length === 0) _negativeMemo.set(bot, { key, at: Date.now(), resolved: match.resolved });
+  else _negativeMemo.delete(bot);   // anything found retires the memo immediately
 
-  const how = `rings ${tierTrace.join(' ')}`;
-  return finalize(filter, result.blocks, result.resolved, center, surface, how);
+  const c = rings.cost();
+  return finalize(filter, blocks, match.resolved, center, surface,
+    `${c.rings} ring(s), ${c.read} read, ${c.skipped} skipped, ${c.ms}ms, ${c.raw} raw hit(s)`);
+}
+
+// offer(bot, filter, objectives, resolved, how) — targets an asker took from a ring (the ring whole, or what is
+// left of it) become the answer the navigator reads, the same way a scan's list does.
+function offer(bot, filter, objectives, resolved, how) {
+  const center = bot.entity.position.floored();
+  const surfaceY = surfaceYAt(bot, readerFor(bot), center.x, center.z);
+  return finalize(filter, objectives, resolved, center, { surfaceY, onSurface: Math.abs(center.y - surfaceY) <= 2 }, how);
 }
 
 function getLastScan() { return _lastScan; }
 
-module.exports = { scan, getLastScan };
+module.exports = { scan, openRings, offer, dominantMatch, getLastScan };

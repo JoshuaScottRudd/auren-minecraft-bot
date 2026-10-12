@@ -1,82 +1,35 @@
 /*
 ============================================================
-preflight.js — the one button: the code gate, and the session's write briefing
+preflight.js — the code gate and the session's write briefing
 ============================================================
-NAMED FOR WHAT IT IS, and the old name is worth recording because a successor will find it in the
-archives. It was `verify_graph_load.js`, which described its FIRST pass and nothing else — by the time it
-held four passes and a write briefing the name was reporting a fraction of the file, which is the same
-class of fault the passes themselves exist to catch (Law 7: the name describes the purpose; Law 25: a
-label that understates what ran is not a smaller truth, it is a different claim). It is called preflight
-because that is where it runs: both conductors press it before a JVM starts and before `raised` flips, so
-a refusal costs nothing, and every code change presses it before the change is real.
+Loads every fragment file in the graph headlessly and reports any that fail to require() — bad
+requires, missing/renamed exports, broken module aliases, load-time syntax/reference errors. Proves the
+graph loads and wires up; it does not prove the bot behaves (only a live master_core run does that).
 
-TWO JOBS, AND THEY ARE ONE JOB. The passes below refuse code that would fail (a bad require, an unbound
-name, a hand-written catch). The briefing above them tells the session where its written record goes.
-Both exist because this is the single point every piece of work passes through — the only place a rule
-reaches an AI developer AT THE MOMENT OF WORK rather than depending on it having read a document first.
+Bootstraps mineflayer/vec3/prismarine/module-alias exactly as js_kernel/utils/node_module_homes
+resolves them for this machine, then registers the @-aliases, so the graph loads here as it does at
+runtime.
 
-Purpose: Load every fragment file in the graph in a headless process and
-         report any that fail to `require()`. This closes the "wiring" tier of
-         verification: bad requires, missing/renamed exports, broken module
-         aliases, and load-time syntax/reference errors — the class of bug that
-         otherwise survives all the way to a live server run and stalls the bot
-         mid-session.
-
-What this is NOT: it does not connect to a Minecraft server and does not run the
-brain end-to-end. Real-world behaviour (pathfinding, timing, block interaction)
-is still confirmed only by an actual `master_core.js` run against a live world.
-This test proves the graph *loads and wires up*, not that it *behaves*.
-
-Why it needs a bootstrap: mineflayer/vec3/prismarine live in whichever module
-homes js_kernel/utils/node_module_homes names for this machine (Auren_Bot/node_modules
-first, then the Architect's workstation file). We replicate that resolution here so
-the whole graph can load exactly as it does at runtime, then register module-alias
-for the @-aliases.
-
-Four passes, all live and all built on ONE walk of the tree:
+Passes, all built on one walk of the tree:
   1  every file the walk finds is require()d          (bad requires, renamed exports, syntax)
-  2  every module's load-time throws fire during 1    (data integrity — free, not extra machinery)
-  3  unbound identifiers + dead-zone reads            (a name read where nothing binds it, and a
-                                                       let/const read before its own init completes)
-  4  the catch shape                                  (a `try` outside external_library_guard.js)
+  2  every module's load-time throws fire during 1     (data integrity)
+  3  unbound identifiers + dead-zone reads              (a name read where nothing binds it, or a
+                                                        let/const read before its own init completes)
+  4  the catch shape                                    (a `try` outside external_library_guard.js)
 Passes 3 and 4 need the vendored analyzer under tools/vendor/ and FAIL the run if it is missing.
-Pass 3 covers the one code-level fault a loader cannot reach: loading a module executes only its top
-level, so a bad reference inside a function body is invisible until the world reaches that line. It
-presents QUIETLY — the ReferenceError lands in a catch written for a misbehaving world, so the system
-reads as declining to act rather than as crashing.
-An earlier pass (declared source scans) was deleted 2026-08-10 and another 2026-08-15; the numbering
-closed up each time, so a number here names a position and never an identity.
+A pass number names a position, not an identity.
 
-Excluded on purpose: files with live side effects on require —
-  - foreman/foreman_hub.js  (binds a WebSocket port on load)
-  - master_core.js               (connects to a live Minecraft server)
-Loading those would bind ports / open sockets, which a smoke test must not do. Parsing has no side
-effects, so a parser-based pass COULD sweep them; pass 3's census is deliberately scoped to the fragment
-graph instead (see its header), so today nothing reads those two files.
+Excluded from require() — files with live side effects on load:
+  - foreman/foreman_hub.js  (binds a WebSocket port)
+  - foreman/foreman.js      (joins the Minecraft server)
+  - master_core.js          (connects to a live Minecraft server)
+Parsing has no side effects, so the parser-based passes (3, 4) still cover these files.
 
-THE WRONG TURN A SUCCESSOR WILL REACH FOR, named here because it was built, run for
-five days, and deleted: a "forbidden token" source scan — a list of identifiers that
-must appear nowhere in the tree, each with the ruling that deleted it. It looks like
-it belongs beside these passes and it does not. The WALK shifts, but each RULE is an
-anchor on one token, and what it pins is a DESIGN DECISION rather than a law. Every
-design decision here may be legitimately reversed, and on the day one is, the scan
-reports a violation for code that is now correct — an instrument emitting a false
-verdict, which is worse than no instrument (Law 25). A pass earns its place here only
-if it DISCOVERS what to check; a pass that carries a list is stale the day after the
-next refactor and reports green the whole time. Every pass below discovers. If you
-want a guarantee that some construction is the only pathway, it goes in the module
-that owns it as a Law 13 throw, where it shifts with the code — not in a token list.
-(The deleted rules and their rulings are preserved verbatim in
-Documentation/Refurbishing planning/architect_scratchpad.md §15, as a record of
-decisions and explicitly NOT as a checklist.)
-
-It also prints the WRITE BRIEFING before the passes — for each of the three records a session writes:
-which one this work belongs in, how close it is to its archive trigger, which archive volume is next, the
-newest entry already there, the next entry's number, and the exact line to anchor an Edit on. It rides
-this file because this is the one thing every code change already runs; the reasoning is at that block.
+Prints the write briefing before the passes — which record a session's work belongs in, how close it
+is to its archive trigger, the next volume, the newest entry, and the exact anchor line for an Edit.
 
 Run:  node preflight.js
-Exit: 0 if every fragment loads, 1 if any fail (usable as a pre-handoff gate).
+Exit: 0 if every fragment loads, 1 if any fail.
 ============================================================
 */
 'use strict';
@@ -86,20 +39,8 @@ const path = require('path');
 const fs = require('fs');
 const { spawnSync } = require('child_process');
 
-// Resolve mineflayer/vec3/prismarine/module-alias, then register the bot's @-aliases, so the graph
-// loads here exactly as it does at runtime. Both are one call because both are one question — where the
-// bot is — and `workshop_paths` is where the workshop answers it (Law 16).
-//
-// THE HAND-WRITTEN LIST THAT STOOD HERE IS GONE. It named node_env2 and MinecraftServer and was a
-// fourth copy of `js_kernel/utils/node_module_homes`, which also carries `Auren_Bot/node_modules` as a
-// last resort — so this file could refuse on a machine where the live launcher runs fine. The canonical
-// list is now what preflight resolves against, which is the only way "the graph loads as it does at
-// runtime" is a claim rather than a hope.
-//
-// AND THE BARE `require('module-alias')(base)` IS GONE WITH IT. It auto-discovers by walking up from the
-// module-alias INSTALL dir when given no base, and on a portable-node machine that lands on
-// MinecraftServer/package.json, which has no `_moduleAliases` and registers nothing. Passing the base
-// fixed that and introduced a worse one on a second call — see the WHY block in `workshop_paths.js`.
+// Resolves mineflayer/vec3/prismarine/module-alias and registers the bot's @-aliases through
+// workshop_paths, the one place the workshop answers "where is the bot" (Law 16).
 const paths = require('../workshop_paths');
 if (!paths.bootstrapModules().length) {
   console.error('WARN: no node_modules found - run npm install in Auren_Bot/ first; vec3/mineflayer may not resolve.');
@@ -107,52 +48,24 @@ if (!paths.bootstrapModules().length) {
 paths.registerAliases();
 
 // ── THE WRITE BRIEFING (prints on every run, before any pass) ────────────────────────────────────
+// Reaches a session at the moment of work (Invariant C). Prints before the passes so no exit path
+// can drop it (a process.on('exit') hook would
+// lose output on Windows, where a TTY write is asynchronous). Computed in record_keeper.js /
+// record_briefing.js (Law 16); this file only calls it. Read-only — archiving is a separate command.
 //
-// WHY A BRIEFING RIDES A GATE. Every code change in this fleet runs this file — it is the one button,
-// and both conductors press it in preflight before anything is raised. That makes it the only channel
-// that reaches an AI developer AT THE MOMENT OF WORK instead of depending on it having read a document
-// first. A rule that must be remembered is followed by whoever happened to read it; a rule that arrives
-// with the tool reaches everyone who works (Invariant C: reasoning reaches whoever depends on it).
-//
-// THE LOGIC LIVES IN record_keeper.js / record_briefing.js, NOT HERE, and it was moved out on the
-// Architect's ask (2026-09-01: *"maybe we could extract the logic into a utility and import it"*). It had
-// two callers the moment archiving became a command of its own, and one capability gets one
-// implementation (Law 16). What remains here is the CALL — this file's job is to be the place the
-// briefing happens, not the place it is computed.
-//
-// IT PRINTS FIRST, NOT LAST, and that is deliberate. The obvious shape is a `process.on('exit')` hook so
-// the briefing lands beneath the verdict on all seven exit paths below. On Windows a write to a TTY is
-// ASYNCHRONOUS, so output emitted from an exit handler is truncated or dropped — the briefing would
-// vanish on exactly the platform this fleet runs on. Printing before the passes needs no hook, cannot be
-// missed by an exit path added later, and survives a hard crash mid-run.
-//
-// IT READS AND NEVER WRITES. Archiving is a verb and lives behind its own command; a gate that quietly
-// rewrote two large documents while the reader was studying its output would be a surprise, and it runs
-// inside conducted runs where a document rewrite has no business happening at all.
-// THE SESSION BOARD PRINTS FIRST, because it changes how everything under it should be read. Several
-// sessions now share one working tree, and a session that does not know another is writing will report a
-// half-written file as a finding. That is not hypothetical — it happened on 2026-09-01, when this session
-// read the tree during another's reset-and-restore and reported two turns of work as destroyed. Nothing
-// was destroyed. The board is the fix for the class: see who else is here BEFORE trusting what you read.
+// The session board prints first: several sessions share one working tree, and a tree read during
+// another session's write looks like destroyed work when it is not. See who else is here before
+// trusting what follows.
 const _sessionArg = (flag) => {
   const i = process.argv.indexOf(flag);
   return i === -1 ? null : process.argv[i + 1] || null;
 };
-// WHAT IT WRITES IS A STATUS THAT OVERWRITES, NOT A RECORD — "this is what i'm currently working on".
-// `session_sync` overwrites it with "this is what i finished doing last" when the turn closes. The
-// history of the work lives in the commit message and the two records, never here. See the status block
-// at the top of `session_board.js`.
+// Writes a STATUS that overwrites — "working on" now, "finished last" once session_sync closes the
+// turn. Never a history; that lives in the commit message and the two records.
 const _session = _sessionArg('--session');
-// THE SESSION LAYER LIVES OUTSIDE THE BOT (Architect 2026-09-01): *"lets move all the session logging
-// systems outside of auren_bot into a different domain."* It is in `Sessions/` at the repo root, alongside
-// `Cutting_room/` — machinery about AI-developer sessions, not about the fleet.
-//
-// IT IS LOADED BY PRESENCE, not by a catch. The session domain is a SIBLING of the workshop at the repo
-// root, not a part of it, and neither one ships: the published bot is a snapshot of `Auren_Bot/` alone.
-// So this file has to run as a plain code checker wherever the session layer is absent — a bare checkout
-// of the workshop, or a machine set up to run the fleet and not to develop it. A directory either exists
-// or it does not, and asking is a decision with an answer; a `try` around the require would be an error
-// swallowed on contact (Law 13) and would hide a genuinely broken module behind the same silence.
+// Sessions/ lives at the repo root, a sibling of the workshop, and does not ship — the published bot
+// is Auren_Bot/ alone. Loaded by presence (existsSync), never by a catch (Law 13): this file must run
+// as a plain code checker wherever the session layer is absent.
 const _SESSIONS = paths.repo('Sessions');
 const _hasSessions = fs.existsSync(_SESSIONS);
 const _board = _hasSessions ? require(path.join(_SESSIONS, 'session_board.js')) : null;
@@ -163,11 +76,9 @@ if (_board) {
   }
   _board.print(_session);
 
-  // IS THE ONE ROUTE TO THE TRUNK ACTUALLY THE ONLY ROUTE? `Sessions/hooks/pre-commit` refuses a commit
-  // that did not come through `session_sync`, but a hook only runs if git has been pointed at it, and
-  // `core.hooksPath` is per-CLONE config that no commit can carry — so the second workstation gets the
-  // hook file and none of its protection until this is set there too. Checked on every run because the
-  // failure is silent by nature: everything works exactly as before, minus the guarantee.
+  // core.hooksPath is per-clone config no commit can carry, so a second workstation can silently lack
+  // the pre-commit hook that refuses a hand commit. Checked every run since the failure is otherwise
+  // invisible — everything still works, minus the guarantee.
   const _hooks = spawnSync('git', ['config', '--get', 'core.hooksPath'],
     { cwd: paths.REPO_ROOT, encoding: 'utf8' });
   if ((_hooks.stdout || '').trim() !== 'Sessions/hooks') {
@@ -178,11 +89,9 @@ if (_board) {
   }
 }
 
-// THE OVERLAP FLAG. It fires while the session is still EDITING, which is the only moment it is cheap to
-// act on — at commit time the work is already done. It is aimed at the session, never at the Architect:
-// he guarantees that no two sessions are given the same work, so an overlap here is a shared FILE rather
-// than shared WORK, and shared files are exactly what the last-writer rule resolves. What it is for is
-// the case that guarantee does not cover — a session that has quietly wandered off its own subject.
+// Fires while the session is still editing, the only moment acting on it is cheap. Flags a shared FILE
+// another session claims — ordinary and resolved by the last-writer rule at commit — so the reader can
+// catch the one case that rule does not cover: two sessions doing the same WORK.
 const _sync = _hasSessions ? require(path.join(_SESSIONS, 'session_sync.js')) : null;
 const _overlap = _sync ? _sync.overlapWarning(_session) : null;
 if (_overlap && _overlap.size) {
@@ -197,24 +106,23 @@ if (_overlap && _overlap.size) {
   console.log('    is a thing that should never happen and means a session drifted off its own subject.\n');
 }
 
-// ── HAS THE OTHER WORKSTATION MOVED? (added 2026-09-06) ──────────────────────────────────────────────
-// THE GAP THIS CLOSES, measured on 2026-09-06 rather than imagined: nothing in this tool had ever touched
-// the remote. It could say everything about this machine and nothing about the other one, while the fetch
-// that knows sat in `session_sync`, which runs at the END of a turn. So a session declared its work, did
-// all of it, and only then discovered another workstation had done the same job — 2 minutes 39 seconds
-// earlier, in the case that prompted this. The comment above `pullFirst` was already titled *"PULL BEFORE
-// THE TURN, NOT ONLY BEFORE THE PUSH"*; the reasoning was written and living in the tool that runs last.
-//
-// IT NEVER BLOCKS. The last session in has the authority to carry the tree forward (CLAUDE.md practice 5),
-// so this is information for the session's judgment in the same voice as the churn table below — never a
-// door, and never an escalation to the Architect.
-//
-// A FETCH UNDER A MINUTE OLD IS REUSED, because this runs after every code change and the trunk does not
-// move meaningfully inside a minute of editing. The first run of a turn pays a round trip; the rest are
-// local. `session_sync` passes no age and therefore always fetches fresh, which is right there: it is
-// about to push.
-const _trunk = _sync ? _sync.pullFirst(60000) : null;
-if (_trunk && _trunk.ok && _trunk.behind > 0) {
+// ── HAS THE OTHER WORKSTATION MOVED? ─────────────────────────────────────────────────────────────────
+// Fetches the trunk so a session's judgment is informed by the tree's current state (practice 5: the
+// last session in carries the tree forward). A fetch under a minute old is reused. Only the run that opens
+// a turn (--doing) merges; later runs in the same turn fetch and report without moving HEAD, since a
+// rebase landing mid-edit is worse than a stale read. session_sync performs the second pull before push.
+const _trunk = _sync ? _sync.pullFirst(60000, { merge: !!_sessionArg('--doing') }) : null;
+if (_trunk && _trunk.merged > 0) {
+  console.log(`=== THE TRUNK MOVED AND THIS CLONE HAS BEEN BROUGHT UP TO IT — ${_trunk.merged} commit(s) rebased in ===`);
+  console.log(`  You are now measuring and editing ${_trunk.remote}/${_trunk.branch} as it actually stands.`);
+  console.log(`      git log --oneline -${_trunk.merged}\n`);
+} else if (_trunk && _trunk.mergeRefused) {
+  console.log(`=== THE TRUNK HAS MOVED — ${_trunk.behind} commit(s), AND NOTHING WAS PULLED ===`);
+  console.log(`  ${_trunk.mergeRefused}.`);
+  for (const f of _trunk.collisions.slice(0, 8)) console.log(`      ${f}`);
+  if (_trunk.collisions.length > 8) console.log(`      … and ${_trunk.collisions.length - 8} more`);
+  console.log(`      git log --oneline HEAD..${_trunk.remote}/${_trunk.branch}\n`);
+} else if (_trunk && _trunk.ok && _trunk.behind > 0) {
   console.log(`=== THE TRUNK HAS MOVED — ${_trunk.behind} commit(s) on ${_trunk.remote}/${_trunk.branch} this clone does not have ===`);
   if (_trunk.collisions.length) {
     console.log(`  ${_trunk.collisions.length} of them touch file(s) you have already changed:`);
@@ -230,11 +138,9 @@ if (_trunk && _trunk.ok && _trunk.behind > 0) {
   console.log(`=== THE TRUNK WAS NOT CHECKED — ${_trunk.skipped}. The other workstation may have moved. ===\n`);
 }
 
-// WHAT IS ACTUALLY MOVING ON DISK, printed against what the board CLAIMS should be moving. The board is
-// declarations; this is mtimes, which no session has to remember to write. The whole value is in the
-// disagreement — ground that is changing while its owner reads cold, or changes belonging to nobody at
-// all. It is information for THIS session's judgment, never an instruction: *"its a tool for you to
-// reason… im empowering you with enough info to make informed reasonable decisions."*
+// What is actually moving on disk (mtimes), printed against what the board declares. The value is in
+// the disagreement — ground changing while its owner reads cold, or changes nobody claimed. Information
+// for the session's judgment, never an instruction.
 const _churn = _sync ? _sync.recentChurn(_session) : { ok: false, rows: [], contradictions: [] };
 if (_churn.ok && (_churn.rows.length || _churn.contradictions.length)) {
   const byOwner = new Map();
@@ -249,9 +155,8 @@ if (_churn.ok && (_churn.rows.length || _churn.contradictions.length)) {
     if (files.length > 6) console.log(`      … and ${files.length - 6} more`);
   }
   for (const c of _churn.contradictions) {
-    // Logged, not just printed. A contradiction is the one thing here that a session might see, act on,
-    // and never mention — and it is exactly the kind of event he wants a record of independent of what
-    // any session chose to report.
+    // Logged, not just printed — a contradiction is the one finding here a session might act on and
+    // never mention, so the record does not depend on it being reported.
     require(path.join(_SESSIONS, 'session_log.js')).write(_session, 'FLAG',
       `${c.owner} reads ${c.verdict} but its ground is changing: ${c.files.slice(0, 4).join(', ')}${c.files.length > 4 ? ` (+${c.files.length - 4})` : ''}`);
     console.log(`\n  !! CONTRADICTION: ${c.owner} reads ${c.verdict}, but its ground changed inside the window.`);
@@ -266,50 +171,27 @@ if (_churn.ok && (_churn.rows.length || _churn.contradictions.length)) {
   console.log('');
 }
 
-// The write briefing reads the three records, which live in `Documentation/` and `Cognitive_documents/` —
+// The write briefing reads the worklog, which lives in `Documentation/` —
 // outside the extract, same as the session layer. Printed only when the domain that owns them is present.
 if (_hasSessions) require(path.join(_SESSIONS, 'record_briefing.js')).print();
 
-// Layer ROOTS to sweep, walked RECURSIVELY. Order is irrelevant — each file is loaded independently.
-//
-// THE WALK USED TO BE ONE LEVEL DEEP PER LISTED PATH, and every subfolder split since has caught it:
-// calculators/ dropped the count 88 → 86 with no error, movement/ and locomotion/ were each invisible
-// until someone noticed and added a line, and combat_counters/ (2026-08-03) loaded 108 of 108 while
-// three brand-new files sat unswept. That is a Law 25 fault in the instrument itself — "108 of 108
-// fragment files" was true of the files this list happened to name and false of the fragments that
-// exist, and the shape of the failure is silent shrinkage rather than a red line.
-//
-// The list is roots now, so a new subfolder is swept the moment it exists. Adding one to this array is
-// only for a genuinely new TOP-LEVEL layer, which is a design act and not a refactor.
+// Layer ROOTS to sweep, walked recursively — a new subfolder is covered the moment it exists (Law 25).
+// Order is irrelevant; each file loads independently.
 const LAYERS = [
   'Thinking_fragments',
   'action_fragments.js',
   'perception_nodes.js',
   'custom_api',
   'js_kernel',
-  // The foreman was once missing from this list, so every file under it loaded for the first time in
-  // front of a human standing in the world. That is the silent-shrinkage fault this header describes,
-  // seen from the other side: the count was honest about the layers named and quiet about a layer that
-  // exists (Law 25). Since 2026-09-18 the hub (once `overseer/`) lives in this folder too.
-  'foreman',
-  // `monitoring/` IS DELIBERATELY NOT A LAYER, and this is the one entry stating an omission because the
-  // omission is the decision. The lens stack moved into the bot on 2026-09-10 so a stranger can diagnose
-  // their own run; it is a READ-ONLY OBSERVER that lives outside the construct — no fragment, no signal
-  // bus, decides nothing in the loop, and nothing in the fleet's runtime requires it. Every gate below
-  // is scoped to the construct: pass 1 loading a lens would run a CLI that calls `process.exit`, and
-  // pass 4's one-`try` rule exists because a boundary INSIDE the construct must report through
-  // `external_library_guard` — a reader whose whole job is to survive a half-written file it did not
-  // write is a different question with a different right answer. Adding this name would refuse sixteen
-  // correct files.
+  'foreman',   // the hub also lives here
+  // monitoring/ is deliberately absent — a read-only observer outside the construct, not a layer.
 ];
 
 // Files with live side effects on require (bind ports / open sockets / connect).
 const EXCLUDE = new Set([
-  path.join('foreman', 'foreman_hub.js'),
-  // Creates its mineflayer client at module scope, so requiring it JOINS THE SERVER — a load check that
-  // takes a player slot is not a load check.
-  path.join('foreman', 'foreman.js'),
-  'master_core.js',
+  path.join('foreman', 'foreman_hub.js'),   // binds a WebSocket port at module scope
+  path.join('foreman', 'foreman.js'),       // creates its mineflayer client at module scope — joins the server
+  'master_core.js',                         // connects to a live Minecraft server
 ]);
 
 const BOT_DIR = paths.BOT_ROOT;
@@ -329,18 +211,9 @@ function sweep(rel) {
 for (const layer of LAYERS) sweep(layer);
 
 // ── THE PARSE-TARGET LIST — `files` PLUS THE THREE EXCLUDED ONES ─────────────────────────────────
-// EXCLUDE exists for ONE reason: requiring those files has live side effects (binds a port, joins the
-// server, builds a bot). That reason is about LOADING and says nothing about READING, so every
-// parser-based pass must see them — parsing has no side effects at all.
-//
-// WHY THIS IS A SHARED CONSTANT RATHER THAN A LOOP IN EACH PASS. Pass 3 carried its own copy of this
-// re-add and closed the debt for itself; pass 4 did not, and nothing said so. `master_core.js` — what
-// every bot runs — therefore held twelve hand-written `try` blocks, eight of them silent and none of them
-// through the guard, and was never once seen by the gate whose whole purpose is that there is exactly ONE
-// `try` in the fleet (found 2026-09-10 by scoring the guard-admission gates against the tree).
-//
-// One list, derived once, used by every parser pass. A fourth parser pass added tomorrow gets the right
-// scope by using this name, which is the property two hand-written copies could not hold.
+// EXCLUDE keeps requiring safe; it says nothing about parsing, which has no side effects. Every
+// parser-based pass (3, 4) needs to see those files too, so this list is derived once and shared —
+// one scope every parser pass uses.
 const parseTargets = (() => {
   const t = [...files];
   for (const rel of EXCLUDE) {
@@ -351,79 +224,19 @@ const parseTargets = (() => {
 })();
 
 // ── PASS 3: UNBOUND IDENTIFIERS AND DEAD-ZONE READS ──────────────────────────────────────────────
+// Closes a hole in pass 1: loading a file executes only its top level, so a name unbound inside a
+// function body is invisible to a loader and throws only once the world reaches that line — quietly,
+// because the ReferenceError lands in a catch written for a misbehaving world and reads as the system
+// declining to act. Parses every static target and asks, via espree + eslint-scope
+// (the analyzer behind eslint's no-undef), whether each identifier resolves in scope, and whether a
+// let/const/class binding is read inside its own dead zone. Both questions share one parse and one walk.
+// The allowed-globals set is read off the running runtime (globalThis), not typed out, so it tracks
+// whatever this Node actually provides.
 //
-// TWO QUESTIONS, ONE PARSE, ONE WALK. Both ask what a name refers to at the moment its line executes,
-// both are answered by the same scope analysis, and neither can be answered without one. They are the
-// same pass because splitting them would parse every file twice to ask a question the analyzer has
-// already answered.
-//
-// THE HOLE THIS CLOSES, and it is a hole in pass 1 specifically. Pass 1 proves a file LOADS, which
-// executes only its top level: requires, constants, module.exports. An identifier referenced inside a
-// function body is never evaluated until that function runs, so a reference to a binding that does not
-// exist there is invisible to a loader — the file imports clean, wires clean, and throws the first time
-// the world reaches that line. The two ways it gets written are both ordinary edits: a refactor deletes
-// the statement that defined a local while a use of it survives further down, and a function extracted
-// out of its parent keeps reading a binding that stayed behind in the parent's scope. Neither changes
-// the top level, so neither is detectable by loading.
-//
-// WHY THE FAILURE IS QUIET RATHER THAN LOUD, which is what makes it worth an instrument. A ReferenceError
-// raised deep in a manager lands in whatever catch is nearest, and the catches in this fleet are written
-// for a world that misbehaves — they warn, skip the item, and return a not-done outcome. So the fault
-// presents as the system deciding not to act, repeatedly and with an explanation, which reads as a
-// gated or blocked condition rather than a crash. That is the most expensive shape a bug can have here.
-//
-// IT SHIFTS, IT DOES NOT ANCHOR, and that property is now the whole admission test for a pass here. It
-// is built on pass 1's own walk and names no file, no function and no identifier — it DISCOVERS what to
-// check rather than carrying a list, so it cannot cover less than pass 1 does and a file written tomorrow
-// is covered the day it exists. The allowlist has the same property by construction: it is READ OFF THE
-// RUNNING RUNTIME (`globalThis`) rather than typed out, so the globals it permits are exactly the ones
-// this Node actually provides — a hand-written list would be an anchor in the one place an anchor would
-// silently un-cover things as Node adds globals.
-//
-// WHY A REAL PARSER RATHER THAN A REGEX. Deciding whether an identifier is bound requires scope, and
-// scope needs an AST: hoisting, block versus function scope, shadowing, parameters, catch bindings and
-// closures all change the answer for identical text. A regex approximation of that emits well-formed
-// falsehoods in both directions, and a scanner that cries wolf gets worked around instead of fixed
-// (Law 25/26 — a check whose verdict cannot be trusted is worse than no check). espree + eslint-scope
-// are the analyzer behind the standard `no-undef`; the analysis is theirs, not a local re-derivation.
-//
-// VENDORED IN-TREE ON PURPOSE (Auren_Workshop/tools/vendor/). `node_env2/` is gitignored, so a dependency
-// installed there exists on one workstation and is missing on the other — the instrument would crash
-// on one machine or, worse, be made optional and silently skip. Vendored under the tracked tree it
-// travels with the repo and runs identically on both. `.gitignore` carries one negation for this path.
-//
-// VENDOR THE PUBLISHED TARBALL, NEVER THE REPOSITORY SOURCE. espree is `"type": "module"` and ships its
-// CommonJS entry as a BUILD ARTEFACT — `dist/espree.cjs`, produced by rollup at publish time and absent
-// from the source tree; `eslint-scope` and `eslint-visitor-keys` are built the same way. A vendoring
-// that copies source only leaves `main` pointing at a file that never existed, and the pass cannot run
-// at all. Re-vendor with `npm install` using `tools/vendor` as the prefix, then confirm `dist/` exists
-// under espree, acorn, eslint-visitor-keys and eslint-scope before committing.
-// ── THE SECOND QUESTION: A READ INSIDE ITS OWN DEAD ZONE ─────────────────────────────────────────
-//
-// WHY IT IS NOT COVERED BY THE FIRST, which is the whole reason it needs saying. `const x = x()` binds
-// `x` perfectly well — to the very variable being declared — so the unbound scan is CORRECTLY silent.
-// But a `let`/`const`/`class` binding is in a temporal dead zone until its initializer completes, so
-// reading it inside that initializer throws `ReferenceError: Cannot access 'x' before initialization`
-// the moment the line runs. Same symptom as an unbound name, opposite cause: too many bindings rather
-// than none.
-//
-// HOW IT GETS WRITTEN, and it is a decomposition's signature failure. A helper and one of its callers'
-// locals may share a name freely while they live in different scopes — a file-private `_x` beside a
-// caller's local `x` is a normal, safe arrangement. Extracting the helper into its own module makes it
-// an export, the leading underscore stops being true, and dropping it collapses two names into one:
-// the local now shadows the import, and the initializer that meant to call the helper calls itself.
-// Nothing about the top level changes, so the file loads clean and pass 1 is silent too.
-//
-// THE ONE DISTINCTION THAT MAKES THIS USABLE — and a version without it reports ordinary recursion as
-// a fault, which is how a scanner earns the reputation that gets it worked around (Law 25/26). A
-// reference inside an initializer is only in the dead zone if it is REACHED during that initializer.
-// `const walk = (d) => { ... walk(sub) ... }` puts the reference inside a nested function body, which
-// runs after the binding is initialized and is correct. The discriminator is therefore a function
-// boundary between the reference and the declaration, not text position — which is exactly why this
-// needs the analyzer and not a search.
-//
-// The same test covers the plainer shape: a read textually before its own `let`/`const`, in the same
-// function, with no closure between them.
+// Vendored in-tree under tools/vendor/ (not node_modules/, which is gitignored) so the analyzer is
+// identical on both workstations. Re-vendor with `npm install` using tools/vendor as the prefix; espree,
+// eslint-scope and eslint-visitor-keys ship their CommonJS entry as a build artefact (dist/), so vendor
+// the published tarball, never the repository source — confirm dist/ exists under each before committing.
 const ESPREE_DIR = path.join(__dirname, 'vendor', 'node_modules');
 let espree = null, eslintScope = null, analyzerError = null;
 try {
@@ -433,43 +246,27 @@ try {
   analyzerError = e && e.message ? e.message : String(e);
 }
 
-// Read off the runtime, never typed out — see above. The four CJS module-scope names are added because
-// they are provided by the module wrapper rather than by globalThis, so the runtime cannot report them.
+// Read off the runtime, not typed out (see above). The four CJS wrapper names are added because
+// globalThis does not report them.
 const ALLOWED_GLOBALS = new Set([
   ...Object.getOwnPropertyNames(globalThis),
   'require', 'module', 'exports', '__dirname', '__filename', 'arguments', 'globalThis',
 ]);
 
-// Parsing has NO side effects, so this pass sweeps the two files pass 1 must skip for their
-// load behaviour. That closes the declared debt above for this pass rather than inheriting it: the
-// reason those files are excluded is that requiring them binds a port or a socket, and nothing here
-// requires anything.
-// Walk out to the nearest enclosing function (or the module top level). Two references share an
-// evaluation moment only when this returns the same scope for both; anything else means a function
-// body sits between them and runs later.
+// Walks out to the nearest enclosing function (or module top level). Two references share an
+// evaluation moment only if this returns the same scope for both; otherwise a function body sits
+// between them and runs later.
 function enclosingFunction(scope) {
   let s = scope;
   while (s && s.type !== 'function' && s.type !== 'global' && s.type !== 'module') s = s.upper;
   return s;
 }
 
-// ── THE STATIC PASSES CAN REACH FURTHER THAN THE LOADING ONES, AND NOW DO (2026-09-10) ──────────────
-// `parseTargets` is the construct: the layers pass 1 can safely `require`. That bound is correct for
-// LOADING — pass 1 requiring a lens or a bench would run a CLI that calls `process.exit`, which is why
-// `LAYERS` states its omission of `monitoring/` as a decision. It was never a correct bound for a scan
-// that only PARSES. espree reads a file without executing a line of it, so the reason to stop at the
-// construct's edge simply does not apply here.
-//
-// WHAT THE GAP COST, measured the same day it was found: `fleet_control.stopAnyRecording()` branched on
-// a bare `RECORD_OVERLAY_REQUESTED_NOT_REAPED` that was declared in no scope anywhere. It loaded clean,
-// it passed every gate in this file, and it threw a ReferenceError out of `down` — so the FIRST thing
-// that ever reported it was a live teardown crashing at the end of a real run. That is exactly the
-// failure pass 3 exists to catch, one directory outside where pass 3 was looking.
-//
-// It matters more now than it did last week: the workshop ships as of 2026-09-10, so an unbound name in
-// a bench is a stranger's crash rather than only the Architect's. Pass 4 deliberately does NOT widen —
-// its one-`try` rule is about boundaries inside the construct, and a reader whose job is to survive a
-// half-written file it did not write is a different question with a different right answer (Law 29).
+// ── THE STATIC PASSES REACH FURTHER THAN THE LOADING ONES ───────────────────────────────────────────
+// parseTargets is bounded to what pass 1 may safely require. Parsing executes nothing, so that bound
+// does not apply here: staticTargets adds the workshop and the lenses, since an unbound name in a bench
+// is a stranger's crash too. Pass 4 does not widen the same way — its one-try rule is about boundaries
+// inside the construct (Law 29).
 const staticTargets = (() => {
   const t = [...parseTargets];
   for (const root of ['Auren_Workshop', 'monitoring']) {
@@ -498,21 +295,21 @@ function scanReferences(targets) {
     try {
       ast = espree.parse(fs.readFileSync(file, 'utf8'), { ecmaVersion: 'latest', range: true, loc: true });
     } catch (e) {
-      // A parse failure here is real: pass 1 already proved every swept file loads, so anything that
-      // cannot be parsed is either an excluded file with a genuine syntax error or a parser mismatch.
+      // Pass 1 already proved every swept file loads, so a parse failure here is an excluded file's
+      // genuine syntax error, or a parser mismatch.
       violations.push({ file: rel, line: 0, name: '(parse failed)', text: e && e.message ? e.message : String(e) });
       continue;
     }
     const scopeManager = eslintScope.analyze(ast, { ecmaVersion: 2024, sourceType: 'commonjs' });
-    // `through` is exactly the set of references that escaped every enclosing scope unresolved — the
-    // question this pass asks, answered by the analyzer rather than reconstructed from it.
+    // `through` is every reference that escaped unresolved — the unbound-identifier question, answered
+    // by the analyzer.
     for (const ref of scopeManager.globalScope.through) {
       const name = ref.identifier.name;
       if (ALLOWED_GLOBALS.has(name)) continue;
       violations.push({ file: rel, line: ref.identifier.loc.start.line, name });
     }
-    // The second question. Every scope, not just the global one: a dead-zone read is resolved — it
-    // found its binding — so it never appears in `through`.
+    // Every scope, not just global: a dead-zone read is resolved (it found its binding), so it never
+    // appears in `through`.
     const scopes = [scopeManager.globalScope];
     while (scopes.length) {
       const scope = scopes.pop();
@@ -522,11 +319,11 @@ function scanReferences(targets) {
         if (!variable || !variable.defs.length) continue;
         const def = variable.defs[0];
         // Only let/const/class have a dead zone; var and function declarations are hoisted and
-        // initialized, so reading one early yields undefined rather than a throw.
+        // initialized.
         const kind = def.type === 'Variable' ? (def.parent && def.parent.kind) : def.type;
         if (kind !== 'let' && kind !== 'const' && kind !== 'ClassName') continue;
-        // A function boundary between the reference and the declaration means the reference runs
-        // later — see the argument above; this is the line that keeps recursion out of the report.
+        // A function boundary between reference and declaration means the reference runs later —
+        // keeps ordinary recursion out of the report.
         if (enclosingFunction(ref.from) !== enclosingFunction(variable.scope)) continue;
         const at = ref.identifier.range[0];
         const init = def.node && def.node.init;
@@ -548,74 +345,27 @@ function scanReferences(targets) {
 }
 
 // ── PASS 4: THE CATCH SHAPE (A GATE) ─────────────────────────────────────────────────────────────
+// Law 13: a catch is a decision to continue, written before anyone knows what will arrive — a defect
+// behind one reads as the system declining to act, which hides in this size of
+// graph. Law 16 permits exactly one catch: a translator over a third-party throw that logs and never
+// swallows, owned by external_library_guard.js. Enforced as a SHAPE: a wrong catch is textually
+// identical to a right one, so one `try` in the fleet is legal and any other `try` is the violation.
 //
-// THIS IS A LAW 13 RULE BEFORE IT IS A LAW 16 ONE, and reading it the other way around is what makes a
-// successor treat it as tidiness. The one-pathway reading — "the fleet already owns one boundary
-// translator, so a second is a redundant route" — is true and it is the smaller half. The load-bearing
-// half is default-stopped: a catch is a decision to CONTINUE, written before anyone knows what will
-// arrive at it. Law 13 inverts that burden — code proves it is safe to proceed rather than proceeding
-// until it cannot — and a hand-written catch proves nothing. It converts an unknown into a known-good
-// path by assertion, at a place chosen for where the author expected trouble rather than for where the
-// trouble is.
-//
-// WHY THAT MATTERS MORE HERE THAN IN A SMALLER SYSTEM. A defect that throws surfaces at its own line,
-// with its stack, and travels to master_core's uncaughtException handler. The same defect behind a catch
-// surfaces as a warn line and a not-done outcome — the system deciding not to act, repeatedly, with an
-// explanation — which is indistinguishable from a gated or blocked world condition. Across a graph this
-// size that is a bug with somewhere to hide: it is read as a plan problem, and the search starts in the
-// wrong subsystem. The census's own findings are the demonstration — a catch answered "you can see it"
-// on a line-of-sight predicate, another closed a build as FINISHED because the instrument that measures
-// it broke, another returned an empty cell list that read as a completed field.
-//
-// Law 16 supplies the ONE exception and the shape it must take: a translator turning a third-party throw
-// into an outcome, which logs and never swallows. Enforcing that by READING catches is not possible — a
-// catch doing the wrong thing is textually identical to one doing the right thing, and the difference is
-// what it wraps and what it does next, which is a judgment. So the rule moves off the catch and onto a
-// SHAPE: one module owns the only `try` in the fleet, every boundary goes through it, and `try` appearing
-// anywhere else is the violation. That question an AST answers with no judgment at all.
-//
-// WHY A SHAPE RATHER THAN A MARKER COMMENT. A marker (`// LAW16-BOUNDARY`) is a declaration, and anything
-// can write a declaration without having done what it claims — a scan over markers proves a string is
-// present, never that a boundary is correct. That is Law 26's simulation case: the form survives and the
-// guarantee behind it is gone. A shape cannot be claimed, only performed.
-//
-// IT IS A GATE. It was a printed figure for exactly as long as the migration ran, because a rule nobody
-// can satisfy is ignored drift while a number that must only ever go down is visible drift. The figure
-// reached zero and the pass became what the figure existed to earn: one hand-written `try` fails the run.
-// The reader who is about to add a guard is the audience — the failure arrives before the commit, which
-// is the only place a default-stopped rule can be cheap to honour.
-// `--catch-detail` CLASSIFIES EACH SITE, kept past the migration because a violation is worth more than
-// its line number. Two mechanical axes decide what a site becomes, and neither needs judgment to read:
-//   GUARDS — does the try body touch a third-party surface (the mineflayer bot, a module required from
-//            outside the @-alias tree, JSON/fs) or only our own fragments? A third-party surface is the
-//            only thing Law 16 lets a catch translate; a guard around our own code is a defect converted
-//            into a decline-to-act, and its repair is DELETION, not a wrapper.
-//   CATCH  — empty (silent swallow, explicitly named illegal), silent (does work but never logs),
-//            logged (reaches watcher), rethrow (already Law 13 compliant).
-// The pair is the whole verdict: library/* → call the guard; own/* → delete; a `finally` that catches
-// nothing → withCleanup. Printing the matrix is what turns "you have a violation" into "here is which of
-// three repairs it takes".
+// `--catch-detail` classifies each site on two axes: GUARDS (does the try body touch a third-party
+// surface, or only our own code) and CATCH (empty / silent / logged / rethrow). guards=library calls the
+// guard; guards=own is deleted, not wrapped; a finally-only try becomes withCleanup.
 const BOUNDARY_OWNER = path.join('js_kernel', 'utils', 'external_library_guard.js');
 
-// THE SECOND EXEMPT FILE, AND IT IS NARROWER THAN AN EXEMPTION. The watcher cannot route its own failures
-// through the guard, because the guard reports by calling the watcher: on the exact failure the guard
-// exists to translate — a log write that will not complete — the report re-enters the broken writer and
-// recurses. That is structural, not a preference; no ordering of requires removes it.
-//
-// So the watcher carries its own translator, `_selfFault`, which reports to console.error — the one
-// channel that does not depend on the channel that just failed. Its exemption is therefore not "logging is
-// special" but "the log's own boundary must report somewhere the log is not", and it is checked rather
-// than trusted: inside this file a catch must do one of three things, all of them AST-visible.
-//   1. call _selfFault  — the watcher's guard, equivalent to guardExternal elsewhere
-//   2. rethrow          — instrumentation that observes a failure and lets it travel (track())
-//   3. sit inside _selfFault itself — the one terminal swallow in the fleet: if console.error throws
-//      (closed/EPIPE stderr) there is no remaining channel to report a failure to report.
-// A fourth shape in this file is a violation and fails the pass exactly as a stray try elsewhere does.
+// The watcher cannot route its own failures through the guard — the guard reports by calling the
+// watcher, so a failure in the watcher's own log write would recurse. It carries its own translator,
+// `_selfFault`, reporting to console.error, the one channel that does not depend on the failing one.
+// A catch in this file must: call _selfFault, rethrow, or sit inside _selfFault itself (the terminal
+// case: console.error itself throwing has nowhere left to report to). Anything else is a violation.
 const WATCHER_OWNER = path.join('js_kernel', 'watcher.js');
 const WATCHER_TRANSLATOR = '_selfFault';
 
-// True when this catch is one of the three shapes above. `insideTranslator` is passed by the walk rather
-// than recomputed, because "am I lexically inside _selfFault" is a fact about the path taken to get here.
+// True when this catch is one of the three legal shapes above. `insideTranslator` is passed by the
+// walk, since it is a fact about the path taken to reach this node.
 function _watcherCatchIsLegal(node, insideTranslator) {
   if (insideTranslator) return true;
   const handler = node.handler;
@@ -665,9 +415,8 @@ function _walkNode(node, fn) {
   }
 }
 
-// Names bound to something OUTSIDE our own source tree. A require whose argument starts with '@' is an
-// alias into this fleet; anything else (bare package, node builtin, relative path into our own tree is
-// rare and treated as ours) is a foreign surface whose throws we do not author.
+// Names bound to something outside our own source tree. A require starting with '@' is an alias into
+// this fleet; anything else is a foreign surface whose throws we do not author.
 function _foreignNames(ast) {
   const names = new Set(['bot', 'JSON', 'fs', 'path', 'process']);
   const bind = (id) => {
@@ -676,12 +425,10 @@ function _foreignNames(ast) {
       for (const p of id.properties) if (p.value && p.value.type === 'Identifier') names.add(p.value.name);
     }
   };
-  // ONE HOP IS NOT ENOUGH, so this runs to a fixpoint. A foreign object routinely arrives in a local and is
-  // then operated on for the rest of the function -- `const furnace = await bot.openFurnace(b)` followed by
-  // `furnace.takeOutput()`. Reading only the direct `bot.` calls counts that whole block as our own code and
-  // would recommend deleting a guard around a genuine third-party surface, which is the one way this census
-  // can do harm. Taint is over-inclusive by design: a false 'library' costs a wrapper that was arguably
-  // needed anyway, a false 'own' costs an unguarded boundary.
+  // Runs to a fixpoint: a foreign object often lands in a local and is operated on for the rest of the
+  // function (`const furnace = await bot.openFurnace(b)` then `furnace.takeOutput()`), so one hop would
+  // undercount. Taint is deliberately over-inclusive — a false 'library' costs a wrapper, a false 'own'
+  // costs an unguarded boundary.
   let grew = true;
   while (grew) {
     grew = false;
@@ -714,18 +461,15 @@ function _rootName(node) {
   return cur && cur.type === 'Identifier' ? cur.name : null;
 }
 
-// Three-way, and the middle value is the one that matters. Passing `bot` to one of OUR functions is not a
-// foreign call — the throw would come from our code — so the discriminator is whether the try body CALLS
-// something foreign (`call`), only READS a property off one (`read`, e.g. bot.entity.position, where a null
-// from an unloaded chunk is a genuine world condition), or neither (`own`, where a catch has nothing
-// legitimate to translate).
+// Classifies a try's body as calling a foreign surface ('library'), only reading a property off one
+// ('read' — e.g. bot.entity.position, where a null is a genuine world condition), or neither ('own',
+// where a catch has nothing legitimate to translate).
 function _classifyTry(node, foreign) {
   let calls = false, reads = false;
   _walkNode(node.block, (n) => {
     if (n.type === 'CallExpression') {
       if (n.callee.type === 'Identifier' && foreign.has(n.callee.name)) calls = true;
-      // A require() is only a foreign act when the module is foreign. `require('@thinking/x').y()` inside a
-      // try is OUR code throwing — counting it as a boundary would license a wrapper around our own defect.
+      // A require() is foreign only when the module is foreign — an @-alias require is our own code.
       if (n.callee.type === 'Identifier' && n.callee.name === 'require') {
         const a = n.arguments[0];
         if (!a || a.type !== 'Literal' || (typeof a.value === 'string' && !a.value.startsWith('@'))) calls = true;
@@ -794,15 +538,11 @@ if (failures.length) {
 }
 console.log('Graph wiring OK  (pass 1 loaded, pass 2 throws fired).');
 
-// Pass 3 after the load, for the ordering reason every pass here follows: a tree that does not load is
-// already refused, and an unbound identifier reported beside a load failure buries the one the reader
-// must fix first.
+// Pass 3 runs after the load: a tree that does not load is already refused, and an unbound-identifier
+// report beside a load failure would bury the fix-first item.
 //
-// A MISSING ANALYZER IS A FAILURE, NOT A SKIP. The tempting shape is to run this pass when the vendored
-// parser happens to resolve and pass silently when it does not — which turns the one instrument that
-// runs on every change into something that reports OK while checking nothing, and does it on whichever
-// machine is missing the install. An instrument that cannot perform its check says so and refuses
-// (Law 25: the verdict states the true result, and "not run" is never "passed").
+// A missing analyzer is a FAILURE, not a skip (Law 25) — an instrument that cannot perform its check
+// says so and refuses.
 if (analyzerError) {
   console.log('\n--- PASS 3 CANNOT RUN ---');
   console.log('  The vendored parser did not load: ' + analyzerError);
@@ -837,12 +577,8 @@ if (deadZone.length) {
 }
 console.log('Dead-zone read scan OK.');
 
-// Pass 4 last, for the same reason the others are ordered: a tree that does not load, or that reads an
-// unbound name, is already refused, and a catch reported beside either buries the one the reader must
-// fix first.
-// The watcher's exemption is checked BEFORE the census, because it is the one place a catch is legal and
-// an exemption nobody checks is the hole the shape rule was built to avoid — the three legal shapes are
-// the exemption's whole content.
+// Pass 4 runs last for the same ordering reason. The watcher's exemption is checked before the general
+// census, since an exemption nobody checks is the hole the shape rule exists to avoid.
 const watcherOffenders = scanWatcherCatchShape();
 if (watcherOffenders.length) {
   console.error(`\n--- WATCHER CATCH SHAPE: ${watcherOffenders.length} illegal catch(es) in ${WATCHER_OWNER} ---`);
@@ -855,90 +591,13 @@ if (watcherOffenders.length) {
 }
 console.log(`Watcher catch shape OK — every catch in ${WATCHER_OWNER} reports through ${WATCHER_TRANSLATOR}() or rethrows.`);
 
-// ── THE LOOP RECORD HOLDS HIS WORDS AND NOTHING ELSE (Architect 2026-09-10) ──────────────────────
-// A rule that bounds what the AI developer may write cannot be enforced by the AI developer — "did I
-// write too much" is the self-judged question that record was founded to escape. It is a whitelist with
-// no dial: below the archive boundary, a line is blank, a session heading, or a timestamped verbatim
-// prompt. Checked here because `session_sync` gates on this file, so a violating passage cannot reach the
-// trunk. Only runs where the session layer exists — the extracted bot repo has no such record.
-if (_hasSessions) {
-  const _keeper = require(path.join(_SESSIONS, 'record_keeper.js'));
-  for (const _rec of _keeper.RECORDS) {
-    const _pure = _keeper.auditPurity(_rec);
-    if (!_pure.checked) continue;
-    // ── ORDER IS A SEPARATE QUESTION FROM CONTENT, SO IT IS A SEPARATE PASS (Law 29) ────────────
-    // The purity pass reads WHAT is in the file. This one reads WHAT ORDER it is in, and nothing did
-    // until 2026-09-10 — when the renumber-plus-union combination put the newest entry in the wrong
-    // place four times in one day, on both workstations, each time repaired by hand. It REFUSES and
-    // never sorts: rewriting his record is his ruling to give, not this file's to take. Full reasoning,
-    // including the four admission gates it is scored against, is in `record_keeper.auditOrder`.
-    const _ord = _keeper.auditOrder(_rec);
-    if (_ord.checked && !_ord.ok) {
-      console.error(`\n--- LOOP RECORD IS OUT OF ORDER (${_ord.violations.length} heading(s)) ---`);
-      console.error(`  ${_rec.file}`);
-      console.error('  The record\'s own rule is "Newest session at the TOP, directly under this block."');
-      console.error('  A renumber fixes which NUMBER a colliding entry gets; it never moves the block, and');
-      console.error('  merge=union places blocks by hunk order. So a colliding turn gets a correct number in');
-      console.error('  the wrong position. Move whole lines — never retype a prompt — and run this again.');
-      for (const v of _ord.violations) {
-        console.error(`      :${String(v.line).padStart(4)}  ${v.why}`);
-        console.error(`             ${v.text}`);
-      }
-      if (_ord.unreadable.length) {
-        console.error(`  ${_ord.unreadable.length} heading(s) whose ordinal words did not parse were SKIPPED, not failed:`);
-        for (const u of _ord.unreadable) console.error(`      :${String(u.line).padStart(4)}  ${u.text}`);
-      }
-      process.exit(1);
-    }
-    if (_pure.ok) {
-      console.log(`Loop record OK — ${_rec.file} holds his verbatim prompts and nothing else, newest first.`);
-      continue;
-    }
-    console.error(`\n--- LOOP RECORD CARRIES THE AUDITOR'S OWN WORDS (${_pure.violations.length} line(s)) ---`);
-    console.error(`  ${_rec.file}`);
-    console.error('  The Architect struck the auditor\'s half on 2026-09-10: "keep only my verbatim prompts');
-    console.error('  and metadata only." Below the archive boundary exactly four things are permitted —');
-    console.error('  a blank line, a session heading, **HH:MM** *"his prompt"*, or **HH:MM** — a thread ran.');
-    console.error('  Mechanism, outcomes and reasoning go to the scratchpad and the bugsquashing report,');
-    console.error('  which is where they already go in the same turn. Full rules and the reasoning:');
-    console.error('  Cognitive_documents/1_AUDITS/cognitive_self/Architect_Watcher_Story_RULES.md');
-    for (const v of _pure.violations.slice(0, 20)) {
-      console.error(`      :${String(v.line).padStart(4)}  ${v.why}`);
-      console.error(`             ${v.text}`);
-    }
-    if (_pure.violations.length > 20) console.error(`      … and ${_pure.violations.length - 20} more line(s)`);
-    process.exit(1);
-  }
-}
-
 // ── PASS: NOTHING THAT SHIPS MAY `require` ANYTHING PRIVATE ─────────────────────────────────────────
-//
-// THE ASK (Architect 2026-09-10): *"the public person is handed all the code, none of the documents…
-// we can just make sure everything outside of auren bot is never syned to open source place… i should
-// just ship the whole thing as one piece."*
-//
-// This pass is what makes that safe to do, and it exists because a MECHANISM is being deleted to make
-// room for it. Until now the stranger test built a copy of `Auren_Bot/` from `git ls-files` and ran the
-// copy, and the copy PROVED — as a side effect, once per run — that nothing shipped reached outside the
-// shipped set: a require that did would have failed as MODULE_NOT_FOUND in the download. Shipping the
-// whole stack as one piece removes the copy, so that proof has to become something stated rather than
-// something incidental (Law 13 — the guarantee cannot quietly leave with the thing that happened to
-// provide it).
-//
-// IT IS STRICTLY BETTER THAN THE COPY WAS. It runs after every change instead of once per run, and it
-// names the file, the line and the offending path instead of surfacing forty seconds into a live run as
-// a module that is not there.
-//
-// ── ONLY A `require` COUNTS, AND THAT IS THE WHOLE RULE (Law 29) ────────────────────────────────────
-// A require is a LOAD-TIME DEPENDENCY: on a machine without that folder the file cannot even parse into
-// existence, and every caller above it dies. That is the one failure this pass is for.
-//
-// A private path MENTIONED in a comment, a help string, or a path computed and then existence-checked is
-// a different thing with a different right answer — `preflight` itself reads the three records out of
-// `Documentation/` and `Cognitive_documents/` and prints its briefing only when the domain that owns
-// them is present, which is correct behaviour and must not be refused. Making this pass judge mentions
-// too would need a whitelist of blessed files, and a whitelist of exceptions is how a guard becomes
-// something people edit instead of obey.
+// The public person is handed all the code and none of the documents (Auren_Bot/ ships whole, nothing
+// outside it). A require reaching outside the shipped set is a load-time dependency — the caller dies on
+// a machine without that folder — so this pass states that guarantee explicitly (Law 13). Only a
+// `require` counts (Law 29): a private path mentioned in a comment
+// or an existence-checked path is a different, legitimate thing — this file's own write briefing does
+// exactly that.
 const PRIVATE_DOMAINS = [
   'Cognitive_documents', 'Documentation', 'Privacy', 'Sessions',
   'Long_term_memory', 'MinecraftServer', 'Public_server', 'Cutting_room', 'Scratch_tools',
@@ -980,41 +639,15 @@ if (leaks.length) {
 console.log(`Shipped tree is self-contained — ${shipped.length} file(s), no require reaches private ground.`);
 
 // ── PASS: THE SHIPPED TREE MAY EXPLAIN THE LAYER ABOVE IT. IT MAY NOT TELL YOU TO USE IT ────────────
-//
-// ── WHY THIS EXISTS (Architect 2026-09-11) ──────────────────────────────────────────────────────────
-// *"look for other ways to separate architect from user. so ways we start and end is the biggest part.
-// the second part is the troubleshooting tools. i want my run to be the same as a user run one level
-// higher. a user run wont even know that theres a second layer above it."*
-//
-// The `require` pass above catches the layer above being DEPENDED ON — a load-time failure a stranger
-// meets as MODULE_NOT_FOUND. This pass catches the quieter half: the layer above being ADVERTISED. A
-// document in the shipped tree that says `node Cutting_room/photograph_page.js` costs a stranger nothing
-// at load and everything at the moment they need it — they type the one command their troubleshooting
-// guide gave them and get "cannot find module", from an instruction their own copy handed them. Nothing
-// fails, so nothing reports it; that is the shape of thing this file exists to catch.
-//
-// ── THE RULE, AND WHY IT IS NOT A WHITELIST (Law 29) ────────────────────────────────────────────────
-// A mention of private ground is a leak when it is an INSTRUCTION and fine when it is an EXPLANATION.
-// `foreman/owner_memory.js` names `Privacy/` eight times to explain why that folder is legitimately
-// absent on a published copy — that is the separation being documented, which is the opposite of the
-// separation failing, and a pass that flagged it would be teaching people to delete their own reasons.
-//
-// The machine form of "instruction" is a line a person would COPY: it starts with a runner (`node`,
-// `&`, `.\`, `./`, a `$`-prefixed shell line) or sits inside a fenced code block. That is a property of
-// the line, not a list of blessed files — so there is nothing here to add yourself to, which is what
-// keeps a guard something people obey rather than something they edit.
-//
-// ── IT WARNS, IT DOES NOT REFUSE, AND THAT ASYMMETRY IS DELIBERATE (Law 13) ─────────────────────────
-// The require pass exits 1 because its finding is a stranger's copy that cannot load. This one's finding
-// is a stranger's copy that loads perfectly and then misleads, which is a real fault and not a broken
-// build — refusing every commit until the prose is rewritten would stop work on the fleet to fix a
-// paragraph. It prints the file, the line and the text, every run, so the list is impossible to lose.
+// Catches the quieter half of layer separation: not a require that fails to load, but a document in the
+// shipped tree that tells a stranger to RUN something in a layer they do not have — nothing fails at
+// load, so nothing else reports it. A mention is a leak only when it is an instruction (a line a person
+// would copy: starts with a runner, or sits in a fenced code block); an explanation of why a folder is
+// legitimately absent is not (Law 29). Warns, and does not refuse (Law 13) — the finding is misleading
+// prose, not a broken build.
 const DOC_EXT = /\.(md|txt)$/i;
-// A markdown TABLE ROW is prose in a grid, so `|` is not a bullet here — `fleet_runbook.md`'s resolver
-// table names `../Architect_workstation/workstation.json` as the thing a stranger does NOT have, which is
-// this separation being documented. A `$name = ...` assignment is code computing a path, not a command
-// somebody types; `scripts/_node.ps1` builds the manifest path and then existence-checks it, which is the
-// resolver doing its job. Both were flagged on this pass's first run and both were the pass being wrong.
+// A markdown table row (`|`) is prose in a grid, not a bullet; a `$name = ...` assignment is code
+// computing a path, not a command somebody types — neither counts as a runner line.
 const RUNNER_LINE = /^\s*(?:[-*>]\s*)?(?:`{0,3})\s*(?:node|npm|npx|&|\.\\|\.\/|git)\s/;
 const advertised = [];
 (function sweepAdvertised(rel) {
@@ -1050,31 +683,51 @@ if (advertised.length) {
   console.log('Layer separation OK — nothing in the shipped tree tells a stranger to run anything they do not have.');
 }
 
+// ── PASS: COMMENTS STATE PURPOSE, NEVER STORY (LAW 14) ─────────────────────────────────────────────
+// A session copies the comment style it reads, so a storytelling comment in the shipped tree is a
+// template for the next one. This is the blacklist of storytelling triggers; a comment matching any of
+// them is refused. The story itself belongs in the commit message and the records.
+const STORY_TRIGGERS = [
+  { kind: 'date',     re: /\b20\d\d-\d\d-\d\d\b/ },
+  { kind: 'person',   re: /(?<![-`])\bArchitect\b/ },
+  { kind: 'run',      re: /\b(?:run|round|volume)\s+#?\d+\b/i },
+  { kind: 'history',  re: /\b(?:used to be|originally|formerly|was (?:deleted|removed|replaced|retired)|turned out|we (?:tried|found|saw)|(?:he|she|they) (?:said|ruled|asked)|his (?:ruling|call|words))\b/i },
+  { kind: 'records',  re: /\b(?:bugsquashing|scratchpad)\b|§\s?\d/i },
+  { kind: 'argument', re: /\b(?:deliberately not|do not reintroduce|the wrong turn|for two reasons)\b/i },
+];
+if (espree) {
+  const told = [];
+  for (const rel of shipped) {
+    const src = fs.readFileSync(path.join(BOT_DIR, rel), 'utf8').replace(/^#!.*/, '');
+    const { comments } = espree.tokenize(src, { ecmaVersion: 'latest', comment: true, loc: true });
+    for (const c of comments) {
+      c.value.split('\n').forEach((text, i) => {
+        const hit = STORY_TRIGGERS.find(t => t.re.test(text));
+        if (hit) told.push({ rel, line: c.loc.start.line + i, kind: hit.kind, text: text.trim().slice(0, 110) });
+      });
+    }
+  }
+  if (told.length) {
+    console.error(`\nSTORYTELLING COMMENT — ${told.length} comment line(s) in the shipped tree tell the code's story (Law 14).`);
+    console.error('  A comment states what the code beneath it is FOR, in the present tense. Dates, people, run');
+    console.error('  numbers, what used to be, and record pointers go in the commit message and the records.');
+    console.error('  Rewrite each line as purpose, or delete it:');
+    for (const t of told.slice(0, 40)) console.error(`      ${t.rel}:${t.line}   [${t.kind}]  ${t.text}`);
+    if (told.length > 40) console.error(`      … and ${told.length - 40} more line(s)`);
+    process.exit(1);
+  } else {
+    console.log(`Comment style OK — no comment in ${shipped.length} shipped file(s) tells the code's story.`);
+  }
+}
+
 // ── PASS: THE DEPENDENCY RUNS ONE WAY — THE WORKSHOP READS THE BOT, THE BOT NEVER READS THE WORKSHOP ──
-//
-// A DIFFERENT QUESTION FROM THE PASS ABOVE, and it gets its own pass for that reason (Law 29). That one
-// asks whether shipped code reaches material a stranger does not have. This one asks whether shipped bot
-// code reaches its own INSTRUMENTS — which every stranger now does have, so it is not a disclosure
-// question at all. It is about direction.
-//
-// WHY IT HAS TO BE CHECKED NOW, HAVING NEVER NEEDED CHECKING BEFORE (2026-09-10). Until the workshop
-// moved inside the bot, this invariant was enforced by ABSENCE: a fragment requiring a bench simply could
-// not resolve in the extract, so the failure announced itself the first time anybody downloaded. Shipping
-// the whole stack as one piece makes that same require resolve perfectly everywhere — which is to say the
-// mistake now WORKS, and a mistake that works is one nothing will ever report. That is exactly the shape
-// of thing this file exists to catch (Law 13 — a guarantee must not quietly leave with the accident that
-// happened to provide it).
-//
-// WHAT GOES WRONG IF IT INVERTS. The bot's fragments are loaded by the kernel in a fixed order and mount
-// onto the signal bus; the benches drive a live world and the lenses read finished records. A fragment
-// that requires a lens pulls a reader into the construct it is reading and makes the instrument part of
-// what it measures (Law 26 — the translator machine must sit outside). A fragment that requires a BENCH
-// is worse: benches connect clients and send RCON, so loading one as a side effect of loading the bot can
-// raise processes nobody asked for. That is not hypothetical — earlier in this same turn, a require typed
-// at a bench path started a live bench by accident.
-//
-// NAMING THE DIRECTORY IS SUFFICIENT DETECTION: no entry in `package.json._moduleAliases` points into the
-// workshop, so every route from shipped code into this folder has to traverse it by name.
+// A direction question, not a disclosure one (Law 29): every stranger has the workshop too, since it
+// ships inside the bot, so this checks that bot code never reaches into its own instruments. A fragment
+// requiring a lens pulls a reader inside the construct it measures (Law 26); one requiring a bench can
+// raise a live process (client connect, RCON) as a side effect of loading the bot. Shipping both inside
+// one tree means such a require now resolves everywhere instead of failing on download, so the guarantee
+// has to be checked directly (Law 13). Detected by name: no package.json alias points
+// into the workshop, so every route in has to spell "Auren_Workshop" out loud.
 const inward = [];
 for (const rel of shipped) {
   if (rel.split(/[\\/]/)[0] === 'Auren_Workshop') continue;   // the workshop reading itself is its job
@@ -1098,46 +751,16 @@ if (inward.length) {
 console.log('Dependency direction OK — no bot file requires the workshop.');
 
 // ── PASS: ANYTHING IN THE WORKSHOP OR THE LENSES THAT RUNS MUST ASK THE DOOR FIRST ──────────────────
+// A user running the bot must never see a developer tool start. A file under Auren_Workshop/ or
+// monitoring/ that DOES SOMETHING when loaded must make developer_door.enter(...) its first executable
+// statement, above anything that connects or spawns — checked from the parse tree, since an omission
+// works fine for whoever already has the door open and is invisible until a stranger's copy runs it
+// (the same shape as the dependency-direction pass above).
 //
-// THE ASK (Architect 2026-09-11): *"no tool for troubleshooting shall run for a user… a user who is just
-// running the bots shall not know that the tools are there and should not start for any of their
-// processes. if you want to work on the code then you go into debug mode or developer mode and must enter
-// through the architects door."*
-//
-// ── WHY THIS NEEDS A MACHINE AND CANNOT BE A HABIT ──────────────────────────────────────────────────
-// The door is one line at the top of thirty-odd files. A new bench written next month works perfectly
-// without it — it runs, it does its job, and NOTHING is wrong from where its author is standing, because
-// its author has the door open. The omission is invisible on every machine that could notice it and
-// visible only on a stranger's, which is the exact shape of fault this file exists for and the same
-// argument as the dependency-direction pass above: a mistake that works is a mistake nothing reports.
-//
-// ── THE RULE, STATED AS A WHITELIST (Law 29) ────────────────────────────────────────────────────────
-// A file under `Auren_Workshop/` or `monitoring/` that DOES SOMETHING WHEN IT IS LOADED must make
-// `developer_door.enter(...)` its FIRST executable statement.
-//
-// "Does something when it is loaded" is decided from the parse tree, and the permitted top-level
-// statements are named here and nowhere else: a directive (`'use strict'`), a declaration (`const`,
-// `let`, `function`, `class`), an assignment to `module.exports` or `exports.x`, and the MODULE-PATH
-// BOOTSTRAP. A file built only from those is a LIBRARY — requiring it computes nothing and starts
-// nothing, so the door has nothing to guard and the lens modules, `run_config.js` and
-// `workshop_paths.js` are silently correct. Any other top-level statement means `node <file>` acts, and
-// the first act must be the question.
-//
-// ── WHY THE PATH BOOTSTRAP IS ON THAT LIST, SAID OUT LOUD BECAUSE IT IS THE ONE JUDGEMENT CALL ──────
-// `paths.registerAliases()`, `paths.bootstrapModules()` and `module.paths.unshift(bootstrapModulePath())`
-// are how a file in this tree teaches `require` where the kernel lives. They are declarations wearing a
-// call's clothing: nothing connects, nothing spawns, nothing prints, and a module that skipped them could
-// not resolve its own next line. Eight lens and helper modules do exactly this and nothing else, and
-// forcing a door into them would be WRONG rather than merely noisy — a library is loaded by a parent that
-// has already asked, so the refusal would name the wrong file and the gate would fire twice.
-//
-// The cost of the exemption, named rather than hidden: a statement that CALLS one of those three and also
-// does something else in the same breath reads as inert here. It is one line in a file whose whole top
-// level is being read, so the exposure is a line somebody would have to write on purpose.
-//
-// FIRST, not merely present. A door call below a `mineflayer.createBot()` is a bot already connected; a
-// door call below a `spawn()` is a process already raised. The gate is only a gate at the top (Law 13 —
-// the default is STOPPED, so nothing may happen before the state is known).
+// A file built only from directives, declarations, module.exports/exports.x assignments, and the
+// module-path bootstrap calls (registerAliases/bootstrapModules/bootstrapModulePath — they teach
+// require where the kernel lives and start nothing) is a LIBRARY and needs no door; anything else is an
+// act (Law 29).
 {
   const DOOR_DIRS = new Set(['Auren_Workshop', 'monitoring']);
   const ungated = [];
@@ -1186,59 +809,19 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
 }
 
 // ── PASS: A LENS PRINTS FIELD NAMES AND VALUES. IT HAS NO GRAMMAR TO STATE A CONCLUSION WITH ────────
+// A lens extracts data; it was not present for the decision it reports on, so it has no standing to say
+// what the data means — the bot does, and a bot's own words copied into a VALUE are fine. Taking prose
+// out of the instrument removes the grammar a claim would need, which is a whitelist and needs no list
+// of forbidden words (Law 29).
 //
-// THE ASK (Architect 2026-09-16, replacing a vocabulary guard written earlier the same day):
-// *"First of all the bot has the right to interpret its own data because it's the one doing the
-// reasoning. Just like I can tell you why I made a choice so can the bot. Who cannot is the lens who had
-// no participation within the decision making process. The purpose of the lens is to extract data from
-// large files without reading it.*
+// Two checks:
+// A. ONE PATHWAY TO THE ANSWER (Law 16) — nothing under monitoring/ writes to stdout except data_out.js.
+// B. NO AUTHORED PROSE — no string literal containing a space, outside the two files that own
+//    presentation. A literal with no space is a field name, key, flag or bot name.
 //
-// *So back to the guard. How about this. Each lens answers a question without any string… there's no
-// longer any sentences or grammar in the output of the monitor. It answers a question directly and
-// outputs the data directly. Then we can guard against it by checking to see if there's ever a string?…
-// The purpose is that if you prevent trace monitor from saying anything except variables and timestamps
-// then it can never interpret data right?"*
-//
-// ── WHY THE PREVIOUS SHAPE WAS WRONG, KEPT BECAUSE THE MISTAKE IS INSTRUCTIVE ───────────────────────
-// The first guard scanned printed strings for interpretive WORDS — `because`, `likely`, `not a fault`.
-// That is a BLACKLIST across an open field, and Law 29 names exactly what is wrong with one: it permits
-// everything it forgot to name. It could be walked around by a synonym, it argued with its own author
-// over `may` meaning PERMITTED rather than PERHAPS, and no list of words could ever catch an
-// interpretation phrased in words nobody thought of. It also could not say WHY a word was forbidden
-// except by asserting it.
-//
-// THE STRUCTURAL SHAPE NEEDS NO LIST. A lens that cannot form a SENTENCE cannot state a CONCLUSION.
-// Take prose out of the instrument and interpretation has nowhere to live — not because the words are
-// banned, but because there is no grammar left to carry them. That is a whitelist: field names, values,
-// timestamps, and by omission nothing else.
-//
-// ── WHERE INTERPRETATION IS STILL LEGAL, AND WHY THAT IS THE POINT RATHER THAN A HOLE ───────────────
-// THE BOT MAY INTERPRET ITSELF. `farm_manager` writing `[STUCK — nothing worked]` into the record is a
-// participant reporting its own reasoning, and it is the only thing in the system that was present for
-// that decision. A lens reproducing that text VERBATIM as a VALUE is copying, not claiming. What a lens
-// may never do is compose a sentence of its own ABOUT a value, because it was not there. So this pass
-// does not look at values at all — it looks at whether the lens AUTHORED any prose.
-//
-// ── THE RULE, AS TWO CHECKS (Law 29: one topic, one list, each check its own topic) ─────────────────
-// A. ONE PATHWAY TO THE ANSWER (Law 16). Nothing under `monitoring/` writes to stdout except
-//    `data_out.js`. Every lens hands it field names and values.
-// B. NO AUTHORED PROSE. No string literal containing a SPACE, outside the two files that own
-//    presentation. A literal without a space is a field name, a key, a flag or a bot name.
-//
-// ── THE EXEMPTIONS, NAMED HERE AND NOWHERE ELSE ─────────────────────────────────────────────────────
-// `data_out.js` and `report_formatting.js` are THE FORMATTING LAYER: they own every space, separator,
-// column width and timestamp shape in the output, which is precisely why no other file needs one.
-// `throw` text and `console.error` are a CRASH and an IO failure, not an answer about a run — they
-// report that the instrument could not read, never what a reading means.
-//
-// ── THE COSTS, NAMED RATHER THAN DISCOVERED ─────────────────────────────────────────────────────────
-// 1. A sentence could still be smuggled in as `rows_laid_far_too_few` — a field name with underscores
-//    for spaces. `data_out.field()` caps a name at 48 characters, but the real answer is that this is a
-//    thing somebody would have to do on purpose, and a guard's job is to stop the mistake that happens
-//    by accident while feeling helpful.
-// 2. A lens could route a report to `console.error` and escape check A. Same category: deliberate.
-// 3. Output stops reading like a report and starts reading like a table. That is the intended trade —
-//    a report is persuasive and a table is not, and the reader is meant to do the persuading.
+// Exemptions: data_out.js and report_formatting.js own every space and separator in the output, so no
+// other file needs one. `throw` text and console.error/stderr report that the instrument could not
+// read, never what a reading means, so they are not an answer about a run.
 {
   const LENS_DIR = 'monitoring';
   const FORMATTING_LAYER = new Set(['data_out.js', 'report_formatting.js']);
@@ -1292,16 +875,12 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
         && (n.callee.property.name === 'error' || n.callee.property.name === 'warn')) {
         n.arguments.forEach(markSubtree);
       }
-      // `fail(...)` is trace_monitor's own abort — it prints to stderr and exits. A helper that WRAPS
-      // the error channel is still the error channel, and the alternative is every usage message being
-      // rewritten as fields, which would make a broken flag harder to diagnose rather than easier.
-      // Named here rather than inferred: a function is exempt because it is on this list, not because
-      // of what its body happens to do.
+      // fail(...) is trace_monitor's own abort — prints to stderr and exits, so it is the error channel.
       if (n.type === 'CallExpression' && n.callee.type === 'Identifier' && n.callee.name === 'fail') {
         n.arguments.forEach(markSubtree);
       }
-      // `process.stderr.write` is the same channel as console.error and was missed on the first cut:
-      // stderr carries what the instrument could not do, stdout carries what it read.
+      // process.stderr.write is the same channel as console.error: it carries what the instrument
+      // could not do, never what it read.
       if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && !n.callee.computed
         && n.callee.property.name === 'write' && n.callee.object.type === 'MemberExpression'
         && n.callee.object.object.name === 'process' && n.callee.object.property.name === 'stderr') {
@@ -1309,14 +888,8 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
       }
     });
 
-    // ── WHAT COUNTS AS PROSE, SHARPENED BY WHAT THE FIRST CUT CAUGHT ───────────────────────────────
-    // "Contains a space" was too blunt and its false positives were all one thing: PUNCTUATION. A lens
-    // legitimately holds `', '` to split the record on, `' · '` and `'|'` to join a value with, and
-    // `` `${m}m ${s}s` `` to shape a timestamp. None of those can carry a claim, because a claim needs
-    // WORDS. So the test is a space PLUS a run of two or more letters — which still catches every
-    // authored fragment (`'fed '`, `'queued behind '`, `'still running at trace end'`) and stops
-    // arguing with the separators. `'use strict'` is a directive to the engine, not output, and is the
-    // one worded literal named here.
+    // A space plus a run of two or more letters distinguishes prose from punctuation separators
+    // (', ', ' · ', timestamp templates). 'use strict' is a directive, not output, and is exempted.
     const WORDED = /[A-Za-z]{2,}/;
     _walkNode(ast, (n) => {
       if (exempt.has(n)) return;
@@ -1348,34 +921,14 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
   console.log('Lens output OK — field names and values only; no lens can author a sentence.');
 }
 
-// ── PASS: THE FLEET NEVER REACHES FOR A LENS (Architect 2026-09-16, STANDING) ────────────────────────
-//
-//   "Nothing should be using trace monitor while the bot is online, its post Mortem only. Run.js should
-//    be talking directly to the program it needs... It should skip that and talk directly. Make sure no
-//    live code program uses a lens or monitor and talks directly to the system needed"
-//
-// ── WHAT THIS PASS CAN PROVE, AND WHAT IT DELIBERATELY LEAVES TO THE GATE ───────────────────────────
-// "Live" is a property of WHEN a program runs, and no static scan can see when. So this pass proves the
-// half that IS structural — the half where "live" is not a moment but an identity.
-//
-// THE CONSTRUCT IS LIVE BY DEFINITION. Everything under `Auren_Bot/` that is not `monitoring/` and not
-// `Auren_Workshop/` exists only to be a running bot: the kernel, the thinking and action fragments, the
-// perception nodes, the foreman, master_core. There is no hour of the day at which one of
-// those files is doing a post-mortem. So a require or a spawn of a lens from any of them is wrong in
-// every possible execution, which makes it exactly the kind of thing a file scan can settle (Law 13).
-//
-// The workshop is NOT scanned here and that is not an oversight. A bench legitimately does both — it
-// drives a fleet and then reports on it — so its lens reads are governed by WHEN, which is the gate's
-// job (`monitoring/post_mortem_gate.js`): a captured read of a record that is still being written is
-// refused at the instrument, whoever is asking. Two mechanisms, one for each half of the rule, and
-// neither pretending to cover the other's (Law 29 — one topic, one list).
-//
-// WHY A FLEET REACHING FOR A LENS IS A FAULT AND NOT A SHORTCUT. `record_homes` states the shape the
-// records were given: the traces are EXHAUST, and *"nothing in the running fleet reads it."* A bot that
-// read one would be deriving its own behaviour from a description of its own past behaviour — a loop
-// through a file, where a direct question to the owning module is one call (Law 16). It also breaks the
-// records room's one guarantee: a start empties it whole, so a bot reading it mid-run reads a file that
-// may have been deleted underneath it.
+// ── PASS: THE FLEET NEVER REACHES FOR A LENS (STANDING) ────────────────────────
+// A lens reconstructs a run that is over; live code asking one reads a description of its own past
+// behaviour out of a file that the next start empties whole (Law 16 — the owning module is one call
+// away). "Live" is a property of WHEN code runs, which a static scan cannot see, so this pass proves
+// the structural half: everything under Auren_Bot/ that is not monitoring/ or Auren_Workshop/ exists
+// only to be a running bot, so any require or spawn of a lens from there is wrong in every execution
+// (Law 13). The workshop is not scanned here — a bench legitimately drives a fleet and reports on it,
+// and that is governed by WHEN instead, at monitoring/post_mortem_gate.js (Law 29).
 {
   const lensOffenders = [];
   // The permitted readers, named positively: the lenses themselves, and the workshop, whose live reads
@@ -1434,44 +987,15 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
 }
 
 // ── PASS: THE AUTHORED VERSION AGAINST WHAT THE INSTALLED LIBRARIES CAN ACTUALLY REACH ──────────────
+// The fleet's Minecraft version ceiling is set by the CLIENT LIBRARY, not by Mojang's newest release:
+// the highest version both minecraft-protocol.supportedVersions and mineflayer.testedVersions carry is
+// the highest a bot here can join. That ceiling moves whenever a dependency is updated, silently, so
+// this pass re-derives it directly from the two installed manifests (Law 26).
 //
-// WHY THIS EXISTS (Architect 2026-09-17, on finishing the 1.21.5 → 26.1 move). The fleet's Minecraft
-// version is not chosen by looking at minecraft.net. It is chosen by the CLIENT LIBRARY: the highest
-// version present in BOTH `minecraft-protocol.supportedVersions` and `mineflayer.testedVersions` is the
-// highest version a bot here can join, whatever Mojang has published. At the time this pass was written
-// Mojang's newest release was 26.3 and that ceiling was 26.1 — a two-release gap that has nothing to do
-// with the fleet and everything to do with what PrismarineJS has shipped support for.
-//
-// Before this pass, the whole of that reasoning lived in a comment block in `architect_config.js`. A
-// comment is fine for explaining a decision and useless for NOTICING one, and the noticing is the part
-// that has an owner problem: **the ceiling moves when somebody runs `npm update`, not when anybody
-// decides anything.** So the upgrade-is-now-possible moment arrives silently, attached to an unrelated
-// action, and the only thing standing between it and being missed for months is a person remembering to
-// go and re-derive two fields by hand. That is precisely the class of fact this file exists to hold.
-//
-// IT ANSWERS OFFLINE, AND THAT IS DELIBERATE. The question is not "what is the newest Minecraft" — that
-// needs the network, goes stale, and is not actionable anyway. The question is "given what is installed
-// on THIS machine right now, can the fleet go higher than it is going?", which is answerable from two
-// manifests and is exactly the question whose answer changes after a dependency bump.
-//
-// WHY BOTH LIBRARIES AND NOT JUST ONE (Law 29 — the ceiling is ONE number, so it needs one rule that
-// produces one number). `minecraft-protocol` can parse a version that `mineflayer` has never tested
-// against; taking the protocol library alone would report a ceiling the bot cannot actually stand on.
-// The intersection is the honest answer, and the two are printed separately when they disagree so the
-// reader can see WHICH library is the binding constraint — that is the one to watch for a release.
-//
-// THE COMPARISON IS BY PROTOCOL NUMBER, NEVER BY STRING. Minecraft's version names changed shape in this
-// very migration: `1.21.11` sorts below `1.21.5` under every string comparison and below `1.21.9` under a
-// naive numeric split, and `26.1` sorts below all of them. Protocol numbers are monotonic by definition —
-// they are what the handshake actually negotiates — so they are the only ordering that cannot be wrong.
-//
-// THE THREE OUTCOMES, AND WHY ONLY ONE OF THEM FAILS THE RUN (Law 13 applied honestly, rather than
-// uniformly). A config ABOVE the ceiling is a defect: the fleet cannot connect, every run is dead before
-// it starts, and the failure it would otherwise produce is a handshake error four layers away from the
-// line that caused it. That one exits non-zero. A config BELOW the ceiling is not a defect at all — it is
-// an OPPORTUNITY, and an opportunity that failed the build would make `npm update` break a green tree and
-// teach everyone to stop running this. It reports and passes, the same asymmetry the layer-separation
-// pass draws for the same reason.
+// Compares by PROTOCOL NUMBER, never by version string — Minecraft version names do not sort correctly
+// as strings, but protocol numbers are monotonic by definition. A configured version ABOVE the ceiling
+// fails the run (every connection dies at the handshake); a version BELOW it is an opportunity and only
+// reports, so `npm update` never breaks a green tree (Law 13).
 {
   const NM = path.join(BOT_DIR, 'node_modules');
   const manifestVersions = (pkg, field) => {
@@ -1494,8 +1018,7 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
   const mfList = manifestVersions('mineflayer', 'testedVersions');
 
   if (!mcpList || !mfList) {
-    // Absence is reported and never guessed past: a missing manifest means this machine cannot answer
-    // the question, which is a different statement from "the version is fine" (Law 26).
+    // Absence is reported as unread, never assumed fine (Law 26).
     console.log('Version ceiling UNREAD — minecraft-protocol/mineflayer manifests not resolvable from ' +
                 'this tree, so no ceiling was computed. Nothing is claimed about the configured version.');
   } else {
@@ -1515,15 +1038,9 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
     const mcpTop = highest(mcpList);
     const mfTop = highest(mfList);
 
-    // THE TEST IS MEMBERSHIP, NOT ORDERING — and that distinction was found by testing this pass rather
-    // than by designing it (2026-09-17). The first cut asked only "is the authored protocol number above
-    // the ceiling?", which silently passed the WORST input it can be given: `26.2`, a real Minecraft
-    // release that `minecraft-data` has never heard of. It resolved to no protocol number at all, fell
-    // into the can't-answer branch, and the run went green — a configured version the stack cannot even
-    // name, reported as nothing to see. A version absent from the lists is not an unknown to be reported
-    // around; it is the strongest possible evidence the fleet cannot join, so it is a refusal. Ordering
-    // now only decides WHICH sentence a failure prints, never whether it fails (Law 26: the honest
-    // failure and the well-formed silence are one keystroke apart, and only a test tells them apart).
+    // Membership decides the refusal, never ordering alone: a version absent from both lists (one the
+    // libraries have never heard of) is the strongest evidence the fleet cannot join, not an unknown to
+    // report around. Ordering only decides which sentence a failure prints (Law 26).
     if (!ceiling) {
       console.log('Version ceiling UNREAD — the library lists did not resolve to protocol numbers on ' +
                   'this machine. Nothing is claimed about the configured version.');
@@ -1547,9 +1064,7 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
       console.log(`Version ceiling OK — configured for ${authored} (protocol ${authoredProto}), which IS ` +
                   'the highest the installed libraries reach. Nothing to upgrade to.');
     } else {
-      // The whole reason the pass was written: this line is the notification that an upgrade became
-      // possible, printed at the moment somebody next touches the code rather than whenever they think
-      // to go and look.
+      // Notifies that an upgrade became possible, at the moment the code is next touched.
       const binding = (mfTop && mcpTop && mfTop.p < mcpTop.p) ? 'mineflayer' : 'minecraft-protocol';
       console.log(`Version ceiling — AN UPGRADE IS AVAILABLE: configured for ${authored} ` +
                   `(protocol ${authoredProto}), libraries now reach ${ceiling.v} (protocol ${ceiling.p}).`);
@@ -1564,14 +1079,91 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
   }
 }
 
+// ── STALE BUILD PLAN — THE ONE CHANGE THAT PASSES EVERY OTHER CHECK AND STILL DOES NOTHING ─────────
+// A downloaded building is not planned at runtime: plan_blueprint.js computes the plan once into
+// <name>.build_plan.json, and downloaded_plan_registry.load reads that file for the whole run — so an
+// edit to the planner is invisible to the fleet until the plan is regenerated, however clean the headless
+// check of the planner reads. Compares each plan's own schema field against downloaded_plan_registry's
+// own export (Law 16). Silent when there are no plans.
+try {
+  const planDir = paths.repo('html and json', 'Downloaded_Blueprints');
+  if (fs.existsSync(planDir)) {
+    const { SCHEMA } = require(paths.bot('js_kernel', 'downloaded_plan_registry.js'));
+    const stale = [];
+    let checked = 0;
+    for (const f of fs.readdirSync(planDir).filter(n => n.endsWith('.build_plan.json'))) {
+      const full = path.join(planDir, f);
+      let plan;
+      try { plan = JSON.parse(fs.readFileSync(full, 'utf8')); } catch { continue; }
+      if (!plan || typeof plan.schema !== 'string') continue;
+      checked++;
+      if (plan.schema !== SCHEMA) stale.push({ name: plan.name || f.replace('.build_plan.json', ''), f, schema: plan.schema });
+    }
+    if (stale.length === 0) {
+      console.log(`Build plans OK — ${checked} plan(s) made by the current planner (${SCHEMA}).`);
+    } else {
+      console.error(`\n--- STALE BUILD PLAN: ${stale.length} plan(s) were made by a different planner ---`);
+      console.error('  The fleet reads the PLAN FILE, not the planner. Until these are rebuilt the run refuses');
+      console.error('  them at startup, and every other check here will still pass.');
+      for (const s of stale) {
+        console.error(`      ${s.name}: plan is ${s.schema}, the fleet reads ${SCHEMA}`);
+      }
+      console.error('  Rebuild each one with:');
+      console.error('      node Auren_Bot/Auren_Workshop/tools/plan_blueprint.js "html and json/Downloaded_Blueprints/downloaded_blueprints.json" --name=<name>');
+      process.exit(1);
+    }
+  }
+} catch (e) {
+  // Environmental — a shipped tree may carry no imports at all — so this is stated, not failed.
+  console.log(`Build plans — not checked (${e.message}).`);
+}
+
+// ── THE TIMER SHAPE (A GATE) ─────────────────────────────────────────────────────────────────────
+// A repeating timer is what a heartbeat is made of, and a heartbeat judges work by a clock set before
+// anyone knew how long the work takes. The construct has one repeating timer and one clock that judges
+// work, both in timeout_crash.js: `every()` names each repeating timer so a crash report can list it,
+// and `watch()` ends the whole run at one limit. Enforced as a SHAPE, the way the catch is: a
+// `setInterval` or `clearInterval` written anywhere else in the construct is the violation.
+const TIMER_OWNER = path.join('js_kernel', 'utils', 'timeout_crash.js');
+const REPEATING_TIMER_NAMES = new Set(['setInterval', 'clearInterval']);
+function scanTimerShape() {
+  const sites = [];
+  for (const file of parseTargets) {
+    const rel = path.relative(BOT_DIR, file);
+    if (rel === TIMER_OWNER) continue;
+    let ast;
+    try {
+      ast = espree.parse(fs.readFileSync(file, 'utf8'), { ecmaVersion: 'latest', loc: true });
+    } catch (e) { continue; }
+    _walkNode(ast, (node) => {
+      if (node.type !== 'Identifier' || !REPEATING_TIMER_NAMES.has(node.name)) return;
+      sites.push({ rel, line: node.loc.start.line, name: node.name });
+    });
+  }
+  return sites;
+}
+const timerSites = scanTimerShape();
+if (timerSites.length === 0) {
+  console.log('Timer shape OK — every repeating timer in the construct is placed through timeout_crash.');
+} else {
+  console.error(`\n--- TIMER SHAPE: ${timerSites.length} repeating timer(s) written outside timeout_crash ---`);
+  console.error('  A heartbeat judges work by a clock, and a clock is always too short or too long. Work');
+  console.error('  that fails reports itself; work that never comes back is caught by ONE clock, at ONE');
+  console.error('  number, and it ends the whole run with a report. Both live in');
+  console.error('  js_kernel/utils/timeout_crash.js. The two repairs:');
+  console.error('    a periodic job (a flush, a sample)   → timeoutCrash.every(tag, what, fn, ms) / .stop(timer)');
+  console.error('    "is it still alive / did it answer"  → const w = timeoutCrash.watch(tag, what); … w.done()');
+  for (const s of timerSites) console.error(`      ${s.rel}:${s.line}  ${s.name}`);
+  process.exit(1);
+}
+
 const shape = scanCatchShape();
 if (shape.total === 0) {
   console.log('Catch shape OK — every boundary goes through external_library_guard.');
   process.exit(0);
 }
-// The classification prints on a FAILURE now rather than behind a flag, because the reader here is
-// someone who just wrote one try and needs to know which of three repairs it takes — not someone
-// surveying a migration. `--catch-detail` still lists every site for a sweep.
+// Prints the classification on failure — the reader just wrote one try and needs to know which of the
+// three repairs it takes. `--catch-detail` lists every site for a full sweep.
 console.error(`\n--- CATCH SHAPE: ${shape.total} hand-written try block(s) outside external_library_guard ---`);
 console.error('  Default state is stopped (Law 13). A catch is a decision to CONTINUE written before');
 console.error('  anyone knows what will arrive at it, and it proves nothing about being safe to proceed —');

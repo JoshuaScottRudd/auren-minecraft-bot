@@ -2,68 +2,53 @@
 // THE CAMERA WARDEN — a camera per bot on a run where the bots do not exist yet.
 //
 // ── WHY THIS EXISTS ─────────────────────────────────────────────────────────────────────────────────
-// Every filming route in this system was built for a crew whose size is known before the world starts:
-// `-Count N`, N windows, one director, one `up`, one `start`. A CONTRACTOR run inverts that. The world
-// comes up with zero bots on purpose — the thing under test is the desk — and a person standing in the
-// game says `foreman get`, at which point two bodies come into being that nothing had heard of a minute
-// earlier. A camera per bot then has to be raisable DURING the take, or the only run type a let's play
-// is actually made of is the one run type that cannot be filmed.
-//
-//   Architect 2026-09-06: *"because i use contractors through foreman i want starting bots to also
-//   start their spectator cameras… then ill call foreman get and get 2 bots, they start up and with
-//   their start also starts cameras that are recording."*
+// Every other filming route is built for a crew whose size is known before the world starts. A
+// CONTRACTOR run inverts that: the world comes up with zero bots, and a hire in game can bring bodies
+// into being that nothing had heard of a minute earlier. A camera per bot has to be raisable DURING the
+// take, or a let's-play run is the one run type that cannot be filmed.
 //
 // ── IT WATCHES THE WORLD, NOT THE LAUNCHER ──────────────────────────────────────────────────────────
-// The obvious wiring is a hook in `foreman get`, or in `fleet_control botStart`, firing a camera launch
-// beside each bot launch. It is the wrong joint twice over. First, `bot-start` RETURNS WHEN THE PROCESS
-// IS LAUNCHED — a body enters the foreman's registry only after it connects, spawns and master_core
-// initialises, seconds later — so a camera raised on the launcher's return is a camera aimed at a bot
-// that is not in the world yet. That is the exact defect the foreman's own crew loop was rebuilt to fix
-// (Law 26: the launcher's fact and the world's fact are different facts). Second, it would put the film
-// crew inside the fleet's own pathway: the foreman would have to know cameras exist, and a run's
-// behaviour would depend on whether it was being filmed — which is the one thing filming must never do
-// (Law 19, and the camera runbook's opening rule: the film crew observes, it does not act).
+// A hook in `foreman get` or `fleet_control botStart` is the wrong joint twice over. First, `bot-start`
+// returns when the PROCESS is launched — a body enters the foreman's registry only after it connects,
+// spawns and master_core initialises, seconds later — so a camera raised on the launcher's return aims
+// at a bot not yet in the world (Law 26: the launcher's fact and the world's fact are different facts).
+// Second, it would put the film crew inside the fleet's own pathway, making a run's behaviour depend on
+// whether it is being filmed (Law 19 — the film crew observes, it does not act).
 //
-// So the warden SENSES instead. It asks the foreman's registry who is standing, every few seconds, and
+// So the warden SENSES instead: it asks the foreman's registry who is standing, every few seconds, and
 // gives a camera to anyone who has none. That covers `foreman get`, a hand `bot-start`, a revive, and
-// anything not yet written, because none of them is what it is watching (Invariant B — re-sense the
+// anything not yet written, since none of them is what it is watching (Invariant B — re-sense the
 // world, never track it from remembered events).
 //
-// ── ATTACH ONLY. A CAMERA IS NEVER TAKEN DOWN MID-TAKE, AND THAT IS A CHOICE ────────────────────────
-// A dismissed contractor leaves the registry, and its camera goes on filming an empty spectator vantage
-// until the take ends. That costs disk and nothing else. Reaping it would mean removing a live OBS
-// source and killing a client whose Source Record filter is mid-file, and a file no muxer closed is the
-// expensive failure this whole stack is arranged to avoid — expensive because it is only discovered
-// after the episode. The whole crew comes down together, in order, at teardown, where the recording is
-// stopped BEFORE any window disappears (record_overlay's reap). Law 8 is satisfied there, by the owner
-// that raised the run, rather than here in pieces.
-// The registry is also the right sensor for this specifically: it holds CONNECTION, not life, so a bot
-// that merely DIED is still in it and keeps its camera. Only a bot that genuinely left drops out.
+// ── ATTACH ONLY. A CAMERA IS NEVER TAKEN DOWN MID-TAKE ────────────────────────────────────────────────
+// A dismissed contractor leaves the registry, and its camera keeps filming an empty spectator vantage
+// until the take ends, costing disk and nothing else. Reaping it would mean removing a live OBS source
+// and killing a client whose Source Record filter is mid-file — a file no muxer closed is the expensive
+// failure this whole stack exists to avoid. The whole crew comes down together, in order, at teardown,
+// where recording stops before any window disappears (record_overlay's reap; Law 8).
+// The registry holds CONNECTION, not life, so a bot that merely died is still in it and keeps its
+// camera; only a bot that genuinely left drops out.
 //
 // ── WHAT IT DOES PER ATTACH, AND WHY EACH STEP IS THE OWNER'S ───────────────────────────────────────
 //   start_cameras.ps1 -Bots <every standing bot> -Add    build + launch the missing clients, then
 //                                                        restart the director and titler over all of them
 //   recorder.bindLate   --bots=<the same set>            (record only) bind the new captures and prove every
 //                                                        file is really writing — the recorder is the
-//                                                        Architect's, reached through workstation.findRecorder
-// Not one line of that is implemented here. This file holds the TRIGGER and the ORDER and nothing else;
-// every step is a call to the unit that already owns it (Law 16). The order is the same order a cold
-// filmed run uses and it is not negotiable — a capture bound before its window exists records black and
-// reports a clean start.
+//                                                        operator's, reached through workstation.findRecorder
+// Not one line of that is implemented here: this file holds the TRIGGER and the ORDER, and every step
+// is a call to the unit that already owns it (Law 16). The order matches a cold filmed run and is not
+// negotiable — a capture bound before its window exists records black and reports a clean start.
 //
-// THE MID-TAKE ATTACH WORKS, AND IT WAS MEASURED RATHER THAN ASSUMED (2026-09-06). A Source Record
-// filter CREATED 7 SECONDS AFTER StartRecord began writing immediately: 3.1 MB on disk 14s later while
-// the already-running capture kept growing untouched. Had that come back the other way this whole design
-// would have needed OBS's recording stopped and restarted for every contractor, splitting the
-// presenter's own file every time he hired somebody.
+// THE MID-TAKE ATTACH IS MEASURED: a Source Record filter created after StartRecord began wrote
+// immediately, alongside the already-running capture, so a running recording does not need to be
+// stopped and restarted for a new contractor.
 //
 // ── WHAT IT REFUSES ─────────────────────────────────────────────────────────────────────────────────
-// A ceiling on cameras, because this raises GAME CLIENTS and nothing else in the loop is counting. Four
-// windows at an unpinned framerate held this box's GPU at 98% flat for five minutes (measured
-// 2026-08-16, which is why every camera is now pinned to 60 fps). The bound is stated and reported
-// rather than silent: past it the warden says which bots it is NOT filming and keeps going, because a
-// run that stops filming is better than a run whose machine stalls, and both are better than a warden
-// that quietly films some bots and never says which (Law 25).
+// A ceiling on cameras, since this raises GAME CLIENTS and nothing else in the loop is counting — an
+// unpinned framerate across several windows can hold a GPU flat (every camera is pinned to 60 fps for
+// this). Past the ceiling the warden reports which bots it is NOT filming and keeps going: a run that
+// stops filming is better than a run whose machine stalls, and both are better than a warden that
+// quietly films some bots and never says which (Law 25).
 
 'use strict';
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/camera_warden.js');
@@ -76,17 +61,16 @@ const paths = require('../workshop_paths');
 const TOOLS_DIR = __dirname;
 const BOT_DIR = paths.BOT_ROOT;
 const REPO_ROOT = paths.REPO_ROOT;
-// The scripts are the ARCHITECT'S one-button starts and they live in the workshop, never in the shipped
+// The scripts are the operator's one-button starts and they live in the workshop, never in the shipped
 // bot — so this one path crosses back to this side of the split while the rest reach across it.
 const SCRIPTS = paths.workshop('scripts');
 const KERNEL = paths.bot('js_kernel');
 
-// THE FLEET'S OWN DOOR CLIENT, borrowed rather than re-spelled — the same borrow tools/foreman_probe
-// makes, and for the same reason: the one fact this file needs is which bots the foreman has
-// REGISTERED, and a second socket client written here would be a parallel route to it that drifts the
-// day the envelope changes (Law 16). It is used to OBSERVE and never to command; the warden issues no
-// verb to any bot, which is what keeps the film crew out of the fleet's pathways (Law 19).
-// The aliases are registered because the door is written for a process that has them.
+// THE FLEET'S OWN DOOR CLIENT, borrowed, not re-spelled — the same borrow tools/foreman_probe makes,
+// for the same reason: a second socket client here would be a parallel route to which bots the foreman
+// has REGISTERED, and the two would drift (Law 16). It only OBSERVES; the warden issues no verb to any
+// bot, keeping the film crew out of the fleet's pathways (Law 19).
+// Aliases are registered because the door is written for a process that has them.
 paths.registerAliases();
 const door = require(path.join(BOT_DIR, 'foreman', 'foreman_door.js'));
 
@@ -94,11 +78,11 @@ const door = require(path.join(BOT_DIR, 'foreman', 'foreman_door.js'));
 // foreman allows ninety), so a contractor is filmed within a few seconds of standing up, and the cost
 // of asking is one short-lived socket to a process on this machine.
 const POLL_MS = 6000;
-// The ceiling, and it counts GAME CLIENTS rather than bots: the host seat and the Architect's eye are
-// windows on the same GPU. See the header for the measurement behind it.
+// The ceiling counts GAME CLIENTS, not bots: the host seat and the operator's eye are windows on the
+// same GPU too.
 const DEFAULT_MAX_CAMERAS = 6;
 // A raise takes tens of seconds (an instance build, a Minecraft launch, a director restart). The poll
-// is suspended across one rather than run concurrently — two converging launches over one crew is two
+// suspends across one instead of running concurrently: two converging launches over one crew are two
 // owners of one set (Invariant D), and the second would restart the director the first just raised.
 
 const argv = process.argv.slice(2);
@@ -160,9 +144,9 @@ async function standingBots() {
   return { ok: true, ids: state.bots.map(b => b.id).filter(Boolean) };
 }
 
-// The one attach pass. Converges the whole crew rather than adding one name, because -Add and `up` are
-// both convergent and a converging call is its own repair path — a client that died in between is
-// relaunched by the same pass that adds the new one (Invariant B).
+// The one attach pass. Converges the whole crew instead of adding one name: -Add and `up` are both
+// convergent, so a converging call is its own repair path — a client that died in between is relaunched
+// by the same pass that adds the new one (Invariant B).
 async function attach(all, added) {
   say(`${added.join(' and ')} ${added.length === 1 ? 'is' : 'are'} standing and ${added.length === 1 ? 'has' : 'have'} no camera — raising ${added.length === 1 ? 'one' : added.length}.`);
 
@@ -187,9 +171,8 @@ async function attach(all, added) {
   }
 
   // RECORD ONLY. A watched run has nothing to bind: the new window is up and the director is cutting to
-  // it, which is the whole of watching. On a recorded run this is the step that makes the attach true
-  // rather than likely — the recorder binds the new capture and proves every file is putting real bytes
-  // on disk, which for a mid-take attach is the only moment the new file can be proved.
+  // it, which is the whole of watching. On a recorded run the recorder binds the new capture and proves
+  // every file is putting real bytes on disk — the only moment a mid-take attach can be proved.
   if (RECORDER) {
     const obsArgs = [`--bots=${all.join(',')}`, `--host=${HOST_ON ? 'on' : 'off'}`, `--architect=${ARCHITECT_ON ? 'on' : 'off'}`];
     if (!RECORDER.bindLate(obsArgs)) {
@@ -205,9 +188,9 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
 
-// Generous, and the ceiling is a real failure rather than a delay: a converge that never finished
-// leaves the new camera unbound, and saying so is what lets the operator act during the take instead of
-// finding a black file afterwards.
+// Generous, and the ceiling is a real failure, not a delay: a converge that never finished leaves the
+// new camera unbound, and saying so lets the operator act during the take instead of finding a black
+// file afterwards.
 const CREW_READY_TIMEOUT_MS = 240000;
 async function waitForCrew(expected) {
   const deadline = Date.now() + CREW_READY_TIMEOUT_MS;
@@ -269,12 +252,10 @@ async function main() {
     }
     if (!take.length) continue;
 
-    // ATTACHED OR NOT, THE NAME IS RECORDED — which is why the result is not branched on. A failed
-    // converge left un-recorded would be retried every six seconds for the rest of the run, relaunching
-    // Prism and restarting the director each time: a repair loop with no judge, which is the shape
-    // Law 27 names, and it would do more damage than the missing camera. The failure is already stated
-    // out loud where it happened; the operator decides whether to act, and the repair path is the same
-    // convergent call by hand — `start_cameras.ps1 -Bots … -Add`, then the recorder's own bind on a recorded run.
+    // ATTACHED OR NOT, THE NAME IS RECORDED: a failed converge left un-recorded would retry every six
+    // seconds for the rest of the run, relaunching Prism and restarting the director each time — a
+    // repair loop with no judge (Law 27), doing more damage than the missing camera. The repair path is
+    // the same convergent call by hand.
     await attach([...filmed, ...take], take);
     for (const id of take) filmed.add(id);
   }

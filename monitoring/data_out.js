@@ -2,51 +2,23 @@
 // THE ONE PLACE IN THIS FOLDER THAT WRITES TO STDOUT. Every lens hands it FIELD NAMES and VALUES; it
 // owns every space, every separator and every column width in the output. Nothing else here may.
 //
-// ── THE ASK (Architect 2026-09-16) ──────────────────────────────────────────────────────────────────
-// *"First of all the bot has the right to interpret its own data because it's the one doing the
-// reasoning. Just like I can tell you why I made a choice so can the bot. Who cannot is the lens who had
-// no participation within the decision making process. The purpose of the lens is to extract data from
-// large files without reading it.*
+// STRUCTURAL, NOT A VOCABULARY GUARD: a lens that cannot form a SENTENCE cannot state a CONCLUSION. Only
+// field names, values, and timestamps are admitted here — a whitelist of what may leave this file
+// (Law 29), so interpretation has no grammar left to live in.
 //
-// *So back to the guard. How about this. Each lens answers a question without any string… there's no
-// longer any sentences or grammar in the output of the monitor. It answers a question directly and
-// outputs the data directly… The purpose is that if you prevent trace monitor from saying anything except
-// variables and timestamps then it can never interpret data right?"*
+// THE BOT MAY INTERPRET ITSELF. A bot's own recorded sentence about its own reasoning, reproduced
+// verbatim, is a copied value, not a claim this file forms — the sentence belongs to the bot and this
+// file is the envelope. What a lens may never do is compose a sentence of its own ABOUT a value. Every
+// string a lens prints is either a field name it declared or a value it copied, never a third kind.
 //
-// ── WHY THIS SHAPE BEATS THE VOCABULARY GUARD IT REPLACES ───────────────────────────────────────────
-// The first attempt (2026-09-16, same day) scanned printed strings for interpretive WORDS — "because",
-// "likely", "not a fault". That is a BLACKLIST across an open field, and Law 29 says a blacklist permits
-// everything it forgot to name. It could be walked around by a synonym, it argued with its own author
-// over `may` meaning PERMITTED rather than PERHAPS, and it could never catch an interpretation phrased in
-// words nobody thought to list. It was the wrong shape.
-//
-// THE RIGHT SHAPE IS STRUCTURAL: a lens that cannot form a SENTENCE cannot state a CONCLUSION. Remove
-// prose from the instrument entirely and interpretation has nowhere to live — not because the words are
-// forbidden, but because there is no grammar left to carry them. That is a whitelist: field names,
-// values, timestamps, and nothing else is admitted.
-//
-// ── WHERE INTERPRETATION IS STILL LEGAL, AND WHY THAT IS NOT A LOOPHOLE ─────────────────────────────
-// THE BOT MAY INTERPRET ITSELF. `farm_manager` writing `[STUCK — nothing worked]` into the record is a
-// participant reporting its own reasoning, and it is the only thing in the system that was present for
-// that decision. A lens reproducing that text VERBATIM is copying a value, not forming a claim — the
-// sentence belongs to the bot and the lens is the envelope. What the lens may never do is compose a
-// sentence of its own ABOUT the value, because it was not there.
-//
-// So the rule is not "no strings reach the terminal". It is: EVERY STRING A LENS PRINTS IS EITHER A FIELD
-// NAME IT DECLARED OR A VALUE IT COPIED. It never writes a third kind.
-//
-// ── THE COST, NAMED RATHER THAN DISCOVERED LATER ────────────────────────────────────────────────────
-// Output stops reading like a report and starts reading like a table. That is the intended trade: a
-// report is persuasive and a table is not, and the reader is meant to do the persuading.
+// Output is a table of fields and values; the reader does the interpreting.
 
 'use strict';
 
 const { ABSENT, padRight, padLeft } = require('./report_formatting');
 
-// A field name is an IDENTIFIER, never a phrase — this is what makes grammar impossible upstream. The
-// shape is enforced here at the call rather than trusted, because a field name is the one string a lens
-// authors and it is exactly where a sentence would try to re-enter (`rows_laid` fine, `rows laid so far`
-// refused, and so is the underscore-smuggled `rows_laid_which_is_too_few`).
+// A field name is an IDENTIFIER, never a phrase, enforced at the call: lower-case, digits, `_` and `.`
+// only (`rows_laid` fine, `rows_laid_which_is_too_few` refused as a smuggled sentence).
 const FIELD = /^[a-z0-9][a-z0-9_.]{0,46}[a-z0-9]$|^[a-z0-9]$/;
 
 function field(name) {
@@ -73,11 +45,8 @@ const KEY_WIDTH = 28;
 
 // One field, one value. The whole vocabulary of a scalar answer.
 //
-// NEVER TRUNCATES, and that is not a style choice. The first cut of this used `padRight`, which pads AND
-// clips to the column — so `farm_standing_at_first_sweep` lost its tail and printed as
-// `farm_standing_at_first_sweepfalse`, a field name welded to its own value. A column is a convenience
-// and a measurement is the product; when they conflict the column gives way (Law 25 — an instrument must
-// not quietly destroy the thing it was asked to report).
+// NEVER TRUNCATES: a column is a convenience and a measurement is the product; when they conflict the
+// column gives way (Law 25 — an instrument must not quietly destroy the thing it was asked to report).
 function kv(name, v) {
   const n = field(name);
   console.log(n + (n.length >= KEY_WIDTH ? ' ' : ' '.repeat(KEY_WIDTH - n.length)) + value(v));
@@ -97,12 +66,9 @@ function table(fields, rows) {
     console.log(names.join('\t'));
     return;
   }
-  // THE CAP IS ON THE PADDING, NEVER ON THE CONTENT — and that distinction is the whole lesson here.
-  // The first cut used `padRight`, which pads AND clips: a 60-char cap silently cut the navigator's own
-  // owner string mid-measurement. Removing the cap fixed the loss and made one 2,000-character bot line
-  // pad every other row out to 2,000 columns. So: a column is padded to at most PAD_CAP, and a cell
-  // wider than that simply runs long and leaves the row ragged. Alignment is a convenience, the
-  // measurement is the product, and when they collide the convenience gives way (Law 25).
+  // THE CAP IS ON THE PADDING, NEVER ON THE CONTENT: a column pads to at most PAD_CAP, and a cell wider
+  // than that simply runs long and leaves the row ragged. Alignment is a convenience, the measurement is
+  // the product, and when they collide the convenience gives way (Law 25).
   const PAD_CAP = 40;
   const cells = rows.map(r => r.map(value));
   const w = names.map((n, i) => Math.min(PAD_CAP, Math.max(n.length, ...cells.map(r => (r[i] || '').length))));
@@ -117,8 +83,7 @@ function list(name, values) {
   table([name], values.map(v => [v]));
 }
 
-// A count of something that did not occur. Reported as a field with 0, never as a phrase about absence:
-// "no A* path lines in the latest run" was where a reason for the zero used to get attached.
+// A count of something that did not occur. Reported as a field with 0, never as a phrase about absence.
 function zero(name) {
   kv(name, 0);
 }
@@ -132,10 +97,9 @@ function blank() {
 // piece of presentation, so no lens needs its own `process.stdout.write` and check A in preflight can be
 // a flat rule with no exceptions. The caller hands the same `field=value` text it would print anyway.
 //
-// THIS IS THE ONE PLACE TRUNCATION IS CORRECT, and it is worth saying why given the rule everywhere else
-// forbids it: a ticker line is EPHEMERAL — overwritten a second later and never part of an answer — and a
-// line longer than the terminal wraps, which breaks the redraw and leaves torn text on screen. Nothing is
-// lost because nothing here was a record.
+// THE ONE PLACE TRUNCATION IS CORRECT: a ticker line is EPHEMERAL — overwritten a second later and never
+// part of an answer — and a line longer than the terminal wraps, which breaks the redraw and leaves torn
+// text on screen. Nothing is lost because nothing here was a record.
 let _tickerOpen = false;
 function ticker(text) {
   if (!process.stdout.isTTY) { console.log(text); return; }
@@ -148,9 +112,9 @@ function tickerEnd() {
   if (_tickerOpen) { process.stdout.write('\n'); _tickerOpen = false; }
 }
 
-// The same answer as a machine artefact. A caller that asked for JSON wants the structure, not a table,
-// and this is still data leaving through the one door rather than a second stdout writer growing in a
-// lens (Law 16 — the reason check A in preflight can be a flat rule with no exceptions).
+// The same answer as a machine artefact. A caller that asked for JSON wants the structure, not a table.
+// This is still data leaving through the one door (Law 16 — the reason check A in preflight can be a
+// flat rule with no exceptions).
 function json(obj) {
   console.log(JSON.stringify(obj, null, 2));
 }

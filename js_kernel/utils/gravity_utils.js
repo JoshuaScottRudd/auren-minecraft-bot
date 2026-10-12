@@ -1,53 +1,31 @@
-// util: gravity_utils
-// purpose: Single source of truth for gravity-block / fluid identification, the
-//          shared "gravel-to-fluid conduit" hazard scan used by both the shaft
-//          site picker (find_buildingspot) and the cell hazard scan (scanCell),
-//          and water source-vs-flow classification (used by find_buildingspot's
-//          farmland site search — a river/ocean SOURCE is a valid attach point,
-//          a flowing stream is not).
-//
-// WHY this exists (Law 16 — one pathway): find_buildingspot, mining_integrity and
-//   the cell scanner all need the SAME notion of "what is a gravity block" and
-//   "what is a fluid", and two of them need the SAME conduit-detection logic. Three
-//   copies of the sets + two copies of the column walk would drift apart. They live
-//   here once and are imported everywhere (Law 16).
-//
-// THE GRAVEL DOCTRINE: gravel/sand are NOT rejected on sight. A gravity block is
-//   only a *hazard* if its column connects to a fluid — as the column falls into
-//   the dug space, the fluid follows. Everything else is a benign runtime nuisance
-//   the executor repeat-mines until the column is exhausted. So this module
-//   distinguishes CONDUIT (hard reject) from BENIGN (buildable).
+// Identifies gravity blocks and fluids, classifies a gravity column as a fluid CONDUIT
+// (hard hazard) or BENIGN (a runtime nuisance the executor repeat-mines), and tells a
+// water source apart from flowing water. The one definition find_buildingspot,
+// mining_integrity and the cell hazard scanner all share (Law 16).
 
 const { Vec3 } = require('vec3');
 const { guardExternalSync } = require('@utils/external_library_guard');
 
-// Blocks that fall under gravity. A gravity block in a mined space cascades: dig the
-// bottom one and the column above drops into the vacated spot.
+// Blocks that cascade when the block beneath is mined.
 const GRAVITY_BLOCKS = new Set(['gravel', 'sand', 'red_sand', 'suspicious_sand', 'suspicious_gravel']);
 
-// Blocks that flood or burn a dug space. The only material-based hard disqualifier
-// underground — everything solid is fair game to dig.
+// Blocks that flood or burn a dug space — the only material-based hard disqualifier underground.
 const FLUID_HAZARDS = new Set(['water', 'flowing_water', 'lava', 'flowing_lava', 'bubble_column']);
 
-// Safety cap on the upward column walk: no Minecraft column is taller than the build
-// limit. Without it a pathological world read (or a bug) could spin forever.
+// Bounds the upward column walk to the tallest possible Minecraft column.
 const MAX_COLUMN_WALK = 384;
 
 function isGravityBlock(name) { return GRAVITY_BLOCKS.has(name); }
 function isFluid(name) { return FLUID_HAZARDS.has(name); }
 
-// Unguarded: blockAt ANSWERS null for an unloaded column rather than throwing, and null is already
-// the reading every caller of this handles.
+// Reads a block's name; null for an unloaded column, the reading every caller here handles.
 function blockName(bot, x, y, z) {
   const b = bot.blockAt(new Vec3(x, y, z));
   return b ? b.name : null;
 }
 
-// isWaterSource — distinguishes a still water SOURCE block (river/ocean surface,
-// safe to attach a farmland site to) from flowing water (a stream feed, drains
-// dry over time). The "level" blockstate property is 0 only at a source; any
-// other value (1-15) is a flow tier — a literal name check against FLUID_HAZARDS
-// cannot make this distinction.
+// True for a still water SOURCE block (safe farmland attach point), false for flowing water.
+// The "level" blockstate property is 0 only at a source; 1-15 is a flow tier.
 function isWaterSource(bot, x, y, z) {
   const block = bot.blockAt(new Vec3(x, y, z));
   if (!block || block.name !== 'water') return false;
@@ -60,18 +38,10 @@ function isWaterSource(bot, x, y, z) {
   return false;
 }
 
-// followGravityColumn — given a gravity block at (x,y,z), decide whether its column
-// is a fluid conduit (hard hazard) or benign (the executor will repeat-mine it).
-//
-// Walks UP the contiguous gravity column to its top, then checks two ways a fluid can
-// reach the dug space: (1) a fluid directly capping the top of the column (it drops in
-// once the plug is removed), and (2) a fluid as a horizontal neighbor of any block in
-// the column (it flows in sideways as the column falls). Returns 'CONDUIT' or 'BENIGN'.
-//
-// Bounded by column height + a constant 4-neighbor check per level — cheap. A null
-// (unloaded) block is treated as non-fluid here; the CALLER is responsible for the
-// separate "unloaded chunk → defer" decision (Law 13 environmental), because that is a
-// different outcome (defer, not reject) than this function's hazard verdict.
+// Walks up a gravity column from (x,y,z) to its top and checks whether a fluid reaches
+// the dug space by capping the column or touching a horizontal neighbor at any level.
+// Returns 'CONDUIT' (hard hazard) or 'BENIGN'. An unloaded block reads as non-fluid here;
+// the caller owns the separate unloaded-chunk defer decision (Law 13).
 function followGravityColumn(bot, x, y, z) {
   let cursor = y;
   let guard = MAX_COLUMN_WALK;

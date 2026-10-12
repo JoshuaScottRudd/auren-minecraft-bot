@@ -1,82 +1,72 @@
 // util: wheat_plot_scanner (farm siting)
-// purpose: THE siting authority for the phase-1 ad-hoc wheat field. Given a bot's voxels, it returns up to N
-//          (crop, stand) plots that are hydrated, stand-paired, LAND-REACHABLE and mutually PENALTY-FREE, cut
-//          from the BIGGEST plot cluster in the loaded area first. lock_all_buildspots locks each returned plot
-//          as one `wheat_plot_pair` blueprint instance; find_buildingspot does NOT site these — its per-spot fit
-//          knows nothing of the hydration Y-rule or the cross-plot penalty graph, which are the entire point
+// purpose: the siting authority for the phase-1 ad-hoc wheat field. Given a bot's voxels, it returns up to N
+//          (crop, stand) plots that are hydrated, stand-paired, land-reachable and mutually penalty-free, cut
+//          from the biggest plot cluster in the loaded area first. lock_all_buildspots locks each returned plot
+//          as one `wheat_plot_pair` blueprint instance; find_buildingspot does not site these — its per-spot fit
+//          knows nothing of the hydration Y-rule or the cross-plot penalty graph
 //          (Law 16: one siting pathway for this field, and it is this one).
 //
 // ── THE MODEL: A PLOT IS A TUPLE, AND THE FIELD IS BUILT IN LAYERS ──────────────────────────────────────
-// A plot is a CROP cell (the seed spot) and a STAND cell (where the body stands to work it), one cardinal step
-// apart at the same height. Reuse is ASYMMETRIC:
-//   • a STAND may serve several crops — a walkway between two rows serves both;
-//   • a CROP belongs to one plot, and a stand is never a crop nor a crop a stand — farmland under a body is
+// A plot is a crop cell (the seed spot) and a stand cell (where the body stands to work it), one cardinal step
+// apart at the same height. Reuse is asymmetric:
+//   • a stand may serve several crops — a walkway between two rows serves both;
+//   • a crop belongs to one plot, and a stand is never a crop nor a crop a stand — farmland under a body is
 //     trampled back to dirt, so the two sets are disjoint.
 // The field is built in four layers, each reading only what the one before it produced:
 //   1. WATER — every sea-level water source in the loaded area, flooded body by body.
 //   2. LAND  — every column within HYDRATION_RADIUS of a shore, judged by the one column rule (plotColumn).
 //   3. TUPLES — each usable column, nearest the water first, becomes a crop if a stand can be paired with it and
-//      the PENALTY OVERLAY admits it (see tupleLayer for the order and the tests).
+//      the penalty overlay admits it (see tupleLayer for the order and the tests).
 //   4. CUT   — the plots group into clusters; the field is cut from the biggest, topped up from the next.
 //
-// ── WHY TUPLES AND NOT A FIELD-WIDE STRIPE PATTERN ──────────────────────────────────────────────────────
-// The previous layout fixed ONE stripe axis, parity and stand side for the whole loaded area, then kept only the
-// columns that happened to agree with it, in contiguous runs of four. Every bank that faced another way, every
-// cell on the walkway parity, and every run shorter than four was discarded — the pattern was chosen once and
-// the terrain had to fit it, so most usable bank columns in any real loaded area never became plots. The overlay
-// decides per column, so a winding bank keeps every stretch whatever it faces, and penalty-freedom is CHECKED rather
-// than produced by stripe spacing (verifyNoPenalty re-derives it off the finished field).
-// The cost, named: single plots may stand alone, so a field fragments more easily. The CUT is what holds
-// cohesion — biggest cluster first, and within a cluster the plots nearest its own centre.
+// A per-column overlay decides admission individually, so a winding bank keeps every stretch whatever it faces,
+// and penalty-freedom is checked, never assumed (verifyNoPenalty re-derives it off the finished field).
+// Single plots may stand alone, so a field fragments more easily; the CUT is what holds cohesion — biggest
+// cluster first, and within a cluster the plots nearest its own centre.
 //
 // ── HYDRATION Y-RULE, AND WHY THE FARM PLANE IS PINNED TO seaY ──────────────────────────────────────────
-// Vanilla farmland (FarmBlock.isNearWater) is wet when water sits within 4 in x/z AND at the farmland's own Y or
-// ONE ABOVE — never below. So a sea-level source waters a crop at seaY and nothing higher. Every crop is AT seaY,
-// and a bank that rises inland is terraformed down to it rather than farmed dry.
-// THE COLUMN RULE (plotColumn) answers for a crop and a stand alike: the cell AT seaY must already be solid, and
-// the PLOT_HEADROOM cells above it must each be air already or CLEARABLE — diggable, not a fluid, and at most one
+// Vanilla farmland (FarmBlock.isNearWater) is wet when water sits within 4 in x/z and at the farmland's own Y or
+// one above — never below. So a sea-level source waters a crop at seaY and nothing higher: every crop is at
+// seaY, and a bank that rises inland is terraformed down to it.
+// The column rule (plotColumn) answers for a crop and a stand alike: the cell at seaY must already be solid, and
+// the PLOT_HEADROOM cells above it must each be air already or clearable — diggable, not a fluid, and at most one
 // full solid block, as the first cell. Nothing below seaY is ever touched. Every cell it clears is one the plot's
 // own blueprint already owns — `wheat_plot_pair` declares the cells over its stand and over its crop as `air` —
-// so the ordinary build digs them; this module only decides WHERE.
-// WHAT STAYS EXCLUDED, and the list stops there: two solid layers above seaY (a terrace — cutting it leaves a
-// pit), a fluid touching any cell being cleared (`wouldFlow`), and anything below seaY (the pre-v3 code allowed
-// it and cut a channel beside the river).
-// A PLANT ON THE BANK is cleared like any other diggable: leaf litter, grass and flowers are the crop cell's own
+// so the ordinary build digs them; this module only decides where.
+// Excluded: two solid layers above seaY (a terrace — cutting it leaves a pit), a fluid touching any cell being
+// cleared (`wouldFlow`), and anything below seaY.
+// A plant on the bank is cleared like any other diggable: leaf litter, grass and flowers are the crop cell's own
 // `air` voxel, so a littered shore is a hydrated plot, not a refusal.
 //
 // ── THE DIG-BESIDE-WATER RULE, AND WHY SOIL IS EXEMPT ───────────────────────────────────────────────────
-// The crop cell is a `dirt` voxel. Where the ground already IS soil (the blueprint's dirt group — grass, dirt,
+// The crop cell is a `dirt` voxel. Where the ground already is soil (the blueprint's dirt group — grass, dirt,
 // podzol, coarse dirt, farmland) the field phase tills it where it lies: no dig, so no hole for water to enter,
-// and such a crop may sit right against the water. Any other ground (sand, gravel, stone, clay) is DUG and
+// and such a crop may sit right against the water. Any other ground (sand, gravel, stone, clay) is dug and
 // re-placed as dirt, and a hole opened beside water floods before the dirt goes in — so that crop may not touch
-// water on any side. That is the safety property itself, tested directly. The old layout enforced it by a proxy
-// (the walkway always between the crop and the water), which also refused every soil crop on the waterline.
+// water on any side. That is the safety property itself, tested directly.
 //
 // ── MAX-GROWTH SPACING ──────────────────────────────────────────────────────────────────────────────────
-// A crop grows at half speed if, within its 3×3, any DIAGONAL holds the same crop, or BOTH the E/W and the N/S
+// A crop grows at half speed if, within its 3×3, any diagonal holds the same crop, or both the E/W and the N/S
 // axis do (CropBlock.getGrowthSpeed). The overlay admits a crop only if adding it penalises neither itself nor a
 // crop already chosen. Crops interact only within one Y layer, and every crop is at seaY.
 //
 // ── REACHABILITY ────────────────────────────────────────────────────────────────────────────────────────
-// A stand that passes the column rule is dry to stand ON — it is not proven WALKABLE-TO. A lone block at the
+// A stand that passes the column rule is dry to stand on — it is not proven walkable-to. A lone block at the
 // waterline is an island the navigator can only wade to, and the farm manager then re-picks it forever. So a
-// stand also needs a LAND APPROACH (hasLandApproach): a cardinal neighbour that is land and not a crop. A ONE-HOP
+// stand also needs a land approach (hasLandApproach): a cardinal neighbour that is land and not a crop. A one-hop
 // test, not a pathfind. Because crops are admitted one at a time, a new crop is also refused when it would take
-// the LAST approach of a stand already chosen (`strands`).
-//
-// A STEPPED TUPLE WAS BUILT AND WITHDRAWN: letting a stand sit a block off its crop needed two extra blueprint
-// geometries, and every crop it won sat on the HIGH side of the step, which the hydration rule cannot reach — the
-// whole field came out dry. Terraforming to seaY gets coplanarity by lowering the ground instead.
+// the last approach of a stand already chosen (`strands`). Terraforming to seaY holds every plot coplanar, since
+// a stepped tuple would put its far side above the hydration rule's reach.
 //
 // Reuse, not invention (Law 16): every voxel question — reads, water-source and pacing — goes through the one
-// front door, @utils/voxel_scan_throttle.makeVoxelScan. Pure decision over READ voxels — it never transforms the
+// front door, @utils/execution_yield.makeVoxelScan. Pure decision over read voxels — it never transforms the
 // world. The bot handed in need only satisfy the reader and expose `world.getColumns()` (the loaded area); a
 // connected mineflayer bot does, and so does a loaded voxel snapshot (Auren_Workshop/tools/voxel_snapshot_store).
 
 'use strict';
 
 const Vec3 = require('vec3');
-const { makeVoxelScan } = require('@utils/voxel_scan_throttle');
+const { makeVoxelScan } = require('@utils/execution_yield');
 const { isFluid } = require('@utils/gravity_utils');                  // the one fluid set (Law 16)
 const { group_to_item } = require('@utils/fragment_utils');
 const { FARM_BLUEPRINT_NAME } = require('@thinking/architect_config');
@@ -92,8 +82,9 @@ const PLOT_HEADROOM = 2;      // cells above seaY the plot owns and must end up 
 const TERRAIN_LAYERS = 1;     // how many of those cells may be a FULL SOLID BLOCK — one layer of bank comes off,
                               // never two (a terrace; see WHAT STAYS EXCLUDED).
 const CARDINALS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-// The ground a crop is TILLED on rather than dug out: the members the blueprint's `dirt` voxel accepts as they
-// stand. Read from the group itself, so a member added there is tillable here with no second edit (Law 16).
+// The ground a crop is tilled on where it stands, not dug out: the members the blueprint's `dirt` voxel
+// accepts as-is. Read from the group itself, so a member added there is tillable here with no second edit
+// (Law 16).
 const TILLED_IN_PLACE = new Set(group_to_item.dirt);
 
 function planarDist(o, x, z) { const dx = x - o.x, dz = z - o.z; return Math.sqrt(dx * dx + dz * dz); }
@@ -241,10 +232,10 @@ function touchesWater(scan, x, y, z) {
 }
 
 // tupleLayer — LAYER 3: the pool becomes plots, one column at a time.
-// ORDER: nearest the water first (Chebyshev ring to the nearest water cell), then x, then z. Nearest first is
-// what makes a bank's first row the crops rather than the walkway: the waterline row claims its crops before the
-// row behind it is asked, and the row behind becomes their shared walkway. The x/z tie-break walks a straight
-// bank end to end, so a row fills contiguously and deterministically.
+// ORDER: nearest the water first (Chebyshev ring to the nearest water cell), then x, then z. Nearest first
+// gives the bank's first row to the crops: the waterline row claims its crops before the row behind it is
+// asked, and the row behind becomes their shared walkway. The x/z tie-break walks a straight bank end to
+// end, so a row fills contiguously and deterministically.
 // A COLUMN BECOMES A CROP when all of these hold, tested in this order and tallied by the first that fails:
 //   onStand        — it is not already a chosen stand
 //   digBesideWater — it touches water only if its ground is TILLED_IN_PLACE (see the header's dig rule)
@@ -340,8 +331,8 @@ function cutField(plots, target, origin) {
   return { field, clusterSizes: meshes.map(m => m.plots.length), clustersUsed: used };
 }
 
-// emptyScan — the no-water return. Must mirror the real return's shape exactly (Law 10): it feeds the same log
-// line and the same bench readers, and a missing key surfaces as `undefined` in a report rather than an error.
+// emptyScan — the no-water return. Must mirror the real return's shape exactly (Law 10): it feeds the same
+// log line and the same bench readers, and a missing key would surface silently as `undefined` in a report.
 function emptyScan(scan, t0, columnsSwept) {
   return {
     field: [], keptTotal: 0, poolSize: 0, candidates: 0, plotsAvailable: 0,
@@ -355,15 +346,13 @@ function emptyScan(scan, t0, columnsSwept) {
   };
 }
 
-// scanWheatPlots — the WHOLE-AREA sea-level scan (v6). No early exit anywhere: the biggest cluster can only be
+// scanWheatPlots — the whole-area sea-level scan. No early exit anywhere: the biggest cluster can only be
 // chosen from a picture that holds every candidate, and a stop at "enough" is a stop at whichever lake came first.
 //   1. SWEEP + FLOOD — every column of every chunk loaded when the scan starts; each sea-level water source not
 //      already flooded starts a body, flooded to exhaustion at seaY. The loaded area is the bound — an unloaded
-//      cell is not water — so no radius is imposed on top of it. (A fixed square around the body did that before
-//      and dropped banks in view: the server's view reaches past a square's edges and the body is rarely at the
-//      view's centre by the time the scan runs.)
-//      ANY sea-level water, whatever its biome: a river's biome is narrower than its water, so the edge water
-//      carries the land's biome and a biome-gated flood stops a cell short of every bank.
+//      cell is not water — so no radius is imposed beyond the server's own view.
+//      Any sea-level water, whatever its biome: a river's biome is narrower than its water, so the edge water
+//      carries the land's biome and a biome-gated flood would stop a cell short of every bank.
 //   2. LAND — a water cell with a cardinal neighbour that is not sea water is SHORE, and only a shore cell opens
 //      the 9×9 hydration box. Exact, not a sample: a bank cell within 4 of some water is within 4 of a shore cell
 //      (walk the monotone cardinal path from that water toward the bank; its last water cell has a dry neighbour
@@ -457,10 +446,10 @@ async function scanWheatPlots(bot0, { origin, target = TARGET, seaY = DEFAULT_SE
     noStand: tally.noStand, waterLocked: tally.waterLocked, strands: tally.strands,
     // Every cluster the tuples formed, biggest first — the field was cut from the first `clustersUsed`.
     clusterSizes, clustersUsed,
-    // HOW MUCH GROUND THIS FIELD MOVES — the cost of the terraform ruling, counted rather than assumed.
+    // How much ground this field moves — the cost of the terraform ruling, counted, not assumed.
     terraformedCrops: field.filter(p => p.crop.terraform).length,
     terraformedStands: new Set(field.filter(p => p.stand.terraform).map(p => p.stand.key)).size,
-    // THE PIN, RE-DERIVED RATHER THAN ASSERTED (Law 25): `farmY` reads seaY and `dryPlots` zero on every run.
+    // The pin, re-derived, not asserted (Law 25): `farmY` reads seaY and `dryPlots` zero on every run.
     farmY: field.length ? field[0].crop.y : null,
     hydratedPlots: field.filter(p => hydrated(p.crop, seaY)).length,
     dryPlots: field.filter(p => !hydrated(p.crop, seaY)).length,
@@ -482,7 +471,7 @@ async function scanWheatPlots(bot0, { origin, target = TARGET, seaY = DEFAULT_SE
   };
 }
 
-// clustering — "how close together are the tiles?" bbox footprint + nearest-neighbour spacing + adjacency.
+// clustering — how close together the tiles are: bbox footprint, nearest-neighbour spacing, adjacency.
 function clustering(tiles) {
   const xs = tiles.map(t => t.x), ys = tiles.map(t => t.y), zs = tiles.map(t => t.z);
   const bbox = { dx: Math.max(...xs) - Math.min(...xs) + 1, dy: Math.max(...ys) - Math.min(...ys) + 1, dz: Math.max(...zs) - Math.min(...zs) + 1 };
@@ -532,30 +521,13 @@ function clusterReport(field, origin) {
   };
 }
 
-// plotRotation — the quarterTurns a plot instance needs so its dirt/crop voxel (blueprint-local +x from the
-// stand_ground anchor at the origin) lands on THIS plot's crop. build_center is the STAND; the crop sits one
-// cardinal step away. rotateOffsetY(1,0,q) maps local +x to:
-//   q0 → (+1,0) E   q1 → (0,-1) N   q2 → (-1,0) W   q3 → (0,+1) S   (blueprint_survey.rotateOffsetY convention)
-// Chosen PER PLOT: a tuple's stand may lie on any side of its crop. Y is not rotated — stand and crop share seaY,
-// which is the offset the fixed blueprint already carries.
-// Throws on a non-cardinal offset — a coding violation, since tupleLayer only pairs cardinal neighbours (Law 13).
-function plotRotation(stand, crop) {
-  const dx = crop.x - stand.x, dz = crop.z - stand.z;
-  if (dx === 1 && dz === 0) return 0;
-  if (dx === 0 && dz === -1) return 1;
-  if (dx === -1 && dz === 0) return 2;
-  if (dx === 0 && dz === 1) return 3;
-  throw new Error(`[wheat_plot_scanner] CODING VIOLATION: stand→crop offset (${dx},${dz}) is not a unit cardinal — tupleLayer pairs only cardinal neighbours. Plot stand (${stand.x},${stand.y},${stand.z}) crop (${crop.x},${crop.y},${crop.z}).`);
-}
 
 
 // ── THE LOADED AREA MUST HAVE ARRIVED BEFORE ANYTHING IS JUDGED FROM IT ──────────────────────────────────
-// Here rather than in lock_all_buildspots since wheat_site_probe became its second caller: one wait, two callers
-// (Law 16). ARRIVED MEANS EVERY COLUMN IN VIEW IS HERE — "stopped growing" was measured not to mean that: the
-// server pauses while it GENERATES terrain, and a four-second quiet once read a third of the area as all of it.
-// So the wait ends when every chunk of the server's view around the body is loaded (inServerView). An inner disc
-// was used before on the argument that it sits inside every shape a server sends; it does, and that is why it
-// ended the wait with a quarter of the view still streaming — the scan then read only what had come.
+// Lives here, not in lock_all_buildspots, since wheat_site_probe is a second caller: one wait, two callers
+// (Law 16). Arrived means every column in view is here — a quiet gap in chunk arrivals does not prove that,
+// since the server also pauses while it generates terrain. The wait ends only when every chunk of the
+// server's actual view around the body is loaded (inServerView), the whole shape and not an inner subset.
 // inServerView — the vanilla server's membership test for a player's view (ChunkTrackingView.isWithinDistance
 // with its neighbour margin on): each axis distance less 2, floored at 0, squared and summed, strictly under
 // viewDistance². Measured against a connected client at view distance 10: 473 chunks held once settled, every
@@ -639,7 +611,6 @@ function describeScan(scan, target) {
 
 module.exports = {
   scanWheatPlots,
-  plotRotation,
   loadedAreaSettled,
   inServerView,
   settleLine,

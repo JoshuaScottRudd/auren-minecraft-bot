@@ -1,8 +1,8 @@
-// assessors/wood_preference — lifted verbatim out of job_board 2026-08-26. See assessor_registry.
+// assessors/wood_preference — startup one-shot that locks the fleet's wood species. See assessor_registry.
 
 'use strict';
 
-// Architect-owned tables, imported never restated (Law 16 — one source).
+// Tunables imported from architect_config, never restated (Law 16 — one source).
 const {
     JOB_TYPE,
     ACCEPTABLE_BIOMES,

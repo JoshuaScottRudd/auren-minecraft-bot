@@ -1,42 +1,26 @@
-// combat_witness_lens — the ONE reader of fleet_logs/combat_witness/combat_witness.jsonl.
+// combat_witness_lens — the ONE reader of fleet_logs/combat_witness/combat_witness.jsonl (Law 16: a
+// recorded run is read only through its monitor).
 //
 // The record is written by camera/combat_witness.js: the server's own account of every fight the fleet
-// had, taken by an outside observer with no vote in it. Nothing else may open that file (CLAUDE.md's
-// standing rule — a recorded run is read only through its monitor), and this file is what makes that
-// rule affordable rather than merely stated.
+// had, from an observer outside the bot's own combat decisions.
 //
-// ── IT READS BOTH RECORDS, AND THAT IS THE POINT ────────────────────────────────────────────────────
-// Architect 2026-08-09: "one saying what the bot claimed it did and the server tracking what actually
-// happened… we can rebuild combat data by combining 2 seperate sources of truth."
+// ── THE JOIN ─────────────────────────────────────────────────────────────────────────────────────────
+// The witness's record and the bot's own journal are written blind to each other and meet for the first
+// time in this reducer, so a disagreement between the two is a finding, not a bug. The join keys are both
+// the server's:
+//   · the MOB'S ENTITY ID — `mob`/`otherId` are the same server-assigned integer for the same mob on
+//     both sides, not a name match or a nearest-in-time guess.
+//   · the ABSOLUTE CLOCK — both records carry `t0` (an epoch millisecond) in their header and stamp every
+//     row `t` relative to it, so `t0 + t` puts both on one timeline.
 //
-// The joining happens HERE and nowhere earlier. The witness never reads the bot's journal while it
-// records — a witness who has heard the defendant's story first is not a second source. So the two
-// records are written blind to each other and meet for the first time in this reducer, which is the only
-// place a DISAGREEMENT between them is a finding rather than a bug.
+// It does not decide who was right: when the bot claims a fight the observer never saw, or the observer
+// records blows the bot's journal has no row for, both are printed and the disagreement is named (Law 25).
 //
-// TWO KEYS MAKE THE JOIN, both of them the server's and neither of them ours:
-//   · the MOB'S ENTITY ID. battle_stations writes `mob` on its engage/end rows; the observer writes
-//     `otherId` on its engagement rows. Minecraft assigns entity ids server-side and broadcasts the same
-//     number to every client, so these are the same integer for the same mob — not a name match, not a
-//     nearest-in-time guess.
-//   · the ABSOLUTE CLOCK. Both records carry `t0` (an epoch millisecond) in their header and stamp every
-//     row `t` relative to it, so `t0 + t` puts them on one timeline with no wall clock per row. That
-//     shared convention is why this reducer is eight lines and not a correlation engine.
-//
-// ── WHAT IT REFUSES TO DO ───────────────────────────────────────────────────────────────────────────
-// It does not decide who was right. When the bot claims a fight the observer never saw, or the observer
-// records blows the bot's journal has no row for, BOTH are printed and the disagreement is named. Which
-// one is wrong is a question about the code, and a monitor that quietly picked a side would be answering
-// an unasked question (Law 25). The same discipline the --knockback lens already keeps for the
-// measured-vs-modelled gap one file over.
-//
-// It also does not decode mob metadata. The samples carry raw `md` frames — the creeper's swell and fuse
-// are somewhere in there — and this prints the FRAME COUNT, never a fuse value, because whether 1.21.5's
-// registry names that key the way we assume is unverified. Decoding it is the next piece of work and it
-// needs one real capture to write against (Law 23: an unverified claim is not a fact).
+// It does not decode mob metadata: samples carry raw `md` frames and this prints the FRAME COUNT only,
+// never a decoded value (Law 23).
 //
 // Machine-facing verbs RETURN and never exit (readWitness, reduceWitness, witnessEngagementsSince);
-// runWitness renders. Neither process.exit()s — trace_monitor owns the exit code, this owns the answer.
+// runWitness renders. Neither exits — trace_monitor owns the exit code, this owns the answer.
 
 'use strict';
 
@@ -47,11 +31,9 @@ const combatLens = require('../../monitoring/combat_lens');
 const WITNESS_DIR = require('../workshop_paths').fleetLogs('combat_witness');
 const WITNESS_FILE = path.join(WITNESS_DIR, 'combat_witness.jsonl');
 
-// How close two records' timestamps must be to be talking about the same moment. 1.5 s, and it is a
-// measurement window rather than a tolerance: the observer's pulse rests at 1 Hz, so it can be up to a
-// second late noticing a fight the bot opened instantly. A tighter window would report that structural
-// lag as a disagreement on every single engagement — an instrument manufacturing the defect it exists to
-// find. Widening it past a couple of seconds starts pairing separate encounters with the same mob.
+// How close two records' timestamps must be to count as the same moment — a measurement window, not a
+// tolerance: the observer's pulse rests at 1 Hz, so it can be up to a second late noticing a fight the
+// bot opened instantly.
 const JOIN_WINDOW_MS = 1500;
 
 const fmtSec = ms => `${(ms / 1000).toFixed(1)}s`;
@@ -63,9 +45,8 @@ const pct = (n, d) => (d > 0 ? `${(100 * n / d).toFixed(1)}%` : 'n/a');
 
 // readWitness() -> { available, reason, rows }
 //
-// A missing file is not an error — it is the ordinary state of a fleet that has never run with
-// mode.witness on, and it must read as that rather than as a broken instrument (Law 25). The reason
-// string says which of the two it is.
+// A missing file is the ordinary state of a fleet that has never run with mode.witness on, and it reads
+// as that state, not as a broken instrument (Law 25). The reason string says which case applies.
 function readWitness() {
   let text;
   try { text = fs.readFileSync(WITNESS_FILE, 'utf8'); }
@@ -80,18 +61,16 @@ function readWitness() {
   for (const line of text.split('\n')) {
     const s = line.trim();
     if (!s) continue;
-    // A torn last line is the normal cost of reading a file still being written. Skipping it is the only
-    // correct read of a partial row, not a swallow (Law 13 — never default a field).
+    // A torn last line is the cost of reading a file still being written; skipping it is the correct
+    // read of a partial row, not a swallow (Law 13).
     try { rows.push(JSON.parse(s)); } catch { torn++; }
   }
   if (!rows.length) return { available: false, rows: [], reason: 'witness record is empty' };
   return { available: true, rows, torn, reason: null };
 }
 
-// reduceWitness(rows) -> the run, as facts.
-//
-// Every number below is counted off rows the server produced. Nothing here models Minecraft's rules —
-// the same line the recorder draws for itself, kept on this side of the wall too.
+// reduceWitness(rows) -> the run, as facts. Every number is counted off rows the server produced; nothing
+// here models Minecraft's rules.
 function reduceWitness(rows) {
   const header = rows.find(r => r.k === 'h') || null;
   const trailer = rows.find(r => r.k === 'f') || null;
@@ -159,10 +138,8 @@ function reduceWitness(rows) {
     }
     if (r.k === 'o') {
       observed++;
-      // An instant is attributed to whichever OPEN fight it names. A blow that names no open fight is
-      // still on the tape as a k:'o' row and is counted in `observed` — it is not silently dropped, it
-      // simply has no fight to belong to, which is itself the interesting case (a hit the detector never
-      // opened a pair for).
+      // An instant is attributed to whichever OPEN fight it names. A blow that names no open fight still
+      // counts in `observed`, keeping visible a hit the detector never opened a pair for.
       for (const [, f] of fights) {
         if (f.endT != null) continue;
         if (r.type === 'hurt') {
@@ -177,8 +154,8 @@ function reduceWitness(rows) {
   }
 
   // Deaf overlap per fight — how much of each engagement the camera spent inside its own ray loops. This
-  // is the honesty column: a fight with 40% deafness and two recorded blows did not necessarily take two
-  // blows, and a reader has to be able to see that before trusting the count above it.
+  // is the honesty column: a fight with high deafness and a low blow count needs that read before the
+  // count above it is trusted.
   for (const [, f] of fights) {
     const end = f.endT != null ? f.endT : (trailer ? trailer.t : f.startT);
     for (const b of blind) {
@@ -202,22 +179,16 @@ function reduceWitness(rows) {
 // joinClaims(reduced, { bot }) -> the observer's fights with the bot's own record attached.
 //
 // The bot's side comes from combat_lens — this file never opens the bot's record itself, because that
-// record already has exactly one reader and it is not this one (Law 16, and CLAIM/OBSERVATION stays
-// legible precisely because each side keeps its own door).
+// record has exactly one reader and it is not this one (Law 16).
 //
-// THE CLAIM SIDE MOVED WITH THE RECORD (2026-08-22). It used to read the per-decision combat journal;
-// that record is deleted and the bot's engagements are now `engage` lines on its own watcher trace,
-// which carry an absolute ISO stamp per line. The join got SIMPLER rather than weaker: the journal
-// stamped rows relative to a header `t0` and a journal without one had to be skipped entirely, so a
-// missing clock could drop a whole bot's claims silently. There is no clock to be missing now.
+// The bot's claims come from `engage` lines on its own watcher trace, each carrying an absolute ISO
+// stamp, joined against the observer's `t0`-relative rows.
 //
-// The verdict field is deliberately three-valued and none of the values is a judgement:
+// The verdict field is three-valued and none of the values is a judgement:
 //   'both'        — the bot opened a fight against this mob and the observer saw one, within the window.
-//   'claim_only'  — the bot's journal has an engage the observer never saw. Not a lie: the observer may
-//                   have been out of range, and the eyes' own coverage is printed beside it.
-//   'witness_only'— the observer saw a fight the bot's journal has no engage for. THIS is the row the
-//                   whole design exists to produce (Architect 2026-08-02: the fight the bot failed to
-//                   notice is the observation worth having).
+//   'claim_only'  — the bot's journal has an engage the observer never saw; the observer may have been
+//                   out of range, and its own coverage is printed beside it.
+//   'witness_only'— the observer saw a fight the bot's journal has no engage for.
 function joinClaims(reduced, { bot = null } = {}) {
   const claims = [];
   for (const id of (bot ? [bot] : combatLens.traceBots())) {
@@ -241,8 +212,8 @@ function joinClaims(reduced, { bot = null } = {}) {
 }
 
 // witnessEngagementsSince(sinceEpochMs, { bot }) -> machine-facing. The observer's answer to "what fights
-// happened after this instant", shaped like combat_lens.completedBattlesSince so a tool can ask both
-// sources the same question and compare the answers rather than trusting one.
+// happened after this instant", shaped like combat_lens.completedBattlesSince so a tool can compare the
+// two sources' answers to the same question.
 function witnessEngagementsSince(sinceEpochMs, { bot = null } = {}) {
   const read = readWitness();
   if (!read.available) return [];

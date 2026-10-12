@@ -1,23 +1,18 @@
-// module: movement/facing_aim — how a block whose placed STATE matters is placed from wherever the body
-// stands. It chooses the block to click, the face, the cursor point, the rotation to report, whether to
-// sneak, and whether the block must be used once after it lands (to open it). It never turns the head and
-// never places; place_authority does both, in that order.
+// How a block whose placed STATE matters is placed from wherever the body stands. It chooses the block to
+// click, the face, the cursor point, the rotation to report, whether to sneak, and whether the block must
+// be used once after it lands (to open it). It never turns the head and never places; place_authority does
+// both, in that order.
 //
 // ── WHAT THE SERVER DECIDES, AND FROM WHAT ──────────────────────────────────────────────────────────────
 // A placed block's state is not in the place packet. The server derives it from what the player sends:
 // the ROTATION the player last reported (yaw, and pitch for six-way blocks), WHICH FACE was clicked at WHAT
-// CURSOR POINT, and whether the player is SNEAKING. Each family below names the rule it follows. Every
-// rule and every state it can give was placed and read back on a live 1.21.5 server before it was
-// written here (scratchpad vol 67 §3, and the full-block matrix in the section that added this table).
+// CURSOR POINT, and whether the player is SNEAKING. Each family below names the rule it follows.
 //
-// ── THE SNAP: ANY STATE FROM ONE STAND (Architect 2026-09-16, a ruling on Law 19) ───────────────────────
+// ── THE SNAP: ANY STATE FROM ONE STAND (Law 19) ─────────────────────────────────────────────────────────
 // A vanilla server checks that the clicked block is within reach and never checks that the look ray meets
-// the clicked face — the fleet's corner-cheat placements have relied on that since June (anchored_repair
-// header). So the reported rotation is set EXACTLY on what the rule needs, for the moment of the click,
-// and the click lands on any solid neighbour face in reach, seen or not. The Architect ruled this within
-// bounds: *"we can bend law 19 if the point is the bot got all the resources fairly and just wants to place
-// the block it already has in the correct facing direction. its not cheating or doing anything unfair."*
-// That is what lets an anchor stay one stand: no extra anchors for facing.
+// the clicked face. So the reported rotation is set exactly on what the rule needs, for the moment of the
+// click, and the click lands on any solid neighbour face in reach, seen or not — an anchor stays one
+// stand, with no extra anchors needed for facing.
 //
 // ── KEYS THE GAME DECIDES ITSELF ────────────────────────────────────────────────────────────────────────
 // A downloaded blueprint's block state carries keys no placement sets: a stair's corner shape, a fence's
@@ -33,6 +28,13 @@ const DERIVED = new Set([
   'shape', 'waterlogged', 'powered', 'occupied', 'in_wall', 'north', 'south', 'east', 'west', 'up',
   'distance', 'persistent', 'snowy', 'level', 'has_bottle_0', 'has_bottle_1', 'has_bottle_2', 'side_chain',
   'bottom', 'signal_fire', 'lit', 'attached', 'disarmed', 'triggered', 'enabled', 'extended', 'note', 'instrument',
+  // `power` — the SIGNAL STRENGTH a weighted pressure plate or a redstone wire is currently putting out,
+  // which is a reading of what is standing on it and not a choice anyone makes when placing it. The header
+  // above already named redstone power as a key the game decides; `powered` (the boolean form) was listed
+  // and `power` (the 0–15 form) was not, so a downloaded castle's heavy_weighted_pressure_plate arrived
+  // carrying `power=0` and the plan's startup check reported a block family with no placement rule. There
+  // is no rule to write: the plate chooses nothing.
+  'power',
 ]);
 
 const H = ['north', 'east', 'south', 'west'];                   // clockwise order
@@ -87,6 +89,18 @@ const FAMILIES = [
   {
     family: 'slab', matches: n => /_slab$/.test(n), controls: ['type'],
     options: (s, b) => halfFaces(need(s, 'type', ['bottom', 'top'], b)),
+    // A slab clicked onto the open half of a single slab of its own kind joins it as a double in THAT cell
+    // and leaves the wanted cell empty: the open top of a bottom slab, the open underside of a top slab,
+    // and any side of a single slab of the other half (the cursor height that gives the wanted half is the
+    // neighbour's open half). Those faces are not clicks for this slab.
+    refuses: (ref, o, s, b) => {
+      if (ref.name !== b) return false;
+      const type = String(ref.getProperties().type);
+      if (type === 'double') return false;
+      if (o.normal === 'up') return type === 'bottom';
+      if (o.normal === 'down') return type === 'top';
+      return type !== String(s.type);
+    },
   },
   {
     // A trapdoor clicked on a side takes the clicked face as its facing and the cursor height as its half;
@@ -114,20 +128,14 @@ const FAMILIES = [
       return [{ normal: 'up', cursor: c, ...look(f) }];
     },
     check: (bot, pos, s) => {
-      const f = String(s.facing); const hinge = withDefault(s, 'hinge', 'left');
       const above = bot.blockAt(pos.offset(0, 1, 0));
       if (above && above.boundingBox !== 'empty') return `the cell above (${pos.x},${pos.y + 1},${pos.z}) holds ${above.name}; a door needs it empty`;
-      const full = (p) => { const bl = bot.blockAt(p); return !!bl && bl.boundingBox === 'block'; };
-      const lowerDoor = (p) => { const bl = bot.blockAt(p); return !!bl && /_door$/.test(bl.name) && bl.getProperties().half === 'lower'; };
-      const L = normalOf(ccw(f)); const R = normalOf(cw(f));
-      const i = (full(pos.plus(L)) ? -1 : 0) + (full(pos.plus(L).offset(0, 1, 0)) ? -1 : 0) + (full(pos.plus(R)) ? 1 : 0) + (full(pos.plus(R).offset(0, 1, 0)) ? 1 : 0);
-      const dl = lowerDoor(pos.plus(L)); const dr = lowerDoor(pos.plus(R));
-      let forced = null;
-      if (!((!dl || dr) && i <= 0)) forced = 'right';
-      else if (!((!dr || dl) && i >= 0)) forced = 'left';
-      if (forced && forced !== hinge) return `hinge=${hinge} cannot be set here: the blocks beside the door decide it as ${forced}`;
+      // The hinge is the game's to set, from the blocks beside the door: no hinge is refused here, and the
+      // door that results stands for the plan's (standsFor below).
       return null;
     },
+    // A door of the asked facing and half is the plan's door whichever side the game hung it on.
+    standsFor: (got, s) => String(got.facing) === String(s.facing) && (s.half === undefined || String(got.half) === String(s.half)),
     use: (s) => String(s.open) === 'true',
   },
   {
@@ -151,10 +159,21 @@ const FAMILIES = [
   {
     // A chest faces away from the look. Its type: single is forced by sneaking; left/right come from a
     // single chest of the same facing already standing on the correct side (the partner flips to match).
+    // The first half of a pair therefore goes down as a single; `stage` names that state, and `standsFor`
+    // lets that single count as the half it will become.
     family: 'chest', matches: n => n === 'chest' || n === 'trapped_chest', controls: ['facing', 'type'],
+    stage: (bot, pos, s) => {
+      const type = withDefault(s, 'type', 'single');
+      if (type === 'single') return s;
+      const bl = bot.blockAt(pos.plus(normalOf(type === 'left' ? cw(String(s.facing)) : ccw(String(s.facing)))));
+      return bl && (bl.name === 'chest' || bl.name === 'trapped_chest') ? s : { ...s, type: 'single' };
+    },
+    standsFor: (props, s) => props.type === 'single' && String(props.facing) === String(s.facing),
     options: (s, b) => {
       const f = need(s, 'facing', H, b); const type = withDefault(s, 'type', 'single');
-      return anyFace().filter(o => o.normal !== 'down').map(o => ({ ...o, ...look(OPP[f]), sneak: type === 'single' }));
+      const faces = anyFace().filter(o => o.normal !== 'down').map(o => ({ ...o, ...look(OPP[f]), sneak: type === 'single' }));
+      // A sneaking click on the partner's facing side pairs with it, whatever else is around the cell.
+      return type === 'single' ? faces : [...faces, { normal: type === 'left' ? ccw(f) : cw(f), ...look(OPP[f]), sneak: true }];
     },
     check: (bot, pos, s) => {
       const f = String(s.facing); const type = withDefault(s, 'type', 'single');
@@ -213,12 +232,14 @@ const FAMILIES = [
     options: (s, b) => [{ normal: 'up', yaw: rotationYaw(need(s, 'rotation', Array.from({ length: 16 }, (_, i) => String(i)), b)) }],
   },
   {
-    family: 'lantern', matches: n => n === 'lantern' || n === 'soul_lantern', controls: ['hanging'],
+    family: 'lantern', matches: n => n === 'lantern' || n === 'soul_lantern' || n === 'copper_lantern', controls: ['hanging'],
     options: (s, b) => [{ normal: need(s, 'hanging', ['true', 'false'], b) === 'true' ? 'down' : 'up' }],
   },
   {
     family: 'axis', controls: ['axis'],
-    matches: n => /_log$|_wood$|_stem$|_hyphae$/.test(n) || ['chain', 'hay_block', 'bone_block', 'basalt', 'polished_basalt', 'quartz_pillar', 'purpur_pillar', 'muddy_mangrove_roots', 'deepslate'].includes(n),
+    // `iron_chain` is `chain` under the 1.21.9 name; `blueprint_importer.RENAMES` maps both directions, so
+    // this table lists only one name per block.
+    matches: n => /_log$|_wood$|_stem$|_hyphae$/.test(n) || ['chain', 'iron_chain', 'copper_chain', 'hay_block', 'bone_block', 'basalt', 'polished_basalt', 'quartz_pillar', 'purpur_pillar', 'muddy_mangrove_roots', 'deepslate'].includes(n),
     options: (s, b) => {
       const a = need(s, 'axis', ['x', 'y', 'z'], b);
       return { x: ['east', 'west'], y: ['up', 'down'], z: ['north', 'south'] }[a].map(normal => ({ normal }));
@@ -234,50 +255,78 @@ function familyOf(name) {
   return FAMILIES.find(f => f.matches(name)) || null;
 }
 
-// requested — the keys of `state` this placement is answerable for, derived keys removed. Throws on a key
-// the family cannot set.
-function requested(blockName, state) {
+// unplaceableReason — why this block/state pair cannot be placed as asked, or null when it can. Gives the
+// same judgment `requested` throws on, without throwing, so a caller can ask before attempting (Law 16). A
+// downloaded blueprint's loader checks its whole voxel list through this at startup (Law 26).
+//
+// The predicate is the implementation; the throw in `requested` is one caller of it (Law 29).
+function unplaceableReason(blockName, state) {
   const fam = familyOf(blockName);
-  if (!fam) {
-    throw new Error(`[facing_aim] CODING VIOLATION (Law 13): a blueprint asks ${blockName} for state ${JSON.stringify(state)}, and no placement rule for ${blockName} is known. Rules exist for: ${FAMILIES.map(f => f.family).join(', ')}. Measure the family live and add its rule, or remove the state from the blueprint.`);
+  if (fam && fam.family === 'slab' && state && String(state.type) === 'double') {
+    return `${blockName} asks for type="double", which one click cannot give; a double slab is built as its full block (blueprint_material_rule).`;
   }
-  const out = {};
+  if (!fam) {
+    return `no placement rule for ${blockName} is known (state ${JSON.stringify(state)}). Rules exist for: ${FAMILIES.map(f => f.family).join(', ')}. `
+      + 'Measure the family live and add its rule, or remove the state from the blueprint.';
+  }
   for (const [k, v] of Object.entries(state || {})) {
     if (DERIVED.has(k)) continue;
     if (!fam.controls.includes(k)) {
-      throw new Error(`[facing_aim] CODING VIOLATION (Law 13): ${blockName} asks for ${k}=${JSON.stringify(v)}, which the ${fam.family} rule does not set (it sets ${fam.controls.join(', ') || 'nothing'}; the game derives ${[...DERIVED].slice(0, 6).join(', ')}…).`);
+      return `${blockName} asks for ${k}=${JSON.stringify(v)}, which the ${fam.family} rule does not set `
+        + `(it sets ${fam.controls.join(', ') || 'nothing'}; the game derives ${[...DERIVED].slice(0, 6).join(', ')}…).`;
     }
+  }
+  return null;
+}
+
+// requested — the keys of `state` this placement is answerable for, derived keys removed. Throws on a key
+// the family cannot set.
+function requested(blockName, state) {
+  const why = unplaceableReason(blockName, state);
+  if (why) throw new Error(`[facing_aim] CODING VIOLATION (Law 13): ${why}`);
+  const fam = familyOf(blockName);
+  const out = {};
+  for (const [k, v] of Object.entries(state || {})) {
+    if (DERIVED.has(k)) continue;
     out[k] = v;
   }
   return { fam, state: out };
 }
 
-// findAim — the click that gives `blockName` the wanted `state` at `pos`, from where the body is.
+// findAim — the click that gives `blockName` the wanted `state` at `pos`, from where the body is, or from the
+// eye point `from` when a caller asks about a stand the body is not on yet.
 //   returns { ok:true, anchor, face, delta, yaw, pitch, sneak, use, family, state }
 //        or { ok:false, reason }
 // Among usable options the nearest clicked point wins, so the choice is a pure function of the world.
-function findAim(bot, pos, blockName, rawState) {
-  const { fam, state } = requested(blockName, rawState);
+function findAim(bot, pos, blockName, rawState, from = null) {
+  const { fam, state: asked } = requested(blockName, rawState);
   const reach = require('@utils/fragment_utils').BLOCK_REACH;
   const isInteractable = require('@api/anchored_repair').isInteractable;
   const target = new Vec3(pos.x, pos.y, pos.z);
+  const state = fam.stage ? fam.stage(bot, target, asked) : asked;
   const options = fam.options(state, blockName);
   const blocked = fam.check ? fam.check(bot, target, state) : null;
   if (blocked) return { ok: false, reason: `no_state_click: ${blockName} ${JSON.stringify(state)} at (${pos.x},${pos.y},${pos.z}): ${blocked}` };
 
-  const eye = bot.entity.position.offset(0, bot.entity.eyeHeight, 0);
+  const eye = from ? new Vec3(from.x, from.y, from.z) : bot.entity.position.offset(0, bot.entity.eyeHeight, 0);
   let best = null;
   const seen = [];
   for (const o of options) {
     const n = normalOf(o.normal);
     const ref = bot.blockAt(target.minus(n));
-    if (!ref || ref.boundingBox !== 'block' || isInteractable(ref.name)) { seen.push(`${o.normal}:${ref ? ref.name : 'unloaded'}`); continue; }
+    // A sneaking click places against an interactable block instead of opening it, so an interactable
+    // neighbour is a usable face with the click made sneaking. An option that states its own sneak (a chest's
+    // single/paired choice) keeps it.
+    if (!ref || ref.boundingBox !== 'block') { seen.push(`${o.normal}:${ref ? ref.name : 'unloaded'}`); continue; }
+    const sneak = o.sneak !== undefined ? o.sneak : isInteractable(ref.name);
+    if (isInteractable(ref.name) && !sneak) { seen.push(`${o.normal}:${ref.name}`); continue; }
+    if (fam.refuses && fam.refuses(ref, o, state, blockName)) { seen.push(`${o.normal}:${ref.name} would join it`); continue; }
     const delta = o.cursor || cursor(o.normal);
     const point = ref.position.plus(delta);
     const dist = point.distanceTo(eye);
     if (dist > reach) { seen.push(`${o.normal}:${dist.toFixed(2)}>reach`); continue; }
     if (best && dist >= best.dist) continue;
-    best = { o, ref, n, delta, point, dist };
+    best = { o, ref, n, delta, point, dist, sneak };
   }
   if (!best) {
     return { ok: false, reason: `no_state_click: ${blockName} ${JSON.stringify(state)} at (${pos.x},${pos.y},${pos.z}) has no usable neighbour face in reach [${seen.join(' ')}]` };
@@ -295,7 +344,7 @@ function findAim(bot, pos, blockName, rawState) {
 
   return {
     ok: true, anchor: best.ref, face: best.n, delta: best.delta, yaw, pitch,
-    sneak: !!o.sneak, use: fam.use ? fam.use(state) : false, family: fam.family, state,
+    sneak: !!best.sneak, use: fam.use ? fam.use(state) : false, family: fam.family, state,
   };
 }
 
@@ -307,4 +356,21 @@ function stateMatches(block, state) {
   return { ok: Object.entries(state).every(([k, v]) => String(props[k]) === String(v)), got };
 }
 
-module.exports = { findAim, stateMatches, familyOf, requested, DERIVED };
+// standsFor — does the block already stand for the wanted state: an exact match, or a staged half
+// its family says will become it.
+function standsFor(block, state) {
+  if (stateMatches(block, state).ok) return true;
+  const fam = familyOf(block.name);
+  return !!(fam && fam.standsFor && fam.standsFor(block.getProperties(), state));
+}
+
+// clickCells — the cells whose solid block serves a click that gives `blockName` the wanted `state` at `pos`:
+// one per option of its family, the same cells findAim reads.
+function clickCells(bot, pos, blockName, rawState) {
+  const { fam, state: asked } = requested(blockName, rawState);
+  const target = new Vec3(pos.x, pos.y, pos.z);
+  const state = fam.stage ? fam.stage(bot, target, asked) : asked;
+  return fam.options(state, blockName).map(o => target.minus(normalOf(o.normal)));
+}
+
+module.exports = { findAim, clickCells, stateMatches, standsFor, familyOf, requested, unplaceableReason, DERIVED };

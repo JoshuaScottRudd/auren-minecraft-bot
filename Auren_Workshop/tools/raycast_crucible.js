@@ -2,21 +2,16 @@
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/raycast_crucible.js');
 // tool: raycast_crucible — put a LIVE body in the world and audit every claim its sight makes.
 //
-// WHY IT EXISTS (Architect 2026-08-06): "i keep losing monster fights due to not engaging the monster
-// thats a few blocks away and i want to rule out 100% that its not raycast." Ruling a suspect out needs
-// a measurement, and until now there was none: the retired eye-height bench pinned the constants against
-// DRIFT and said so itself — it never proved they match the server, which is what this tool does — and
-// the combat journal's `blockedBy` names a blocker after the fact but
-// cannot say whether that blocker was real. Nothing in the tree asked the sight system to prove itself
-// against the world it is looking at.
+// Proves the sight system against the world and the server it is actually reading, closing a gap no
+// other instrument covers: the combat journal's `blockedBy` names a blocker after the fact but cannot
+// say whether that blocker was real.
 //
 // ── WHAT IT PROVES, AND WHAT IT CANNOT (Law 26 — the run IS the guarantee, so name what actually ran) ──
 // The bot's picture of its surroundings arrives on TWO independent channels, and raycast reads exactly
 // one of them:
 //   channel 1  BLOCKS   — chunk packets → the client world model → `bot.world.raycast` walks it
 //   channel 2  ENTITIES — spawn/move packets → `bot.entities` — raycast NEVER touches this
-// So "raycast rebuilds the world including mobs" is not a thing that can be true of raycast alone, and
-// PHASE M measures the entity channel separately rather than pretending one number covers both.
+// Raycast alone cannot answer for the entity channel, so PHASE M measures it separately.
 //
 // Four independent audits, each with its own ground truth — none of them the thing under test:
 //   PHASE W  world model vs THE SERVER (RCON `execute if block`) — is the map the bot is reading true?
@@ -32,12 +27,10 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/rayc
 // ray/AABB entry test against every collision shape in each. Two implementations that agree are evidence;
 // re-running the same one twice is not (that is grading your own paper — Law 26).
 //
-// WRONG TURN, ALREADY TAKEN ONCE IN THIS TREE: judging "does this block the ray" by `boundingBox`.
-// prismarine stops on collision SHAPES, and sugar cane / tall grass / vines are `boundingBox: 'empty'`
-// with no shapes — a ray goes straight through them while they are fully opaque on screen (measured
-// 2026-07-21, camera_scout's `lineClear` header). Slabs and stairs are the other half: `boundingBox:
-// 'block'` but a partial shape a ray can miss. So the re-walk tests SHAPES, and reports the two
-// populations separately (PASSTHROUGH NAMES) rather than folding them into a pass.
+// The re-walk judges each cell by collision SHAPES, not `boundingBox`: prismarine stops on shapes, and
+// sugar cane / tall grass / vines are `boundingBox: 'empty'` with no shapes — a ray goes straight through
+// them while they are fully opaque on screen. Slabs and stairs are `boundingBox: 'block'` but carry a
+// partial shape a ray can miss. The re-walk reports these two populations separately (PASSTHROUGH NAMES).
 //
 // IT MUTATES THE WORLD, AND PUTS EVERYTHING BACK (Law 8 — nothing raised outlives the run):
 //   · joins as a spectator, so a hostile cannot end the measurement halfway through
@@ -79,7 +72,7 @@ const flag = k => argv.includes(`--${k}`);
 
 const HOST = arg('host', 'localhost');
 const PORT = Number(arg('port', 25565));
-// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// Version READ from architect_config, never restated here — one authored answer (Law 16).
 // A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
 const VERSION = arg('version', SERVER_MINECRAFT_VERSION);
 const USERNAME = arg('username', 'RaycastCrucible');
@@ -152,18 +145,17 @@ function rayShapeEntryT(origin, dir, bx, by, bz, shapes, maxT) {
 
 // cellSpan — the interval of the ray that lies inside one unit cell, or null if it never enters.
 //
-// This exists to tell a CORNER TOUCH from a real crossing, and that distinction is the difference
-// between a finding and a false alarm. prismarine's DDA breaks a simultaneous boundary crossing by
-// axis priority (x, then y, then z), so on a ray that passes exactly through a cell corner it steps
-// into a cell the ray only touches at a SINGLE POINT — span zero — and then reports that cell's shape
-// as a blocker. Measured on the first live run: a body standing at exactly (-0.5, 72, 7.5) casting to
-// block centres makes every diagonal ray a corner ray, and 57 of 2197 came back this way.
+// Tells a CORNER TOUCH from a real crossing, the difference between a finding and a false alarm.
+// prismarine's DDA breaks a simultaneous boundary crossing by axis priority (x, then y, then z), so on
+// a ray that passes exactly through a cell corner it steps into a cell the ray only touches at a SINGLE
+// POINT — span zero — and then reports that cell's shape as a blocker. A cell-aligned body casting to
+// block centres makes every diagonal ray a corner ray.
 //
-// It is not a fault. Java's own sight clip uses the same style of traversal and the same convention,
-// which is the property terrain_predicates' symmetry argument depends on — the bot and the server must
-// agree, and they do. It is reported rather than absorbed because a silently-excluded case is a hidden
-// rule (Invariant C), and because a high count is itself the signal that the body is cell-aligned and
-// the field should be re-run from somewhere else with --at.
+// Not a fault: Java's own sight clip uses the same style of traversal and the same convention, which is
+// the property terrain_predicates' symmetry argument depends on — the bot and the server must agree. A
+// count is surfaced here because a silently-excluded case is a hidden rule (Invariant C), and a high
+// count is itself the signal that the body is cell-aligned and the field should be re-run from somewhere
+// else with --at.
 function cellSpan(origin, dir, x, y, z) {
   const lo = [x, y, z], hi = [x + 1, y + 1, z + 1];
   const o = [origin.x, origin.y, origin.z], d = [dir.x, dir.y, dir.z];
@@ -209,7 +201,7 @@ function voxelsAlong(origin, dir, len, step) {
 // firstBlockerIndependent — the re-walk's verdict: the nearest collision shape the segment enters, over
 // every cell it passes through. Returns { x, y, z, t, name, second } or null for a clear line.
 // `second` carries the runner-up entry parameter so a corner tie (two cells entered at the same t) can
-// be named as a tie rather than mis-reported as a disagreement.
+// be named as a tie.
 function firstBlockerIndependent(getBlock, origin, dir, len, step) {
   let best = null, secondT = null;
   for (const v of voxelsAlong(origin, dir, len, step)) {
@@ -269,7 +261,7 @@ function verifyRay(bot, getBlock, eye, target) {
     agreed = (hitPos === null && expect === null) || samePos(hitPos, expect);
   }
   if (!agreed) {
-    // ── CLASSIFY BY DIRECTION, WHICH IS THE WHOLE POINT (2026-08-06) ────────────────────────────────
+    // ── CLASSIFY BY DIRECTION, WHICH IS THE WHOLE POINT ────────────────────────────────
     // The first run of this crucible printed "57 disagreements" and that number was worth nothing: it
     // welded together three conditions with opposite meanings, one of them harmless. WHICH WAY the two
     // answers differ is the finding —
@@ -300,8 +292,8 @@ function verifyRay(bot, getBlock, eye, target) {
 
   const unloaded = unloadedAlong(getBlock, eye, dir, Math.min(len, range), STEP);
 
-  // The cells the segment crosses BEFORE whatever it stopped on — the Architect's own criterion made
-  // literal: "if a bot can confirm raycast to a solid block 3 tiles away then 2 of them should be air."
+  // The cells the segment crosses before whatever it stopped on, collected so a near stop can be checked
+  // against every cell that should already read clear.
   const stopT = hitPos ? (expect ? expect.t : len) : len;
   const interposed = [];
   for (const v of voxelsAlong(eye, dir, Math.min(stopT, len), STEP)) {
@@ -320,10 +312,9 @@ function verifyRay(bot, getBlock, eye, target) {
 
 // explainRay — one target, the whole segment printed cell by cell.
 //
-// It exists because the first run of this crucible reported 57 disagreements and there was no way to
-// tell a defect in raycast from a defect in the re-walk that accuses it. A checker that can only say
-// "these two differ" pushes the diagnosis onto whoever reads it; naming the cell, its shapes and its
-// entry parameter is what makes the claim checkable (Law 25 — the verdict has to carry its evidence).
+// A checker that can only say "these two differ" pushes the diagnosis onto whoever reads it; naming the
+// cell, its shapes and its entry parameter is what makes the claim checkable (Law 25 — the verdict has
+// to carry its evidence).
 function explainRay(bot, getBlock, eye, target) {
   head(`EXPLAIN — the full segment from the eye to ${fmt(target)}`);
   const centre = new Vec3(target.x + 0.5, target.y + 0.5, target.z + 0.5);
@@ -470,8 +461,8 @@ async function phaseWorld(bot, link, getBlock) {
   const base = bot.entity.position.floored();
   const cells = [];
   const seen = new Set();
-  // Deterministic spread rather than random: a bench that samples differently every run cannot be
-  // compared with its own previous run.
+  // A deterministic spread: a bench that samples differently every run cannot be compared with its own
+  // previous run.
   const span = RADIUS;
   for (let i = 0; cells.length < CENSUS && i < CENSUS * 40; i++) {
     const dx = ((i * 7) % (2 * span + 1)) - span;
@@ -523,8 +514,8 @@ async function summonAt(link, mob, pos, tag) {
 async function killTagged(link, tag) { await link.command(`kill @e[tag=${tag || TAG}]`); }
 
 // waitForEntity — the client must actually receive the spawn packet before anything is asked of it.
-// Polling for it rather than sleeping a fixed time is the difference between measuring sight and
-// measuring latency (Law 23: sense the arrival, do not assume it).
+// Polling for the arrival keeps this a measurement of sight, separate from a measurement of latency
+// (Law 23: sense the arrival, do not assume it).
 async function waitForEntity(bot, truth, timeoutMs = 4000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
@@ -581,9 +572,9 @@ async function phaseMobs(bot, link) {
   console.log(`  the fleet's own predicate, hasEntityLineOfSight → ${hasEntityLineOfSight(bot, solo, AGGRO_RANGE) ? 'CLEAR ✅' : 'BLOCKED'}`);
 
   // ── M2: bot.entities against the server's own list ────────────────────────────────────────────────
-  // The real "can it rebuild the mobs around it" question, asked of the channel that actually carries
-  // the answer. Positions are compared, not just presence: a mob the client has at the wrong place
-  // aims every sightline at empty air.
+  // Whether the client can rebuild the mobs around it, asked of the channel that actually carries the
+  // answer. Positions are compared, not just presence: a mob the client has at the wrong place aims
+  // every sightline at empty air.
   console.log('');
   const ring = [];
   const R = 6;
@@ -615,7 +606,7 @@ async function phaseMobs(bot, link) {
   }
 
   // ── M3: does a mob occlude a mob? ─────────────────────────────────────────────────────────────────
-  // Worth measuring because the intuitive answer is "yes" and the correct answer is "no, and Java agrees".
+  // Whether a mob occludes another mob for entity line-of-sight — Java's own traversal answers no.
   await killTagged(link);
   await sleep(300);
   const near = base.offset(3, 0, 0), far = base.offset(6, 0, 0);
@@ -679,15 +670,12 @@ async function phaseMobs(bot, link) {
 }
 
 // ── PHASE R: the near-field ring — the exact question the fight gate asks ───────────────────────────
-// "a monster a few blocks away" is the Architect's own description of the failure, so this walks a body
-// around the bot at close range and asks the PRODUCTION predicate at every station. A false BLOCKED here
-// is the smoking gun; a clean sheet rules the sight test out and moves the search to the arm.
+// Walks a body around the bot at close range and asks the PRODUCTION predicate at every station. A false
+// BLOCKED here is the smoking gun; a clean sheet rules the sight test out and moves the search to the arm.
 // corroborateDecline — the ring's own audit of a refusal.
 //
-// A decline that names a blocker is a CLAIM, not a finding (Law 23). The first live run of this phase
-// reported "17 declines on OPEN GROUND" purely because it judged openness from the MOB's dy and never
-// looked at the segment: the body had spawned inside an oak canopy and every one of those refusals was
-// correct, with `oak_leaves @ 1.7b` named right there in the output the tool then contradicted. So the
+// A decline that names a blocker is a CLAIM, not a finding (Law 23): judging openness from the mob's dy
+// alone, without reading the segment, can call a body's own surrounding canopy "open ground". So the
 // decline is re-walked here by the same independent method PHASE C uses on raycast — eye to eye, the
 // identical endpoints the predicate used, since eyePos is imported and not restated.
 //
@@ -775,9 +763,9 @@ async function phaseRing(bot, link) {
     }
   }
   if (corners) {
-    // Raised at warning weight rather than as a defect, and the distinction is the honest one: the
-    // refusal is geometrically defensible, and whether the SERVER breaks the same tie the same way is
-    // a question this crucible has not answered (Law 25 — unverified is named unverified).
+    // Raised at warning weight, not as a defect: the refusal is geometrically defensible, and whether
+    // the SERVER breaks the same tie the same way is a question this crucible has not answered
+    // (Law 25 — unverified is named unverified).
     console.log(`\n  ◹ ${corners} refusals rest on a CORNER TOUCH: the eye-to-eye line clips a block at a single`);
     console.log('    point and the traversal counts that as blocked. It is what a 45° bearing from a');
     console.log('    cell-centred body produces. UNVERIFIED: whether the server\'s own sight traversal breaks');
@@ -844,8 +832,8 @@ async function main() {
   log('boot', `standing at ${fmtf(bot.entity.position)}, eye ${fmtf(eyePos(bot.entity))} (eyeHeight ${bot.entity.eyeHeight})`);
 
   // One cache for the whole run, and a re-read at the end that PROVES the map did not move under the
-  // audit. A cached read is only honest while the thing it caches is static; asserting that rather than
-  // assuming it is the difference between a measurement and a story (Law 23).
+  // audit. A cached read is only honest while the thing it caches is static, and that is checked here,
+  // not assumed (Law 23).
   const cache = new Map();
   const getBlock = (x, y, z) => {
     const k = `${x},${y},${z}`;

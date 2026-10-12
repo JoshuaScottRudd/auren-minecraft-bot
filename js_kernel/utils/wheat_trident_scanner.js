@@ -1,5 +1,5 @@
-// util: wheat_trident_scanner (farm siting — THE water-built wheat field, chosen by the Architect 2026-09-15 over the
-//       bank farm and the bridge island; NOT yet wired into lock_all_buildspots, which still calls wheat_plot_scanner)
+// util: wheat_trident_scanner (farm siting — the water-built wheat field; not yet wired into
+//       lock_all_buildspots, which still calls wheat_plot_scanner)
 // purpose: site the phase-1 wheat field as TINES built out from the bank into sea-level water, as the anchors a body
 //          stands on and the cells it places from each, so the build, tend and repair all run "stand on an anchor,
 //          work the cells in front of it".
@@ -35,7 +35,7 @@
 'use strict';
 
 const Vec3 = require('vec3');
-const { makeVoxelScan } = require('@utils/voxel_scan_throttle');
+const { makeVoxelScan } = require('@utils/execution_yield');
 const { plotColumn, usableColumn, hasLandApproach, verifyNoPenalty, DEFAULT_SEA_Y } = require('@utils/wheat_plot_scanner');
 const { computeAStar } = require('@utils/pathfinding_utils');
 const { FARM_PLOT_COUNT } = require('@thinking/architect_config');

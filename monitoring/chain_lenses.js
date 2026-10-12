@@ -1,16 +1,14 @@
 // Auren_Bot/monitoring/chain_lenses.js
-// THE SUPPLY-AND-CONSEQUENCE CHAINS, each read end to end.
+// The supply-and-consequence chains, each read end to end.
 //
-// ── WHY THESE THREE ARE ONE FILE, AND WHY THEY LEFT trace_monitor ────────────────────────────────────
-// Each one reduces a chain that spans three or four owners — job_board posts, a manager routes, an
-// executor works the block — and answers ONE question about it: did the chain close. That is a different
-// verb from trace_monitor's own (find what went wrong in a run), and it is the verb all three share.
-// They flag nothing, wake nobody, and never touch a signature or the watch policy.
+// Each reducer here spans three or four owners — job_board posts, a manager routes, an executor works the
+// block — and answers one question about it: did the chain close. That is a different verb from
+// trace_monitor's own (find what went wrong in a run), and it is the verb all three share. They flag
+// nothing, wake nobody, and never touch a signature or the watch policy.
 //
-// The split follows the combat_lens precedent exactly: a lens takes its inputs as ARGUMENTS, RENDERS,
-// and RETURNS. It never reads process.argv and never calls process.exit — a library that exits kills its
-// caller mid-run, which is the trap the old shape set. trace_monitor is the CLI; it reads the trace once,
-// segments it, and hands the run's lines down.
+// Each lens takes its inputs as arguments, renders, and returns. It never reads process.argv and never
+// calls process.exit — a library that exits would kill its caller mid-run. trace_monitor is the CLI; it
+// reads the trace once, segments it, and hands the run's lines down.
 //
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --compost [--bot=B] [--all]
 
@@ -21,24 +19,20 @@ const out = require('./data_out');
 
 // ── --compost : did the composter chain actually run? ────────────────────────────────────────────
 //
-// WHY A LENS. Compost has no job, no claim and no dispatch — it happens inside inventory_swapper's dump,
-// which means it leaves no trace of its own on the board and cannot be seen in a job tally at all. The
-// reducer that says whether the chain CLOSED — compostables in, bone meal out — is the only way to ask
-// whether the feature worked. Reading it by hand is the thing the standing rule forbids, and the answer
-// would die with the session.
+// Compost has no job, no claim and no dispatch — it happens inside inventory_swapper's dump, so it leaves
+// no trace of its own on the board and cannot be seen in a job tally at all. This reducer says whether the
+// chain closed — compostables in, bone meal out — the only way to ask whether the feature worked.
 //
-// COMPOSTING HAS NO JOB OF ITS OWN, so no claim, route, or per-decline verdict can describe it — a counter
-// built for a pathway that can never fire would read as a fault on every single run. The only per-visit
-// facts are the pair that decides everything: FED (the dump got there) and HELD (it could not, and the
-// material rode along). A run with high HELD and zero FED is the composter missing or permanently locked —
-// which a job-shaped tally could never show, because the errand is never claimed in the first place.
+// No claim, route, or per-decline verdict can describe it, since the errand is never claimed in the first
+// place: the only per-visit facts are the pair that decides everything — FED (the dump got there) and
+// HELD (it could not, and the material rode along). A run with high HELD and zero FED is the composter
+// missing or permanently locked, which a job-shaped tally could never show.
 //
-// THE PRECONDITION IS THE HEADLINE, and it is why this lens leads with it rather than with a tally.
-// The composter is voxel [-5,2,1] of headframe ANCHOR 1 (114 voxels), not anchor 0. Until anchor 1 is
-// built there is no block, the dump holds everything, and the whole subsystem is correctly invisible. A
-// run that reports "0 compost activity" is therefore ambiguous between *the chain is broken* and *the
-// chain was never reachable* — so this lens states which, and never lets a silent zero read as a verdict
-// (Law 25). Cross-read with --milestones for when anchor 1 landed.
+// The precondition leads, ahead of any tally. The composter is voxel [-5,2,1] of headframe ANCHOR 1 (114
+// voxels), not anchor 0. Until anchor 1 is built there is no block, the dump holds everything, and the
+// whole subsystem is correctly invisible. A run that reports "0 compost activity" is ambiguous between
+// the chain being broken and the chain never having been reachable, so this lens states which and never
+// lets a silent zero read as a verdict (Law 25). Cross-read with --milestones for when anchor 1 landed.
 //
 // FED IS NOT PROGRESS; LEVEL IS. Each item has a ~30% chance of raising the composter one level, so a
 // visit that fed 12 items for zero levels is normal (compost_executor's own verdict says so). The
@@ -75,10 +69,8 @@ function runCompost({ seg = [], traceName = '?', bot: botFilter = null, verbose 
     maxRel = Math.max(maxRel, l.relSec);
     if (!/compost/i.test(l.raw)) continue;
     let m;
-    // AN EVENT IS A TOKEN AND ITS FIELDS, NEVER A PHRASE (Architect 2026-09-16). This used to take one
-    // composed sentence (`fed 12, 3→4, +1 bone_meal`) and print it in a column, which is the lens
-    // narrating what it read. The same four numbers now travel as their own cells, and `reason` below is
-    // the DUMP's own word carried through untouched.
+    // AN EVENT IS A TOKEN AND ITS FIELDS, NEVER A COMPOSED PHRASE: the four numbers travel as their own
+    // cells, and `reason` below is the DUMP's own word carried through untouched.
     const touch = (b, kind, fields) => {
       if (b.firstAt === null) b.firstAt = l.relSec;
       b.lastAt = l.relSec;
@@ -113,13 +105,10 @@ function runCompost({ seg = [], traceName = '?', bot: botFilter = null, verbose 
     }
   }
 
-  // ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ──────────────────────────────────────────────
+  // ── OUTPUT IS DATA, NOT PROSE ──────────────────────────────────────────────
   // Field names and values only. Every reason string below is carried VERBATIM out of the bot's own line
   // (`composter_not_built_yet`, `no_composter_in_blueprint`, `composter_lock_lost_to_peer`) — the bot was
-  // present for that decision and may name it; this lens was not and may only copy it. What used to live
-  // here and no longer does: a VERDICT line folding fed/harvested/held into one of three named outcomes,
-  // and a footnote explaining what a low harvest at a low fed count means. Both were this instrument
-  // deciding what its own numbers amounted to. The numbers are all still below, one field each.
+  // present for that decision and may name it; this lens was not and may only copy it.
   out.kv('lens', 'compost');
   out.kv('record', traceName);
   out.kv('span', relativeTime(maxRel));
@@ -177,23 +166,7 @@ function runCompost({ seg = [], traceName = '?', bot: botFilter = null, verbose 
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────────
-// --deaths WAS HERE AND IS DELETED. It reduced the death-pile chain: `☠️ Pile recorded` from
-// death_pile_recorder, the board's `death_pile/retrieve` offers, and death_pile_executor's despawn
-// timeouts — all three fragments deleted when salvage became a live ground scan
-// (perception/ground_drop_scanner), so none of its patterns can ever match again.
-//
-// IT WAS DELETED RATHER THAN LEFT TO GO QUIET: a lens whose source vanished must not report nothing,
-// since silence here reads as a false all-clear on a run that actually had deaths — worse than no
-// instrument at all (Law 25), and a failure mode `preflight` cannot catch because the code still
-// runs.
-//
-// WHERE THE QUESTION GOES NOW: `--combat` owns deaths and always did — it reads the combat journal, which
-// no part of this change touched. What is genuinely lost is WHAT A DEATH COST (the item list), because
-// nothing records a dying bot's inventory any more. That is a real gap, named here rather than papered
-// over; the place to close it, if it is ever wanted, is the combat journal's own death row.
-//
-// --hunt WENT THE SAME WAY — the bed left the blueprint and the whole hunt chain was deleted.
-
+// `--combat` owns deaths, reading the combat journal — a death's item cost is not recorded anywhere
+// (Law 25: an unowned question is named, not left to be discovered by its absence).
 
 module.exports = { runCompost };

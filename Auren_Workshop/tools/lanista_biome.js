@@ -1,63 +1,31 @@
 // lanista_biome — find ground in a NAMED biome, and say exactly how it was found.
 //
-// ── WHY IT EXISTS ────────────────────────────────────────────────────────────────────────────────────
-// Lanista is responsible for placing combatants together in the correct biome; when none is present
-// nearby, it must teleport a client around to load new chunks until one is found.
+// The biome is a CONTROL VARIABLE: a ladder run in a forest and one on a plain are different
+// experiments — different sightlines, footing, light under canopy — so a row that does not name its
+// biome, or names one never verified, cannot be compared to any other (Law 25). Finding the biome is
+// part of setting the experiment up, authored here and read back at the fight cell by lanista itself.
 //
-// The biome is a CONTROL VARIABLE, and that is the whole reason this file is not a convenience. A ladder
-// run in a forest and a ladder run on a plain are two different experiments — different sightlines,
-// different footing, different light under canopy — so a row that does not name its biome cannot be
-// compared to any other row, and a row that names one it never verified is worse than one that names
-// none (Law 25). Finding the biome is therefore part of setting the experiment up, not part of reading
-// it, which is why it is authored here and read back at the fight cell by lanista itself.
+// ── THE HOP: A CLIENT, NOT THE SERVER ───────────────────────────────────────────────────────────────
+// No server command answers what biome is at a cell — `execute if biome` only tests a guess already
+// held. A client holding the chunk answers it in one lookup, so the hunt teleports the scout, waits for
+// its chunks, reads, and repeats. The scout is a spectator: it cannot fall, be hit, or aggro anything
+// (Law 26 — the bench moves its own instrument, never the thing being measured).
 //
-// ── THE HOP, AND WHY A CLIENT RATHER THAN THE SERVER ────────────────────────────────────────────────
-// There is no server command that ANSWERS "what biome is at this cell" — `execute if biome` only tests a
-// guess you already have, so finding an unknown biome over RCON would mean testing every biome id at
-// every cell. A client holding the chunk answers it in one lookup. The bench already runs such a client
-// for exactly this class of question (the scout, which reads terrain for the siting sweep), so the hunt
-// is: teleport the scout, wait for its chunks, read, repeat. Nothing new joins the world.
+// ── THE SPIRAL IS DETERMINISTIC ─────────────────────────────────────────────────────────────────────
+// Same origin + same target + same world ⇒ same hop sequence ⇒ same cell, which is what makes a trial
+// repeatable.
 //
-// THE SCOUT IS THE RIGHT BODY AND THE BOT IS THE WRONG ONE. Teleporting the fleet's body around to
-// look for ground would run the system under test through forty chunk loads, a fall, and possibly a
-// death before the experiment started — and every one of those is state the trial then carries silently.
-// The scout is a spectator: it cannot fall, cannot be hit, and cannot aggro anything (Law 26 — the bench
-// moves its own instrument, never the thing being measured).
-//
-// ── THE SPIRAL IS DETERMINISTIC ON PURPOSE ──────────────────────────────────────────────────────────
-// Same origin + same target + same world ⇒ same hop sequence ⇒ same cell. That is what makes a trial
-// repeatable, which is the whole ask ("we should be able to replicate battles over and over"). A random
-// walk would find a biome just as well and would make every row a one-off.
-//
-// ── WHAT IT CANNOT PROVE, stated up front (Law 25) ──────────────────────────────────────────────────
-// The coarse sweep samples the biome at three FIXED altitudes per column, not at the real surface —
-// resolving the true surface height would cost a downward block scan per cell and turn a millisecond
-// lookup into tens of thousands of reads per hop. Minecraft 1.21 biomes are volumetric, so a column
-// whose ground sits far above or below those altitudes can read as a CAVE biome and be passed over. The
-// consequence is a false NEGATIVE (a hop skipped that did contain the target), never a false positive:
-// every cell this file returns has had its biome re-read at the actual floor of an actual open box.
-// So the hunt can take more hops than it needed to; it cannot hand back the wrong ground.
+// ── WHAT IT CANNOT PROVE (Law 25) ───────────────────────────────────────────────────────────────────
+// The coarse sweep samples the biome at three fixed altitudes per column, not the real surface, so a
+// column whose ground sits far above or below those altitudes can read as a cave biome and be passed
+// over — a false NEGATIVE, never a false positive: every cell this file returns has had its biome
+// re-read at the actual floor of an actual open box.
 //
 // ── A GROUP IS A TARGET TOO, AND `open` IS THE ONE THAT MATTERS ────────────────────────────────────
-// Attack tuning is meant to isolate swing distance, not pathfinding — the biome should offer non-tree,
-// open ground first (plains, desert, ...) so there are no obstacles to route around.
-//
-// A single biome NAME is the strictest control and it is also the one that fails most: the bench has one
-// world, and a declared name that cannot be found at all silently becomes 'any' — which can put an entire
-// tuning run inside a forest. A pathfinding/occlusion reading (declines for no_sightline, leaves stopping
-// the cast) then contaminates what was meant to be a pure swing-distance experiment.
-//
-// So the target may now be a GROUP, and the group is ranked. `open` means "treeless ground, plains first",
-// and it is strictly more findable than any single name while being strictly more controlled than 'any'.
-// The row still records the ONE biome that was actually confirmed at the floor, so nothing about the
-// experiment's legibility is traded for the findability (Law 25).
-//
-// WHY RANKED-WITHIN-A-HOP AND NOT PLAINS-EVERYWHERE-FIRST. Strict preference order means sweeping all 24
-// hops for plains before ever looking at desert — 24× the teleports and chunk waits for a preference, not
-// a control. Instead every accepted biome is collected at each hop and the winner is (rank, then distance),
-// so a hop offering both plains and savanna always yields plains, and a hop offering only savanna yields
-// it rather than costing another 23 hops. The cost is named because it is real: a plains 200 b away loses
-// to a savanna 40 b away.
+// Attack tuning isolates swing distance, not pathfinding, so the target may be a ranked GROUP: `open`
+// means treeless ground, plains first, more findable than any single name while staying more controlled
+// than 'any'. The row still records the one biome actually confirmed at the floor (Law 25). Every
+// accepted biome at a hop is collected and the winner is (rank, then distance).
 //
 // Usage (normally driven by lanista_ladder, but standalone for a look around):
 //   node lanista_biome.js --biome=open [--bot=AurenBot] [--hops=24] [--hop=96]
@@ -73,52 +41,26 @@ const {
 } = require('./lanista_shared');
 const lanista = require('./lanista');
 
-// The scout's own loaded radius. server.properties view-distance is 10 chunks → 160 blocks, and the
-// sweep stays inside 128 so a column at the edge of the frontier (which may be mid-load) is never the
-// one a trial is sited on.
+// View-distance is 10 chunks (160b); the sweep stays inside 128 so a trial is never sited at the
+// loaded frontier's edge.
 const SWEEP_RADIUS = 128;
-// 8 blocks between samples. Biomes are stored at 4×4×4, so this reads one cell in four — deliberately
-// coarse, because the target is a REGION big enough to hold a 15-block arena, and a patch narrower than
-// 8 blocks is not one. Halving it would quadruple the sweep for ground the ladder would refuse anyway.
+// Blocks between samples: biomes are stored at 4×4×4, so this reads one cell in four.
 const SWEEP_STEP = 8;
-// Three altitudes per column, spanning the surface relief a hop can land in. One altitude misses a hop
-// whose ground is a hill; a full column scan costs four orders of magnitude more (see the header).
+// Altitudes sampled per column, spanning the surface relief a hop can land in.
 const SWEEP_LIFTS = [0, 24, 48];
-// How far apart two hops are. Slightly less than a full loaded diameter (256) so consecutive rings
-// overlap rather than leaving unread seams between them — a seam is exactly where a small patch hides.
+// Distance between hops, less than a full loaded diameter (256) so consecutive rings overlap.
 const HOP_BLOCKS = 96;
 const MAX_HOPS = 24;
-// Eight bearings per ring: the four axes plus the four diagonals. More bearings per ring would re-read
-// ground the overlap already covers; fewer would leave the seams the overlap exists to close.
+// Eight bearings per ring: the four axes plus the four diagonals.
 const BEARINGS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
-// How many of a hop's nearest candidate cells get the expensive box test before the hunt moves on. The
-// box test is a terrain sweep per candidate; a hop that offers 300 cells of the right biome and no open
-// ground in the first six of them is ground the ladder does not want anyway.
+// How many of a hop's nearest candidate cells get the expensive box test before the hunt moves on.
 const CANDIDATES_PER_HOP = 6;
 
 // ── THE `open` GROUP, IN PREFERENCE ORDER ───────────────────────────────────────────────────────────
-// Ranked by how little stands between two bodies 12 b apart, which is the only property this group is
-// for. Plains and desert are flat and empty; savanna and meadow carry sparse trees and are here because a
-// world that offers neither of the first two still offers a better swing-tuning floor than a forest. The
-// beaches and the snowy variants are last: findable almost anywhere, and flat, but narrow — a beach strip
-// can be too thin to hold a 15 b arena, and the box test will say so.
-//
-// EXCLUDED ON PURPOSE, so a successor does not "helpfully" add them back: every *_forest, taiga, jungle,
-// grove, swamp, and windswept_forest (canopy — the thing this group exists to avoid); stony_shore and the
-// peaks (treeless but so uneven that relief replaces canopy as the confound); rivers and oceans (the box
-// test refuses water, so they only ever cost hops).
-//
-// ── THE BEACHES CAME OUT, and the reason is structural ──────────────────────────────────────────────
-// Beaches were here as a last-resort filler — findable almost anywhere and flat — on the assumption that
-// a strip too thin to hold the arena would simply fail the box test. That check was not enough: `beach`
-// is by definition the seam between water and whatever rises behind it, so the strips that ARE wide
-// enough are exactly the ones with a cliff at their back. A trial sited on such an anchor can take fall
-// damage it never attributes to the fight, corrupting the combat result it was supposed to measure.
-//
-// TWO DEFENCES NOW, NOT ONE, AND THEY ARE NOT REDUNDANT (Law 16's test answered honestly): this list
-// decides which biome the hunt FLIES TO, `SITING.ground` decides which anchor inside it is acceptable.
-// Removing a biome cannot police the cliff at the edge of a plains; the ground dial cannot stop the hunt
-// spending twenty hops on a coastline. Different jobs, different scopes.
+// Ranked by how little stands between two bodies 12b apart. Plains and desert are flat and empty;
+// savanna and meadow carry sparse trees and still beat a forest floor; snowy plains is last, findable
+// almost anywhere. This list decides which biome the hunt flies to; `SITING.ground` decides which
+// anchor inside it is acceptable — different jobs, different scopes.
 const OPEN_GROUND = [
   'plains', 'sunflower_plains', 'desert',
   'savanna', 'savanna_plateau', 'meadow',
@@ -127,12 +69,9 @@ const OPEN_GROUND = [
 
 const BIOME_GROUPS = { open: OPEN_GROUND };
 
-// resolveTargets — one name, a comma list, or a group name, all reduced to the same ranked map. Kept as
-// its own function so the ranking is decided once and every caller below reads it rather than re-parsing
-// the string (Law 16 — a second parse is a second answer waiting to disagree).
-//
-// A BARE STRING IS STILL ACCEPTED at every consumer below, because that is what the existing callers
-// pass. Widening a signature is not licence to break the narrow case.
+// resolveTargets — one name, a comma list, or a group name, all reduced to the same ranked map, decided
+// once (Law 16) so every caller reads it instead of re-parsing the string. A bare string is still
+// accepted at every consumer below.
 function resolveTargets(target) {
   if (target instanceof Map) return target;
   const names = BIOME_GROUPS[target] || String(target).split(',').map(s => s.trim()).filter(Boolean);
@@ -152,9 +91,8 @@ function describeTarget(target) {
   return t.size === 1 ? [...t.keys()][0] : `${target} [${[...t.keys()].join(' > ')}]`;
 }
 
-// hopCells — the spiral, as pure data. Extracted from the hunt so the sequence can be asserted without a
-// server: a hunt that silently changed its own order would make two trials incomparable and nothing
-// would say so (this is the file's one determinism claim, so it is the one thing a test can pin).
+// hopCells — the spiral, as pure data, extracted from the hunt so the sequence can be asserted without a
+// server (the file's one determinism claim, and the one thing a test can pin).
 function hopCells(origin, { hops = MAX_HOPS, hop = HOP_BLOCKS } = {}) {
   const cells = [{ x: origin.x, y: origin.y, z: origin.z, ring: 0, bearing: 0 }];
   let ring = 1;
@@ -173,10 +111,10 @@ function hopCells(origin, { hops = MAX_HOPS, hop = HOP_BLOCKS } = {}) {
   return cells;
 }
 
-// waitForChunks — the scout has arrived somewhere only when it can ANSWER about it. Polling the biome
-// read is the honest test because it is the read the sweep is about to make; polling a fixed sleep would
-// be a guess about the server's chunk-send latency, and a wrong guess produces an empty sweep that reads
-// exactly like "the target biome is not here" (Law 23 — an unread cell is unknown, never a verdict).
+// waitForChunks — the scout has arrived only when it can ANSWER about the cell. Polling the biome read
+// is the honest test, since that is the read the sweep is about to make; a fixed sleep would guess at
+// the server's chunk-send latency, and a wrong guess produces an empty sweep indistinguishable from the
+// target biome being absent (Law 23 — an unread cell is unknown, never a verdict).
 async function waitForChunks(scout, cell, timeoutMs = 15000) {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
@@ -186,12 +124,9 @@ async function waitForChunks(scout, cell, timeoutMs = 15000) {
   return false;
 }
 
-// sweepForBiome — every sampled column at this hop whose biome is in the target set, best first.
-//
-// BEST = (rank, then distance). Rank first because the group is a PREFERENCE and the box test below is
-// the expensive half — only the first few candidates get one, so the order decides which ground the trial
-// actually lands on. Distance second because within one rank there is nothing to choose between two
-// columns except how far the fight ends up from where the bot started.
+// sweepForBiome — every sampled column at this hop whose biome is in the target set, best first: rank
+// then distance. Rank first because the group is a preference and the box test below is the expensive
+// half, so the order decides which ground the trial actually lands on.
 function sweepForBiome(scout, centre, target) {
   const targets = resolveTargets(target);
   const hits = [];
@@ -213,10 +148,10 @@ function sweepForBiome(scout, centre, target) {
   return { hits, read };
 }
 
-// confirmGround — the promotion from claim to fact (Law 23). A biome sample says the REGION is right; it
+// confirmGround — the promotion from claim to fact (Law 23). A biome sample says the region is right; it
 // says nothing about whether a body can stand there. The open-box test is the construct's own siting
-// criterion, imported rather than restated (Law 16), and the biome is re-read AT THE BOX'S FLOOR because
-// that — not the sampled altitude — is where the fight will happen.
+// criterion, imported (Law 16); the biome is re-read at the box's floor, since that is where the fight
+// will happen.
 async function confirmGround(scout, candidate, target) {
   const targets = resolveTargets(target);
   const dials = { blueprint: SITING.blueprint, flatness: SITING.flatness };
@@ -225,13 +160,10 @@ async function confirmGround(scout, candidate, target) {
   const cell = { x: spawn.box.x, y: spawn.box.y, z: spawn.box.z };
   const biome = lanista.readBiome(scout, cell);
   if (biome === null) return { ok: false, why: `the box at ${fmt(cell)} is not readable — its column is not loaded` };
-  // The sample and the floor disagreeing is the NORMAL case at a biome edge, not a fault: the sample was
-  // taken at a fixed altitude and the box resolved a real floor some blocks away. It is reported, not
-  // repaired, because the only thing that matters is what the floor says.
-  //
-  // A GROUP IS CHECKED AS A SET, never as the name the SAMPLE happened to hit: the floor is what the fight
-  // stands on, and a floor of 'desert' under a 'plains' sample is a perfectly good `open` arena. Falling
-  // back to the sample's own name here would refuse it and cost a hop for nothing.
+  // The sample and the floor disagreeing is the normal case at a biome edge: the sample was taken at a
+  // fixed altitude, the box resolved a real floor some blocks away, and only the floor's answer counts.
+  // A group is checked as a set, never as the name the sample happened to hit — a floor of 'desert'
+  // under a 'plains' sample is a perfectly good `open` arena.
   if (!targets.has(biome)) {
     return { ok: false, why: `the box at ${fmt(cell)} is '${biome}', not ${describeTarget(target)} — a biome edge` };
   }
@@ -239,14 +171,12 @@ async function confirmGround(scout, candidate, target) {
 }
 
 // ── The hunt ────────────────────────────────────────────────────────────────────────────────────────
+// Returns { found, cell, biome, hops, scanned, why }; `hops` belongs on the result because it belongs in
+// the trial row — a biome found on hop 0 and one found on hop 19 are the same control, but the reader is
+// owed the distance from base.
 //
-// Returns { found, cell, biome, hops, scanned, why } — and `hops` is on the result rather than in a log
-// line because it belongs in the trial row: a biome found on hop 0 and a biome found on hop 19 are the
-// same control, but the second one is 19 hops from the fleet's base and the reader is owed that.
-//
-// 'any' short-circuits to the origin and reports the biome it finds there. The ladder is meant to be
-// runnable without a biome control at all — the first thing anyone does with a new bench is run it where
-// they are standing — and forcing a declared biome to do that would make the honest cheap run impossible.
+// 'any' short-circuits to the origin and reports the biome it finds there, so the ladder is runnable
+// without a biome control at all.
 async function huntBiome(scout, rcon, { target, origin, hops = MAX_HOPS, hop = HOP_BLOCKS, quiet = false } = {}) {
   if (!target || target === 'any') {
     const biome = lanista.readBiome(scout, origin);
@@ -279,21 +209,11 @@ async function huntBiome(scout, rcon, { target, origin, hops = MAX_HOPS, hop = H
       const ground = await confirmGround(scout, c, targets);
       if (ground.ok) {
         // ── THE SCOUT FOLLOWS THE ANSWER ─────────────────────────────────────────────────────────────
-        // The hunt teleports the scout to each HOP, then reads a target column up to SWEEP_RADIUS (128b)
-        // further out and hands that cell back. Without this move the scout is left standing at the hop
-        // while the caller sites a fight 100+ blocks away — and everything the caller does next reads
-        // through the scout: the reach gate's A* and the sightline partition both run on its chunk cache.
-        // At that distance the cache is ragged or absent, so a box the terrain would have accepted is
-        // refused for want of data.
-        //
-        // A reach-gate refusal produced from an absent chunk cache reads as terrain unfightable when it
-        // is really the instrument reporting its own blindness — the Law 23 failure pointed inward: a
-        // verification run on absent data is a claim wearing a fact's clothes (Law 25 — the refusal is
-        // true about the search and false about the ground).
-        //
-        // Reuses the hunt's own two lines — the same tp and the same waitForChunks the hops already use
-        // — rather than adding a second way to move the instrument (Law 16). A cell whose chunks never
-        // arrive is NOT returned: it would hand the caller the same blindness one step later.
+        // Teleports the scout to the confirmed cell before returning it: everything the caller does next
+        // reads through the scout's chunk cache, and left standing at the hop that cache would be ragged
+        // or absent nearby, reading as terrain unfightable when it is the instrument's own blindness
+        // (Law 23/25). Reuses the hunt's own tp and waitForChunks (Law 16); an unreachable cell is not
+        // returned.
         await rcon.command(`tp ${SCOUT_NAME} ${ground.cell.x + 0.5} ${ground.cell.y} ${ground.cell.z + 0.5}`);
         if (!await waitForChunks(scout, ground.cell)) {
           refusals.push(`hop ${i}: ${fmt(ground.cell)} confirmed, but the scout's chunks never arrived there — cannot survey the fight`);
@@ -305,9 +225,9 @@ async function huntBiome(scout, rcon, { target, origin, hops = MAX_HOPS, hop = H
     }
   }
 
-  // A shortfall is reported as a shortfall, with what was actually looked at — never as "no such biome"
-  // (which this cannot know: it searched a spiral, not the world) and never as a silent fall back to
-  // wherever the bot happened to be standing (Law 25).
+  // A shortfall is reported with what was actually looked at, never as proof no such biome exists
+  // anywhere (this searched a spiral, not the world) and never as a silent fall back to wherever the
+  // bot happened to be standing (Law 25).
   return {
     found: false, cell: null, biome: null, hops: route.length, scanned, declared: true, refusals,
     why: `${label} was not found with standable ground in ${route.length} hop(s) of ${hop}b `

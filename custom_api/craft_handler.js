@@ -3,78 +3,49 @@
 //          target item into an ordered dependency sequence (blueprint expansion),
 //          then executes each step: ensure a station exists, craft until the step's
 //          target is met, return result.
-//          Called directly by craft_executor (and available to any fragment that
-//          needs on-demand crafting). No signal-bus entry point.
+//          Called directly by craft_executor and available to any fragment that
+//          needs on-demand crafting. No signal-bus entry point.
 //
-// THIS FILE BREAKS NOTHING. It places crafting tables and never takes one back up
-// (Architect 2026-09-07 — see THE TABLE IS NOT TAKEN BACK UP, below), so it holds no
-// dig verb at all and imports none. A craft that needs a cell cleared is asking the
-// wrong unit; the answer is a different placement spot, which is what the placement
-// search already returns.
+// Holds no dig verb and no place verb: it crafts at the crew's one table, the home blueprint's.
 //
-// NESTED API (Law 15): craft_handler calls the locomotion API (goTo) to reach
-// distant stations. Locomotion owns its own abandonment clause — if it can't
-// reach the station it returns arrived=false. craft_handler treats that as an
-// environmental failure and abandons the caller (Law 15 caller abandonment),
-// originating a fresh signal to recursive_judge.
+// NESTED API (Law 15): calls the locomotion API (goTo) to reach distant stations; a locomotion
+// abandonment (arrived=false) is an environmental failure that abandons the caller to recursive_judge.
 //
 // invariants:
-//  - Resolution expands a target item into dependency-ordered steps using
-//    crafting_blueprints.json. Group items (logs, planks) are resolved to the
-//    best-inventory variant. Recursive dependency unfolding uses a visited set
-//    to prevent cycles.
-//  - TARGET-BASED, ABSOLUTE SEMANTICS (Law 10): every step's `target` is the
-//    DESIRED TOTAL inventory count AFTER this step — not a delta. The loop is
-//    "craft/smelt one operation, then check inventory.count(item) >= target."
-//  - Only the LAST step's item/target decides overall success.
-//  - Coding violations (unresolvable items, empty sequence, no-op dispatch)
-//    throw immediately (Law 13).
-//  - Environmental failure (crafting_failed) triggers caller abandonment.
-//  - Success returns { success, metrics, finalItem, finalCount, requiredFinal,
-//    sequenceLength } to the caller.
-//  - THREE OUTCOMES, NOT TWO. A craft that runs out of an ingredient part way
-//    through is a PARTIAL, and it is the ordinary end of a pull chain rather
-//    than a fault — material is never withheld from a craft that can spend it.
-//    Whether a short delivery counts is the CALLER's to declare, never this
-//    module's to assume, so a partial is only returned to a caller that asked
-//    for one with `{ allowPartial: true }`; everyone else keeps the
-//    all-or-nothing abandonment unchanged. The partial return carries
-//    `success: false, partial: true` with the true counts — a shortfall never
-//    wears a success flag (Law 25).
+//  - Resolution expands a target item into dependency-ordered steps via crafting_blueprints.json; group
+//    items (logs, planks) resolve to the best-inventory variant; a visited set prevents cycles.
+//  - TARGET-BASED, ABSOLUTE SEMANTICS (Law 10): every step's `target` is the desired total inventory
+//    count after the step, not a delta.
+//  - Only the LAST step's item/target decides overall success; a coding violation throws (Law 13);
+//    an environmental failure (crafting_failed) triggers caller abandonment.
+//  - Success returns { success, metrics, finalItem, finalCount, requiredFinal, sequenceLength }.
+//  - THREE OUTCOMES, NOT TWO: a craft that runs out of an ingredient part way through is a PARTIAL,
+//    always kept and returned, carrying `success: false, partial: true` with the true counts (Law 25).
 
 'use strict';
 
-const path = require('path');
 const { Vec3 } = require('vec3');
 const watcher = require('@kernel/watcher');
-const { group_to_item: OBJECT_GROUPS, BLOCK_REACH, hasLineOfSightToBlock } = require('@utils/fragment_utils');
+const { group_to_item: OBJECT_GROUPS, BLOCK_REACH } = require('@utils/fragment_utils');
 const { routeToJudge } = require('@utils/signal_utils');
-// Entered through combatCheckpoint, never battleStations directly (Architect 2026-08-08: "remove it
-// from the callers"). One process-wide 500 ms clock, shared with the dig and drive primitives that now
-// carry the same gate, plus the engaging/escaping bypass so combat's own arms cannot re-enter it. The
-// whole reasoning is in its header; a call a primitive already paid for costs nothing here.
+// Entered through combatCheckpoint, never battleStations directly: one process-wide 500 ms clock
+// shared with the dig and drive primitives, with an engaging/escaping bypass so combat's own arms
+// cannot re-enter it.
 const { combatCheckpoint } = require('@api/battle_stations');
-const { performPlace } = require('@utils/movement/place_authority');
-const { classifyFloor } = require('@utils/movement/terrain_predicates');
 const stationRegistry = require('@perception/station_registry');
 const craftingRegistry = require('@kernel/crafting_blueprint_registry');
 const locomotion = require('@locomotion/locomotion_dispatcher');
 
 const portableJudge = require('@kernel/portable_judge');
-const { guardExternal, guardExternalSync } = require('@utils/external_library_guard');
+const { guardExternal } = require('@utils/external_library_guard');
 
 const TAG = 'craft_handler';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Deferred phase notes (Law 5: accumulate-then-post). A single craftItems() call
-// used to emit ~6 summary lines (request, resolution JSON, per-step craft delta,
-// station place/cleanup, final result) — and several crafts fire back-to-back, so
-// the console flooded. Instead we push each piece of per-step detail into this
-// buffer and post ONE consolidated summary when the whole phase completes. Nothing
-// is removed — every count/coordinate the old lines carried is folded into that one
-// line. Module-level temporary state is safe here: Law 4 guarantees only one craft
-// runs at a time. `null` means no phase is open, in which case note() falls back to
-// an immediate summary so a stray call is never silently dropped.
+// Deferred phase notes (Law 5: accumulate-then-post). Buffers per-step detail across one craftItems()
+// call — resolution, craft deltas, station placement — for one consolidated summary at phase end.
+// Module-level state is safe here: Law 4 guarantees only one craft runs at a time. `null` means no
+// phase is open, and note() then posts immediately so a stray call is never lost.
 let _phaseNotes = null;
 function note(msg) {
   if (_phaseNotes) _phaseNotes.push(msg);
@@ -85,29 +56,11 @@ const FINAL_OUTPUT_CONSTRAINTS = {
   ladder: { maxTotal: 64 }
 };
 
-// A LOCAL PLACE TIMEOUT USED TO LIVE HERE (1500 ms, raced against bot.placeBlock) AND IT IS GONE. Two
-// reasons, and the second is why its loss is a repair rather than a regression:
-//   · It was a SECOND bound on a call that already has one. mineflayer's placeBlock waits on the real
-//     server blockUpdate with its own 5000 ms timeout and REJECTS when it does not come, so the race was
-//     two bounds on one call — and two bounds can only disagree (Law 16).
-//   · Promise.race CANCELS NOTHING. The block_place packet is already on the wire when the local timer
-//     fires, so "timed out" never meant "the placement failed", only "we stopped waiting". The station
-//     could still land at the abandoned spot while the retry placed a second one somewhere else.
-// WHAT IT COSTS, stated because it is real: a spot the server never answers for now occupies the full
-// 5 s rather than 1.5 s before the next spot is tried, so a pathological run of refusals is slower.
-// The common failures are unaffected — an unholdable item or a server revert throws immediately — and
-// the loudest former cause of a no-answer cell (a placement inside spawn protection) is now refused
-// before the packet is ever sent.
-const AFTER_PLACE_SLEEP_MS = 200;
-const POST_PLACE_SUCCESS_MS = 300;
-// 4.5 — PLACEMENT and SCAN reach only: anywhere inside this is placed in situ, and it is the radius the
-// nearby-station scan sweeps. It is NOT how close a bot must stand to USE a station: using one means
-// standing on the blueprint anchor that owns it (locomotion.goToStationStance), which is a cell rather
-// than a distance. This number now answers only "can I click to PLACE here" and "how far out shall I look
-// for a table I could reuse".
+// The settle after a craft click, before the pocket is read back.
+const AFTER_CRAFT_SLEEP_MS = 200;
+// Scan reach only — the radius the nearby-station scan sweeps. USING a station is a cell
+// (locomotion.goToStationStance's blueprint anchor), not a distance, and this constant does not govern that.
 const STATION_REACH = BLOCK_REACH;
-const PLACE_SCAN_MAX = 32;           // outward ring-expansion cap for finding a place spot
-const MAX_PLACE_ATTEMPTS = 16;       // Law-13 safety valve (distinct reachable spots tried), not the primary exit
 
 // ---------------------------------------------------------------------------
 // SECTION 1 — Helpers
@@ -126,7 +79,7 @@ function effectiveTarget(step) {
 // SECTION 2 — Blueprint resolution
 // ---------------------------------------------------------------------------
 
-const PLANK_DERIVED_GROUPS = new Set(['stairs', 'door', 'fence', 'slab']);
+const PLANK_DERIVED_GROUPS = new Set(['stairs', 'door', 'fence', 'slab', 'trapdoor', 'fence_gate', 'sign', 'button', 'wood']);
 
 const WOOD_VARIANTS = {
   oak_planks: 'oak',
@@ -136,6 +89,39 @@ const WOOD_VARIANTS = {
   acacia_planks: 'acacia',
   dark_oak_planks: 'dark_oak'
 };
+
+// Results the game crafts from the `coals` tag (coal OR charcoal). The recipe data mineflayer reads
+// expands that tag unevenly — campfire carries 43 coal variants and 1 charcoal — so a pocket holding
+// charcoal and oak logs matches no recipe the server would accept. Each coal variant of these results
+// gets its charcoal twin, once per recipe table.
+const COALS_TAG_RESULTS = ['campfire', 'fire_charge', 'torch', 'soul_torch', 'copper_torch'];
+const _coalsFilled = new WeakSet();
+
+function fillCoalsTag(bot) {
+  const mcData = bot.registry;
+  if (_coalsFilled.has(mcData.recipes)) return;
+  _coalsFilled.add(mcData.recipes);
+  const coal = mcData.itemsByName.coal.id;
+  const charcoal = mcData.itemsByName.charcoal.id;
+  const swap = (i) => (i === coal ? charcoal : (i && typeof i === 'object' && i.id === coal ? { ...i, id: charcoal } : i));
+  for (const name of COALS_TAG_RESULTS) {
+    const item = mcData.itemsByName[name];
+    const list = item ? mcData.recipes[item.id] : null;
+    if (!Array.isArray(list)) continue;
+    const seen = new Set(list.map(r => JSON.stringify(r)));
+    for (const r of list.slice()) {
+      const twin = {
+        ...r,
+        ...(r.inShape ? { inShape: r.inShape.map(row => row.map(swap)) } : {}),
+        ...(r.ingredients ? { ingredients: r.ingredients.map(swap) } : {}),
+      };
+      const key = JSON.stringify(twin);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      list.push(twin);
+    }
+  }
+}
 
 function resolveGroupItem(bot, groupName) {
   const group = OBJECT_GROUPS[groupName];
@@ -154,15 +140,8 @@ function resolveGroupItem(bot, groupName) {
     }
   }
 
-  // planks follow the LOG SUPPLY, not the most-held plank (Architect 2026-07-18, "prefer craftable").
-  // WHY: this used to return the most-held plank and only derive from logs when the bot held ZERO planks
-  // (`maxCount <= 0`). A bot holding a few oak_planks but only birch_log then picked oak — a species it
-  // cannot replenish (no oak_log) — and craft_handler looped on "No recipe found for oak_planks" until the
-  // judge killed it (live standard test, TessaBot, round 50a). The variant a bot can PRODUCE is set by its
-  // logs, so the log supply is the primary signal: pick the plank whose log the bot has the most of, and
-  // fall back to the most-held plank only when it has no logs at all. Same Law 16 the 'fence' fix restored
-  // (the group definition follows what you can make; oak was a wrong default) — applied to the plank itself.
-  // Accepted trade-off (the ruling): a few already-held planks of another species may be stranded.
+  // Plank variant follows the log supply, not the most-held plank: picks the plank whose log the bot
+  // holds the most of, and falls back to the most-held plank only when it holds no logs at all.
   if (groupName === 'planks') {
     const logGroup = OBJECT_GROUPS['logs'];
     let bestPlank = null, bestLogs = 0;
@@ -177,18 +156,10 @@ function resolveGroupItem(bot, groupName) {
     return bestItem;                   // no logs at all → use whatever planks we already hold
   }
 
-  // Groups whose variant follows the bot's plank species (birch_planks → birch_fence), not the
-  // most-held member. Without 'fence' here a bot with zero fences falls to group[0]=oak_fence and
-  // craft_handler tries to make oak_fence from birch_planks → "no recipe" halt in every non-oak
-  // biome (Law 16: the 'fence' group is the definition; oak was a wrong second route).
-  //
-  // 'slab' joined 2026-08-05 and cost a soak to find: the composter's ingredient shipped with a group
-  // but not a membership here, so a birch-biome bot resolved oak_slab and warned "No recipe found for
-  // oak_slab" every pass — the composter simply never got built, with no error to wake anyone. THE
-  // RULE, so the next group does not repeat it: any group whose members are `<species>_<group>` for the
-  // plank species belongs here. Exported at module scope for a registry bench retired 2026-08-10
-  // (`tools/README.md`); deriving this set from group_to_item and failing on a missing member is owed as
-  // a load-time throw in the crafting registry. Until then a missing member is only noticed live.
+  // Groups whose variant follows the bot's plank species (birch_planks → birch_fence), never the
+  // most-held member (Law 16). Membership rule: any group whose members are `<species>_<group>` for
+  // the plank species belongs in PLANK_DERIVED_GROUPS; a group missing from this set resolves to
+  // group[0] instead and fails only live, with no load-time check yet.
   if (PLANK_DERIVED_GROUPS.has(groupName)) {
     const plankItem = resolveGroupItem(bot, 'planks');
     const variantName = plankItem.replace(/_planks$/, `_${groupName}`);
@@ -210,9 +181,40 @@ function extractStation(obj) {
   return obj.station || obj.station_type || obj.stationType || null;
 }
 
-function resolveBlueprintRecursive(bot, targetItem, allBlueprints, resolved = [], visited = new Set(), variantState = {}, targetCount = 1) {
-  if (visited.has(targetItem)) return;
-  visited.add(targetItem);
+// ── A RECIPE TREE IS A GRAPH, NOT A TREE, AND THE DIFFERENCE IS A DIAMOND ──────────────────────────
+// Two branches of one recipe can reach the same intermediate (e.g. a barrel needs planks directly and
+// via slabs). Demand accumulates across branches via three maps: `path` (items on the stack now, the
+// cycle guard), `demand` (total required per item across every branch), and `sent` (what each
+// parent→child edge has already contributed, so a re-walk adds only the delta). Demand only rises and
+// the graph is finite, so the re-walk terminates; inventory is read against the accumulated total.
+function resolveBlueprintRecursive(bot, targetItem, allBlueprints, resolved = [], path = new Set(), variantState = {}, targetCount = 1, demand = new Map(), sent = new Map()) {
+  // Cycle guard: an item already on the stack refuses immediately (Law 13). Merely having been seen
+  // before does not refuse it — that is what lets demand accumulate across diamond branches.
+  if (path.has(targetItem)) return;
+
+  // Parents' demands add; a visit asking no more than the prior total contributes nothing and stops,
+  // which is what makes the re-walk converge.
+  const priorDemand = demand.get(targetItem) || 0;
+  const total = priorDemand + Math.max(0, targetCount);
+  if (total <= priorDemand) return;
+  demand.set(targetItem, total);
+  path.add(targetItem);
+  _resolveOne(bot, targetItem, allBlueprints, resolved, path, variantState, total, demand, sent);
+  // Leaves the stack without forgetting the item: `demand` keeps the total for a later branch to add to.
+  // No try/finally — a throw here is a Law 13 violation that aborts the whole plan, and `path` is local
+  // to that plan and dies with it; every catch in this fleet goes through external_library_guard instead.
+  path.delete(targetItem);
+}
+
+// One step per item, carrying the accumulated total: raising an existing step's target delivers
+// accumulated demand to the executor as a single number (Law 16).
+function _raiseOrPush(resolved, step) {
+  const existing = resolved.find(s => s.item === step.item);
+  if (existing) { existing.target = Math.max(existing.target, step.target); return; }
+  resolved.push(step);
+}
+
+function _resolveOne(bot, targetItem, allBlueprints, resolved, path, variantState, targetCount, demand, sent) {
 
   let blueprint = allBlueprints[targetItem];
   if (!blueprint) {
@@ -256,9 +258,6 @@ function resolveBlueprintRecursive(bot, targetItem, allBlueprints, resolved = []
     const opsNeeded = deficit > 0 ? Math.max(1, Math.ceil(deficit / makesPerOp)) : 0;
 
     const fromItems = Array.isArray(step.from) ? step.from : [step.from];
-    // Unguarded: every call here is ours. A dropped dependency does not fail the plan — it produces a
-    // plan that is SHORT one ingredient and looks complete, so the shortage surfaces much later as a
-    // craft that cannot find its input, with nothing linking it back to the resolution that skipped it.
     for (const dep of fromItems.filter(Boolean)) {
       const depResolvedName = OBJECT_GROUPS[dep] ? resolveGroupItem(bot, dep) : dep;
       let ingredientKey = dep;
@@ -267,9 +266,17 @@ function resolveBlueprintRecursive(bot, targetItem, allBlueprints, resolved = []
         if (groupKey && (groupKey in ingredientsMap)) ingredientKey = groupKey;
       }
       const perOpNeed = Number.isFinite(ingredientsMap[ingredientKey]) ? ingredientsMap[ingredientKey] : 1;
-      const depTargetCount = perOpNeed * opsNeeded;
-
-      resolveBlueprintRecursive(bot, depResolvedName, allBlueprints, resolved, visited, variantState, depTargetCount);
+      // Tracks each parent→child edge's own total, not the child's: two different parents may both
+      // order the same ingredient and their contributions sum (Law 7). A re-walk sends only the delta
+      // above what this edge already asked for.
+      const edgeKey = `${targetItem}→${depResolvedName}`;
+      const edgeWants = perOpNeed * opsNeeded;
+      const alreadySent = sent.get(edgeKey) || 0;
+      const delta = edgeWants - alreadySent;
+      if (delta > 0) {
+        sent.set(edgeKey, edgeWants);
+        resolveBlueprintRecursive(bot, depResolvedName, allBlueprints, resolved, path, variantState, delta, demand, sent);
+      }
     }
 
     let station = extractStation(step) || extractStation(blueprint);
@@ -278,7 +285,7 @@ function resolveBlueprintRecursive(bot, targetItem, allBlueprints, resolved = []
       station = blueprint.requires.find(r => knownStations.includes(r));
     }
 
-    resolved.push({
+    _raiseOrPush(resolved, {
       item: resolvedItem,
       target: targetCount,
       makes_per: makesPerOp,
@@ -301,18 +308,15 @@ function resolveBlueprintRecursive(bot, targetItem, allBlueprints, resolved = []
       const knownStations = ['crafting_table', 'furnace'];
       station = blueprintForFinal.requires.find(r => knownStations.includes(r));
     }
-    resolved.push({ item: finalItem, target: targetCount, makes_per: 1, ...(station && { station }) });
+    _raiseOrPush(resolved, { item: finalItem, target: targetCount, makes_per: 1, ...(station && { station }) });
   }
 }
 
+const _aliasSaid = new Set();
 function resolveBlueprint(bot, targetItem, quantity = 1) {
-  // Registry, not a live read. The old fs.readFileSync here ran on EVERY craft plan, and Law 13
-  // correctly makes an unreadable declared file a throw — so deleting the file to upload a new one
-  // (how the Architect actually edits it) killed the bot at the next craft. The registry snapshots at
-  // boot, so that window is unobservable, and an edit is reported at warn level instead of silently
-  // taking effect mid-run. Still no catch and still no `{}` fallback (r33/F7): that fallback turned an
-  // unreadable recipe book into the confident world-claim "no recipes exist", which reads downstream as
-  // "this item is uncraftable" rather than "we failed to read the book".
+  // Reads the registry's boot-time snapshot, so an in-place file edit cannot crash a plan mid-run; an
+  // edit is reported at warn level. No catch and no `{}` fallback (Law 13): an unreadable recipe book
+  // must throw, never read downstream as this item is uncraftable.
   const blueprintData = craftingRegistry.getRecipes();
 
   let actualTarget = targetItem;
@@ -320,7 +324,11 @@ function resolveBlueprint(bot, targetItem, quantity = 1) {
   if (!directMatch) {
     const alias = Object.entries(OBJECT_GROUPS).find(([_, list]) => list.includes(targetItem))?.[0];
     if (alias) {
-      watcher.warn(TAG, `Falling back to group alias for "${targetItem}" — "${alias}"`);
+      // Said once per item: every later resolve of the same item takes the same alias.
+      if (!_aliasSaid.has(targetItem)) {
+        _aliasSaid.add(targetItem);
+        watcher.summary(TAG, `Falling back to group alias for "${targetItem}" — "${alias}"`);
+      }
       actualTarget = alias;
     } else {
       throw new Error(`[${TAG}] CODING VIOLATION (Law 13): Cannot resolve target item: ${targetItem}`);
@@ -352,36 +360,10 @@ async function tryScanNearbyStation(bot, stationType) {
   if (entry && entry.pos) {
     const pos = new Vec3(entry.pos.x, entry.pos.y, entry.pos.z);
     let block = bot.blockAt(pos);
-    // Reuse-before-place (Architect): a registered station across the map reads as
-    // null here because its chunk isn't loaded — that's "far", not "stale". Walk to
-    // it FIRST, then re-verify; only a loaded-but-wrong block is truly stale. This is
-    // what let the 2 Jul run ignore its own registered table and carve a throwaway.
-    // NOT A BARE COORDINATE. A bare coordinate is a STAND-HERE order: the navigator must make that cell
-    // occupiable, so it digs the station out for the feet and the block above for the head — destroying
-    // the very station this function exists to reuse. That is not a hypothetical: on 2026-07-20 the
-    // headframe's crafting_table(11,71,-20) and furnace(11,72,-20) vanished together, in pairs, three
-    // times in one run ("gone after navigation"), the build executor re-placed them, and the building
-    // never closed past 162/163. Same run, same cause: every 30-70s SLOW-NAV tripwire had goal
-    // (11,71,-20) — a protected voxel A* had to price at the full detour budget, forcing an exhaustive
-    // sweep of everything cheaper (136k-200k nodes at ANY hop length).
-    //
-    // THE STANCE IS THE BLUEPRINT'S ANCHOR (2026-08-31). Two searched stances came before it and both
-    // were the same mistake: a raycast vantage, then a radius — each returns whichever acceptable cell is
-    // cheapest from wherever the body is, and cheapest from outside a building is a cell outside the
-    // wall. goToStationStance stands the body on ONE authored cell — the blueprint's anchor where a
-    // blueprint claims the voxel, otherwise the cell the body stood on when it placed the station. When
-    // it can resolve neither and the block is out of reach it moves nothing and says `no_stance`, and the
-    // fall-through below is the answer to that: the local scan, then a fresh table of this bot's own.
-    // ── THE WALK IS UNCONDITIONAL NOW, AND THAT IS THE FIX (2026-09-10) ──────────────────────────────
-    // These four lines were guarded by `if (!block || block.name !== stationType)` — walk only when the
-    // block reads WRONG — and the answer was discarded. So a registered table that was plainly VISIBLE
-    // but 12.6 blocks away was returned untouched, the body never moved, and `bot.craft` waited 20 s for
-    // a window that cannot open at that range, five times, until the judge killed the chain. The whole
-    // regression was that "can I see it" was standing in for "can I reach it" (bugsquashing §11).
-    //
-    // A NAVIGATION RESULT IS READ, LIKE AT EVERY OTHER CALL SITE. This was the only one in the codebase
-    // that threw it away; `goToStationStance` exists to answer "is the body now somewhere it can use
-    // this", and discarding that makes arriving indistinguishable from refusing to move.
+    // A registered station reading null here may mean its chunk isn't loaded ("far"), not that it's
+    // gone ("stale") — walk to it first, then re-verify. Uses goToStationStance, never a bare
+    // coordinate, since a bare coordinate is a stand-here order the navigator may dig out to make
+    // occupiable, destroying the station being reused; the walk always runs and its result is read.
     const nav = await locomotion.goToStationStance({ x: pos.x, y: pos.y, z: pos.z });
     if (!nav.arrived) {
       watcher.warn(TAG, `registered ${stationType} at ${pos} is not usable from here (${nav.reason}) — `
@@ -420,317 +402,22 @@ async function tryScanNearbyStation(bot, stationType) {
   return null;
 }
 
-// scanPlaceRing: the floor cells on the square SHELL at Chebyshev radius `r` from the
-// bot (max(|dx|,|dz|)===r) on which a station can sit — a safe walkable/jumpable surface
-// (classifyFloor, single source of truth) whose cell ABOVE (where the station block lands)
-// is air. The bot's own column is r=0, never scanned, so a station is never placed in the
-// feet/head cell. Shell-only so the caller can expand OUTWARD cheaply (O(r) per ring) and
-// stop at the first ring that yields a spot. Nearest first within the ring.
-function scanPlaceRing(bot, r) {
-  const bx = Math.floor(bot.entity.position.x);
-  const by = Math.floor(bot.entity.position.y);
-  const bz = Math.floor(bot.entity.position.z);
-  const spots = [];
-  for (let dx = -r; dx <= r; dx++) {
-    for (let dz = -r; dz <= r; dz++) {
-      if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;   // shell only
-      for (let dy = -2; dy <= 2; dy++) {
-        const fx = bx + dx, fy = by + dy, fz = bz + dz;
-        const floor = bot.blockAt(new Vec3(fx, fy, fz));
-        if (!floor || floor.boundingBox !== 'block') continue;
-        if (!classifyFloor(bot, floor)) continue;   // safe surface + clearance above
-        spots.push({ x: fx, y: fy, z: fz, dist: Math.hypot(dx, dy, dz) });
-      }
-    }
-  }
-  spots.sort((a, b) => a.dist - b.dist);
-  return spots;
-}
+// THE CREW HAS ONE TABLE, AND IT IS THE HOME BLUEPRINT'S. This file never sets a table down: a craft that needs
+// one walks to the registered table (tryScanNearbyStation), which the home blueprint's own build places. With
+// none standing yet the step soft-fails, and job_gates.craftStationGate holds the job until it stands.
 
-// The station lands on the TOP face of a floor cell; these gate whether the bot can ACTUALLY place it
-// from where it stands right now. This is the check the old scan lacked — it accepted any solid+air-above
-// cell and left bot.placeBlock to fail on occluded/out-of-reach ones, timing out 16× without ever moving.
-function faceCenter(floorVec) { return floorVec.offset(0.5, 1.0, 0.5); }
-function withinPlaceReach(bot, floorVec) {
-  return bot.entity.position.distanceTo(faceCenter(floorVec)) <= STATION_REACH;
-}
-function canPlaceFrom(bot, floorVec) {
-  return withinPlaceReach(bot, floorVec) && hasLineOfSightToBlock(bot, floorVec, STATION_REACH);
-}
-
-// standingFeetFor: a feet-cell the bot can occupy ADJACENT to floorVec to place on it — the nearest
-// horizontal neighbour that is itself a safe standing surface, so the bot stands BESIDE the station cell,
-// never in it. This is what makes relocation deterministic: locomotion is handed a concrete "stand here,
-// next to the open spot", not a direction to wander. null if the spot has no standable neighbour.
-function standingFeetFor(bot, floorVec) {
-  let best = null, bestDist = Infinity;
-  for (let dx = -1; dx <= 1; dx++) {
-    for (let dz = -1; dz <= 1; dz++) {
-      if (dx === 0 && dz === 0) continue;
-      for (let dy = -1; dy <= 1; dy++) {
-        const nb = bot.blockAt(new Vec3(floorVec.x + dx, floorVec.y + dy, floorVec.z + dz));
-        if (!nb || nb.boundingBox !== 'block' || !classifyFloor(bot, nb)) continue;
-        const feet = new Vec3(nb.position.x, nb.position.y + 1, nb.position.z);
-        const d = bot.entity.position.distanceTo(feet);
-        if (d < bestDist) { best = feet; bestDist = d; }
-      }
-    }
-  }
-  return best;
-}
-
-// A STATION FOR THE POCKET MAY NOT BE SET DOWN IN OR AGAINST BUILT WORK. This route places only the
-// bot's own field stations — a blueprint's stations are placed by the build itself, from its own step
-// list, and never come through here — so a station landing among protected voxels is a private
-// convenience squatting in shared work: it cooks inside the shell while the walls go up around it, the
-// build's own step then wants a cell an unrelated block occupies, and the only route back to the cell it
-// stands on runs through a protected voxel, which A* prices at the full detour budget. Adjacency and not
-// merely occupancy, because a station flush against a wall is still standing in the build's working
-// volume; the six FACE neighbours are what physically contacts the station block, and a diagonal shares
-// no face to press against.
-//
-// PROTECTED VOXELS ARE READ, NEVER RESTATED — `navigator.loadProtectedBlocks` is the single inspection
-// point for "what does the bot refuse to chew through" (Law 16), and a second copy of that question here
-// would go out of date the first time an integrity node joins its list.
-//
-// ── AND THE GROUND A BUILDING HAS ONLY CLAIMED, WHICH THE PROTECTED SET DELIBERATELY DOES NOT COVER ──
-// A field table is PERMANENT now (see placeStation), so the question this gate has to answer got larger:
-// not "would placing here damage finished work" but "will this block ever be in a builder's way". The
-// protected set answers the first — it is diffed against the world on purpose, because pricing unbuilt
-// terrain as protected once turned a 2-block hop into a 140,315-node search. A locked-but-unbuilt
-// footprint is therefore invisible to it, and a table set down inside one stands there until the builder
-// arrives and has to break it — which is exactly the digging that was just removed.
-//
-// So the two sets are read separately and unioned HERE, at the one caller that needs both. Merging them
-// upstream would put planned cells back into A*'s pricing and reinstate that regression silently.
-const STATION_TOUCH_OFFSETS = [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
-function stationCellClear(excludedKeys, floorVec) {
-  if (!excludedKeys) return true;   // pre-lock there is genuinely nothing built or claimed
-  // The station lands on the TOP face, so the cell it occupies is one above the floor cell — and the
-  // floor cell it rests on is that cell's [0,-1,0] neighbour, so "sitting on a protected block" is
-  // already one of the seven and needs no separate test.
-  const sx = floorVec.x, sy = floorVec.y + 1, sz = floorVec.z;
-  for (const [dx, dy, dz] of STATION_TOUCH_OFFSETS) {
-    if (excludedKeys.has(`${sx + dx},${sy + dy},${sz + dz}`)) return false;
-  }
-  return true;
-}
-
-// The union the gate above reads: what is BUILT (never damage it) plus what is CLAIMED (never stand in
-// the way of it). Built once per placement, like the protected read it extends — both walk several
-// perception nodes, which is a per-placement cost and not a per-ring one.
-function stationExclusionKeys(bot) {
-  const set = new Set();
-  // Required lazily — navigator pulls in battle_stations, which this file also imports, so a top-level
-  // require would close the cycle.
-  const built = require('@locomotion/navigator').loadProtectedBlocks(bot);
-  if (built) for (const k of built) set.add(k);
-  const claimed = require('@perception/building_integrity').getAllFootprintCells();
-  if (claimed) for (const k of claimed) set.add(k);
-  return set.size > 0 ? set : null;
-}
-
-// nearestPlaceableCell (Architect design): PICK the spot, don't try-and-guess. Expand rings outward and
-// return the NEAREST cell the bot can place on from where it stands (in reach + clear line of sight) — no
-// move needed. If nothing in reach is clear, return the nearest genuine open spot that HAS a standable
-// neighbour, tagged needsMove, so the caller walks the bot to that exact neighbour and places — "here's
-// the closest open spot outside my reach, go stand by it", never a random step-away-and-retry. null only
-// if nothing placeable exists within PLACE_SCAN_MAX (a sealed void — caller treats it as replan).
-//
-// THE PROTECTED-VOXEL GATE BELONGS ON THE ASK, NOT THE SERVE: the selection stops WANTING a cell in or
-// against built work, rather than the placer discovering after the fact that it took one. The Set is
-// passed in, never read here — building it walks three perception nodes, which is a once-per-placement
-// cost, not a once-per-ring one.
-function nearestPlaceableCell(bot, tried, excludedKeys) {
-  let moveCand = null;
-  for (let r = 1; r <= PLACE_SCAN_MAX; r++) {
-    for (const s of scanPlaceRing(bot, r)) {
-      const key = `${s.x}|${s.y}|${s.z}`;
-      if (tried.has(key)) continue;
-      if (!stationCellClear(excludedKeys, s)) continue;
-      const floorVec = new Vec3(s.x, s.y, s.z);
-      if (canPlaceFrom(bot, floorVec)) return { floorVec, key, needsMove: false };
-      if (!moveCand) {
-        const stand = standingFeetFor(bot, floorVec);
-        if (stand) moveCand = { floorVec, key, needsMove: true, stand };
-      }
-    }
-  }
-  return moveCand;
-}
-
-// tryPlaceOn: equip, aim at the floor cell's top face, place, verify. Returns the placed
-// block or null (obstructed / block changed under us). Non-throwing — a failed attempt just
-// means "try another spot".
-async function tryPlaceOn(bot, stationType, floorPos) {
-  const item = bot.inventory.items().find(i => i.name === stationType);
-  if (!item) return null;
-  const floorBlock = bot.blockAt(floorPos);
-  if (!floorBlock || floorBlock.boundingBox !== 'block') return null;
-  // The one place route (Law 16) owns equip, the spawn-protection gate, the combat checkpoint, the aim
-  // and the click. It carries NO timeout of its own and needs none: mineflayer's placeBlock already
-  // waits on a real server block update with a 5 s bound and REJECTS if it does not arrive — which is
-  // exactly what the local placeWithTimeout race that used to stand here was duplicating (Law 16: two
-  // bounds on one call can only disagree).
-  const attempt = await performPlace(bot, floorPos.offset(0, 1, 0), floorBlock, new Vec3(0, 1, 0), stationType, TAG, { settleMs: AFTER_PLACE_SLEEP_MS });
-  if (!attempt.ok) return null;
-  // The verdict is the world, not the call: a place the server silently dropped returns just like one
-  // it accepted, so the only honest answer is what is standing there (Invariant B).
-  const placed = bot.blockAt(floorPos.offset(0, 1, 0));
-  if (placed?.name === stationType) {
-    note(`placed ${stationType}@(${floorPos.x},${floorPos.y + 1},${floorPos.z})`);
-    await sleep(POST_PLACE_SUCCESS_MS);
-    return placed;
-  }
-  watcher.warn(TAG, `place verify failed for ${stationType}@(${floorPos.x},${floorPos.y + 1},${floorPos.z}) — got "${placed?.name || 'air'}"`);
-  return null;
-}
-
-// placeStation (Architect design): find the nearest spot the bot can ACTUALLY place on and place there;
-// if none is in reach with a clear line of sight, walk to the standing cell beside the nearest open spot
-// and place — a deterministic "pick the spot, go stand by it, place", NOT the old "retry the same
-// occluded cluster in place, or step away and guess". Locomotion is the ONE thing that may abandon this
-// call (arrived=false = it genuinely cannot reach the chosen spot, Law 15). MAX_PLACE_ATTEMPTS is only a
-// Law-13 valve — with reach+LOS selection a place resolves in one or two attempts; 16 distinct visible,
-// reachable spots all failing to place means something is truly wrong → human inspection, not a spin.
-// Cells in or against built work are excluded from the selection entirely — see stationCellClear.
-async function placeStation(bot, stationType) {
-  await combatCheckpoint(bot, 'craft');
-  if (!bot.inventory.items().find(i => i.name === stationType)) {
-    watcher.warn(TAG, `No ${stationType} item in inventory to place`);
-    return null;
-  }
-
-  const tried = new Set();
-  // Read ONCE for the whole placement, never once per ring or per attempt: each read walks every
-  // PROTECTED_SOURCE and every locked conference-room chair. Nothing this loop does builds, destroys or
-  // sites anything, so a second read would answer the same question at a higher price.
-  const excludedKeys = stationExclusionKeys(bot);
-  for (let attempt = 0; attempt < MAX_PLACE_ATTEMPTS; attempt++) {
-    await combatCheckpoint(bot, 'craft');
-
-    const cell = nearestPlaceableCell(bot, tried, excludedKeys);
-    if (!cell) {
-      watcher.warn(TAG, `No placeable cell within ${PLACE_SCAN_MAX} blocks for ${stationType} clear of built work and claimed footprints — replan`);
-      return null;
-    }
-    tried.add(cell.key);
-
-    if (cell.needsMove) {
-      // Deterministic relocation: go stand at the specific cell beside the chosen open spot, then place.
-      const nav = await locomotion.goTo({ x: cell.stand.x, y: cell.stand.y, z: cell.stand.z });
-      if (!nav || nav.arrived === false) {
-        watcher.warn(TAG, `locomotion could not reach stance (${cell.stand.x},${cell.stand.y},${cell.stand.z}) beside ${stationType} spot — abandoning place (Law 15)`);
-        return null;
-      }
-      // We stood right next to it; place only if it's now genuinely reachable+visible. If a mid-move
-      // world change spoiled it, fall through to the next-nearest spot instead of forcing a timeout.
-      if (!canPlaceFrom(bot, cell.floorVec)) continue;
-    }
-
-    const placed = await tryPlaceOn(bot, stationType, cell.floorVec);
-    if (placed) { await registerFieldStation(bot, placed); return placed; }
-    // Placement failed at a spot we could see and reach — mark tried, take the next-nearest.
-  }
-
-  watcher.warn(TAG, `exhausted ${MAX_PLACE_ATTEMPTS} place attempts for ${stationType} — replan`);
-  return null;
-}
-
-// ── A STATION SET DOWN IS A STATION THAT STAYS, SO IT GOES ON THE RECORD ─────────────────────────────
-// Architect 2026-09-07: *"placing a crafting table is a permanent thing. it registers it and everything.
-// and any bot can use it after."* Before this, the table was placed, used and dug back up inside one
-// craft book, so it never existed as far as the fleet was concerned and a row for it would have been a
-// lie one minute later. A permanent block is a fact about the world, and Invariant C says a fact the
-// fleet depends on is recorded where the fleet can read it.
-//
-// WHAT THE ROW ACTUALLY BUYS, since "so other bots can find it" is only half true: a field station has
-// no blueprint, therefore no authored stance, therefore nothing can WALK to it (resolveVoxelAnchor
-// answers null by design and callers must not improvise a stance). What the row does buy is the pocket
-// credit — assessors/supply counts registered blueprint-less stations as stock the fleet already holds,
-// so the board stops ordering a replacement table for one that is standing in a field. Without the row,
-// every placement would post a fresh craft.
-//
-// NULL blueprint IS THE MEANING, NOT AN OMISSION: the tag is what separates a building's own station
-// from one set down beside a body, and both the pocket credit and findStation's preference read it.
-//
-// A REFUSED REGISTRATION IS NOT A FAILED CRAFT, and this is the one place that differs from
-// build_executor's identical-looking call. There, a station that will not register is a Law 13 crash,
-// because preconstruction crafted exactly one chest and the build cannot proceed without it. Here the
-// block is standing and usable whatever the registry says — the craft this table was placed for runs
-// either way — so an unregistered table costs one redundant craft order later, and stopping the fleet
-// over it would trade a real loss for a bookkeeping one (Law 25: report the shortfall, do not inflate it).
-async function registerFieldStation(bot, block) {
-  const diag = {};
-  const win = await stationRegistry.openProofWindow(bot, block, diag);
-  // ── THE STANCE IS RECORDED HERE, AND HERE IS THE ONLY MOMENT IT CAN BE (2026-09-10) ────────────────
-  // Architect: *"however that works extract as a utility and use it for both."* A blueprint station's
-  // stance is its owning anchor; a field station had none, so nothing could walk to it and the caller
-  // crafted at range instead (bugsquashing §11). This gives it one — and not a computed one.
-  //
-  // THE CELL IS WHERE THE BODY IS STANDING RIGHT NOW, which is the strongest evidence available that it
-  // reaches this block: `canPlaceFrom` proved reach and visibility from this exact cell moments ago, and
-  // then the placement actually succeeded from it. Recorded once, never re-derived — so unlike the two
-  // searched stances he rejected, it cannot answer differently on the next approach (Law 19).
-  //
-  // STORED AS THE FLOOR CELL, matching what an anchor names: `locomotion.goToStand` owns the "+1 to
-  // stand ON it" conversion, so both sources hand it the same kind of cell and neither caller has to
-  // know which kind of station it is holding.
-  const feet = bot.entity.position.floored();
-  const stance = { x: feet.x, y: feet.y - 1, z: feet.z };
-  const result = stationRegistry.registerStation(block.position, block.name, win, null, stance);
-  if (win) {
-    guardExternalSync(TAG, 'closeWindow after field registration', () => bot.closeWindow(win));
-    await sleep(AFTER_PLACE_SLEEP_MS);
-  }
-  if (!result.ok) {
-    watcher.warn(TAG, `${block.name}@(${block.position.x},${block.position.y},${block.position.z}) is standing but did not register (${result.reason}) — `
-      + `it stays where it is and is usable; the cost is that the board may order a replacement it does not need. ${JSON.stringify(diag)}`);
-  }
-}
-
-// THE TABLE IS NOT TAKEN BACK UP. `cleanupPlacedStations` stood here and was the whole of this file's
-// station lifecycle: place a table, craft on it, dig it up, collect the drop. It is DELETED, on the
-// Architect's ruling of 2026-09-07 — *"placing a crafting table is a permanent thing… i want to remove
-// drop and dig logic and leave every crafting table as permanent and registered for other bots to use."*
-//
-// IT WAS NEVER A GENERAL CLEANUP, and knowing that is what makes the deletion safe rather than partial:
-// the only station this route ever places is a crafting table, because ensureStation returns null for a
-// furnace before any placement is attempted (smelting is furnace_executor's one pathway). So the ledger
-// entry, the `cleanup` flag, the pickaxe equip and the dig were four pieces of machinery serving one
-// block type, and removing the behaviour for that block type removes all of them. What remains of
-// `placedStations` is a per-batch list of what this book set down, kept for the stale-cache eviction in
-// ensureStation and for the `tables placed=` count.
-//
-// WHAT REPLACES IT IS THE REGISTRY ROW (registerFieldStation, above): the table stops being a private
-// throwaway and becomes a fact the fleet holds, which is why it may be left standing at all.
-//
-// THE SAFETY NET IF ONE LANDS BADLY IS ALREADY BUILT AND STAYS: `crafting_table` is the single member of
-// dig_authority's BREAKABLE_STATIONS, so a build that finds one in a cell its blueprint wants can clear
-// it — that exemption was made for exactly this case and is now load-bearing rather than a convenience.
-// The placement search avoids locked footprints up front (stationExclusionKeys), so the net should not be
-// needed; both are kept because the search cannot see a site locked AFTER the table went down.
-
-// SECTION 4 (smelting) removed: smelting is no longer synchronous here. It moved to the
-// async furnace_executor load-and-leave chain (Law 16 — one pathway). craft_handler now only
-// crafts at a crafting_table; a furnace step (charcoal/iron_ingot) is deferred to that chain
-// (see the `stationType === 'furnace'` branch in craftWithSequence).
+// Smelting is not synchronous and not here — it belongs to the async furnace_executor load-and-leave
+// chain (Law 16). This file crafts at a crafting_table only; a furnace step defers to that chain — see
+// the `stationType === 'furnace'` branch in craftWithSequence.
 
 // ---------------------------------------------------------------------------
 // SECTION 5 — Execution engine
 // ---------------------------------------------------------------------------
 
-// Sweep any residue out of the PLAYER crafting area — the cursor (selectedItem), the result slot
-// (0), and the 2x2 grid (slots 1-4) — back into the main inventory. WHY this is mandatory:
-// mineflayer's bot.craft collects the crafted item with a putAway/click sequence (craft.js
-// grabResult) that can desync and leave the result on the CURSOR or in a grid slot.
-// bot.inventory.count() counts only main+hotbar, so stranded output reads as 0 — the craft loop
-// then sees no progress and spins until the portable judge escalates to a strict kill — and worse,
-// the server EJECTS cursor/grid contents on disconnect (the "bot dropped a pile of planks on exit"
-// the Architect saw). Reclaiming after every craft keeps the count honest and leaves nothing to
-// drop; running it before is cheap insurance against residue a prior craft left. The cursor is
-// cleared FIRST because putAway needs a free cursor to pick a slot up. Idempotent and near-free
-// when the area is already clean; every step is wrapped so a stray click never fails the craft.
+// Sweeps residue out of the player crafting area — the cursor, the result slot (0), the 2x2 grid
+// (1-4) — back into main inventory. mineflayer's bot.craft can desync and leave output on the cursor or
+// in a grid slot, where bot.inventory.count() cannot see it and the server ejects it on disconnect.
+// Cursor clears first, since putAway needs a free cursor. Idempotent and near-free when already clean.
 async function clearCraftingResidue(bot) {
   const win = bot.inventory;                      // player window: slot 0 = result, 1-4 = 2x2 grid
   if (!win || !Array.isArray(win.slots)) return;
@@ -743,15 +430,10 @@ async function clearCraftingResidue(bot) {
   }
 }
 
-// locateCraftedItem — the TRUE count of an item, broken out by WHERE it sits. bot.inventory.count()
-// sees only main+hotbar; a fresh craft can leave its output in the RESULT slot (0), the 2x2 grid
-// (1-4), or on the CURSOR (selectedItem) — invisible to count(). That blind spot is the recurring
-// "craft output not counted" bug (Architect): the torch lands in-hand/output, count() reads 0, the
-// loop concludes it made nothing and re-crafts forever, burning ingredients until the judge halts.
-// Completion is now verified against `total` (every location), so a stranded output still counts as
-// made; the per-location split feeds the watcher so we can finally SEE where an output went — is it
-// stranded (recoverable, sweep didn't stow it) or truly absent (grid-craft desync / real shortage).
-// Same slot layout clearCraftingResidue already commits to (Law 16: one definition of that layout).
+// The true count of an item broken out by where it sits: bot.inventory.count() sees only main+hotbar,
+// but a fresh craft can leave output in the result slot, the grid, or on the cursor. Completion is
+// verified against `total` so stranded output still counts as made (same slot layout as
+// clearCraftingResidue, Law 16).
 function locateCraftedItem(bot, itemId) {
   const win = bot.inventory;
   const inv = win ? win.count(itemId) : 0;
@@ -769,32 +451,17 @@ function locateCraftedItem(bot, itemId) {
 }
 
 // ── CAN THE OUTPUT LAND AT ALL? (Law 13 — prove it is safe to act, do not act and find out) ─────────
-// MEASURED 2026-09-10, and this is the whole "planks crafting loop": a homesteader with a FULL pocket
-// asked for 12 oak_planks. `bot.craft` RESOLVED — mineflayer reports the craft, the server consumes the
-// ingredient — and the four planks had no slot to land in, so they never materialized:
-//
-//   craft no-op: oak_planks total did not rise (0→0/12) though bot.craft resolved
-//   split[inv=0 cursor=0 result=0 grid=0], free_slots=0, table=no, delta[have(Δ)]=oak_log:4(-1)
-//
-// The no-op net below caught it correctly and broke, but by then a log was already gone. The job was
-// re-dispatched, another log went, and the trace shows `oak_log:4 → 3 → 2` — **each retry silently
-// destroyed a log** until `recursive_judge` killed the signal at 5/5 contiguous repeats. Nothing in the
-// loop was wrong; it was answering the wrong question. "Did the craft work?" cannot be asked safely,
-// because asking it costs a log. "Can the output land?" is free, and it is knowable first.
-//
-// THE ANSWER IS NOT `emptySlotCount() > 0`. A craft can also land by topping up a stack of the same item
-// that has room, which is the ordinary case for a bot part-way through an order. So the test is: no empty
-// slot AND no room in any existing stack of the output.
-//
-// IT FAILS OPEN, deliberately (Law 23): an inventory whose free count cannot be read is not evidence of a
-// full one, and suppressing a legitimate craft on a missing measurement is the more expensive mistake.
+// A full pocket makes bot.craft consume an ingredient with nowhere for the output to land, silently.
+// The test is not `emptySlotCount() > 0` alone — a craft can also land by topping up a stack with room
+// — so it checks no empty slot AND no room in any existing stack. Fails open (Law 23): an unreadable
+// free count is not evidence of a full one.
 function outputHasNowhereToLand(bot, itemId) {
   const inv = bot && bot.inventory;
   if (!inv || typeof inv.emptySlotCount !== 'function' || typeof inv.items !== 'function') return false;
   if (inv.emptySlotCount() > 0) return false;
-  // Resolved here rather than taken as a parameter, matching this file's other three sites: `mcData` is
-  // a per-function local keyed on `bot.version`, never a module constant, so a helper that wants it asks
-  // for it the same way (Law 16 — one way to reach minecraft-data in this file).
+  // Resolved here, matching this file's other three sites: `mcData` is a per-function local keyed on
+  // `bot.version`, never a module constant, so a helper that wants it asks for it the same way (Law 16
+  // — one way to reach minecraft-data in this file).
   const mcData = require('minecraft-data')(bot.version);
   const stackSize = (mcData.items[itemId] && mcData.items[itemId].stackSize) || 64;
   const roomInStacks = inv.items()
@@ -803,31 +470,15 @@ function outputHasNowhereToLand(bot, itemId) {
   return roomInStacks <= 0;
 }
 
-// THE STATION OUTLIVES THE ORDER, AND NOW THE BOOK AS WELL. `ctx` is the batch's shared workspace — the
-// station context, the placed-station ledger and the metric counters — created ONCE per batch by
-// `newCraftContext()`, not once per order: an order that arrives second finds the table already in
-// `ctx.stationContext` and `ensureStation` returns it without a walk, a place or a verify.
-//
-// THE SECOND HALF ARRIVED 2026-09-07 AND IS WHAT MADE THE FIRST FULLY PAY. A table now stays standing
-// when the book ends, so the batch context is no longer the outer boundary of a table's life — the world
-// is. The next book re-finds it through the registry or the local scan and places nothing at all.
-//
-// THE ORIGINAL SHAPE AND WHY IT WAS WASTEFUL, since a reader may be tempted back toward it: two
-// mechanisms, each correct alone, cancelled each other. `stationContext` lived for exactly one call, and
-// a cleanup pass faithfully dug the table back up at the end of that call — so the next order's reuse
-// scan found nothing, every time, by construction. Measured on `contractor_house`: anchor 0 has five
-// craftable types and paid five full place-and-dig cycles to produce nine blocks. The cleanup pass is
-// now deleted outright rather than merely deferred — see THE TABLE IS NOT TAKEN BACK UP above.
+// `ctx` is the batch's shared workspace, created once per batch by newCraftContext(), not once per
+// order, so a second order finds the table already in `ctx.stationContext` and reuses it without a
+// walk, place or verify. The table outlives the batch too — see THE TABLE IS NOT TAKEN BACK UP above.
 function newCraftContext() {
   return {
     stationContext: new Map(),
     placedStations: [],
-    // NO SMELT COUNTERS HERE (Law 16, Law 25). Smelting has exactly one pathway and it is
-    // furnace_executor's; this file defers a smeltable ingredient to the furnace chain and never
-    // runs a furnace itself. A `smelt_ok` field on this object could therefore only ever report a
-    // hardcoded 0 — an outcome signal whose reader cannot tell a constant from a measurement, and
-    // one that reads as "no smelting happened" when it means "smelting is not this unit's verb."
-    // A counter for a verb the unit does not own belongs to the unit that owns it, or nowhere.
+    // No smelt counters here (Law 16, Law 25): smelting is furnace_executor's one pathway, and this
+    // file never runs a furnace, so a counter for that verb belongs to the unit that owns it.
     metrics: { crafts_ok: 0, crafts_fail: 0, stations_placed: 0, stations_reused: 0 },
   };
 }
@@ -843,12 +494,9 @@ async function craftWithSequence(bot, sequence, ctx) {
   async function ensureStation(type) {
     await combatCheckpoint(bot, 'craft');
     // ── THE CACHED STATION IS RE-SENSED, NOT TRUSTED (Invariant B) ────────────────────────────────
-    // The context now spans a whole order book instead of one order, and the checkpoint immediately
-    // above is the reason that matters: combat can take the body over between orders and put it down
-    // somewhere else entirely. A cached block that is no longer there, or no longer in arm's reach,
-    // would be handed to `bot.craft` as the station and fail as a window timeout — a symptom several
-    // steps removed from its cause. Two cheap reads settle it; on a miss the entry is dropped and the
-    // normal scan/place path runs, which is exactly what would have happened before the cache existed.
+    // Combat can move the body between orders in the same batch, so a cached block may not still be
+    // there or in reach. Two cheap reads settle it; on a miss the entry drops and the normal
+    // scan/place path runs.
     if (stationContext.has(type)) {
       const cached = stationContext.get(type).block;
       const still = cached ? bot.blockAt(cached.position) : null;
@@ -864,33 +512,19 @@ async function craftWithSequence(bot, sequence, ctx) {
       }
     }
 
-    // Furnaces are handled entirely by furnace_executor now (Law 16 — smelting has ONE pathway,
-    // the async load-and-leave chain). craft_handler never provides a furnace: any furnace-output
-    // intermediate (charcoal, iron_ingot) must already be in inventory — produced by the furnace
-    // chain on an earlier sweep — before a dependent craft runs here. If it isn't, the dependent
-    // step's target check fails and the craft soft-fails to replan; job_board then posts the
-    // furnace load. This is why ensureStation returns null for furnace instead of placing one.
+    // Furnaces are furnace_executor's alone (Law 16). A furnace-output intermediate must already be
+    // in inventory from an earlier sweep; if it isn't, the dependent step soft-fails to replan and
+    // job_board posts the furnace load. ensureStation never places a furnace; it returns null for that type.
     if (type === 'furnace') return null;
 
     let block = await tryScanNearbyStation(bot, type);
-    let cleanup = false;
+    const cleanup = false;
     if (block) {
-      // ── ONE QUESTION NOW: DID THE BODY GET SOMEWHERE IT CAN USE THIS? ──────────────────────────────
-      // This branch used to make an exception of `no_anchor`, on the reasoning that a station with no
-      // authored stance must be a throwaway and therefore *"within arm's reach by definition (placeStation
-      // puts it on an adjacent cell, and the scan that found it swept only STATION_REACH)"*. That
-      // enumerated two of the three ways a block arrives here. The third is `findStation`, which has no
-      // distance bound at all, so the exception silently covered a table 12.6 blocks away and the craft
-      // was attempted from there (bugsquashing §11).
-      //
-      // `goToStationStance` now answers for BOTH kinds of station — a blueprint's anchor, or the cell the
-      // body stood on when it placed the table — and it decides "already in reach" itself, for the one
-      // legitimate case, by measuring rather than by inferring it from the absence of a blueprint. So
-      // there is nothing left to make an exception of: `arrived` is the whole question, and any reason it
-      // did not arrive drops the block and lets this caller set down its own.
+      // One question: did the body get somewhere it can use this? goToStationStance answers it for the
+      // blueprint's anchor by measuring reach directly.
       const nav = await locomotion.goToStationStance({ x: block.position.x, y: block.position.y, z: block.position.z });
       if (!nav.arrived) {
-        watcher.warn(TAG, `${type} at ${block.position} could not be reached to use (${nav.reason}) — placing its own instead.`);
+        watcher.warn(TAG, `${type} at ${block.position} could not be reached to use (${nav.reason}).`);
         block = null;
       } else {
         const fresh = bot.blockAt(block.position);
@@ -909,28 +543,16 @@ async function craftWithSequence(bot, sequence, ctx) {
       return block;
     }
 
-    block = await placeStation(bot, type);
-    if (block) {
-      cleanup = true;
-      metrics.stations_placed++;
-      stationContext.set(type, { block, cleanup });
-      placedStations.push({ type, block, cleanup });
-      return block;
-    }
-
-    // No reuse, no clear adjacent cell to place on. The old path here carved two
-    // blocks out of the world by yaw-snap and placed blind — the 2 Jul run's #1
-    // fragility (craft abandonment after "clearing space 2 blocks ahead"). Law 17
-    // (no self-injury) + Architect: never dig to make room. Return null and let the
-    // caller soft-fail to recursive_judge (Law 13/15) for a fresh plan from a spot
-    // that has room.
-    watcher.warn(TAG, `No station and no place spot for ${type} — soft-fail to replan`);
+    // No usable home table: the caller soft-fails to recursive_judge (Law 13/15) and the board holds the
+    // craft until the home blueprint's table stands.
+    watcher.warn(TAG, `No usable ${type} at home — soft-fail to replan`);
     return null;
   }
 
   // Start from a clean crafting area so residue a prior op stranded (cursor/grid) can't corrupt
   // this sequence's counts or drop on a later disconnect.
   await clearCraftingResidue(bot);
+  fillCoalsTag(bot);
 
   for (const step of sequence) {
     await combatCheckpoint(bot, 'craft');
@@ -948,13 +570,10 @@ async function craftWithSequence(bot, sequence, ctx) {
     }
 
     if (stationType === 'furnace') {
-      // Smelting moved OUT of the synchronous craft path (Law 16 — one pathway: the async
-      // furnace_executor load-and-leave chain). craft_handler can't produce a furnace output
-      // here; the item must already be in inventory (a prior sweep's furnace collect). It
-      // isn't (current < target above), so leave this step unmet — the final-count check
-      // soft-fails the craft, and job_board posts a furnace load to make it. Nothing is counted
-      // as a smelting failure here because nothing was attempted; this is a deferral, not a loss.
-      watcher.warn(TAG, `${step.item} needs smelting — deferred to the furnace chain (not smelted synchronously)`);
+      // Smelting is out of the synchronous craft path (Law 16); the item must already be in inventory
+      // from a prior furnace sweep. Leaving the step unmet here soft-fails the craft and job_board
+      // posts a furnace load — a deferral, not a smelting failure.
+      watcher.summary(TAG, `${step.item} needs smelting — deferred to the furnace chain (not smelted synchronously)`);
       continue;
     }
 
@@ -966,14 +585,10 @@ async function craftWithSequence(bot, sequence, ctx) {
       recipes = bot.recipesFor(itemId, null, null, craftingStation);
     }
     if (!recipes || recipes.length === 0) {
-      // NAME THE REAL CAUSE (Architect 2026-08-13). `recipesFor` filters by what the bot HOLDS, so an
-      // empty list has two completely different meanings and this line used to report both as "no
-      // recipe found" — which sent the 2026-08-12 furnace diagnosis chasing a missing recipe when the
-      // fleet simply had no cobblestone. `recipesAll` ignores inventory, so it separates them: a recipe
-      // that exists but cannot be filled is a MATERIALS shortage (environmental, restock and retry),
-      // and a recipe that does not exist at all is a bad blueprint or a bad item name (a coding
-      // violation the reader must not have to guess at). Reported, not thrown, because the caller's
-      // final-count check already owns the soft-fail (Law 13, Law 25 — the verdict must be true).
+      // `recipesFor` filters by what the bot holds, so an empty list is ambiguous between a missing
+      // recipe and a materials shortage. `recipesAll` ignores inventory and separates them: an existing
+      // but unfillable recipe is a shortage, a nonexistent one is a bad blueprint or item name. Reported,
+      // not thrown — the caller's final-count check owns the soft-fail (Law 13, Law 25).
       const known = bot.recipesAll(itemId, null, craftingStation);
       watcher.warn(TAG, (known && known.length > 0)
         ? `Cannot craft ${step.item} — the recipe exists but the ingredients are not in inventory`
@@ -983,15 +598,10 @@ async function craftWithSequence(bot, sequence, ctx) {
     const craftStart = locateCraftedItem(bot, itemId).total;
     while (locateCraftedItem(bot, itemId).total < target) {
       await combatCheckpoint(bot, 'craft');
-      // Re-fetch the recipe EVERY batch (not captured once): recipesFor only returns a recipe the
-      // bot can craft with what it holds RIGHT NOW, so this tracks a scarce input draining across
-      // batches and picks whichever fuel (coal OR charcoal) is on hand this pass. An empty list mid-
-      // run means the ingredients ran out — a normal shortage (charcoal is an async furnace output),
-      // NOT a craft failure. Break cleanly: the step stays unmet, the final-count check soft-fails to
-      // replan, and job_board restocks. This was the torch bug — the old code captured recipes[0]
-      // once, then bot.craft threw 'missing ingredient' on the batch after charcoal hit 0, logging a
-      // scary warn + a crafts_fail for what was really "made +4, need more charcoal" (Architect audit,
-      // 2026-07-04).
+      // Re-fetched every batch, not captured once: recipesFor returns only what the bot can craft with
+      // what it holds right now, so this tracks a scarce input draining across batches. An empty list
+      // mid-run is an ordinary shortage, not a craft failure — the step stays unmet and soft-fails to
+      // replan.
       const batchRecipes = bot.recipesFor(itemId, null, null, craftingStation);
       if (!batchRecipes || batchRecipes.length === 0) {
         note(`${step.item}: ran out of ingredients at ${locateCraftedItem(bot, itemId).total}/${target} — restock needed (deferring to replan)`);
@@ -999,50 +609,18 @@ async function craftWithSequence(bot, sequence, ctx) {
       }
       const recipe = batchRecipes[0];
 
-      // CHECKED BEFORE THE CRAFT, NOT AFTER — see `outputHasNowhereToLand`. A full pocket makes
-      // `bot.craft` a pure loss: the ingredient is consumed and the output evaporates. Reported as a
-      // SHORTAGE OF ROOM rather than a craft failure, because the two need opposite responses — a craft
-      // failure invites a retry, and a retry here costs another log (Law 25: name the shortfall, do not
-      // relabel it as the nearest failure the caller already handles).
+      // Checked before the craft, not after — see outputHasNowhereToLand. Reported as a room shortage,
+      // distinct from a craft failure since the two need opposite responses; a retry here costs
+      // another log (Law 25).
       if (outputHasNowhereToLand(bot, itemId)) {
         const held = locateCraftedItem(bot, itemId).total;
 
-        // ── FULL POCKET *AND* NOWHERE TO DUMP IS A DEADLOCK, SO IT IS A CODING VIOLATION ────────────
-        // Ruled 2026-09-10: *"inventory dumping is part of normal bot working. they normally dump after
-        // every turn. or at a certain fullness but only if they have a chest setup. thats a coding
-        // violation because a normal bot cannot craft a chest to empty its inventory if the inventory is
-        // already full."*
-        //
-        // THE ARGUMENT IS AN IMPOSSIBILITY, WHICH IS EXACTLY LAW 13'S TEST. To empty the pocket the bot
-        // needs a chest; to get a chest it must craft one; to craft one it needs a free slot; it has
-        // none. There is no sequence of correct actions out of this state, so it cannot be a world
-        // condition a correct system tolerates — nothing about a normal Minecraft world creates it. It is
-        // reached only by a fleet that stopped doing its ordinary offloading, and a bot that keeps
-        // planning through it burns a log per attempt while never being able to finish (§6 of
-        // architect_bugsquashing has the measured 3-log loss).
-        //
-        // WITH A CHEST REGISTERED IT IS NOT A VIOLATION and must not throw: a dump can empty the pocket,
-        // so the state is recoverable and the honest report is a shortage of ROOM (Law 25 — a craft
-        // failure invites a retry, and a retry here costs another log). The two branches below are the
-        // whole difference between "the fleet is wedged" and "this order has to wait its turn".
-        // ── AND IT STILL DOES NOT THROW, BECAUSE THE WORLD CAN BUILD THIS STATE (2026-09-12) ────────
-        // *"double check that theres no enviomental throws."* (Architect 2026-09-12.)
-        //
-        // The impossibility argument above is sound about the STATE and wrong about its CAUSE. It says
-        // *"nothing about a normal Minecraft world creates it"* — but two ordinary world events do.
-        // `station_registry.verifyStations` de-registers a chest whose block reads as air, so a player
-        // breaking their own chest, or a creeper taking the wall it sat in, removes the last registered
-        // chest from a fleet whose bots are carrying a full load at the time. And a fleet EARLY in a run
-        // has no chest yet by construction — the first one is a blueprint anchor that has to be built —
-        // so a bot that gathers hard before that anchor lands arrives here with a full pocket and an
-        // empty registry, having done nothing wrong.
-        //
-        // The wedge is real and the diagnosis stays: offloading is not happening, and that is worth
-        // saying loudly every time it is reached. What changes is that saying it does not end the bot's
-        // run. `success:false` makes it a counted fault; the craft is still refused, so no ingredients
-        // are consumed into an output with nowhere to land (which was the actual loss being prevented —
-        // §6's measured 3-log leak); and the bot keeps planning, which is what lets it place the chest
-        // that fixes this the moment it can (Law 25).
+        // ── FULL POCKET AND NOWHERE TO DUMP IS A WEDGE, SAID LOUDLY AND NEVER THROWN ──────────────
+        // A deadlock: emptying the pocket needs a chest, getting one needs crafting, and crafting needs
+        // a free slot it has none of. Not a coding violation: an ordinary chest loss or an early run
+        // with no chest yet both build this honestly. The craft is refused, so ingredients are never
+        // consumed into an output with nowhere to land (Law 25). With a chest registered the state is
+        // recoverable and reported as a room shortage.
         const chests = require('@perception/station_registry').findChests();
         if (!chests.length) {
           const why = `cannot craft ${step.item}: the pocket is FULL (0 empty slots, no partial ${step.item} stack with room) `
@@ -1052,9 +630,8 @@ async function craftWithSequence(bot, sequence, ctx) {
             + `If a chest was registered before, check whether it was broken.`;
           watcher.warn(TAG, why);
           note(`${step.item}: pocket full and no chest registered — needs a chest or a manual dump, not another craft attempt`);
-          // `break`, the same exit the recoverable branch below uses, for the same reason: the function's
-          // own tail reports what the batch actually made and the caller already handles a short craft.
-          // Inventing a return shape here would be a second contract for one outcome (Law 16).
+          // Same exit the recoverable branch below uses: the function's tail already reports what the
+          // batch made, so a separate return shape here would be a second contract for one outcome (Law 16).
           break;
         }
 
@@ -1068,21 +645,22 @@ async function craftWithSequence(bot, sequence, ctx) {
       }
 
       const beforeCraft = locateCraftedItem(bot, itemId).total;
-      // Station-window instrumentation (Architect, long-run kill hunt): one dense line per craft
-      // capturing exactly what the crafting window did — the station used, the open window's type,
-      // how long bot.craft took, and on failure WHICH mineflayer event timed out (updateSlot:0 =
-      // the server never sent the result-slot update). Emitted per-attempt (NOT via the note buffer)
-      // on purpose: rising craft_ms across a run is the fingerprint of connection/tick degradation
-      // vs. a one-off desync — the exact thing the trace couldn't show when the judge killed the bot.
+      // One line per craft attempt capturing the station, window type and duration. Emitted directly,
+      // not through the note buffer, since rising craft_ms across a run is a connection/tick-degradation
+      // signal that a buffered line would hide.
       const stationDesc = craftingStation
         ? `table@(${craftingStation.position.x},${craftingStation.position.y},${craftingStation.position.z})`
         : '2x2-inventory';
       const winBefore = bot.currentWindow ? bot.currentWindow.type : 'none';
       const craftT0 = Date.now();
+      // The item book reads what the recipe took and what it gave off the pocket itself.
+      const book = require('@kernel/item_book');
+      await book.open();
       const crafted = await guardExternal(TAG, `bot.craft ${step.item} @ ${stationDesc}`, async () => {
         await bot.craft(recipe, 1, craftingStation);
-        await sleep(AFTER_PLACE_SLEEP_MS);
+        await sleep(AFTER_CRAFT_SLEEP_MS);
       });
+      await book.close('craft', 'crafting');
       if (!crafted.ok) {
         watcher.warn(TAG, `WINDOW craft ${step.item} @ ${stationDesc} — bot.craft FAILED after ${Date.now() - craftT0}ms (win ${winBefore}→${bot.currentWindow ? bot.currentWindow.type : 'closed'})`);
         metrics.crafts_fail++;
@@ -1090,27 +668,20 @@ async function craftWithSequence(bot, sequence, ctx) {
       }
       metrics.crafts_ok++;
       watcher.summary(TAG, `WINDOW craft ${step.item} @ ${stationDesc} — bot.craft OK in ${Date.now() - craftT0}ms (win ${winBefore}→${bot.currentWindow ? bot.currentWindow.type : 'closed'})`);
-      // Reclaim the crafted output from the cursor/grid/result slot into main inventory so nothing
-      // ejects on disconnect and the item is actually usable by later fragments. Completion, though,
-      // is now verified against locateCraftedItem().total — every place the output can land — NOT
-      // main-inventory count alone. WHY this split matters: the recurring torch stall was a craft
-      // whose 4 outputs sat in the result slot / on the cursor; count() read 0, the loop thought it
-      // made nothing and re-crafted forever. Counting the total makes progress honest even on the
-      // pass BEFORE the sweep stows the output; the watcher line below reveals whether the sweep is
-      // failing (stranded>0 persistently) so we can inspect this closely (Architect: recurring bug).
+      // Reclaims crafted output into main inventory so nothing ejects on disconnect. Completion is
+      // verified against locateCraftedItem().total, never main-inventory count alone, so a craft whose
+      // output landed off-inventory is not mistaken for a no-op and re-crafted forever.
       await clearCraftingResidue(bot);
+      await book.close('craft', 'crafting');
       const loc = locateCraftedItem(bot, itemId);
       const afterCraft = loc.total;
       const stranded = loc.cursor + loc.result + loc.grid;
       if (stranded > 0) {
         watcher.warn(TAG, `craft output stranded off main-inventory: ${step.item} total=${loc.total}/${target} split[inv=${loc.inv} cursor=${loc.cursor} result=${loc.result} grid=${loc.grid}] — counted as made; clearCraftingResidue did not fully stow it (recurring craft-output bug, inspect here).`);
       }
-      // No-op safety net (Law 13). The TOTAL (all locations) did not rise while ingredients drained —
-      // so the output genuinely never materialized (missing recipe result, full inventory, or a craft
-      // desync that destroyed it), not a mere off-inventory stranding, which the total now sees.
-      // Unchecked, the loop would re-craft and burn ingredients each pass until the portable judge
-      // escalates forgiving→STRICT and kills the signal. Break on the FIRST no-op: the step stays
-      // unmet, the final-count check soft-fails to a normal replan, and we log the WHY (Law 14).
+      // No-op safety net (Law 13): the total across all locations did not rise, so the output genuinely
+      // never materialized, distinct from merely landing off-inventory. Breaks on the first no-op so the
+      // loop cannot burn ingredients pass after pass; the step stays unmet and soft-fails to replan.
       if (afterCraft <= beforeCraft) {
         const free = typeof bot.inventory.emptySlotCount === 'function' ? bot.inventory.emptySlotCount() : '?';
         const ing = Array.isArray(recipe.delta)
@@ -1144,10 +715,8 @@ async function craftWithSequence(bot, sequence, ctx) {
     throw new Error(`[${TAG}] CODING VIOLATION (Law 13): final step item "${finalStep.item}" is not a recognized minecraft-data item — bad blueprint entry`);
   }
   const requiredFinal = effectiveTarget(finalStep);
-  // Count the final item everywhere (same reason as the loop): the final sweep above SHOULD have
-  // stowed the last batch, but if it didn't, main-inventory count alone would under-report a craft
-  // that actually succeeded and soft-fail a completed job. The total is the honest verdict; a lingering
-  // stranded>0 already warned above so the residue failure is on the record either way.
+  // Counts the final item everywhere, same reason as the loop: if the final sweep above did not fully
+  // stow the last batch, main-inventory count alone would under-report a craft that actually succeeded.
   const finalLoc = locateCraftedItem(bot, finalItemData.id);
   const finalCount = finalLoc.total;
   const success = finalCount >= requiredFinal;
@@ -1168,32 +737,17 @@ function _abandon(reason) {
 // ---------------------------------------------------------------------------
 
 // ── THE ORDER BOOK IS THE UNIT OF WORK, NOT THE ORDER ───────────────────────────────────────────────
-// `craftBatch` is the one implementation (Law 16) and `craftItems` is a one-line order book on top of
-// it, so a single-item caller and a five-item caller run the identical machine. That is what makes the
-// saving arrive for everyone rather than for whichever fragment happened to be rewritten: the batching
-// lives in crafting, not in the caller.
+// craftBatch is the one implementation (Law 16); craftItems is a one-order book on top of it, so a
+// single-item and a five-item caller run the same machine. Shared across the batch: the crafting table,
+// the phase-note buffer, the running counters. Not shared: resolution — each order is expanded by
+// resolveBlueprint on its own, against inventory as it stands at that moment, since a step's `target` is
+// an absolute total and concatenating sequences would let a shared ingredient skip as already satisfied
+// after an earlier order's consumer ate it. The ordering problem this leaves (consumers before the
+// intermediates they eat) belongs to the caller — preconstruction sorts its list for that reason.
 //
-// WHAT IS SHARED AND WHAT IS NOT. Shared across the batch: the crafting table (one walk, one place, one
-// dig), the phase-note buffer, and the running counters. NOT shared: resolution. Each order is expanded
-// by `resolveBlueprint` on its own, against inventory as it stands at that moment, and executed on its
-// own sequence.
-//
-// **Resolution is deliberately NOT merged, and this is the part a later reader will want to "improve".**
-// A step's `target` is an ABSOLUTE desired total, not a delta (see this file's invariants). Merging two
-// orders that share an ingredient therefore cannot be done by concatenating their sequences and letting
-// the `current >= target` skip fire: two orders each needing four planks produce `planks:4` twice, the
-// second is skipped as already satisfied, and the first order's consumer has meanwhile eaten them — so
-// the second consumer starves with a plan that read as complete. Nor can the resolver simply share its
-// `visited` set across targets, which would drop the shared ingredient from the second plan entirely.
-// Resolving per order and re-reading inventory each time is what keeps the absolute semantics honest.
-// The ORDERING problem that creates (make the consumers before the base intermediates they eat) belongs
-// to the caller who knows what it is staging — preconstruction sorts its list for exactly that reason.
-//
-// EVERY ORDER GETS ITS TURN. A failed order does not end the batch — *"it should attempt to craft
-// everything on the list it can craft"* — so the loop records the verdict and moves on. The single
-// exception is a portable-judge escalation, which is the judge saying this body has stopped making
-// progress at all; continuing past it would be arguing with the referee.
-async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
+// A failed order does not end the batch; the loop records the verdict and moves on. The one exception
+// is a portable-judge escalation, which stops the whole book.
+async function craftBatch(bot, orders, payload) {
   if (!Array.isArray(orders) || orders.length === 0) {
     throw new Error(`[${TAG}] CODING VIOLATION (Law 13): craftBatch needs a non-empty order list. Got: ${JSON.stringify(orders)}`);
   }
@@ -1201,6 +755,15 @@ async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
     if (!o || typeof o.item !== 'string' || !Number.isFinite(o.quantity) || o.quantity < 1) {
       throw new Error(`[${TAG}] CODING VIOLATION (Law 13): every craftBatch order needs {item:string, quantity:>=1}. Got: ${JSON.stringify(o)}`);
     }
+  }
+
+  // A POCKET WITH NO EMPTY SLOT BANKS ITS SURPLUS FIRST, before any table is walked to: a craft lands its
+  // output in a free slot, so a full pocket would refuse every order in the batch. The bank is the mine
+  // trip's own (inventory_swapper.dumpExcess, Law 16), and it runs only where a chest stands.
+  if (bot.inventory.emptySlotCount() === 0 && require('@perception/station_registry').findChests().length > 0) {
+    const banked = await require('@api/inventory_swapper').dumpExcess(bot);
+    if (banked?.abandoned) return undefined;   // abandoned to the judge (Law 15) — this line is dead
+    watcher.summary(TAG, `POCKET FULL before crafting ${orders.map(o => o.item).join(', ')} — banked ${banked?.dumped || 0} item(s); ${bot.inventory.emptySlotCount()} slot(s) free now`);
   }
 
   // Open the deferred phase buffer ONCE for the whole batch — all per-step detail (resolution,
@@ -1216,9 +779,8 @@ async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
     const targetItem = order.item;
     const quantity = order.quantity;
 
-    // Snapshot inventory at THIS order's entry so its no-op guard and its `made` count describe this
-    // order and not the batch. Taken per order rather than once up front precisely because an earlier
-    // order may have produced the very item (or consumed the ingredient) this one is about to weigh.
+    // Snapshot inventory at this order's entry so its `made` count describes this order, not the batch
+    // — an earlier order may have produced or consumed the very item this one is about to weigh.
     const entryItemData = mcDataEntry.itemsByName[targetItem];
     const invAtEntry = entryItemData ? bot.inventory.count(entryItemData.id) : -1;
 
@@ -1261,20 +823,9 @@ async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
       quantity,
       success,
       // ── SHORT OF THE ORDER, BUT SOMETHING WAS MADE ────────────────────────────────────────────
-      // Material is never withheld from a craft that can use it, so a craft that runs out of an
-      // ingredient half way is the NORMAL end of a pull chain rather than a failure: two charcoal
-      // against an order for thirty-two torches means eight torches and an honest shortfall, not
-      // nothing.
-      //
-      // WHO DECIDES WHETHER THAT IS ENOUGH IS THE WHOLE POINT (Law 25 — the asker owns the criterion,
-      // the performer owns reporting it truthfully). This function cannot know: a supply row is
-      // topping a bot up and a short delivery is real progress it keeps, while preconstruction stages
-      // an anchor all-or-nothing because a part-load makes it craft against itself and abandon
-      // mid-stage. So the bar arrives WITH the request as `allowPartial`, and every caller that does
-      // not pass it keeps the all-or-nothing outcome unchanged. Defaulting it on would silently relax
-      // two callers whose criterion is stricter — criteria-usurpation wearing the mask of a fix.
-      //
-      // NO SUCCESS FLAG ON A SHORTFALL: `success` stays false and `partial` carries the true counts.
+      // A craft that runs out of an ingredient half way is the normal end of a pull chain, not a
+      // failure. `success` stays false and `partial` carries the true counts; only the book declines
+      // to fail over a shortfall.
       partial: !success && made > 0,
       made,
       shortfall: requiredFinal - finalCount,
@@ -1289,18 +840,17 @@ async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
     });
   }
 
-  // NOTHING IS TAKEN BACK UP HERE. A cleanup pass stood at this line and returned the book's table to
-  // the pocket; the table is permanent now and the pass is deleted — the reasoning is where it used to
-  // live, above `newCraftContext`.
+  // NOTHING IS TAKEN BACK UP HERE — the table is permanent, and the reasoning lives above
+  // `newCraftContext`.
 
   const notes = _phaseNotes || [];
   _phaseNotes = null;
   const detail = notes.length ? notes.join(' · ') : 'no work';
 
-  // A batch succeeds only if every order in it did. A caller that accepts partials gets the same
-  // relaxation it always did, now applied to the book: every order either met its target or made
-  // something toward it.
-  const met = (r) => r.success || (allowPartial && r.partial);
+  // A batch succeeds if every order made something. An order that produced nothing is still a failure;
+  // one that produced less than asked for is carried forward. `all_filled` below says whether the
+  // numbers were actually met.
+  const met = (r) => r.success || r.partial;
   const batchSuccess = !escalated && results.length === orders.length && results.every(met);
   const shortList = results.filter(r => !met(r))
     .map(r => `${r.item} ${r.finalCount}/${r.requiredFinal}`).join(', ');
@@ -1310,9 +860,8 @@ async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
     return `${r.item} x${r.quantity} FAILED ${r.finalCount}/${r.requiredFinal}`;
   }).join(' | ');
 
-  // ONE consolidated summary for the whole craft phase (Law 5). `tables` is the number that says
-  // whether the shared station actually held: one place for a five-order book is the win; five is the
-  // old behaviour leaking back through some path that drops the context.
+  // One consolidated summary for the whole craft phase (Law 5). `tables` says whether the shared
+  // station actually held — one place for a five-order book, not five.
   watcher.summary(TAG,
     `craft book ${results.length}/${orders.length} order(s) — ${bookLine} | ` +
     `tables placed=${ctx.metrics.stations_placed} reused=${ctx.metrics.stations_reused} | ` +
@@ -1328,11 +877,9 @@ async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
     return;
   }
 
-  // `success` is measured against the CALLER'S criterion (`allowPartial`), so it can be true over a
-  // book that contains a short order. `all_filled` is criterion-free and says whether every order
-  // actually met its number — the two are separated because a reader that only ever sees `success`
-  // would have no way to tell "filled" from "accepted as short" (Law 25). Per-order truth is in
-  // `results`, always.
+  // `success` means every order produced something, so it can be true over a book with a short order.
+  // `all_filled` says whether every order actually met its number — separated so a reader of `success`
+  // alone cannot mistake "filled" for "accepted as short" (Law 25). Per-order truth is always in `results`.
   return {
     success: true,
     all_filled: results.every(r => r.success),
@@ -1342,13 +889,11 @@ async function craftBatch(bot, orders, payload, { allowPartial = false } = {}) {
   };
 }
 
-// The single-order front door, unchanged in contract. Every existing caller keeps its exact return
-// shape — including the `undefined` on abandonment and the `partial` object — because a batch of one
-// resolves, executes and reports identically to the way it always did (Law 16: one implementation, and
-// this is the thin one).
-async function craftItems(bot, targetItem, quantity, payload, { allowPartial = false } = {}) {
+// The single-order front door: a batch of one resolves, executes and reports identically to before,
+// keeping every existing caller's exact return shape including `undefined` on abandonment (Law 16).
+async function craftItems(bot, targetItem, quantity, payload) {
   const qty = Math.max(1, Number(quantity) || 1);
-  const batch = await craftBatch(bot, [{ item: targetItem, quantity: qty }], payload, { allowPartial });
+  const batch = await craftBatch(bot, [{ item: targetItem, quantity: qty }], payload);
   if (!batch) return;                       // abandoned to the judge — this line is dead
   const r = batch.results[0];
   if (r.success) {
@@ -1362,7 +907,8 @@ async function craftItems(bot, targetItem, quantity, payload, { allowPartial = f
       progressTag: r.progressTag,
     };
   }
-  // Reached only with allowPartial — craftBatch abandons on anything else.
+  // A SHORT ORDER, and the caller gets the true counts. craftBatch abandons only when an order produced
+  // nothing at all, so reaching this line means something was made.
   return {
     success: false,
     partial: true,
@@ -1377,4 +923,4 @@ async function craftItems(bot, targetItem, quantity, payload, { allowPartial = f
   };
 }
 
-module.exports = { craftItems, craftBatch, placeStation, PLANK_DERIVED_GROUPS, resolveGroupItem };
+module.exports = { craftItems, craftBatch, PLANK_DERIVED_GROUPS, resolveGroupItem };

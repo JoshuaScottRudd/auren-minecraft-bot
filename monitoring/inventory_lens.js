@@ -1,58 +1,68 @@
 // Auren_Bot/monitoring/inventory_lens.js
-// WHERE EVERY ITEM IS, AND EVERY TIME ONE MOVED BETWEEN CONTAINERS.
+// Reports where every item is, and every transfer of one between containers.
 //
-// ── WHY THIS LENS EXISTS (Architect 2026-08-14) ──────────────────────────────────────────────────
-// *"can you make a new lense for tracking inventory transfers? so at a call i want to know what
-//   currently is in every inventory bots and chests and a manifest of every transfer. not from raw
-//   harvest to bot inventory but anywhere else."*
+// The harvest exclusion is structural: a ground pickup never passes through inventory_swapper, so no
+// line here could ever match one. Every container-to-container transfer goes through one function
+// (`_executeTransfer`), so its completion line is the whole manifest (Law 16).
 //
-// THE EXCLUSION IS STRUCTURAL, NOT A FILTER. A pickup off the ground never passes through
-// inventory_swapper, so no line it could match is ever written — "not from raw harvest" costs this lens
-// nothing to honour and cannot drift. Every transfer BETWEEN containers goes through one function
-// (`_executeTransfer`), so its completion line is the whole manifest: one door in the code, one door here
-// (Law 16).
+// Reads the trace, never the world. Every figure is LAST KNOWN — the newest snapshot the record carries
+// for each container, with its timestamp attached (Law 25: a number must answer the question asked of
+// it). A container nobody touched shows its age, not a stale zero.
 //
-// IT READS THE TRACE, NOT THE WORLD, AND SAYS SO ON EVERY NUMBER. "What is currently in every inventory"
-// is answered as LAST KNOWN — the newest snapshot the record carries for each container, with the
-// timestamp attached. The fleet writes a chest's full post-transfer contents into its own completion line
-// and its pocket into every job_board sweep, so the record already holds this; reaching past it into a
-// live registry file would be a second door onto the same question and the two would disagree the moment
-// a bot moved (Law 25 — a number that answers a different question than the reader's is false however
-// true it is). A container nobody touched shows its age rather than a stale-looking zero.
-//
-// WHAT IT IS FOR. The chest-system redesign (generic chests, system-wide requests, a consolidation pass)
-// turns entirely on four costs nothing was totalling: time queued at a chest, the same item deposited and
-// then withdrawn again, one item smeared across several stacks, and the fixed-overhead tax on tiny
-// transfers. All four are computed here, so a before/after is measured rather than argued.
+// Backs the chest-system redesign by totalling four costs: contention wait, double handling (deposited
+// and withdrawn again), stack fragmentation, and the fixed toll a small transfer pays as heavily as a
+// large one.
 
 'use strict';
 
 const { relativeTime } = require('./trace_read');
-// THE ONE WRITER TO STDOUT (Architect 2026-09-16). Every figure below leaves as a field name and a
-// value; this lens no longer owns a space, a separator or a column width.
-const out = require('./data_out');
+const out = require('./data_out'); // the one writer to stdout — every figure leaves as a field name and value
 
-// The one completion line every container-to-container move writes (inventory_swapper._executeTransfer).
-// The chest snapshot is the tail of it, which is why standing contents and the manifest come from the
-// same regex rather than two.
-// One line per WINDOW, carrying however many kinds that window moved — the fleet batches a dump into one
-// visit (2026-08-14), so the unit here is the visit a peer queues behind, never the item kind.
+// The completion line every container-to-container move writes (inventory_swapper._executeTransfer);
+// the chest's post-move snapshot is its tail, so standing contents and the manifest share one regex.
+// One line per window, carrying however many kinds it moved — the unit is the visit, not the item kind.
 const TX_RE = /(deposit|retrieve) complete — (\d+) kind\(s\), (\d+) item\(s\) \[([^\]]*)\] in ([\d.]+)s open \((\d+)ms\/item\) after ([\d.]+)s waiting to get in\. Chest (\S+): (\d+) stack\(s\) \[([^\]]*)\]/;
-// CHEST_TO_CHEST_RE IS DELETED with the chest→chest courier that wrote its line. Storage is one pool
-// measured across every chest, so a courier move could never change the figure it claimed to fix; the
-// emitter is gone, and a lens holding a regex nothing writes reports a permanent zero as though it were
-// a measurement (Law 25).
-// The board's own sweep line carries the pocket. It is the only per-bot inventory the record holds.
-const POCKET_RE = /pocket=\[([^\]]*)\]/;
-// The queue wait, which is NOT the same number as `waiting to get in`: this one is the walk-and-wait for a
-// peer to release the lock, reported only when a queue actually formed.
+// The queue wait, distinct from `waiting to get in`: the walk-and-wait for a peer to release the lock,
+// reported only when a queue actually formed.
 const QUEUE_RE = /chest (\S+) released after (\d+)s in queue/;
+// The composter's visit line (compost_executor.feedFromPocket), fed or given up, carrying the same
+// "waiting to get in" clock the chest line does, so the two sum into one queue figure.
+// The time from the click until the window's contents matched the chest's last picture.
+const PICTURE_RE = /Contents matched the picture in (\d+)ms\./;
+// The walk to the chest's stance, the travel share of the chest line's wait clock.
+const WALK_RE = /Walked ([\d.]+)s of the wait\./;
+const COMPOST_WAIT_RE =/compost_executor: fed (\d+) item\(s\)(.*?) after ([\d.]+)s waiting to get in\./;
+
+// ── THE MATERIAL ACCOUNT ─────────────────────────────────────────────────────
+// A felling line gives the amount that entered the system; joined against fleet_total_held it says
+// where that material ended up. A harvest is not a container transfer, so it stays out of the manifest
+// and feeds only the account section (Law 29).
+//
+// gone_consumed_or_lost cannot be split further: crafted, smelted, burned as fuel, and dropped on death
+// share no common line in the record, so the four are reported as one figure instead of a guess (Law 25).
+const FELLED_RE = /Felled (\w+), mined (\d+)/;
+// ── THE CLAIM LEDGER ─────────────────────────────────────────────────────────
+// A claim is the only thing standing between two bodies and one stack, so whether it fires is the first
+// question to ask of a run. The regexes match the vocabulary the fleet currently writes (Law 25).
+const CLAIM_RE = /(\S+) claimed (.+?) at (\S+) — held until its magnet clears/;
+const UNCLAIM_RE = /(\S+) released its claim at (\S+) \((.*?)\)/;
+// Two reasons a body declines a trip, kept as separate fields (Law 25): trips_skipped_claimed means
+// claims are draining the pool faster than it fills; trips_skipped_tiny means the trip was too small to
+// be worth taking.
+const SKIPPED_RE = /NOT walking to the barrel: (\w+): all of it at (\S+) is claimed by other bodies \((\d+) spoken for\)/;
+const TINY_RE = /NOT walking to the barrel: (\w+): only (\d+) unclaimed and I need (\d+) — too small a trip/;
+// ── THE FIXED TOLL EVERY WINDOW PAYS ─────────────────────────────────────────
+// open_sec covers both the transfer clicks and the fixed open/settle/close a window pays regardless of
+// what it carries; separating them says whether a chest is busy doing work or busy being opened.
+// fixed_toll_sec_floor is a floor, not a measurement — the trace carries no per-phase timing, so this
+// multiplies the known constant by the window count.
+const FIXED_TOLL_SEC = 0.43;
 
 const SMALL_TRANSFER = 2;        // at or below this the fixed ~430ms window overhead dominates entirely
 
 function _parseStacks(text) {
-    // "oak_log x37, oak_log x3, oak_log x1" → [{name, count}], preserving the SPLIT (three entries, not
-    // one sum) because stack fragmentation is one of the four costs this lens exists to measure.
+    // "oak_log x37, oak_log x3, oak_log x1" → [{name, count}], preserving the split (three entries, not
+    // one sum) since fragmentation is one of the four costs this lens measures.
     if (!text || text === 'empty') return [];
     const out = [];
     for (const part of text.split(',')) {
@@ -62,15 +72,6 @@ function _parseStacks(text) {
     return out;
 }
 
-function _parsePocket(text) {
-    if (!text) return [];
-    const out = [];
-    for (const part of text.split(',')) {
-        const m = part.trim().match(/^(\S+):(\d+)$/);
-        if (m) out.push({ name: m[1], count: +m[2] });
-    }
-    return out;
-}
 
 function _prettyId(id) {
     return id.includes('|') ? `(${id.split('|').join(',')})` : id;
@@ -86,7 +87,14 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
     const chests = new Map();     // id → { stacks, at, deposits, retrieves, itemsIn, itemsOut, waitSec, queueSec, queues }
     const pockets = new Map();    // botId → { stacks, at }
     const manifest = [];
+    const gathered = {};          // item → total taken out of the world (the felling line)
+    const claimsTaken = [];       // every claim the ledger filed (the claim system firing at all)
+    const claimsReleased = [];    // every claim it dropped, with the reason
+    const skipped = [];           // trips declined because a peer had already spoken for the stock
+    const tiny = [];              // trips declined as too small to be worth taking
+    let fellings = 0;
     let maxRel = 0;
+    const composter = { waitSec: 0, visits: 0, gaveUp: 0 };
 
     const C = (id) => {
         let c = chests.get(id);
@@ -112,12 +120,9 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
             const c = C(chestId);
             const stacks = _parseStacks(stackText);
 
-            // FLOW IS MEASURED FROM CONSECUTIVE SNAPSHOTS, NOT FROM THE TRANSFER'S OWN ITEM NAME, and
-            // that is the whole reason this works. A deposit names `oak_log` and the withdrawal that takes
-            // it back out names the GROUP token `logs`, so joining the two by name reports zero double
-            // handling on a run that did nothing but double-handle. The chest's post-move contents are
-            // ground truth in the record and need no group table — which also keeps this lens from
-            // carrying a second copy of a table fragment_utils owns (Law 16).
+            // Flow is read from consecutive snapshots, not from the transfer's own item name — a deposit
+            // names `oak_log` while its matching withdrawal names the group token `logs`. The chest's
+            // post-move contents are ground truth and need no group table (Law 16).
             const now = _totals(stacks);
             for (const name of new Set([...Object.keys(now), ...Object.keys(c.lastTotals)])) {
                 const delta = (now[name] || 0) - (c.lastTotals[name] || 0);
@@ -126,9 +131,8 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
             }
             c.lastTotals = now;
 
-            // Fragmentation is measured at its PEAK, never from the closing snapshot. The 2026-08-14 run
-            // held `oak_log x37, oak_log x3, oak_log x1` mid-run and ended with the chest drained, so the
-            // final reading says zero on a run that spent three slots on one item type for ten minutes.
+            // Fragmentation is measured at its peak, never the closing snapshot — a chest drained by
+            // run's end would otherwise report zero after holding fragmented stacks throughout.
             const byName = {};
             for (const s of stacks) byName[s.name] = (byName[s.name] || 0) + 1;
             const extra = Object.values(byName).reduce((n, k) => n + (k - 1), 0);
@@ -139,57 +143,69 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
             c.waitSec += +waitStr;
             if (dir === 'deposit') { c.deposits++; c.itemsIn += count; }
             else                   { c.retrieves++; c.itemsOut += count; }
+            const pic = l.raw.match(PICTURE_RE);
+            const walk = l.raw.match(WALK_RE);
             manifest.push({ t: l.relSec, bot: l.bot, dir, count, kinds, moved: movedText, chestId,
-                            openSec: +openStr, msPerItem: +msPerItem, waitSec: +waitStr });
+                            openSec: +openStr, msPerItem: +msPerItem, waitSec: +waitStr,
+                            pictureMs: pic ? +pic[1] : null, walkSec: walk ? +walk[1] : null });
         } else if ((m = l.raw.match(QUEUE_RE))) {
             const c = C(m[1]); c.queues++; c.queueSec += +m[2];
-        } else if ((m = l.raw.match(POCKET_RE))) {
-            pockets.set(l.bot, { stacks: _parsePocket(m[1]), at: l.relSec });
+        } else if ((m = l.raw.match(COMPOST_WAIT_RE))) {
+            composter.visits++;
+            composter.waitSec += +m[3];
+            if (/gave up/.test(m[2])) composter.gaveUp++;
+        } else if ((m = l.raw.match(FELLED_RE))) {
+            // The felling line names the log TYPE it took, so the account is per-species and joins
+            // straight onto the chest and pocket totals, which are per-species too.
+            gathered[m[1]] = (gathered[m[1]] || 0) + (+m[2]);
+            fellings++;
+        } else if ((m = l.raw.match(CLAIM_RE))) {
+            claimsTaken.push({ t: l.relSec, bot: l.bot, what: m[2], station: m[3] });
+        } else if ((m = l.raw.match(UNCLAIM_RE))) {
+            claimsReleased.push({ t: l.relSec, bot: l.bot, station: m[2], why: m[3] });
+        } else if ((m = l.raw.match(SKIPPED_RE))) {
+            skipped.push({ t: l.relSec, bot: l.bot, item: m[1], station: m[2], spoken: +m[3] });
+        } else if ((m = l.raw.match(TINY_RE))) {
+            tiny.push({ t: l.relSec, bot: l.bot, item: m[1], offered: +m[2], needed: +m[3] });
         }
     }
+    // Pockets are the foreman's item book at the end of the run (item_book_lens.pocketsOf).
+    const itemBook = require('./item_book_lens');
+    for (const [id, items] of itemBook.pocketsOf(itemBook.readBook())) {
+        if (botFilter && id !== botFilter) continue;
+        pockets.set(id, { stacks: Object.entries(items).map(([name, count]) => ({ name, count })), at: maxRel });
+    }
 
-    // ── OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16) ───────────────────────────────────────────
-    // Every string below is either a field name this lens declared or a value it COPIED out of the
-    // record. What stood here and is DELETED rather than given a field name: the `(context only — never
-    // flags, never wakes)` banner; the three-line note about which completion-line shape is matched; the
-    // STANDING INVENTORY preamble about the record not being the live world; the BY CONSTRUCTION note
-    // that ground pickups write no matchable line; the two-clock warning under contention; the name-join
-    // footnote under double handling; the PEAK-not-closing footnote and the `a chest is 27 slots` aside
-    // under fragmentation; the `(per-move, not per-item)` aside; the `none — every item that entered a
-    // chest stayed in it` sentence; and every `--all` pointer. Each was this instrument saying what its
-    // own numbers MEANT or what the reader should do next. Every NUMBER they surrounded is still printed
-    // below, one field each — the metric-type labels became FIELD NAMES (`redundant_slots_peak`).
+    // ── OUTPUT IS DATA, NOT PROSE ───────────────────────────────────────────
+    // Every string below is a field name this lens declared or a value copied from the record.
     out.kv('lens', 'inventory');
     out.kv('record', traceName);
     out.kv('span', relativeTime(maxRel));
     if (botFilter) out.kv('bot_filter', botFilter);
 
     if (!chests.size && !pockets.size) {
-        // The honest zero (Law 25), as three counted fields instead of a paragraph about absence.
+        // The honest zero (Law 25).
         out.zero('chests');
         out.zero('pockets');
         out.zero('transfers');
         return;
     }
 
-    // ── STANDING INVENTORY ─────────────────────────────────────────────────────────────────────────
-    // Contents render as `name:count` pairs joined by a comma — the record's own pocket shape. The SPLIT
-    // is preserved (three `oak_log` entries stay three rather than summing to one) because stack
-    // fragmentation is one of the four costs measured below, and `at` carries the age of the reading.
+    // ── STANDING INVENTORY ───────────────────────────────────────────────────────────────────────────
+    // Contents render as `name:count` pairs, the record's own pocket shape. Split stacks stay split
+    // (three `oak_log` entries, not one sum) since fragmentation is one of the four costs measured below.
     const cells = (stacks) => (stacks.length ? stacks.map(s => `${s.name}:${s.count}`).join(',') : 0);
 
     const fleetTotal = {};
-    // A chest can enter this map from a QUEUE line alone — the record proves the chest exists and that
-    // someone waited on it, and says nothing whatever about its contents. Rendering that as `empty` is a
-    // false verdict of exactly the kind this lens is meant to kill (Law 25), so a chest with no snapshot
-    // goes to its own block with a peer count rather than into the contents table with a zero.
+    // A chest can appear here from a QUEUE line alone, proving only that it exists and was waited on —
+    // not its contents. It gets its own block with a peer count, not a false `empty` (Law 25).
     const unread = [...chests].filter(([, c]) => c.at === null);
     const chestRows = [];
     for (const [id, c] of [...chests].filter(([, c]) => c.at !== null).sort((a, b) => a[0].localeCompare(b[0]))) {
         const t = _totals(c.stacks);
         for (const [n, v] of Object.entries(t)) fleetTotal[n] = (fleetTotal[n] || 0) + v;
-        // The gap between the stack count and the item total IS the fragmentation, so the redundant slot
-        // count of the LAST snapshot is carried as its own field beside the peak figure in cost 3.
+        // The gap between stack count and item total is the fragmentation; the last snapshot's redundant
+        // slot count travels beside the peak figure in cost_fragmentation.
         const redundantNow = Object.keys(t).reduce((n, name) => n + (c.stacks.filter(s => s.name === name).length - 1), 0);
         chestRows.push([_prettyId(id), relativeTime(c.at), c.stacks.length, redundantNow, cells(c.stacks)]);
     }
@@ -210,12 +226,98 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
     out.section('pocket_contents_last_known');
     out.table(['bot', 'at', 'stacks', 'contents'], pocketRows);
 
-    // What the fleet HOLDS, regardless of which container holds it — the same figure job_board judges a
-    // storage threshold against, so this block and the board's verdict are readable against each other.
+    // What the fleet holds, regardless of which container holds it — the same figure job_board judges a
+    // storage threshold against.
     const sorted = Object.entries(fleetTotal).sort((a, b) => b[1] - a[1]);
     out.section('fleet_total_held');
     if (!sorted.length) out.zero('items');
     else out.table(['item', 'count'], sorted);
+
+    // ── THE MATERIAL ACCOUNT ────────────────────────────────────────────────────────────────────────
+    // Three columns of one balance, per item: what entered, what is held now, and what is neither
+    // (gone_consumed_or_lost). held_now repeats the fleet_total_held figure so the row is self-contained
+    // (Law 29).
+    const accountRows = [];
+    for (const item of Object.keys(gathered).sort()) {
+        const held = fleetTotal[item] || 0;
+        accountRows.push([item, gathered[item], held, gathered[item] - held]);
+    }
+    out.section('material_account');
+    out.kv('fellings', fellings);
+    if (!accountRows.length) out.zero('gathered_kinds');
+    else out.table(['item', 'gathered_from_world', 'held_now', 'gone_consumed_or_lost'], accountRows);
+
+    // ── THROUGHPUT ──────────────────────────────────────────────────────────────────────────────────
+    // items_per_min is the rate a one-barrel question turns on; open_share_of_run says whether a chest
+    // is saturated or merely contended, independent of queue length. Both are printed since neither
+    // answers the other.
+    const runMin = maxRel > 0 ? maxRel / 60 : 0;
+    const thruRows = [];
+    for (const [id, c] of [...chests].sort((a, b) => (b[1].itemsIn + b[1].itemsOut) - (a[1].itemsIn + a[1].itemsOut))) {
+        const openSec = manifest.filter(e => e.chestId === id).reduce((n, e) => n + e.openSec, 0);
+        const moved = c.itemsIn + c.itemsOut;
+        thruRows.push([_prettyId(id), c.deposits, c.retrieves, c.itemsIn, c.itemsOut,
+            runMin > 0 ? (moved / runMin).toFixed(1) : '0.0',
+            openSec.toFixed(1),
+            maxRel > 0 ? `${(100 * openSec / maxRel).toFixed(1)}%` : '0.0%']);
+    }
+    out.section('station_throughput');
+    out.kv('run_min', runMin.toFixed(1));
+    if (!thruRows.length) out.zero('stations');
+    else out.table(['chest', 'deposits', 'retrieves', 'items_in', 'items_out', 'items_per_min',
+        'window_open_sec', 'open_share_of_run'], thruRows);
+
+    // ── THE CLAIM LEDGER (chest_ledger) ────────────────────────────────────────────────────────────
+    // claims_taken against chest_retrieves is the health of the mechanism: a retrieval with no claim
+    // behind it is a stack two bodies could have walked for. trips_skipped has no counterpart anywhere
+    // else in the record — a trip not taken writes no transfer, queue, or walk line.
+    out.section('claim_ledger');
+    out.kv('claims_taken', claimsTaken.length);
+    out.kv('claims_released', claimsReleased.length);
+    out.kv('claims_still_held_at_trace_end', Math.max(0, claimsTaken.length - claimsReleased.length));
+    // See SKIPPED_RE / TINY_RE — two skip reasons, two fields.
+    out.kv('trips_skipped_claimed', skipped.length);
+    out.kv('trips_skipped_tiny', tiny.length);
+    if (verbose && claimsTaken.length) {
+        out.table(['at', 'bot', 'claimed', 'station'],
+            claimsTaken.map(c => [relativeTime(c.t), c.bot, c.what, c.station]));
+    }
+    if (verbose && skipped.length) {
+        out.table(['at', 'bot', 'item', 'station', 'spoken_for'],
+            skipped.map(s => [relativeTime(s.t), s.bot, s.item, s.station, s.spoken]));
+    }
+    if (verbose && tiny.length) {
+        out.table(['at', 'bot', 'item', 'offered', 'needed'],
+            tiny.map(s => [relativeTime(s.t), s.bot, s.item, s.offered, s.needed]));
+    }
+
+    // ── WINDOW COST ─────────────────────────────────────────────────────────────────────────────────
+    // A duty cycle alone can't distinguish one bot holding a chest for ten minutes from four hundred
+    // bots holding it a second each. windows and sec_per_window separate them; fixed_toll_sec_floor is
+    // how much of the total was spent on no items at all.
+    const openTotal = manifest.reduce((n, e) => n + e.openSec, 0);
+    const tolls = manifest.length * FIXED_TOLL_SEC;
+    out.section('window_cost');
+    out.kv('windows', manifest.length);
+    out.kv('open_sec_total', openTotal.toFixed(1));
+    out.kv('sec_per_window_mean', manifest.length ? (openTotal / manifest.length).toFixed(2) : '0.00');
+    out.kv('sec_per_window_median', manifest.length
+        ? [...manifest].sort((a, b) => a.openSec - b.openSec)[Math.floor(manifest.length / 2)].openSec.toFixed(2)
+        : '0.00');
+    out.kv('windows_per_min', runMin > 0 ? (manifest.length / runMin).toFixed(1) : '0.0');
+    out.kv('fixed_toll_sec_floor', tolls.toFixed(1));
+    out.kv('fixed_toll_share_of_open', openTotal > 0 ? `${(100 * tolls / openTotal).toFixed(1)}%` : '0.0%');
+    const pictured = manifest.filter(e => e.pictureMs != null).map(e => e.pictureMs).sort((a, b) => a - b);
+    out.kv('windows_with_picture', pictured.length);
+    out.kv('picture_match_sec_total', (pictured.reduce((n, v) => n + v, 0) / 1000).toFixed(1));
+    out.kv('picture_match_ms_median', pictured.length ? pictured[Math.floor(pictured.length / 2)] : 0);
+    out.kv('picture_match_ms_max', pictured.length ? pictured[pictured.length - 1] : 0);
+    const byLoad = { '0': 0, '1-2': 0, '3-8': 0, '9-32': 0, '33+': 0 };
+    for (const e of manifest) {
+        const b = e.count === 0 ? '0' : e.count <= 2 ? '1-2' : e.count <= 8 ? '3-8' : e.count <= 32 ? '9-32' : '33+';
+        byLoad[b]++;
+    }
+    out.table(['items_moved', 'windows'], Object.entries(byLoad).map(([k, v]) => [k, v]));
 
     // ── TRANSFER MANIFEST ──────────────────────────────────────────────────────────────────────────
     out.section('transfer_manifest');
@@ -230,9 +332,8 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
     }
 
     // ── THE FOUR COSTS ─────────────────────────────────────────────────────────────────────────────
-    // Each block is a cost the current chest layout pays and a candidate redesign would change. The two
-    // contention clocks stay in SEPARATE fields and are never added: the queue wait is already inside
-    // the wait figure, so a sum would double-count the worst chest.
+    // Each block is a cost the current chest layout pays. The two contention clocks stay separate
+    // fields: queue wait is already counted inside the wait figure.
     const totalWait = manifest.reduce((n, e) => n + e.waitSec, 0);
     const totalQueue = [...chests.values()].reduce((n, c) => n + c.queueSec, 0);
     const totalQueues = [...chests.values()].reduce((n, c) => n + c.queues, 0);
@@ -249,9 +350,32 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
     }
     out.table(['chest', 'wait_sec', 'moves', 'queue_sec', 'queues'], waitRows);
 
-    // Double handling: the same item both deposited into and withdrawn out of the SAME chest. The
-    // overlap is the round trip the material did not need to make — the cost a system-wide count would
-    // delete outright, since the material was already inside the storage system when it was withdrawn.
+    // ── QUEUE TIME, ONE NUMBER ─────────────────────────────────────────────────────────────────────
+    // Waiting is time a body stands at a station before it gets in. The walk to the chest is WALKING, not
+    // waiting: it is taken out of every window's clock here and tallied with every other walk by
+    // `--walking`. `chest_walk_bot_min` stays beside the wait as the chest's share of that walking.
+    const botMin = (sec) => (sec / 60).toFixed(1);
+    const walkTotal = manifest.reduce((n, e) => n + (e.walkSec || 0), 0);
+    const chestWait = Math.max(0, totalWait - walkTotal);
+    const queueTotal = [...chests.values()].reduce((n, c) => n + c.queueSec, 0);
+    out.section('queue_time');
+    out.kv('chest_windows', manifest.length);
+    out.kv('chest_windows_with_walk', manifest.filter(e => e.walkSec != null).length);
+    out.kv('chest_clock_bot_min', botMin(totalWait));
+    out.kv('chest_walk_bot_min', botMin(walkTotal));
+    out.kv('chest_wait_sec', chestWait.toFixed(1));
+    out.kv('chest_wait_bot_min', botMin(chestWait));
+    out.kv('chest_queue_bot_min', botMin(queueTotal));
+    out.kv('chest_open_bot_min', botMin(manifest.reduce((n, e) => n + e.openSec, 0)));
+    out.kv('composter_wait_sec', composter.waitSec.toFixed(1));
+    out.kv('composter_wait_bot_min', botMin(composter.waitSec));
+    out.kv('composter_visits', composter.visits);
+    out.kv('composter_gave_up', composter.gaveUp);
+    out.kv('total_wait_sec', (chestWait + composter.waitSec).toFixed(1));
+    out.kv('total_wait_bot_min', botMin(chestWait + composter.waitSec));
+
+    // Double handling: the same item deposited into and withdrawn from the SAME chest — the round trip
+    // the material did not need to make, since it was already inside storage when withdrawn.
     let doubleTotal = 0;
     const doubleRows = [];
     for (const [id, c] of chests) {

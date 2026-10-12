@@ -3,47 +3,32 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/ston
 // tool: stone_column_probe — drive stone_column_scanner against a LIVE world and audit its verdict
 //       independently, before the verb that acts on it is ever raised in autonomy.
 //
-// WHY A PROBE AND NOT A BENCH SCENARIO — and the answer changed on 2026-09-10, so read the whole of it.
-//
-// THIS USED TO SAY the ranking was already proven elsewhere: `virtual_playground/scenario_stone_column`
-// held it — a gate that refuses a broken run, a preference that picks the shallower of two whole ones —
-// against voxels this repo authored, so the probe only had to cover what an authored world cannot reach.
-// **That scenario no longer exists.** The bench was deleted whole on the ruling that a kept scenario
-// freezes what was true when it was written (`Auren_Workshop/README.md`), and nothing inherited it.
-// So the honest statement of this file's scope is: NOTHING ELSE TOUCHES THIS SCANNER. If the ranking
-// regresses, this probe is where it surfaces, and it only runs when someone runs it.
-//
-// WHAT WAS NEVER IN DOUBT, and is the reason this is live rather than headless: whether the reader sees
-// REAL terrain at all — chunk load state, biome variety, water and cave geometry, and the
-// surface-vs-canopy question over actual trees. Those are things MINECRAFT decides, so they can only be
-// READ (the rule that outlived the bench — `Auren_Workshop/README.md`, READ DON'T SIMULATE).
+// The scanner is exercised live because chunk load state, biome variety, water and cave geometry, and the
+// surface-vs-canopy call over actual trees are decided by MINECRAFT and can only be READ, never authored
+// (`Auren_Workshop/README.md`). This probe is the only thing that exercises the scanner; a ranking
+// regression surfaces here, and only when someone runs it.
 //
 // THE ONE DISCIPLINE THAT MAKES THE RESULT MEAN ANYTHING (Law 26 — the unit does not grade its own
 // paper): the audit below re-derives every field of the returned column from `bot.blockAt` DIRECTLY,
-// never through the scanner's own voxel reader. If the audit shared the reader, a reader defect would
-// be invisible — both sides would agree, and agreement would be the bug. Any disagreement here is a
-// real finding regardless of which side is wrong.
+// never through the scanner's own voxel reader. Any disagreement here is a real finding regardless of
+// which side is wrong.
 //
-// SAMPLES, NOT ONE SHOT: a single scan says nothing about a scanner meant to work anywhere. The probe
-// teleports the body to a spread of positions and audits every verdict, so the summary answers "how
-// often does it find one, and is every one it found sound" rather than "did it work once".
+// SAMPLES, NOT ONE SHOT: the probe teleports the body to a spread of positions and audits every verdict,
+// so the summary answers how often the scanner finds a column and whether every one it found is sound.
 //
 // EVERY column in the returned list is audited, not just the leader. The executor claims down the list
-// until one is free and reachable, so a defect in the fifth candidate reaches a live shaft exactly as
-// readily as one in the first — auditing only the winner would leave the whole fallback path untested.
-// The ranking itself is checked here too: nearest first, shallowest only breaking the tie.
+// until one is free and reachable, so a defect anywhere in it reaches a live shaft as readily as one in
+// the first. The ranking itself is checked here too: nearest first, shallowest only breaking the tie.
 //
-// The operator's pathway is RCON (tp only — no terrain is authored here, because the whole question is
-// what natural ground looks like to this reader).
+// The operator's pathway is RCON, tp only — no terrain is authored here.
 //
-// Run (server must be UP — `fleet_control.js server-start` is the entire prerequisite):
+// Run (server must be UP — `node start_auren.js --start continue --crew contractor --soak 0` is the entire prerequisite):
 //   . .\Auren_Workshop\scripts\_node.ps1 ; & (Get-AurenNode) Auren_Workshop\tools\stone_column_probe.js
 //   env knobs: PROBE_SAMPLES (default 8) · PROBE_SPREAD blocks between samples (default 220)
 //              PROBE_AT="x,z;x,z" samples those exact columns instead of the ring (aim at terrain
 //                        the ring never lands on — ocean, desert, a mountain face)
 //              PROBE_NAME (default testbot) · PROBE_HOST/PORT/VERSION
 
-const path = require('path');
 const paths = require('../workshop_paths');
 paths.registerAliases();
 
@@ -67,8 +52,8 @@ const { STONE_PROSPECT, SERVER_MINECRAFT_VERSION } = require('@thinking/architec
 
 const HOST = process.env.PROBE_HOST || 'localhost';
 const PORT = Number(process.env.PROBE_PORT || 25565);
-// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
-// A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
+// Version comes from architect_config, the one authored answer (Law 16) — a mismatch would grade the
+// fleet against a game it is not playing.
 const VERSION = process.env.PROBE_VERSION || SERVER_MINECRAFT_VERSION;
 const NAME = process.env.PROBE_NAME || 'testbot';
 const SAMPLES = Number(process.env.PROBE_SAMPLES || 8);
@@ -101,13 +86,12 @@ function auditColumn(bot, col, origin) {
             `surface is canopy, not ground (${surface.name}) — the walk-to target would be a branch`);
     }
     const above = at(col.surfaceY + 1);
-    // An unloaded read is a FAULT here, not a pass. `!above` reading as permission is how a column over
-    // an unread chunk audits clean — the failure mode this line exists to close.
+    // An unloaded read counts as a FAULT, not a pass — `!above` read as permission would let a column
+    // over an unread chunk audit clean.
     claim(!!above, `the stand cell at y=${col.surfaceY + 1} is unloaded — accepted on no evidence`);
     claim(!above || above.boundingBox !== 'block', `the stand cell above the column is capped (${above?.name})`);
-    // A LIQUID stand cell passes every solidity test and still ruins the shaft: the body is swimming
-    // rather than standing, and the first dig-down floods the column it is about to seal. Asked here
-    // because it is exactly the case an authored flat world cannot present.
+    // A LIQUID stand cell passes every solidity test and still ruins the shaft: the body is swimming,
+    // and the first dig-down floods the column it is about to seal.
     claim(!above || !LIQUID.has(above.name),
         `the stand cell above the column is ${above?.name} — the shaft would flood`);
 
@@ -124,7 +108,7 @@ function auditColumn(bot, col, origin) {
         `overburden ${col.overburden} exceeds the ceiling ${STONE_PROSPECT.max_overburden}`);
 
     // 3. THE GATE: the run is uninterrupted and it is all `stone`. Reported per-cell so a failure names
-    //    which block broke it rather than only that one did.
+    //    which block broke it.
     const topStoneY = col.surfaceY - col.overburden;
     for (let i = 0; i < RUN; i++) {
         const b = at(topStoneY - i);
@@ -182,14 +166,13 @@ function auditColumn(bot, col, origin) {
 async function runOneSample(bot, rcon, n, target) {
     log(`──── sample ${n}/${AT.length || SAMPLES} @ x=${target.x} z=${target.z} ────`);
     // Teleport high and let the body fall to the ground it lands on — the surface is the world's to
-    // choose, not the operator's. `spreadplayers` would pick for us; a drop reads what is there.
+    // choose, not the operator's.
     await rcon.command(`tp ${NAME} ${target.x} 200 ${target.z}`);
     await sleep(1200);
     // Settle: wait for the body to stop falling AND for the chunk under it to answer.
     for (let i = 0; i < 30; i++) {
         const p = bot.entity.position.floored();
         const under = bot.blockAt(new Vec3(p.x, p.y - 1, p.z));
-        if (under && under.boundingBox === 'block' && !bot.entity.velocity) break;
         if (under && under.boundingBox === 'block' && Math.abs(bot.entity.velocity.y) < 0.01) break;
         await sleep(400);
     }
@@ -200,7 +183,7 @@ async function runOneSample(bot, rcon, n, target) {
     log(`landed at (${origin.x},${origin.y},${origin.z}) on ${under?.name || 'nothing'}`);
 
     const t0 = Date.now();
-    const { columns, summary } = stoneColumnScanner.scan(bot);
+    const { columns, summary } = await stoneColumnScanner.scan(bot);
     const ms = Date.now() - t0;
     const column = columns[0];
 
@@ -226,8 +209,7 @@ async function runOneSample(bot, rcon, n, target) {
             log(`    ✗ candidate ${i + 1} @${columns[i].x},${columns[i].z}: ${r.faults.join('; ')}`);
         }
     }
-    // NEAREST first, shallowest only breaking the tie — re-derived from the returned rows rather than
-    // trusted from the order they arrived in.
+    // NEAREST first, shallowest only breaking the tie — re-derived here from the returned rows.
     const rankFaults = [];
     for (let i = 1; i < columns.length; i++) {
         const a = columns[i - 1], b = columns[i];

@@ -10,10 +10,11 @@
 //  - start(bot) attaches all survival reflexes to the bot's physicsTick event.
 //  - stop() detaches them. Logs a Law 17 warning — the caller is accepting drowning risk.
 //  - Each reflex is independently toggleable via enable/disable functions.
-//  - No watcher, no signal_bus, no file I/O — pure tick-level reactions.
-//  - Atomic: depends on nothing except the bot instance. No imports from other project modules.
+//  - No signal_bus, no file I/O — pure tick-level reactions. The watcher is its one output: the fall
+//    alert's warning line.
 
 const Vec3 = require('vec3');
+const watcher = require('@kernel/watcher');
 const { guardExternalSync } = require('@utils/external_library_guard');
 
 // ---------------------------------------------------------------------------
@@ -26,34 +27,15 @@ let tickHandler = null;
 const reflexes = {
   antiDrown: true,
   doorHandler: true,
-  // autoTorch REMOVED: the walk-and-place torch reflex had no block-awareness — no sense of existing
-  // torches or build footprints — so the surface piled up with incoherent torches and rogue ones landed
-  // on blueprint voxels. Removed wholesale pending a redesign. The 'autoTorch' key is gone, so
-  // battle_stations/torch_executor's enable/disableReflex('autoTorch') calls become harmless no-ops
-  // (both guard with `if (!(name in reflexes)) return`).
+  // 'autoTorch', 'shieldGuard' and 'shieldFacing' are not keys here: enable/disableReflex calls
+  // naming them are harmless no-ops via the `name in reflexes` guard below, so old callers do not
+  // break.
   //
-  // shieldGuard and shieldFacing REMOVED. Both keys are gone, so every surviving
-  // enable/disableReflex('shieldGuard') call is a harmless no-op by the same `name in reflexes` guard
-  // that absorbs 'autoTorch' above — but the three DIRECT entry points (standDownShield, isShieldUp,
-  // guardTarget) were deleted from the exports rather than stubbed, and their callers cut with them. A
-  // stub that silently answers "no shield" is the redundant pathway Law 16 forbids: it would let a
-  // caller keep asking a question this module no longer has any business answering, and read green
-  // forever.
-  //
-  // What a successor re-adding it must know, because it is the reason the removal was clean rather than
-  // commented-out: shieldFacing was the only CONTINUOUS yaw writer in this module, and the combat split
-  // gives that number to `custom_api/gunner.js`. Re-introducing a tick-rate reflex that aims a shield
-  // puts a second continuous writer back on the yaw, so it comes back through the gunner or not at all.
-  //
-  // THIS MODULE STILL WRITES THE YAW — twice, in doorHandlerTick (bot.lookAt to face a door before
-  // activating it). The two writers are not equivalent and the difference is the whole reason one was
-  // removed and one was kept: shieldFacing wrote EVERY tick of a fight, unconditionally; the door reflex
-  // writes only when `forward` is held and a door sits within 1.5 blocks, which cannot happen during an
-  // open-ground engagement and is momentary when it does.
-  //
-  // It is a real contender for the yaw in a DOORWAY fight, and nothing arbitrates that today. Do not
-  // "fix" it by making the door reflex ask the gunner for permission — that is a second decision-maker
-  // wearing a check (Law 16). It is an arbitration question, and arbitration is the commander's seat.
+  // This module writes the yaw only in doorHandlerTick, to face a door before activating it; the
+  // only other continuous yaw writer in the fleet is the gunner (custom_api/gunner.js). The door
+  // write is conditional (forward held, door within 1.5 blocks) and momentary, so a doorway fight
+  // is the one case where both could want the yaw at once, and nothing arbitrates that today —
+  // arbitration belongs to the commander's seat, not a check added here.
 };
 
 // ---------------------------------------------------------------------------
@@ -94,9 +76,9 @@ const DOOR_BLOCKS = new Set([
 let doorCooldown = false;
 let trackedDoor = null;
 
-// false on refusal means "treat it as shut", which is the safe direction: the handler then opens a door
-// it may not need to rather than walking at one it wrongly believed open (Law 17 — no predictable
-// self-obstruction), and never records the refusal as a measured door state.
+// False on refusal means "treat it as shut", the safe direction (Law 17 — no predictable
+// self-obstruction): the handler may open a door it did not need to, but never records the
+// refusal as a measured door state.
 function isDoorOpen(block) {
   const props = guardExternalSync('survival_instincts', 'read door properties', () => block.getProperties?.());
   return props.ok && !!props.value && String(props.value.open) === 'true';
@@ -154,33 +136,63 @@ function doorHandlerTick(bot) {
   }
 }
 
-// ── WHAT USED TO BE HERE, AND THE ONE THING WORTH CARRYING FORWARD ───────────────────────────────────
-// A ~190-line shield stack lived between the door handler and the tick dispatcher: `shieldGuardTick`
-// (raise-on-edge with the Law 19 sprint exclusion), `standDownShield`, `isShieldUp`, and
-// `shieldFacingTick` (aim the shield at a named target, at tick rate, outside a 50° tolerance). All of
-// it is deleted, not disabled, pending a redesign.
-//
-// It is recorded here rather than left in git alone because ONE of its findings will otherwise be
-// rediscovered the expensive way: a vanilla client cannot sprint and block at the same time (starting an
-// item-use clears the sprint flag), but mineflayer asserts sprint through its own entity-action packet,
-// which the server honours independently — so a bot that just calls activateItem gets to sprint AND
-// block. That is the Rogue Machine error by name (Law 19) — a protocol-level faculty claiming an
-// operational right every other agent pays for — and whatever re-adds the shield owes that exclusion
-// again, held every tick rather than applied once on the raise, because the mover re-asserts sprint at
-// the start of every leg.
+
+// fallAlert: a body never falls in normal work — navigation plans no drop past one block (dig_down
+// is the deepest), so landing 2+ blocks below the take-off point means something threw it (a
+// blast, a hit, a floor that was not there). It warns and changes nothing: the work carries on.
+// Measured take-off to landing, so a jump's arc is not counted; water and climbing reset it.
+// The alert also carries what the body was doing as it left the ground, so the fall can be told
+// apart: the floor under a still body removed (no controls, centre was over a block) or a body
+// that walked off an edge (forward held, centre already over air on its last standing tick).
+const FALL_ALERT_BLOCKS = 1.5;
+let takeoff = null;
+let lastStand = null;
+function heldControls(bot) {
+  const held = ['forward', 'back', 'left', 'right', 'sprint', 'jump', 'sneak'].filter(c => bot.controlState?.[c]);
+  return held.length ? held.join('+') : 'none';
+}
+// The navigator's step in hand as the body left the ground (navigator stamps bot._navStep per step).
+function navStepText(bot) {
+  const s = bot._navStep;
+  if (!s) return 'no navigator step yet';
+  const c = (v) => (v ? `${v.x},${v.y},${v.z}` : '?');
+  return `navigator ${s.edge}${s.run >= 2 ? ` (run of ${s.run})` : ''} (${c(s.from)})→(${c(s.to)}) toward (${c(s.goal)})${s.exact ? ' exact' : ''}, stamped ${Date.now() - s.at}ms ago`;
+}
+function fallAlertTick(bot) {
+  const e = bot.entity;
+  if (!e || !e.position) return;
+  if (e.isInWater || e.isInLava || e.isOnLadder) { takeoff = null; return; }
+  if (!e.onGround) {
+    if (!takeoff) {
+      const hs = Math.hypot(e.velocity?.x || 0, e.velocity?.z || 0);
+      takeoff = { pos: e.position.clone(), controls: heldControls(bot), hspeed: hs, stand: lastStand, nav: navStepText(bot) };
+    }
+    return;
+  }
+  const under = bot.blockAt(e.position.floored().offset(0, -1, 0));
+  lastStand = under ? under.name : 'unloaded';
+  if (!takeoff) return;
+  const drop = takeoff.pos.y - e.position.y;
+  if (drop >= FALL_ALERT_BLOCKS) {
+    const f = (v) => `${v.x.toFixed(1)},${v.y.toFixed(1)},${v.z.toFixed(1)}`;
+    watcher.warn('survival_instincts', `FALL ALERT: fell ${drop.toFixed(1)} blocks, (${f(takeoff.pos)}) → (${f(e.position)}) `
+      + `| controls ${takeoff.controls}, speed ${takeoff.hspeed.toFixed(2)}, under the centre on the last standing tick: ${takeoff.stand ?? 'unknown'} | ${takeoff.nav}.`);
+  }
+  takeoff = null;
+}
 
 // ---------------------------------------------------------------------------
 // SECTION 3: Tick dispatcher
 // ---------------------------------------------------------------------------
 
-// NOTHING IN THIS DISPATCHER WRITES THE YAW, and that is now a property the combat split depends on
-// rather than a coincidence. `shieldFacingTick` used to sit below the door handler and re-aim the body
-// at tick rate; with it gone the only writer of the facing anywhere in the fleet is the gunner. A
-// successor adding a reflex here must not take the yaw (Invariant D) — a tick-rate writer beneath the
-// combat loop is invisible to it and outruns every check it could make.
+// Nothing in this dispatcher writes the yaw: the only writer of the facing anywhere in the fleet
+// is the gunner. A successor adding a reflex here must not take the yaw (Invariant D) — a
+// tick-rate writer beneath the combat loop is invisible to it and outruns every check it could
+// make.
 function onPhysicsTick(bot) {
   antiDrownTick(bot);
   doorHandlerTick(bot);
+  fallAlertTick(bot);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +204,7 @@ function start(bot) {
   tickHandler = () => onPhysicsTick(bot);
   bot.on('physicsTick', tickHandler);
   attached = true;
-  console.log('[survival_instincts] Started — anti-drown, door-handler active.');
+  console.log('[survival_instincts] Started — anti-drown, door-handler, fall-alert active.');
 }
 
 function stop() {
@@ -205,8 +217,8 @@ function stop() {
 
 // Silent by design: a toggle fires on every combat engage/disengage, so a log line here floods the
 // console with no diagnostic value. The state flip is the whole job; the caller already logs the
-// engagement it's suppressing a reflex for. Toggling a name not in `reflexes` (e.g. the removed
-// 'autoTorch') is a deliberate no-op so old callers don't break.
+// engagement it's suppressing a reflex for. Toggling a name not in `reflexes` is a deliberate
+// no-op so old callers don't break.
 function disableReflex(name) {
   if (!(name in reflexes)) return;
   reflexes[name] = false;

@@ -1,203 +1,85 @@
 'use strict';
-// foreman.js — THE IN-GAME DESK. A human in the world says "foreman get bots" and a crew arrives.
+// foreman.js — the in-game desk: a human says "foreman get bots" and a crew arrives. Does not plan,
+// judge, or decide what a bot does once it exists.
 //
-// RENAMED FROM `valet` 2026-08-30. The first name was chosen when the job was fetching and dismissing:
-// *"call it valet, its less ambigious, its job is to get a bot, stop a bot and etc."* The scope outgrew
-// it — this desk now starts, stops, flushes and takes work orders — and the Architect renamed it for the
-// reason the first name was picked, which is that the name should say what the thing does. His original
-// sentence is kept verbatim above because it is his and the record does not rewrite it (Law 20); what
-// changed is the job it was describing, not the sentence.
-//
-// It still does not plan, does not judge, and does not decide what a bot should do once it exists.
-//
-// IT IS NOT A BOT, and the distinction is structural rather than cosmetic. It holds a player slot and
-// it has a body, but it has no BOT_ID, no mandate, no corporate_headquarters, no job board and no
-// place in BOT_SENIORITY — the roster is bots, and the foreman is staff. It is the fourth process type
-// in the fleet after the server, the foreman and the bots.
-//
-// EVERY BOT IT GETS IS A CONTRACTOR, by construction rather than by rule: there is no other way to
-// spawn one, and the foreman passes `--mode=contractor` on the single launcher that exists. Homesteaders
-// come from the terminal. The Architect's model is the one this file is built on —
-//
-//   "there should be no anti logic. meaning guarding against a homesteader to be a contractor.
-//    contractor is an overrided homesteader. thats the main difference between the two."
-//
-// — so nothing here checks that a homesteader is not secretly a contractor. A contractor is the same
-// program with the human channels mounted on top, and the mode decides how much of it mounts. The
-// foreman's own listing shows both species because a human standing in the world should be able to see
-// what is out there; it simply does not offer to command the ones that were never fetched for them.
-//
-// WHY IT SPAWNS `start_bot.js` RATHER THAN REQUIRING master_core ITSELF: `start_bot.js` is the ONE birth
-// in this tree (Law 16) — it stamps the mandate, and every other caller including the Architect's own
-// `fleet_control` goes through it. A second spawn path here would be a second place a bot can be born
-// wrong. See `startBot()` below for what that inherited and what it did not.
+// Not a bot: holds a player slot and a body, but no BOT_ID, mandate, corporate_headquarters, job board or
+// place in BOT_SENIORITY — the fourth process type in the fleet, after the server, the foreman and the bots.
+// Every bot it gets is a contractor, fetched via the one launcher that passes `--mode=contractor`;
+// homesteaders come from the terminal. Spawns `start_bot.js`, the one birth in this tree (Law 16), rather
+// than requiring master_core directly.
 //
 // Run:  node start_auren.js        (raises the foreman and this desk together)
 
-const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
 
 const moduleAlias = require('module-alias');
 const BOT_DIR = path.resolve(__dirname, '..');
-// HAND-REGISTERED AND DELIBERATELY SHORT. The foreman is not a bot and must not become one by accident:
-// every alias added here is a layer of the fleet this process can suddenly reach into, and the clerk's
-// whole scope is fetching and dismissing. These are the four it genuinely needs — the Architect's
-// tables, the shared envelope contract, the mandate vocabulary, and the boundary guard the door uses.
-// Values match package.json's `_moduleAliases` exactly; a second spelling of one of these paths is a
-// second answer to where a layer lives (Law 16).
+// Hand-registered and kept short: each alias is a layer of the fleet this process can reach. Values match
+// package.json's `_moduleAliases` (Law 16).
 moduleAlias.addAliases({
   '@thinking': path.join(BOT_DIR, 'Thinking_fragments'),
   '@kernel':   path.join(BOT_DIR, 'js_kernel'),
   '@utils':    path.join(BOT_DIR, 'js_kernel', 'utils'),
   '@foreman': path.join(BOT_DIR, 'foreman'),
-  // The event grammar the desk's record is written in. Added with the record itself: the alternative
-  // was a second grammar spelled here, which is the drift crew_log's one-file design exists to stop.
+  // The event grammar the desk's record is written in (Law 16).
   '@api':      path.join(BOT_DIR, 'custom_api'),
-  // ONE PERCEPTION NODE, AND THE RULE ABOVE IS WHY THIS LINE CARRIES AN ARGUMENT (2026-09-12).
-  // The desk's `get` gate has to know where world spawn is, and the world-spawn latch has exactly one
-  // owner — `@perception/spawn_protection`, which listens for the server's `spawn_position` packet and
-  // remembers WHETHER it arrived. The alternative to this alias was a second latch spelled in this file,
-  // which would give the desk and the bodies two answers to "where is spawn" and let them drift (Law 16).
-  // Reaching for the owner is the smaller cost, and it is the one the short-list rule is protecting: the
-  // objection above is to the desk acquiring CAPABILITIES, and a read-only sensor is not one.
+  // The `get` gate's read on where world spawn is; `spawn_protection` is the one owner of that latch (Law 16).
   '@perception': path.join(BOT_DIR, 'perception_nodes.js'),
-  // AND THE SITER, for the same reason and with the same limit (2026-09-12). The desk runs
-  // `lock_all_buildspots.run(..., { dryRun: true })` to decide whether a base can be placed where a person
-  // is standing. A second siting opinion spelled in this file is the thing this alias avoids: the desk
-  // must refuse exactly the ground the crew would fail on, which means calling the crew's own surveyor.
-  // It still writes nothing — `dryRun` is what keeps this a read.
+  // The crew's own surveyor, run with `dryRun: true` so the desk's siting check is a read (Law 16).
   '@action':     path.join(BOT_DIR, 'action_fragments.js'),
-  // AND WHAT THAT SURVEYOR LOADS WHILE IT SCANS (2026-09-14). The siting scan yields through
-  // `voxel_scan_throttle`, which reaches `@api/battle_stations` for its combat checkpoint, and that file
-  // requires `@locomotion/survival_instincts` at load. Missing here, every `get` died ~60 s in with
-  // "Cannot find module '@locomotion/survival_instincts'" once the scan reached the checkpoint (the
-  // 20-minute soak of 2026-09-14). It is loaded, never driven: the desk still commands no body.
+  // A load-time dependency of the siting scan's combat checkpoint (battle_stations), loaded but never driven.
   '@locomotion': path.join(BOT_DIR, 'custom_api', 'locomotion'),
 });
 
 // ── THE DESK KEEPS A RECORD, AND IT IS THE FLEET'S OWN WRITER ────────────────────────────────────
-// NAMING THE UNIT IS WHAT OPENS THE FILE, and it must precede the watcher require because the watcher
-// resolves its filename once, at load. This is the CAMERA's arrangement exactly (`BOT_ID=camera_rig`):
-// a non-bot process that needs its own parallel record names itself and inherits the whole discipline —
-// the append-only writer, the index that only advances on a reported success, the sync flush at exit,
-// and fleet_control's run-start sweep of `watcher_*.jsonl`, which is why the name has this shape.
-//
-// IT DOES NOT MAKE THE DESK A BOT. BOT_ID names a RECORD here, not a mandate: this process still has no
-// mandate, no headquarters and no job board, and the foreman forward is a no-op because the desk never
-// connects `foreman_link` — so the desk's record cannot leak into the fleet's merged stream (Law 26 —
-// the camera's record is parallel for the same reason, and the reader keeps them apart by filename).
+// Naming the unit before the watcher require lets it resolve its filename at load, the camera's own
+// arrangement (BOT_ID=camera_rig). Names a record here, not a mandate: never connects `foreman_link`,
+// so the desk's record stays out of the fleet's merged stream (Law 26).
 process.env.BOT_ID = process.env.BOT_ID || 'foreman';
+// ── THE CONSOLE NEVER HOLDS THE ARBITER ─────────────────────────────────────────────────────────
+// Every bot's log line is relayed through this process to one console (foreman_hub.handleLog), and a
+// console or pipe write on Windows waits on the event loop's own thread for whatever is displaying it —
+// a terminal in select mode, a launcher whose reader paused — and with it every claim, token and
+// heartbeat the fleet is asking for. Installed before the first line is printed: the lane hands each
+// line to the thread pool and the loop never waits on a display (js_kernel/utils/console_lane).
+const consoleLane = require('@utils/console_lane');
+consoleLane.install();
 const record = require('./foreman_record');
+const { log, alarm } = require('./utils/say');
 
 // ── WHERE THE THIRD-PARTY PACKAGES LIVE IS ASKED, NEVER ASSUMED ──────────────────────────────────
-// The desk used to inherit a working `NODE_PATH` because `fleet_control` stamped one before spawning it,
-// so the require below resolved without this line and nothing revealed the dependency. `foreman.js` is
-// now started by `start_auren.js` as well, which stamps no path — and the first live run under
-// that launcher died here with `Cannot find module 'mineflayer'`, having brought the foreman up first
-// so the failure looked like a foreman fault rather than a resolution one.
-//
-// It is the same call `start_bot.js` makes for the same reason, and on a published copy it is a no-op:
-// `npm install` puts the packages in `node_modules` beside this tree and Node finds them unaided. It
-// matters on the Architect's machines, where they sit in a sibling directory — which is exactly the case
-// a launcher-inherited path was quietly covering (Law 2 — a unit completes its own verb and leaves
-// nothing to be arranged for it).
+// Resolves the module path itself (Law 2); a no-op once `npm install` has put packages beside this tree.
 require('@utils/node_module_homes').bootstrapModulePath();
 
-// ── THE FOREMAN OPENS HERE, BEFORE THE BODY EXISTS (Architect 2026-09-18) ──────────────────────────
-// *"What I want is one body that isn’t a bit a single process controls… you have to justify to me why each
-// of these merit seperate processes"* The foreman and the desk were two processes joined by a
-// localhost socket. Neither earned it: the desk's heavy work (siting) happens before any bot exists, so
-// there are no claims for it to starve. The bots it fetches were already this process's children, reading
-// their consoles through its pipes. Reasoning in full: architect_scratchpad §31–§32.
-//
-// FIRST, because the fleet's memory is the first thing this process must hold. Requiring the file restores
-// every player's buildings and stations from disk and opens both ports. The desk then reaches it through
-// `foreman_door.local` further down: the same calls and the same answers, with no socket in between.
+// ── THE FOREMAN AND THE DESK ARE ONE PROCESS ────────────────────────────────
+// One body. Requiring the hub restores every player's buildings and stations from disk and opens both
+// ports; the desk reaches it through `foreman_door.local` further down.
+// foreman_config is checked whole and said back here, before memory, ports or world are touched; a
+// rollback start empties the fleet's memory now, before the hub loads it.
+const plan = require('./foreman_plan');
+{
+  const c = plan.check();
+  if (!c.ok) {
+    log('foreman_config.js does not make sense yet, so NOTHING was started:');
+    for (const w of c.wrong) log(`   ${w}`);
+    log('Fix those fields in Auren_Bot/foreman_config.js and start again.');
+    require('@kernel/watcher').flushNow();
+    process.exit(1);
+  }
+  log(`THE RUN: ${plan.sentence()}`);
+  require('./utils/process_priority').apply(process.pid, 'foreman', log);
+  plan.emptyMemory(log);
+}
+
 const { desk: foremanDesk } = require('@foreman/foreman_hub');
 
 const mineflayer = require('mineflayer');
-const { FOREMAN_NAME, FOREMAN_PREFIX, FOREMAN_CHANNEL, BOT_SENIORITY,
-        SERVER_MINECRAFT_VERSION, PERSON_CLEAR_OF_SPAWN,
-        SEA_LEVEL, HUMAN_SURFACE_SLACK, HUMAN_MAX_ABOVE_SEA, ACCEPTABLE_BIOMES } = require('@thinking/architect_config');
+const { FOREMAN_NAME, FOREMAN_PREFIX, FOREMAN_CHANNEL, BOT_SENIORITY, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const channel = require('./foreman_channel');
-// The one owner of "open a visible console window", and the one owner of where a run's records live —
-// this desk shows each body it fetches and keeps that body's console beside the traces. See `startBot`.
-const consoleWindow = require('@utils/console_window');
-const { RECORDS_DIR } = require('@utils/record_homes');
-// THE DESK NO LONGER TELEPORTS ANYTHING, and its `body_recovery` require went with the act (2026-09-10).
-// It used to bring each new body to whoever hired it; the measurement that moved that act into the body's
-// own start path is in the launch loop, and the reason it could not simply be delayed here is that this
-// process holds no handle on the body it was moving, so it could never confirm an arrival. What travels
-// to the crew now is the asker's NAME, in `BOT_START_NEAR`.
 
-// HOW LONG A CREW GETS TO APPEAR IN THE FOREMAN'S REGISTRY after its processes are launched. Matched to
-// `fleet_control.waitForBotsOnline`'s own 90s rather than picked, because it is the same wait for the same
-// thing — a cold JVM, a chunk load and a spawn — and two different answers to one question is the drift
-// Law 16 exists to prevent. Measured on the local server: a warm box registers a crew in a few seconds,
-// so this is the ceiling, not the cost.
-const CREW_ARRIVAL_WAIT_MS = 90000;
-const CREW_ARRIVAL_POLL_MS = 2000;
-// PER BODY, NOT PER CREW. The wait above is the budget for the whole crew and it is spent one member at
-// a time (see the launch loop), so a member that is never coming must not be able to eat the budget the
-// next one needs. Half the total, so the worst case is unchanged from the single deadline it replaced.
-const BODY_ARRIVAL_WAIT_MS = CREW_ARRIVAL_WAIT_MS / 2;
-// ── THE GAP BETWEEN TWO LOGINS FROM ONE MACHINE ──────────────────────────────────────────────────────
-// A SERVER MAY RATE-LIMIT LOGINS PER SOURCE ADDRESS, AND THE WHOLE FLEET IS ONE SOURCE ADDRESS. Two
-// contractors launched back to back reach the door about a second apart from the same IP, and a server
-// that throttles logins drops the second one — before it is authenticated, so before anything logs a
-// reason. From the bot's side it is `socketClosed` at zero seconds and from the desk's side it is a crew
-// that half arrived.
-//
-// MEASURED 2026-09-05, and it is the reason `get` behaves differently on the two worlds. On the dedicated
-// server AurenBot connected and TessaBot's socket closed 0.9s later with no entry of any kind in the
-// proxy's log — a connection refused before it was worth logging. On the local server there is nothing in
-// front of the world, so the same two launches both land and the fault is invisible.
-//
-// THE FLEET DOES NOT KNOW WHAT IS IN FRONT OF IT AND MUST NOT LEARN. This constant is not a proxy setting
-// copied over — it is the fleet's own statement that connecting politely is its job, true against a bare
-// world, a proxy, or whatever comes next. The real spacing usually comes free, because the loop waits for
-// each body to register before launching the next; this is the FLOOR that still applies when a body fails
-// instantly and there is nothing to wait for.
-const CREW_LAUNCH_GAP_MS = 5000;
-
-// HOW FAR "NEXT TO THE HUMAN" IS ALLOWED TO MEAN, when the desk checks there is room to stand before it
-// launches anything. Set to the body's own arrival tolerance (`body_recovery.PLAYER_ARRIVAL_TOLERANCE`,
-// 4.0) rather than to something roomier: a cell this desk accepts and the body then rejects as "not
-// beside my person" is a launch spent on ground that was never going to work. It is written as a number
-// here rather than imported because it is the DESK'S standard for how close a crew is delivered — the two
-// happen to agree today, and the day they should differ this is the one that changes (Law 25).
-const CREW_PLACEMENT_RADIUS = 4;
-
-// ── SAYING `wipe` TWICE IS WHAT MAKES IT A DECISION (Architect 2026-09-05) ───────────────────────────
-// *"make them have to type foreman wipe twice. first time says a warning. second time does the wipe. do
-// not be verbouse with the warning."*
-//
-// IT IS THE ONE IRREVERSIBLE WORD A PLAYER HAS. Every other in-game verb is undoable by saying another
-// one — `stop` is answered by `get`, a request is answered by `cancel`. A wipe destroys the only durable
-// record of where that person's base is, and nothing in the world can reconstruct it. A confirmation is
-// the whole safety mechanism, so it is the only place the desk deliberately refuses a well-formed order.
-//
-// THE WINDOW EXPIRES, and that is the safety rather than a convenience. A pending confirmation that
-// lasted forever would mean a `wipe` said and forgotten an hour ago is armed when the word is typed
-// again for an unrelated reason — the confirmation would then be protecting nothing while appearing to.
-// One minute is long enough to read a line and answer it and short enough that the arming is a fact
-// about this moment (Law 13: the safe side of a stale claim is the one that does not act).
-const WIPE_CONFIRM_MS = 60000;
-// player -> the moment their armed wipe stops counting. Keyed per person because the desk serves
-// everyone at once, and one player's confirmation must never arm another's word.
-const wipeArmed = new Map();
 // ── THE VEIL, RECORDED AT THE CROSSING ITSELF ───────────────────────────────────────────────────
-// Wrapped ONCE here rather than reported at each of the call sites below, and the reason is the reason
-// `correct()` is one function: a record kept by call sites is a record that a new call site silently
-// omits itself from, and the omission looks exactly like nothing having crossed (Law 16).
-//
-// `send` and `request` ARE the crossings — the two roads a person's word takes into the fleet, and both
-// carry the asker, so both events can say whose session they belong to. `query` is deliberately NOT
-// recorded: it is the desk reading the roster to answer its own gate, not something crossing on
-// anybody's instruction, and it fires on every `get` and `list`. Recording a read the desk makes for
-// itself would put the desk's housekeeping into a person's transcript (Invariant D — the record is
-// grouped by whose session it is, and that read belongs to no one's).
+// `send` and `request` cross into the fleet and are recorded here once (Law 16). `query` is not recorded:
+// the desk's own read, not an instruction crossing on anyone's behalf (Invariant D).
 const _door = require('./foreman_door').local(foremanDesk);
 const door = {
   query: (...a) => _door.query(...a),
@@ -205,9 +87,7 @@ const door = {
   async send(verb, args, asker, ...rest) {
     record.relayed(asker, 'command', verb, args && args.bot ? args.bot : null);
     const r = await _door.send(verb, args, asker, ...rest);
-    // THE FLEET'S OWN VERDICT, NOT THE SENTENCE THE PERSON HEARD. That sentence is recorded separately
-    // by `said`, and keeping the two apart is what lets a reader watch the desk translate — a report
-    // that only held the rendering could not show a true verdict rendered wrongly (Law 25).
+    // The fleet's own verdict, kept apart from the sentence `said` records (Law 25).
     record.fleet_said(asker, r.ok && r.sent > 0, r.ok ? (r.reason || `sent=${r.sent}`) : r.error);
     return r;
   },
@@ -220,26 +100,22 @@ const door = {
   },
 };
 
-// THE WORLD IS THIS PROCESS'S OWN (Architect 2026-09-18: *"Who owns the process? Foreman does."*).
-// `foreman_world` starts the local server or reaches the remote one before the body joins, and it is what
-// says which address the body dials: in 'local' mode that is the port the server's own file names, known
-// only once the settings are read, so it is asked at connect time rather than fixed at load. The version
-// is the fleet's one answer (Law 16).
+// `foreman_world` starts or reaches the world before the body joins and says which address it dials,
+// asked at connect time since a local port is known only once settings are read. VERSION is the fleet's
+// one answer (Law 16).
 const world = require('./foreman_world');
+const { runSteps } = require('./foreman_steps');
 const { guardExternal } = require('@utils/external_library_guard');
 const VERSION = SERVER_MINECRAFT_VERSION;
 
-const ROSTER = Object.keys(BOT_SENIORITY).sort((a, b) => BOT_SENIORITY[a] - BOT_SENIORITY[b]);
-
-// ONE CALL, TWO DESTINATIONS, AND THAT IS A LOGGER RATHER THAN TWO PATHWAYS (Law 16). The console half
-// is the desk's live window — the one a person watches while standing in the world, and the one the
-// probe reads — and it is written explicitly because naming the unit above silences the watcher's own
-// echo (a named unit normally has the foreman carrying its lines, and this one does not). The record
-// half is what outlives the window. Same sentence, one emitter, two places it lands.
-function log(msg) {
-  console.log(`[${new Date().toISOString()}] [FOREMAN] ${msg}`);
-  record.note(msg);
+// ── THE BODY'S GAME DATA IS LOADED NOW, WHILE NOTHING IS CONNECTED ───────────────────────────
+// Pre-warms the block, item and chunk data mineflayer loads at join, via the same factories the plugins call.
+{
+  const registry = require('prismarine-registry')(VERSION);
+  for (const m of ['prismarine-chunk', 'prismarine-block', 'prismarine-item', 'prismarine-windows',
+    'prismarine-recipe', 'prismarine-entity', 'prismarine-biome', 'prismarine-chat']) require(m)(registry);
 }
+
 
 (function banner() {
   const C = '\x1b[95m\x1b[1m', R = '\x1b[0m';
@@ -252,1224 +128,87 @@ function log(msg) {
   console.log(`${C}${bar}${R}`);
 })();
 
+// Fetching a body — through start_bot.js, the one birth (foreman/utils/crew_launch.js)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-// Fetching a body — through start_bot.js, the one birth
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-// Launches ONE contractor body and hands back what happened.
-//
-// ── IT SPAWNS `start_bot.js`, WHICH IS THE TREE'S ONE BIRTH (Law 16) ─────────────────────────────────
-// It used to spawn `fleet_control.js`, and that had been BROKEN since the workshop carve (commit
-// 4296854) moved the file to `Auren_Workshop/` without repointing this line — the path resolved under
-// `Auren_Bot/`, where no such file exists, so every `get` reached a human as "could not run
-// fleet_control". The carve is also why pointing it back would be wrong rather than merely awkward:
-// `fleet_control` is the Architect's own equipment and does not ship, so a desk that needs it is a desk
-// that only works on his machine. `start_bot.js` is the file the whole split was built around — it
-// stamps the mandate, it is what `fleet_control` itself spawns, and it exists in every copy.
-//
-// ── WHAT MOVED HERE WITH IT, AND WHAT DID NOT ────────────────────────────────────────────────────────
-// `fleet_control.botStart` owned three things this file deliberately does not re-derive: the roster
-// ceiling, the already-running check, and a visible console window per process. The first two are
-// answered upstream — the caller picks from bots the foreman reports FREE, so a name that is already
-// working is never passed here. The third is workshop behaviour: it exists because his fleet is twenty
-// windows he watches, and a published copy has one terminal that everything streams into.
-//
-// ── IT RESOLVES ON LAUNCH, NOT ON EXIT, AND THAT IS THE REAL CHANGE ──────────────────────────────────
-// `bot-start` was a command that returned; `start_bot.js` REQUIRES master_core in its own process, so it
-// does not return until the bot dies. Awaiting `close` here would hang the desk for the life of the bot.
-// Resolving on launch is also more honest: a launcher returning was never evidence a body stood up, and
-// the caller already polls the foreman's registry for the arrival, which is the world's fact rather than
-// the launcher's (Law 26). An exit inside the grace window is the one thing that IS evidence — of
-// failure — so it is reported with whatever the child managed to say.
-const BOT_LAUNCH_GRACE_MS = 3000;
-
-// Bodies this desk fetched, so they leave when it does (Law 8 — whatever raised a process terminates it).
-// Without this, Ctrl-C on the desk leaves a crew running under roster names nothing can hand out again.
-const fetched = [];
-
-// `species` is 'contractor' or 'homesteader'; `owner` is the asker for a contractor and '' for a
-// homesteader, which `bot_mandate` requires rather than merely tolerates — it refuses a homesteader
-// carrying an owner, so the empty string is the mandate and not a missing field.
-//
-// BOTH SPECIES ARE BORN STARTED WHEN THE DESK FETCHES THEM, and `BOT_AUTOSTART` is what says so for the
-// one that does not get it from its species. A contractor is already born started by constitution; a
-// homesteader waits for an operator's `start`, and being fetched by a person standing in the world is
-// that decision arriving through the only door the shipped layer has. See
-// `bot_mandate.beginsWorkAtBirth` for why this is a launch fact rather than a species one — a
-// homesteader raised any other way still waits.
-// ── AND BOTH ARE PLACED BY THE PERSON WHO ASKED, WHICH IS NOW PART OF THE MANDATE (2026-09-10) ──────
-// `BOT_START_NEAR` carries the asker to the body, and the body puts itself beside them and CONFIRMS it
-// before it plans anything (`start_injector`'s placement gate). The desk no longer teleports the crew
-// itself — see the launch loop for the measurement that moved the act, and why one owner of it is the
-// whole point (Law 16). It is stamped for both species: a homesteader has no owner to derive it from,
-// and a contractor's owner is the same person anyway, so passing it always is one rule rather than two.
-// ── A BOT'S CONSOLE IS KEPT AND SHOWN (2026-09-10) ──────────────────────────────────────────────────
-// Architect: *"why doesent any terminal run? im at home looking at the dedicated computer and nothing
-// runs so i cant see whats going on and help at all. every terminal always needs to be visible."*
-//
-// This desk was one of the three reasons for that, and the worst of them. The bots were spawned
-// `windowsHide: true` with stdout and stderr piped into a local string that was read ONCE — at the
-// three-second launch grace, to explain a body that died on the way up — and then appended to for the
-// rest of the run and never read again. So a bot's console had no window, no file, and no reader: the
-// only surviving account of a crew member was its structured trace, which is the right record for a
-// machine and not the thing a person watches to see whether anything is happening.
-//
-// TWO FAULTS, ONE EDIT. The string also grew without bound for the life of the desk, because nothing
-// detached the handler after the grace window closed — a chatty bot across a twenty-minute soak was
-// accumulating megabytes into a variable whose only purpose had already been served.
-//
-// So the pipe is DRAINED TO A FILE and the in-memory copy stops at the grace window, and a window tails
-// the file. `fleet_logs/` is where a run's records live and a start empties it whole (Architect
-// 2026-08-31 — no record survives a run), so the console belongs there with the traces rather than in a
-// folder of its own; `record_homes` owns that path, so this asks it rather than spelling it (Law 16).
-//
-// THE PIPE IS KEPT RATHER THAN HANDING THE OS A DESCRIPTOR because the grace report genuinely needs the
-// bytes in this process — `run.js` documents the opposite choice for its own children for the opposite
-// reason. Draining to a stream is what makes the pipe safe: the failure mode that killed three soaks was
-// a pipe nobody read, not a pipe as such.
-// ── THE BASE IS ALREADY IN MEMORY BEFORE THIS RUNS (Architect 2026-09-18) ──────────────────────────────
-// *"Bots can't set their own points now"*. The desk writes the site into the hub (`foremanDesk.lockSite`)
-// before calling this, and a body receives it in the broadcast that follows its registration. Nothing about
-// the site rides the launch any more: `BOT_SITE` and the body's own write of it were deleted.
-function startBot(botId, species, owner, placeBeside) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [path.join(BOT_DIR, 'start_bot.js')], {
-      cwd: BOT_DIR,
-      // The mandate, stamped as environment because that is the path `start_bot.js` documents for a
-      // non-human caller: an absent flag falls back to the variable it would have set, so this passes
-      // through whole. BOT_ID is overridden explicitly — this process carries `foreman` in it for its
-      // own record, and inheriting that would file the bot's log under the desk.
-      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: '1', BOT_START_NEAR: placeBeside },
-      // No window of its OWN: with both streams on a pipe the child has no console to show, so the
-      // window is the follower opened below. Keeping the flag would claim an intent this no longer has.
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    fs.mkdirSync(RECORDS_DIR, { recursive: true });
-    const logFile = path.join(RECORDS_DIR, `console_${String(botId).replace(/[^A-Za-z0-9_-]/g, '_')}.log`);
-    const sink = fs.createWriteStream(logFile, { flags: 'w' });
-    // A console log is a convenience, not the run's record — the trace is that. So a write failure says
-    // so once and the bot keeps working, rather than taking a crew member down over a log file.
-    sink.on('error', e => console.log(`  [${botId}] console log unavailable: ${e.message}`));
-    const window = consoleWindow.followFile({ title: `auren ${botId}`, logFile });
-
-    fetched.push({ child, sink, window, botId });
-
-    let out = '';
-    let settled = false;
-    const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
-
-    // Every chunk goes to the file for the whole run; only the grace window keeps a copy in memory.
-    const tee = (d) => {
-      sink.write(d);
-      if (!settled) out += d.toString();
-    };
-    child.stdout.on('data', tee);
-    child.stderr.on('data', tee);
-    child.on('error', e => finish({ code: -1, out: `could not start ${botId}: ${e.message}` }));
-    child.on('exit', code => {
-      // The view goes when the thing it was viewing goes (Law 8, applied to the window rather than the
-      // process): a follower left tailing a dead bot's log reads as a bot that is merely quiet.
-      if (window) consoleWindow.closeWindow(window.pid);
-      if (!sink.writableEnded) sink.end();
-      finish({
-        code,
-        out: out.trim() || `${botId}: stopped immediately (exit ${code}) — nothing was said about why`,
-      });
-    });
-    setTimeout(() => finish({ code: 0, out: `${botId}: launched` }), BOT_LAUNCH_GRACE_MS);
-  });
-}
-
-// Ends every body this desk fetched. Registered for the ordinary exits and for Ctrl-C, because a desk
-// killed at the keyboard is the common case rather than the exotic one.
-// Each entry is { child, sink, window, botId } rather than a bare child — a fetched body now owns a
-// console log and a window watching it, and all three end together (Law 8: whatever raised a thing ends
-// it, and the window is a thing this desk raised).
-function releaseFetched() {
-  for (const { child, sink, window } of fetched) {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
-    if (window) consoleWindow.closeWindow(window.pid);
-    // The log is CLOSED and not deleted: a desk going down is exactly when somebody wants to read why.
-    // The next start empties `fleet_logs/` whole, which is what keeps it one run's record.
-    //
-    // ASKED RATHER THAN ATTEMPTED-AND-CAUGHT. A bot that exited on its own already ended its own sink,
-    // and a second `end()` raises ERR_STREAM_ALREADY_FINISHED on the stream's error channel — which the
-    // handler above would faithfully print as a console-log failure that did not happen. The state is
-    // readable, so it is read (Law 13: a catch here would be a decision to continue taken before knowing
-    // what arrived).
-    if (sink && !sink.writableEnded) sink.end();
-  }
-}
-process.on('exit', releaseFetched);
-// Ctrl-C and the ordinary stop signals take the ONE shutdown road (see `shutdown` in the body section): the
-// bots are sent home, and a server this process started is stopped and saved before it exits.
+const crewLaunch = require('./utils/crew_launch');
+process.on('exit', crewLaunch.releaseFetched);
+// Ctrl-C and the ordinary stop signals take the one shutdown road.
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, () => shutdown(`${sig} at the foreman`, 0));
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-// The vocabulary
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-// TWO KINDS OF WORD, AND THEY TAKE DIFFERENT ROADS FOR A REASON THAT IS NOT INCIDENTAL.
-//
-//   get / list / help — the CLERK's own words. `get` starts an OS process by spawning `start_bot.js`,
-//           the one birth; the FREE-bot list read off the live fleet is what keeps it off a busy name
-//           (Law 16). Nothing about a process launch is an operator verb.
-//   every OPERATOR VERB — travels the in-game door instead. Sent through fleet_control they would be
-//           stamped TERMINAL, because fleet_control's socket IS the operator's console, and a human in
-//           the world would then be commanding homesteaders with console authority. Same words,
-//           different road, and the road decides who hears them.
-//
-// THE VOCABULARY LIVES IN ITS OWN FILE, because the guarantee attached to it has to RUN. This file
-// creates its mineflayer client at module scope, so the load sweep cannot open it — a Law 13 throw
-// written here would fire for the first time in front of a human. See foreman_vocabulary.js.
-const { INGAME_VERBS, CREW_SIZE, SPECIES, helpLines, parseRequest, parseCancel,
-  pluralForms, describeAge, describeProgress, describeCrew } = require('./foreman_vocabulary');
-
-// ── THERE IS NO FUZZY MATCHER, AND THERE MUST NOT BE ONE (Architect 2026-08-30) ─────────────────────
-// "i dont like it. lets take fuzzy matcher out… i would rather a list of legal items to be given to the
-//  human to chose from and its up to them to spell things right… we will list every legal command
-//  instead of fuzzy accepting or guessing what the player wants."
-//
-// One was built and removed the same day. It resolved misspellings by edit distance, folded species into
-// families, and announced every reading it made. Recording why it went, because it worked and a
-// successor will otherwise rebuild it: THE DESK'S JOB IS NOT TO WORK OUT WHAT SOMEBODY MEANT. Guessing
-// puts a reading between the person and the fleet that only the person can check, so every guess needs a
-// confirmation step, and a desk full of confirmation steps is worse than one that simply says what the
-// legal words are. The list is the answer to the problem the matcher was solving: publish the whole legal
-// vocabulary, let the person pick from it, and refuse anything that is not in it (Law 13 — never default
-// a field; the exact-name lookup below cannot produce a wrong item because it cannot produce any item
-// that was not typed).
-//
-// PLURAL IS THE ONE FORGIVENESS, and it is not fuzzy: `logs`/`log` are tried as EXACT lookups against the
-// catalogue and the first that is a real token wins. No scoring, no distance, no candidate ranking — a
-// word either is a legal name or it is not, and being wrong about a plural is impossible rather than
-// unlikely.
-const { isRequestable, isBlueprint } = require('@kernel/requestable_catalogue');
-// The ground test the desk declines on, and the SAME one every base is sited with — see the gate in
-// `get` for why a second implementation here would be the fault rather than the convenience.
-const siteGeometry = require('@utils/site_geometry');
-// The desk's spawn-clearance gate on `get`. `armSpawnProtection` is called at createBot; the two readers
-// are used in the gate itself. One module owns the world-spawn latch and the Chebyshev metric, so the
-// desk's refusal and a body's own dig refusal cannot disagree about where spawn is (Law 16).
-const { armSpawnProtection, maskWorldReads, chebyshevFromWorldSpawn, worldSpawnPoint } = require('@perception/spawn_protection');
-const { getBiomeName } = require('@perception/biome_scanner');      // the one biome read (Law 16)
-// THE BODY'S OWN SITER, called dry. The desk asks whether a base can be placed where a person stands
-// BEFORE it spawns anybody; running the crew's own surveyor is what makes the desk's answer and the
-// crew's answer the same answer. `run` is a plain exported function — requiring this fragment wires it
-// to no signal bus, because the desk has none.
-const lockAllBuildspots = require('@action/lock_all_buildspots');
-const { ownerKeyFor } = require('@kernel/bot_mandate');
-const { roomKeyName, roomKeyOwner } = require('@foreman/message_schema');
-
-// existingSite(buildings, ownerKey) → { site, seat, unreadable } for the base this crew already holds, or
-// null when it holds none. `buildings` is the foreman's read-only answer (`door.query`), so this is the
-// fleet's memory rather than anything the desk remembered (Invariant B).
-//
-// A ROW IS HANDED BACK EXACTLY AS IT WAS LOCKED — the same centre, rotation, footprint and staircase — so a
-// body that already holds it finds the identical centre and records nothing, and a body that does not yet
-// holds the same base as its crew. `unreadable` names a row with no blueprint record: `set_buildspot` writes
-// both chairs in one call, so that is a damaged row, and handing it on would make the body lock a blueprint
-// named after a room key — the fallback `message_schema.roomKeyName` calls a trap.
-function existingSite(buildings, ownerKey) {
-  const site = [];
-  const unreadable = [];
-  for (const [key, entry] of Object.entries(buildings || {})) {
-    if (roomKeyOwner(key) !== ownerKey) continue;
-    const spot = entry && entry.set_buildspot;
-    if (!spot || !spot.build_center) continue;
-    const blueprint = entry.blueprint_paster && entry.blueprint_paster.building_name;
-    if (!blueprint) { unreadable.push(key); continue; }
-    site.push({
-      blueprint,
-      roomKey: roomKeyName(key),
-      candidate: { build_center: spot.build_center, footprint: spot.footprint || null, staircase: spot.staircase || null, rotation: spot.rotation ?? 0 },
-    });
-  }
-  if (site.length === 0 && unreadable.length === 0) return null;
-  const seatRow = site.find(r => r.roomKey === 'headframe') || site.find(r => r.roomKey === 'contractor_house') || site[0];
-  const c = seatRow && seatRow.candidate.build_center;
-  return { site, seat: c ? { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z) } : null, unreadable };
-}
-const { makeVoxelReader } = require('@utils/voxel_reader');
-
-// THE THIRD OUTCOME AT THE HUMAN BOUNDARY. Law 13 throws at a coding violation and soft-fails an
-// environmental one; a person typing the wrong thing is neither, so it CORRECTS — nothing crosses, nothing
-// crashes, and the reply says what would have worked. The doctrine and every named refusal live in that
-// file; this one only decides which applies. See correction.js's header for why the boundary needs its
-// own form at all (Law 26 — the desk is the translator machine between a generator and a machine).
-const correction = require('./correction');
-
-// resolveExact(spoken) → the legal token, or null. Literal first, then the plural/singular forms of the
-// same word. Every candidate is checked against the catalogue itself, so nothing that is not already a
-// legal name can come out of here.
-function resolveExact(spoken) {
-  for (const candidate of [spoken, ...pluralForms(spoken)]) {
-    if (candidate && isRequestable(candidate).ok) return candidate;
-  }
-  return null;
-}
-
-// knownName(spoken) → the spelling the fleet recognises, or null. Membership only.
-//
-// SEPARATE FROM resolveExact BECAUSE THEY ANSWER DIFFERENT QUESTIONS, and welding them produced a wrong
-// refusal. resolveExact asks "can the crew get this"; this asks "is this a word the fleet has an opinion
-// about at all". `string` fails the first and passes the second — it is a real thing with no route to it —
-// while `logdsf` fails both. One refusal for both told the person who spelled string perfectly that their
-// spelling was wrong (Law 25 — the verdict has to be true about the question they asked).
-//
-// NOT A MATCHER. This is a set lookup over names the fleet already holds, with the same plural forms tried
-// as further exact lookups. No distance, no ranking, no nearest-neighbour: a word is in the set or it is
-// not, so this cannot substitute one item for another.
-function knownName(spoken) {
-  const { group_to_item } = require('@utils/fragment_utils');
-  const catalogue = require('@kernel/requestable_catalogue');
-  const known = new Set([
-    ...catalogue.requestableItems(),
-    ...Object.keys(group_to_item),
-    ...catalogue.unreachableLeaves(),
-    ...catalogue.unclassifiedLeaves(),
+// ── A THROW IS A WAY THIS PROCESS ENDS, SO IT TAKES THE SHUTDOWN ROAD TOO ──────
+// Routes through `shutdown`, never exits bare, since the foreman's death ends every body with it.
+// A stuck piece of work or an impossible state, found here or reported by a body, ends the whole run on
+// the same road, with timeout_crash's report as the cause.
+require('../js_kernel/utils/timeout_crash').onCrash(fleetCrash);
+function fleetCrash(report) {
+  const head = report.split('\n');
+  alarm([
+    'THE WHOLE RUN IS ENDING — timeout_crash.',
+    head[0], head[1] || '',
+    '',
+    `Every bot is being sent 'stop' and the world is being saved.`,
+    'The full report is printed below and written to the run record.',
   ]);
-  for (const candidate of [spoken, ...pluralForms(spoken)]) if (candidate && known.has(candidate)) return candidate;
-  return null;
+  console.error(report);
+  record.note(`TIMEOUT_CRASH: ${report}`);
+  require('./utils/run_watch').crashed('timeout_crash', `${head[0]} ${head[1] || ''}`);
+  shutdown(`timeout_crash — ${head[1] || head[0]}`, 1);
 }
 
-// groupMembers(token) → the family's members, or null if the token names one thing.
-// The group table is the assessors' own, so "is this a family" is asked of the same fact the crew will
-// resolve against rather than of a second list kept here (Law 16).
-function groupMembers(token) {
-  const { group_to_item } = require('@utils/fragment_utils');
-  const members = group_to_item[token];
-  return Array.isArray(members) && members.length ? members : null;
+function crashStop(kind, err) {
+  const detail = (err && err.stack) || String(err);
+  const first = String((err && err.message) || err).split('\n')[0];
+  alarm([
+    `THE FOREMAN CRASHED — ${kind}.`,
+    first,
+    '',
+    `Every bot is being sent 'stop' and the world is being saved.`,
+    `The whole fleet ends with the foreman. Nothing restarts by itself.`,
+    `This run is recorded as CRASHED, not as a FAIL — it never finished.`,
+    '',
+    `The stack is printed below. Start again with start_auren.js.`,
+  ]);
+  // Unwrapped, below the alarm block, so the file:line references stay clickable.
+  console.error(detail);
+  record.note(`CRASH (${kind}): ${detail}`);
+  // Told before shutdown runs, since `shutdown` asks it for the verdict after sending every bot home.
+  require('./utils/run_watch').crashed(kind, first);
+  shutdown(`the foreman crashed — ${kind}: ${first}`, 1);
 }
+process.on('uncaughtException', (err) => crashStop('uncaught exception', err));
+process.on('unhandledRejection', (reason) => crashStop('unhandled rejection', reason));
 
-// raisableStructures() → the buildings a person may ask for, read from the Architect's whitelist.
-//
-// A READ, NOT A DERIVATION, and the difference is the whole point. Which structures can be raised ALONE is
-// a fact about how they attach to each other — a mineshaft joins a headframe in a specific way — and no
-// table in this tree records relations between structures, so it is authored in architect_config as
-// REQUESTABLE_STRUCTURES. Deriving it from the requirement ladders was tried and is wrong in a way worth
-// keeping: a ladder is NECESSARY to raise a structure and not SUFFICIENT to offer one, so an attached
-// structure that eventually gets its own rows would silently start being promised standalone.
-//
-// THE DESK HOLDS NO GATE OF ITS OWN ANY MORE. A check stood here for one round, refusing structures the
-// catalogue had offered — a referee between two lists that disagreed. With the whitelist authored, the
-// catalogue's own definition of "requestable" excludes them, so an unoffered structure never resolves and
-// the conflict cannot form (Law 27: where a constitution is available the referee was a symptom, and the
-// repair belongs in the definition). This function survives only to SPEAK the list — the desk still has to
-// tell a person which buildings exist when refusing one that does not.
-function raisableStructures() {
-  return [...require('@thinking/architect_config').REQUESTABLE_STRUCTURES].sort();
-}
-
-// (`legalFamilies()` stood here and is DELETED with the `list` verb that was its only caller, 2026-09-06.
-// It computed the family tokens — `logs`, `sword`, `pillar_block` — that the goods list did not already
-// name. Nothing reads them now: `resolveExact` accepts a family word without needing it enumerated.)
-
-async function handle(from, text, reply) {
-  const parts = text.split(/\s+/).filter(Boolean);
-  const verb = (parts[0] || 'help').toLowerCase();
-  const arg = parts[1];
-  record.read_as(from, verb);
-
-  // correct(c) — speak a correction and let nothing cross. The ONE way a refusal reaches a person, so a
-  // refusal that skipped the doctrine is visible as a bare `reply(...)` at a call site rather than hiding
-  // as a differently-worded sentence among the correct ones (Law 16 — one pathway).
-  //
-  // It also LOGS, because a person being refused repeatedly is the signal that the desk is failing to
-  // guide, and that fact exists nowhere else: the fleet's trace never sees these — the whole point is
-  // that they do not cross (Law 6 — the reasoning has to be recoverable by whoever depends on it, and
-  // for this boundary that is whoever is reading the desk's window).
-  const correct = (c) => {
-    // EVERY refusal, at the one place refusals reach a person — so the record cannot miss one by a
-    // call site forgetting to report it, for the same reason this function exists at all (Law 16).
-    record.refused(from, c.code, c.said);
-    log(`correction[${c.code}] to ${from}: ${c.said ? `'${c.said}' — ` : ''}${c.because}`);
-    for (const line of correction.render(c)) reply(line);
-  };
-
-  // ── trouble(who, code, forThePerson, forTheLog) — THE DESK'S OWN FAULTS, AND WHERE THEY GO ────────
-  //
-  // THE RULING (Architect 2026-09-05): *"foreman should never spam chat with its problems."*
-  //
-  // WHY A THIRD FUNCTION RATHER THAN A CAREFULLY WORDED `reply`. This desk answers in OPEN chat, so every
-  // sentence it says is said to everybody in the world at once. There are three kinds of thing it can
-  // say and only two of them were ever built: an ANSWER (`reply` — the thing the person asked for), a
-  // CORRECTION (`correct` — their word was wrong and here is the one that works), and this: the desk's
-  // own machinery failed, which is neither. With nowhere for it to go it went out as an answer, so a
-  // socket error, a launcher's exit line and an foreman port number were all broadcast to the server —
-  // every one of them addressed to a maintainer who was not there, in front of players who could do
-  // nothing with them and had not asked (Law 24: the audience decides the register; Invariant D: a
-  // failure has one owner and it is not the bystander reading it).
-  //
-  // THE SPLIT IS THE WHOLE POINT. `forThePerson` is one plain sentence: what they have now and what to
-  // say next — never a cause, never an error string, never a component name. `forTheLog` is the machine
-  // half in full, and it goes to the desk's window and its record, which is where somebody diagnosing
-  // this will actually look (Law 6 — the reasoning stays recoverable; it just stops being recovered by
-  // the wrong reader). Nothing is suppressed and nothing is softened; the two halves are simply posted
-  // to the two audiences that exist.
-  //
-  // IT IS NOT A CORRECTION AND MUST NOT BORROW ONE. A correction says the person's input was wrong; this
-  // says the desk was. Sending these through `correct()` would teach somebody to change a word that was
-  // never the problem, which is worse than saying nothing (Law 13's third category is for a generator's
-  // malformed input, and a broken socket is not that).
-  // `log` already writes through to the record, so the machine half reaches both destinations from one
-  // call — the same reason `correct()` does not post its own copy.
-  const trouble = (who, code, forThePerson, forTheLog) => {
-    log(`trouble[${code}] serving ${who}: ${forTheLog}`);
-    reply(forThePerson);
-  };
-
-  if (verb === 'help' || verb === '') {
-    // ONE MESSAGE PER VERB rather than one packed block. The channel paces and wraps whatever it is
-    // handed, so this is no longer about fitting — it is about a person finding the verb they want in
-    // a wall of chat, which is the only reason the help exists.
-    for (const line of helpLines()) reply(line);
-    return;
-  }
-
-  if (verb === 'get') {
-    // ONE `get` HANDS OUT A CREW, NOT A BOT, AND THE SIZE IS NOT NEGOTIABLE.
-    //
-    // The Architect's reasoning is a definition rather than a preference, which is why nothing here
-    // offers a choice: bots are built to SHARE — tasks, resources, a house — and the smallest number
-    // that can share anything is two. One bot cannot demonstrate the property the fleet exists to show;
-    // three would be two plus a spare, and the spare proves nothing the pair does not. So CREW_SIZE is
-    // what a person gets, and there is no argument that changes it (Law 16: one crew size, one door).
-    //
-    // NO BOT NAME IS ACCEPTED, and its absence is the ruling rather than a simplification. A human
-    // cannot command an individual — every verb reaches all of the speaker's bots and nothing else —
-    // so a name on `get` would let somebody choose a body they can never address, which is an
-    // instruction the rest of the system has no way to honour.
-    //
-    // THE COUNT IS ASKED OF THE FLEET, NEVER TALLIED HERE. A counter kept in this process would be
-    // wrong the first time the operator stopped one from the console and every time the foreman
-    // restarted (Invariant B — re-sense, never remember).
-    // ── WHICH SPECIES, SAID OUT LOUD OR NOT AT ALL ───────────────────────────────────────────────────
-    // (Architect 2026-09-09.) Read before the fleet is queried because it costs nothing and a person who
-    // typed the wrong word should not wait on a socket to be told so.
-    const species = (arg || '').toLowerCase();
-    if (!SPECIES.includes(species)) {
-      correct(correction.getNeedsASpecies(`${FOREMAN_PREFIX} get${arg ? ` ${arg}` : ''}`));
-      return;
-    }
-    const wantsContractors = species === 'contractor';
-
-    const state = await door.query();
-    if (!state.ok) {
-      trouble(from, 'fleet_unreachable', "can't check what you have right now — try again in a moment.",
-              `door.query failed on get: ${state.error}`);
-      return;
-    }
-    // ── A CREW IS TOPPED UP TO ITS SIZE, NOT REFUSED FOR BEING NON-EMPTY (fixed 2026-09-05) ────────
-    // This gate read `mine.length > 0`, which made a HALF CREW a dead end: the only door out was `stop`,
-    // which drops the bot you did have to get back the pair you were owed. That is the failing case the
-    // crew-size ruling exists to prevent, reachable through the one verb meant to prevent it — and it is
-    // exactly the state a launch failure leaves a person in, which is how it was found (he asked, one
-    // bot came, and there was no word he could say to get the second).
-    //
-    // `>= CREW_SIZE` MAKES THE CONSTITUTION SELF-HEALING rather than merely declared (Law 27). The size is
-    // still not negotiable and there is still no request that produces a third — `get` now means *bring me
-    // up to a crew*, which is the same sentence for somebody with none and the repair for somebody with
-    // one. Nothing new is offered: the only reachable outcomes remain 0 and CREW_SIZE.
-    // ── WHAT COUNTS AS "ALREADY HAVE" DIFFERS BY SPECIES, AND THE DIFFERENCE IS THE SPECIES ──────────
-    // A CONTRACTOR CREW BELONGS TO A PERSON, so it is counted against the asker — unchanged.
-    //
-    // A HOMESTEAD BELONGS TO THE WORLD. A homesteader has no owner by constitution (`bot_mandate` refuses
-    // one that carries an owner), so there is no per-person tally to keep and inventing one would mean
-    // storing a "who fetched this" fact the species is defined by not having. Counting every ownerless
-    // body answers the question the crew rule is actually asking — *is the homestead staffed* — using
-    // only what the fleet already reports (Invariant B: re-sense, never remember).
-    //
-    // The consequence is deliberate and is stated to the person rather than hidden: a second player who
-    // says `get homesteader` is told the homestead exists instead of being handed a second one. Two bots
-    // sharing the work IS the homestead; two more would be a different world, not a fuller one.
-    // One predicate, used twice — for the tally here and for recognising each body as it registers below.
-    // Two spellings of "is this one of the ones I am fetching" is how the second one drifts (Law 16).
-    const isOurs = (b) => (wantsContractors ? b.owner === from : !b.owner);
-    const mine = state.bots.filter(isOurs);
-    if (mine.length >= CREW_SIZE) {
-      const said = `${FOREMAN_PREFIX} get ${species}`;
-      const names = mine.map(b => b.id);
-      correct(wantsContractors
-        ? correction.crewFull(said, names, CREW_SIZE)
-        : correction.homesteadFull(said, names, CREW_SIZE));
-      return;
-    }
-    const needed = CREW_SIZE - mine.length;
-
-    // A NAME IS NOT INVENTED. The roster is the ceiling — "there can only be as many bots as there
-    // are names" — so a short house is reported as a short house rather than answered with a bot that
-    // does not exist (Law 13). Names go out in seniority order, eldest free first.
-    //
-    // A PARTIAL CREW IS REFUSED WHOLE, and this is the one place that decision is made: half a crew is
-    // not a small crew, it is a bot that cannot do the thing a crew is for. Nothing is launched unless
-    // the whole crew can be (Law 13, default-stopped — and Law 25: the shortfall is named, not filled).
-    // COUNTED AGAINST WHAT IS STILL NEEDED, not against the whole crew size — otherwise somebody holding
-    // one bot is told the house is full while a free name is standing right there.
-    const free = ROSTER.filter(id => !state.bots.some(b => b.id === id));
-    if (free.length < needed) {
-      // THE ROSTER IS NOT PASTED. This line used to name all 22 bots — a wall in a window drawn over the
-      // world, listing bodies the reader cannot ask for by name anyway (no verb takes one). Two numbers
-      // say everything they can act on: how many are free, and how many a crew needs (Law 24).
-      reply(`only ${free.length} of ${ROSTER.length} bots free and a crew is ${CREW_SIZE} — somebody has to let theirs go first.`);
-      return;
-    }
-    const crew = free.slice(0, needed);
-
-    // ── NOTHING IS LAUNCHED UNTIL THE GROUND BESIDE THE ASKER WILL HOLD A BODY ─────────────────────
-    // (Architect 2026-09-10): *"the foreman shouldnt spawn the bot if there is no valid teleport spot
-    // available next to the human. the whole thing should be refused before a bot is even spawned."*
-    //
-    // WHY IT HAS TO BE HERE AND NOT IN THE BODY. The body already refuses to work unless it confirms it
-    // is standing beside its person (`body_recovery.arriveAtPlayer`, gated in `start_injector`), and that
-    // refusal is correct and stays. But it happens AFTER a process has been spawned, a player slot taken,
-    // a login negotiated and a name spent — and the person watching sees a bot arrive and then sit down
-    // dead, which reads as a broken bot rather than as bad ground. The desk holds the one handle that can
-    // decline before any of that is spent, so declining is the desk's job (Law 13, default-stopped: prove
-    // it is safe to act, and this is the last moment the proof is free).
-    //
-    // IT IS THE SAME QUESTION THE BODY WILL ASK, ANSWERED ONCE (Law 16). `standingSpotNear` is
-    // `evaluateOpenBox` at body scale in `@utils/site_geometry` — the module that also sites every base —
-    // so a refusal here and an arrival there cannot disagree about the same cell. A second implementation
-    // in this file is exactly how the desk starts turning bots away from ground a body would have been
-    // happy on, or launching them onto ground it will not accept.
-    //
-    // THE RADIUS IS THIS DESK'S NUMBER AND IT MATCHES THE BODY'S TOLERANCE, deliberately: a spot the body
-    // would land on and then reject as "not beside my person" is not a spot worth launching for.
-    //
-    // A READER THAT CANNOT SEE IS NOT A REFUSAL. If the asker has no entity in the desk's own player
-    // table there is nothing to measure, and saying "no room" about ground nobody looked at is the Law 23
-    // fault pointed inward — the honest answer is that the desk cannot see them, and it is a different
-    // sentence because the person acts on it differently (walk back into view, rather than walk uphill).
-    const asker = bot.players && bot.players[from] && bot.players[from].entity;
-    if (!asker || !asker.position) {
-      trouble(from, 'asker_unseen', `I can't see where you're standing, so I won't send anyone. Come back into view and say "${FOREMAN_PREFIX} get" again.`,
-              `no entity for '${from}' in the desk's player table — nothing to measure ground against`);
-      return;
-    }
-    const feet = { x: Math.floor(asker.position.x), y: Math.floor(asker.position.y), z: Math.floor(asker.position.z) };
-
-    // ── AND NOT AT WORLD SPAWN, WHICHEVER OF US IS ASKING (Architect 2026-09-12) ───────────────────
-    // *"i want to add if the player is standing in world spawn area or within 50 blocks of it to warn and
-    // refuse to spawn bots if asked. right now our faux architect does it but i dont want a user
-    // confused."*
-    //
-    // THE GAP THIS CLOSES, AND IT IS A LAYER GAP RATHER THAN A MISSING RULE. The clearance has been
-    // enforced since 2026-09-11 — but in `Auren_Workshop/run.js`, the Architect's own harness, against
-    // `proxy_human`, which teleports itself clear before it types anything. So the rule was real for every
-    // run he watched and did not exist for anybody who downloaded the bot and typed `foreman get` while
-    // standing where the server had just put them, which is the FIRST thing a new player does and the most
-    // likely place in the world for them to be standing. The harness cannot hold a rule a user's run needs:
-    // the desk is the one door both paths come through, so the rule belongs on the desk (Law 16).
-    //
-    // WHY IT IS A REFUSAL AND NOT A WARNING. Inside the protected square the server silently refuses every
-    // break and placement, and a crew sites its whole base AROUND THE ASKER — so a person standing at
-    // spawn does not get a slow crew, they get two bots that walk, dig nothing, build nothing, and report
-    // refusals into a console they are not reading. The measured shape is in bugsquashing §14.10: every
-    // run that ever started inside the square made no progress at all. Launching would spend two player
-    // slots, two names and two logins to produce that, and the desk is the last moment refusing is free
-    // (Law 13, default-stopped — the same argument the ground check below already makes).
-    //
-    // THE NUMBER IS 50 AND IT IS THE SAME 50 (`PERSON_CLEAR_OF_SPAWN`), read from config rather than
-    // written here, so the desk and the harness cannot drift apart on what "clear" means. It is measured
-    // CHEBYSHEV, the protected square's own metric, which is why this asks `spawn_protection` for the
-    // distance instead of computing a Euclidean one that would pass the corners.
-    //
-    // AN UNKNOWN CENTRE REFUSES TOO, and says so as its own sentence. The desk cannot prove the person is
-    // clear of a place it cannot locate, and Law 13 is prove-safe-to-continue, never prove-unsafe-to-stop.
-    // In practice this is unreachable — `spawn_position` arrives during login, long before anybody can type
-    // — so it exists to be a named state rather than a coordinate quietly trusted.
-    // THE PERSON'S HALF IS A DIRECTION TO WALK, NOT A DIAGNOSIS, AND IT IS ONE CHAT LINE (Law 24;
-    // Architect 2026-09-12: *"make sure you make comments short so it fits in chat"*). They cannot act on
-    // "spawn protection", they can act on "walk 43 blocks out". The machine half carries the numbers.
-    const spawnAt = worldSpawnPoint(bot);
-    if (!spawnAt) {
-      record.refused(from, 'world_spawn_unknown', `${crew.length} launch(es) withheld`);
-      trouble(from, 'world_spawn_unknown',
-        `I don't know where world spawn is yet — try again in a moment. Nobody was sent.`,
-        `no spawn_position packet latched for the desk — cannot measure ${from}'s clearance | withheld ${crew.join(', ')}`);
-      return;
-    }
-    const outFromSpawn = chebyshevFromWorldSpawn(bot, feet);
-    if (outFromSpawn < PERSON_CLEAR_OF_SPAWN) {
-      record.refused(from, 'too_close_to_world_spawn', `${crew.length} launch(es) withheld at ${outFromSpawn}b`);
-      trouble(from, 'too_close_to_world_spawn',
-        `too close to world spawn (${outFromSpawn}b, need ${PERSON_CLEAR_OF_SPAWN}) — building is blocked there. `
-        + `Walk ${PERSON_CLEAR_OF_SPAWN - outFromSpawn} more blocks out. Nobody was sent.`,
-        `${from} at (${feet.x},${feet.y},${feet.z}) is ${outFromSpawn}b Chebyshev from world spawn (${spawnAt.x},${spawnAt.z}), `
-        + `inside the ${PERSON_CLEAR_OF_SPAWN}b clearance | withheld ${crew.join(', ')}`);
-      return;
-    }
-
-    // ── ON THE OVERWORLD SURFACE, NEAR SEA LEVEL (Architect 2026-09-12) ───────────────────────────────
-    // *"we either need to make it so the bots can work from anything including in the middle of the ocean
-    // 500 blocks from land. in the nether, in the overworld at the peak of a mountain, at the bottom of
-    // deepslate or we need to restrict the usage."*
-    //
-    // THE CHOICE IS TO RESTRICT, AND THIS IS WHERE THE RESTRICTION IS STATED. This fleet sites a base on
-    // the overworld surface against sea-level water; everything downstream assumes it (the farm is pinned
-    // to the water plane, the headframe sinks a shaft from the surface). So the limit is declared once, at
-    // the door, in words a person can act on — rather than discovered by a crew that spawns, walks, and
-    // finds nothing it can use.
-    //
-    // THE DIMENSION NEEDS NO CHECK OF ITS OWN. The desk only sees entities in its own dimension, so a
-    // person in the nether or the end has already been turned away by the `asker_unseen` branch above —
-    // a second test here would be a second answer to a question that is already answered (Law 16).
-    const reader = makeVoxelReader(bot);
-    const ground = siteGeometry.surfaceY(reader, feet.x, feet.z, feet.y);
-    if (!ground) {
-      record.refused(from, 'ground_unreadable', `${crew.length} launch(es) withheld`);
-      trouble(from, 'ground_unreadable',
-        `I can't read the ground where you are — move a little and try again. Nobody was sent.`,
-        `surfaceY found no ground in the window at (${feet.x},${feet.z}) ref y=${feet.y} | withheld ${crew.join(', ')}`);
-      return;
-    }
-    if (feet.y < ground.y - HUMAN_SURFACE_SLACK) {
-      record.refused(from, 'underground', `${crew.length} launch(es) withheld at y${feet.y}`);
-      trouble(from, 'underground',
-        `you're underground (${ground.y - feet.y}b below the surface) — come up top. Nobody was sent.`,
-        `${from} at y=${feet.y}, surface of that column is y=${ground.y} (${ground.name}) | withheld ${crew.join(', ')}`);
-      return;
-    }
-    if (feet.y > SEA_LEVEL + HUMAN_MAX_ABOVE_SEA) {
-      record.refused(from, 'too_high', `${crew.length} launch(es) withheld at y${feet.y}`);
-      trouble(from, 'too_high',
-        `you're too high up (y${feet.y}) — a base needs ground near sea level (y${SEA_LEVEL}). Head downhill. Nobody was sent.`,
-        `${from} at y=${feet.y}, ceiling is SEA_LEVEL+${HUMAN_MAX_ABOVE_SEA}=${SEA_LEVEL + HUMAN_MAX_ABOVE_SEA} | withheld ${crew.join(', ')}`);
-      return;
-    }
-    // The biome AT THE FEET, judged against the same set `find_buildingspot` gates sites on — so the desk
-    // cannot welcome somebody onto ground the siter will then refuse (Law 16).
-    const biome = getBiomeName(bot, feet.x, feet.y, feet.z);
-    if (!ACCEPTABLE_BIOMES.has(biome)) {
-      record.refused(from, 'biome', `${crew.length} launch(es) withheld in ${biome}`);
-      trouble(from, 'biome',
-        `${String(biome).replace(/_/g, ' ')} won't work — find forest or plains. Nobody was sent.`,
-        `${from} stands in '${biome}', not in ACCEPTABLE_BIOMES | withheld ${crew.join(', ')}`);
-      return;
-    }
-
-    const room = await siteGeometry.standingSpotNear(reader, feet, { radius: CREW_PLACEMENT_RADIUS });
-    if (!room.found) {
-      record.refused(from, 'no_standing_room', `${crew.length} launch(es) withheld`);
-      trouble(from, 'no_standing_room',
-        `there's nowhere beside you for anyone to stand — try again on open ground. Nobody was sent.`,
-        `${room.why} | withheld ${crew.join(', ')} before launch`);
-      return;
-    }
-
-    // ── AND THE WHOLE BASE IS SITED BEFORE ANYBODY IS SPAWNED (Architect 2026-09-12) ─────────────────
-    // *"we can move setting the blueprints to foreman. and if foreman cant set the blueprints then it
-    // refuses to spawn the bots and explains that it cant… once it does then it tells the human where the
-    // homebase will be."*
-    //
-    // THE SAME SITER THE BODY USES, RUN DRY (Law 16). `lock_all_buildspots.run` with `dryRun` surveys every
-    // blueprint and judges the layout as one unit without writing anything. Calling the body's own siter is
-    // the whole point: a desk with its own opinion about buildable ground would let crews through that the
-    // crew then cannot place, which is the failure this gate exists to remove.
-    //
-    // THE DESK CAN READ THIS GROUND BECAUSE IT CAN SEE THE PERSON. `asker_unseen` above already required an
-    // entity in the desk's own player table, and a client is only sent entities inside its loaded chunks —
-    // so "nearby means loaded chunk" is enforced by the branch that already ran, and needs no second test
-    // and no teleport.
-    //
-    // THE BOOKKEEPING HAS MOVED TOO (2026-09-18). This paragraph used to end *"the body re-runs this same
-    // survey from beside the same person and commits it. The decision has moved; the bookkeeping has not."*
-    // Now the desk writes the survey's answer (`layout.site`) into the fleet's memory itself, before any
-    // body exists, and a body only reads it (§34: the desk and the hub are one process, so the pen moved to
-    // the decider). No second survey, no job, and no write from a bot.
-    // SAID FIRST, BECAUSE THE SURVEY IS SLOW. `loadedAreaSettled` waits for the chunk disc to arrive —
-    // measured at 56 s on fresh ground, capped at 120 s — and a person who typed a command and heard
-    // nothing for a minute has been given every reason to think the desk is broken and say it again.
-    //
-    // AND IT SURVEYS FROM THE PERSON'S FEET, NOT THE DESK'S. The desk's post is wherever the server drops
-    // it, which is world spawn — inside the spawn-protected square, whose every cell reads as bedrock. A
-    // survey rooted there roots its route searches in solid rock and reaches nothing. `origin` is the cell
-    // the crew will be spawned beside and re-survey from, so the desk's answer and the body's answer are
-    // computed from the same ground (Law 16), which is what the paragraph above has always claimed.
-    // ── AN EXISTING BASE IS HANDED BACK, NEVER SURVEYED OVER (Architect 2026-09-18) ──────────────────
-    // *"if theres already a partially constructed building then it again spawns bots nearby."* A crew that
-    // already has a base is sent to THAT base. The survey below cannot see it — the desk surveys with
-    // `unlockedWorld`, blind to the fleet's memory — so without this read it would hand a second site, and
-    // the hub would refuse it against the lock its crew already holds (`lockSite`). The foreman is
-    // asked rather than anything remembered here (Invariant B): `state` is this same get's own roster read.
-    const ownerKey = ownerKeyFor(species, wantsContractors ? from : '');
-    const heldBase = existingSite(state.buildings, ownerKey);
-    let site;
-    let seat;
-    if (heldBase && heldBase.unreadable.length) {
-      record.refused(from, 'base_record_damaged', `${crew.length} launch(es) withheld`);
-      trouble(from, 'base_record_damaged',
-        `your saved base is damaged, so I won't send a crew into it. "${FOREMAN_PREFIX} wipe" clears it. Nobody was sent.`,
-        `building row(s) with a site but no blueprint record: ${heldBase.unreadable.join(', ')} | withheld ${crew.join(', ')}`);
-      return;
-    }
-    if (heldBase) {
-      site = heldBase.site;
-      seat = heldBase.seat;
-      record.note(`${from}: '${ownerKey}' already has a base — handing it back, no survey: ${site.map(r => r.roomKey).join(', ')}`);
-    } else {
-      reply('checking the ground around you...');
-      const layout = await lockAllBuildspots.run(bot, { dryRun: true, species, unlockedWorld: true, origin: feet });
-      if (layout.transient) {
-        record.refused(from, 'world_streaming', `${crew.length} launch(es) withheld`);
-        trouble(from, 'world_streaming',
-          `the world around you is still loading — try again in a few seconds. Nobody was sent.`,
-          `base-layout dry run hit unloaded chunks | withheld ${crew.join(', ')}`);
-        return;
-      }
-      if (!layout.ok) {
-        record.refused(from, 'no_base_site', `${crew.length} launch(es) withheld`);
-        // ONE PROBLEM IN CHAT, ALL OF THEM IN THE LOG. The survey names a problem per blueprint and the
-        // whole list is a wall in a window drawn over the world; the first one is the one they can act on.
-        // TRIMMED, because a survey problem line carries the blueprint, the reason AND the post-mortem's
-        // first line — useful in a window, a wall in chat. The reason is the part they can act on.
-        const firstProblem = String(layout.problems[0] || 'the ground here will not hold it').slice(0, 90);
-        trouble(from, 'no_base_site',
-          `no room for a base here — ${firstProblem}. Try flatter ground near a river. Nobody was sent.`,
-          `base-layout dry run refused: ${layout.problems.join('; ')}\n  survey:\n  ${layout.report.join('\n  ')}\n  withheld ${crew.join(', ')}`);
-        return;
-      }
-      site = layout.site;
-      seat = layout.anchor;
-      // THE DESK WRITES THE SITE, AND NOTHING ELSE CAN. Into the fleet's memory now, before any body exists,
-      // so the crew arrives to a base already set (Architect 2026-09-18: *"Bots can't set their own points
-      // now"*). An existing base above is already in that memory and is not rewritten.
-      foremanDesk.lockSite(site, ownerKey);
-    }
-
-    // WHERE THE BASE WILL BE, SAID BEFORE THE CREW IS FETCHED. The order matters and the first live run
-    // had it the other way round: the person read "getting AurenBot and TessaBot" and only then heard
-    // where the base was, so the reason those two walk off arrived after they had started walking. A
-    // contractor's house lands near the person (flat ground is common); a homestead follows the water and
-    // can be a long way out, which is fine and is said rather than left to look like a bot wandering off.
-    if (seat) {
-      const far = Math.round(Math.hypot(seat.x - feet.x, seat.z - feet.z));
-      reply(heldBase
-        ? `your base is already at (${seat.x}, ${seat.y}, ${seat.z}) — ${far}b away. sending the crew there.`
-        : `base goes at (${seat.x}, ${seat.y}, ${seat.z}) — ${far}b ${far > 60 ? 'out, following the water' : 'away'}.`);
-    }
-
-    // WHAT THEY ARE GETTING IS SAID WHILE THEY WAIT, not after. The two species look identical from here
-    // — same names, same arrival, both walking to where the asker stands — and the difference only shows
-    // itself the first time somebody talks to a homesteader and nothing happens. Saying it now is what
-    // makes that silence a thing they chose rather than a thing that looks broken (Law 25).
-    const forWhom = wantsContractors ? 'for you' : 'for the homestead — they won\'t answer you';
-    reply(needed === CREW_SIZE
-      ? `getting ${crew.join(' and ')} ${forWhom}...`
-      : `you have ${mine.map(b => b.id).join(' and ')} — getting ${crew.join(' and ')} to finish the crew...`);
-    // THE OWNER IS STAMPED AT EACH LAUNCH, which is what makes it un-forgeable later: it becomes an
-    // environment fact of that process, the bot declares it on register, and no message anywhere can
-    // change whose it is. Launched in sequence rather than together because two concurrent launches
-    // would race the FREE-bot list this crew was chosen from.
-    // ── ONE BODY AT A TIME: LAUNCH IT, WAIT FOR IT TO STAND, BRING IT OVER, THEN THE NEXT ──────────
-    // (Architect 2026-09-05, on the dedicated server: *"foreman only spawns one bot and doesent teleport
-    // it to the player. it works when i do the local server but not on the dedicated."*)
-    //
-    // THE OLD SHAPE WAS THREE PHASES — launch them all, then wait for the crew, then teleport the crew —
-    // and it produced both halves of that report at once.
-    //
-    // THE MISSING BOT. Both launches returned within a second of each other, so both bodies knocked on
-    // the door within a second of each other from the same address. A world with a login rate limit in
-    // front of it drops the second knock before authentication, so nothing anywhere logs a refusal: the
-    // proxy has no entry for the bot at all and the bot records `socketClosed` at zero seconds. Waiting
-    // for each body to REGISTER before launching the next spaces the knocks by however long a real join
-    // takes, and `CREW_LAUNCH_GAP_MS` is the floor for when a body fails so fast there is nothing to wait
-    // for. Sequencing on the launcher's RETURN was never sequencing at all — that is Law 26's line again:
-    // the launcher returning is its own fact; a body registering is the world's.
-    //
-    // THE MISSING TELEPORT, and it is the same phase boundary from the other side. The teleport used to
-    // run after the wait for the WHOLE crew, so one body arriving and one never coming meant the person
-    // watched an unmoved bot for the full 90-second budget before anything was brought to them. He said
-    // `stop` at 31 seconds, which is the correct response to a system that appears to be doing nothing —
-    // and that killed the one body he had, so the pass that finally ran found zero and told him none of
-    // his crew arrived. Every one of those sentences was true and the sequence they described was a lie
-    // (Law 25). A body is now brought over the moment it stands, so a short crew is a person holding one
-    // working bot beside them, not a person holding nothing.
-    //
-    // STILL NO RETRY. The desk reports the shortfall and does not relaunch: it cannot know a failure was
-    // transient, and a silent retry turns a diagnosable fault into an intermittent one.
-    const said = [];
-    const standing = [];
-    let reach = null;                       // the last fleet error, when the registry could not be read
-    for (let i = 0; i < crew.length; i++) {
-      const target = crew[i];
-      if (i > 0) await new Promise(r => setTimeout(r, CREW_LAUNCH_GAP_MS));
-      const r = await startBot(target, species, wantsContractors ? from : '', from);
-      said.push(firstMeaningfulLine(r.out) || `${target}: the launcher exited ${r.code}`);
-
-      // POLLED, NEVER SLEPT-THEN-CHECKED: a body that registers in four seconds is brought over in four
-      // seconds, and a fixed wait would make the fast case cost as much as the worst one.
-      const deadline = Date.now() + BODY_ARRIVAL_WAIT_MS;
-      let seen = false;
-      for (;;) {
-        const state2 = await door.query();
-        if (!state2.ok) { reach = state2.error; break; }
-        reach = null;
-        if (state2.bots.some(b => b.id === target && isOurs(b))) { seen = true; break; }
-        if (Date.now() >= deadline) break;
-        await new Promise(r2 => setTimeout(r2, CREW_ARRIVAL_POLL_MS));
-      }
-      if (!seen) { log(`${target} did not register within ${BODY_ARRIVAL_WAIT_MS}ms for ${from}`); continue; }
-      standing.push(target);
-
-      // ── THE TELEPORT USED TO BE HERE, AND MOVING IT IS THE 2026-09-10 FIX ──────────────────────────
-      // This loop teleported each body the moment the registry confirmed it. That was too late, and the
-      // gap was never visible from the desk: a body runs its own spawn sequence in its own process and
-      // injects its start signal there, so the survey that decides where the base goes had already run.
-      // Timed across three runs — survey at 10:41:54.842, this teleport landing at 10:41:55 — and all
-      // three produced the identical world-spawn survey with the asker 130 blocks away.
-      //
-      // A wait here would not have fixed it, and that is why the act MOVED rather than gaining a poll:
-      // the desk cannot know when a body has finished placing itself because it holds no handle on it,
-      // which is the same asymmetry `body_recovery`'s header describes. The body does hold one. So the
-      // body places itself and confirms it (`body_recovery.arriveAtPlayer`, gated in `start_injector`),
-      // the asker travels in `BOT_START_NEAR`, and there is exactly one place a crew is put where its
-      // person is standing (Law 16).
-    }
-    log(`get crew ${crew.join(', ')} for ${from} -> ${said.join(' | ')}`
-        + ` | stood: ${standing.join(', ') || 'none'}`);
-
-    // ── WHAT ARRIVED IS ASKED OF THE FLEET, NEVER QUOTED FROM THE LAUNCHER ─────────────────────────
-    // A launcher says whether it STARTED a process; the foreman's registry says whether a body is
-    // STANDING IN THE WORLD. Those are different facts and they diverge exactly when something has gone
-    // wrong, so grading `get` on the launcher's own output is a component reporting on itself (Law 26).
-    // `tools/foreman_probe.js` has always graded this on the server's player list for that reason; the
-    // loop above is the live desk holding the same standard.
-    //
-    // THE REGISTRY UNREACHABLE IS A THIRD ANSWER, not a failure. The desk then genuinely does not know
-    // what arrived, and saying that is the truthful verdict (Law 25) — a launcher line quoted in its place
-    // would describe a world nobody checked.
-    if (reach && standing.length === 0) {
-      trouble(from, 'crew_unconfirmed', `I started ${crew.join(' and ')} but can't confirm they arrived.`,
-              `door.query failed: ${reach} | launcher said: ${said.join(' | ')}`);
-      return;
-    }
-
-    if (standing.length >= CREW_SIZE) {
-      // "YOURS" IS A CLAIM ABOUT OWNERSHIP AND IT HAS TO BE TRUE. Said to somebody who asked for
-      // homesteaders it is the exact opposite of the fact — they belong to nobody, and the line that
-      // announces their arrival is the last place a person is told otherwise. Caught on the first live
-      // run of `get homesteader`, which reported *"IrisBot and VesperBot are yours"* about two bodies
-      // that will not answer to them (Law 25).
-      //
-      // "HERE" IS NO LONGER THIS DESK'S CLAIM TO MAKE, and the branch that used to hedge it is gone with
-      // the teleport (2026-09-10). The desk once teleported each body and reported which ones it could
-      // not bring; now each body places itself beside the asker and refuses to work until it has
-      // confirmed it, so a bot that is WORKING is a bot that is standing here — the two facts became one
-      // and there is no longer a state where they disagree (Law 27: constitute the fact rather than
-      // report on the gap). A body that could not be placed does not start, says so on its own trace, and
-      // shows up here as a short crew through the branch below.
-      const whose = wantsContractors ? 'yours' : 'the homestead\'s';
-      reply(`${standing.join(' and ')} are ${whose}, here, and working.`);
-      return;
-    }
-    // THE SHORT CASE SAYS WHAT THEY HAVE AND WHAT TO DO — AND NOT ONE WORD OF MACHINE DETAIL.
-    // It used to end by pasting `fleet_control`'s own output into open chat, one line per failed launch,
-    // in front of everybody on the server. That is the desk's diagnostics wearing a player's reply, and
-    // it is unreadable to the person it was aimed at and noise to everybody else (Law 24 — the audience
-    // decides the register; a launcher line is machine-to-machine correspondence). The detail is not
-    // lost: `trouble` puts it in the desk's own log and record, which is where a fault belongs.
-    record.refused(from, 'crew_short', `${standing.length} of ${CREW_SIZE}`);
-    const missing = crew.filter(id => !standing.includes(id));
-    trouble(from, 'crew_short',
-      standing.length
-        ? `${standing.join(' and ')} is yours and working. ${missing.join(' and ')} didn't make it — say "${FOREMAN_PREFIX} get" to try for the rest.`
-        : `couldn't get your crew up. say "${FOREMAN_PREFIX} get" to try again.`,
-      `${standing.length} of ${CREW_SIZE} stood; missing ${missing.join(', ')}; launcher said: ${said.join(' | ')}`);
-    return;
-  }
-
-  // ── WHERE: THE ASKER'S OWN BODIES, AND WHAT EACH IS DOING ───────────────────────────────────────
-  // REPLACED `list` (Architect 2026-09-01). The roster listing answered "who is standing out here, and
-  // whose" — which a person can also answer by looking around — while the thing they have no way to see
-  // is where their own bots went and what work they are on. `list` is now the catalogue.
-  //
-  // IT IS SCOPED TO THE ASKER, and that is the difference from the listing it replaced. The old one
-  // reported the whole fleet deliberately ("what is standing in the world with them"); this reports work
-  // in progress, which is a fact about a crew and belongs to whoever that crew answers to.
-  //
-  // NOTHING IS SENSED FOR IT AND NOTHING IS COMPUTED ABOUT THE WORK (Law 3). Every field was already
-  // travelling: the body's own `body_cell`, published on a timer into its boardroom chair, and the
-  // dispatcher's `magnet` — the task-identity marker written when a job is claimed. The only things this
-  // desk computes are the distance and the bearing, and only because they are the facts neither the bot
-  // nor the foreman can know: they are relations between a body and a person, and the person is standing
-  // in front of THIS process.
-  //
-  // IT IS ALSO THE ONLY WAY A CONTRACTOR'S WORK REACHES A HUMAN AT ALL, since 2026-09-06 — the bodies no
-  // longer narrate. The reasoning, and what was deleted to get here, is in describeCrew.
-  if (verb === 'where') {
-    const state = await door.query();
-    if (!state.ok) {
-      trouble(from, 'fleet_unreachable', "can't reach your bots right now — try again in a moment.",
-              `door.query failed on where: ${state.error}`);
-      return;
-    }
-    const mine = state.bots.filter(b => b.owner === from);
-    if (mine.length === 0) { correct(correction.noBotsOut(`${FOREMAN_PREFIX} where`)); return; }
-
-    // THE SPEAKER'S POSITION IS READ, NEVER ASSUMED. The channel is open chat, which is server-wide, so
-    // a person may say this from anywhere on the map — and mineflayer only carries an entity for a player
-    // whose entity is actually loaded near this body. An absent one is passed through as null and
-    // describeCrew falls back to coordinates, rather than measuring against a position the desk does
-    // not have (Law 25 — an invented figure is the failure; the absence is not).
-    const speaker = bot.players?.[from]?.entity?.position || null;
-    const speakerPos = speaker ? { x: Math.floor(speaker.x), y: Math.floor(speaker.y), z: Math.floor(speaker.z) } : null;
-
-    // ONE reply for the crew, never one per body — see describeCrew for why the channel's one-line-per-
-    // second pacing makes a per-bot answer arrive in two places over two seconds.
-    reply(describeCrew(mine, speakerPos));
-    log(`where for ${from} -> ${mine.map(b => b.id).join(', ')}${speakerPos ? '' : ' (speaker not in view — no bearing)'}`);
-    return;
-  }
-
-  // ── REQUEST: THE ONE VERB THAT IS NOT A COMMAND ─────────────────────────────────────────────────
-  // Everything below this point tells bodies to DO something. This writes a fact down and tells nobody:
-  // the crews find it when they next measure their own needs, exactly as they find a shortfall they
-  // noticed themselves. That is why it takes its own door and not an operator verb.
-  //
-  // Gathering, crafting and building are one word here on purpose. Which of the three a thing needs is
-  // a fact about the item, computable, and already computed — asking a person to classify it invites the
-  // one mistake nothing downstream can catch, because "gather torch" is a perfectly well-formed sentence
-  // meaning something impossible.
-  if (verb === 'request') {
-    const parsed = parseRequest(parts);
-    if (parsed.kind === 'status') {
-      const r = await door.request('status', {}, from);
-      if (!r.ok) {
-        trouble(from, 'fleet_unreachable', "can't read your list right now — try again in a moment.",
-                `door.request status failed: ${r.error || r.reason}`);
-        return;
-      }
-      const rows = Array.isArray(r.rows) ? r.rows : [];
-      if (rows.length === 0) { reply(`you haven't asked for anything. try "${FOREMAN_PREFIX} request 20 logs".`); return; }
-      reply(`you have asked for ${rows.length} thing(s):`);
-      // THE PROGRESS FIGURE IS RELAYED, NEVER COMPUTED HERE. The desk holds no owner key and cannot tell
-      // which chests belong to this crew, so every number below was measured inside a body by the same
-      // lens its own supply assessor stands down on. A figure invented at this distance would be a
-      // confident lie about work in progress (Law 25) — which is why this line said nothing at all until
-      // the crews began reporting it.
-      const progress = (r.progress && typeof r.progress === 'object') ? r.progress : {};
-      for (const row of rows) {
-        // A STRUCTURE IS READ BACK WITHOUT ITS QUANTITY, for the same reason it cannot be asked for with
-        // one. The ledger stores 1 because rows carry quantities; printing it here would show a person the
-        // number the desk refuses to take from them, and a desk that says "a building isn't a quantity" and
-        // then reads back "1 headframe" has taught two rules for one thing.
-        const named = isBlueprint(row.item) ? row.item : `${row.quantity} ${row.item}`;
-        reply(`  ${named} — asked ${describeAge(row.first_asked_at)}${describeProgress(progress[row.item])}`);
-      }
-      return;
-    }
-    // ══ THE VEIL ══════════════════════════════════════════════════════════════════════════════════
-    // EVERY GATE BELOW EITHER PASSES A TYPED VALUE OR CORRECTS, and nothing reaches `door.request` until
-    // all of them have. That ordering is the doctrine's guard half: a malformed sentence stopped here
-    // costs one reply, and the same sentence admitted becomes a row in a ledger, a job on a board and a
-    // crew walking somewhere for a reason nobody can reconstruct (Law 26 — the desk is the translator
-    // machine, and a translator that passes what it could not read is not one).
-    //
-    // The gates run cheapest-first and each answers ONE question, so the correction a person gets names
-    // the single thing that was wrong rather than the first thing a combined check happened to notice.
-
-    // GATE 1 — the shape of the sentence. Three different mistakes, three different corrections; they
-    // used to be one usage line, so a person who reversed the word order and a person who typed a
-    // fraction were told the same thing and only one of them was being helped.
-    if (parsed.kind === 'reversed') {
-      correct(correction.wrongFormat(`${FOREMAN_PREFIX} request ${parsed.item.replace(/_/g, ' ')} ${parsed.quantity}`,
-        `"${FOREMAN_PREFIX} request ${parsed.quantity} ${parsed.item.replace(/_/g, ' ')}" — the number comes first, then the thing.`));
-      return;
-    }
-    if (parsed.kind === 'bad_quantity') {
-      correct(correction.wrongFormat(parsed.said,
-        `"${FOREMAN_PREFIX} request 20 logs" — a whole number above zero, then the thing.`));
-      return;
-    }
-    if (parsed.kind === 'no_item') {
-      correct(correction.wrongFormat(`${FOREMAN_PREFIX} request`,
-        `"${FOREMAN_PREFIX} request 20 logs" — a number, then what you want.`));
-      return;
-    }
-
-    // GATE 2 — the name. An exact lookup with the plural forms tried as further exact lookups; nothing
-    // here can substitute one item for another, so nothing it accepts needs a reading confirmed.
-    const item = resolveExact(parsed.item);
-    if (item === null) {
-      // THREE DIFFERENT REFUSALS, KEPT APART, because one answer for all three is wrong for two of the
-      // people who meet it (Law 13's third category — the correction states the TRUE cause, and Law 25 —
-      // the verdict has to be true about the question they actually asked):
-      //   · `spawn_box` is a real structure, spelled correctly, that cannot be raised on its own yet.
-      //   · `string` is a real material the fleet has no route to.
-      //   · `logdsf` is not a word.
-      // The structure is asked FIRST because it is the only one of the three whose name IS right — telling
-      // that person to check their spelling sends them looking in the one place the fault is not.
-      if (isBlueprint(parsed.item)) {
-        correct(correction.noPlanForThat(parsed.item, raisableStructures()));
-        return;
-      }
-      const known = knownName(parsed.item);
-      if (known === null) {
-        correct(correction.notOnTheList(parsed.item));
-        return;
-      }
-      // ONE VERDICT, READ ONCE. It was called inline for `blockedBy` alone; a species refusal carries
-      // `askInstead` and NO `blockedBy`, so the old line would have told a person their crew "needs
-      // undefined". The two refusals are different facts and are kept apart here rather than by making
-      // one message cover both (Law 25).
-      const verdict = isRequestable(known);
-      correct(verdict.askInstead
-        ? correction.askByFamily(parsed.item, verdict.askInstead)
-        : correction.cannotObtain(parsed.item, verdict.blockedBy));
-      return;
-    }
-
-    // GATE 3 — a building is not a countable thing (Architect 2026-08-30: "requesting buildings dont have
-    // a number anymore. i dont want someone to accidentally request 10 headframes. it makes one building").
-    // Both directions are corrected, because a person who has just learned the building form applies it to
-    // a material next and deserves the same specific answer back.
-    const building = isBlueprint(item);
-    if (building && parsed.quantity !== null) {
-      correct(correction.buildingTakesNoNumber(`${parsed.quantity} ${parsed.item.replace(/_/g, ' ')}`, item));
-      return;
-    }
-    if (!building && parsed.quantity === null) {
-      correct(correction.goodNeedsANumber(parsed.item, item));
-      return;
-    }
-
-    // (A gate stood here refusing structures with no requirement ladder. It is DELETED, not moved: the
-    // catalogue's definition of "requestable" now excludes an unoffered structure, so nothing that reaches
-    // this line can fail that check. Law 27 — the referee was a symptom of two lists disagreeing, and the
-    // repair was in the definition. The refusal it used to speak now fires at Gate 2, where the name fails
-    // to resolve, which is also where the person finds out sooner.)
-
-    // GATE 4 — the same building twice while the first is still going up. ASKED OF THE FLEET, not
-    // remembered here: the desk keeps no tally of what it has filed, because that tally would be wrong
-    // the first time the person cancels from another session and every time the desk restarts
-    // (Invariant B). The ledger is the live fact and the crew's own stage is what says whether it is done.
-    if (building) {
-      const standing = await door.request('status', {}, from);
-      if (standing.ok) {
-        const already = (standing.rows || []).some(row => row.item === item);
-        const stage = ((standing.progress || {})[item] || {}).stage || 'not started';
-        if (already && stage !== 'built') {
-          correct(correction.alreadyUnderway(parsed.item, item, stage));
-          return;
-        }
-      }
-    }
-
-    // A BUILDING IS FILED AS ONE. The ledger's row shape carries a quantity because most rows are
-    // materials; a structure's is always 1 and the read-back reports a STAGE rather than a count, so the
-    // number is a storage detail the person is never shown and never has to say (Law 0 — the desk owns
-    // the vocabulary, the ledger owns the row).
-    const r = await door.request('post', { item, quantity: building ? 1 : parsed.quantity }, from);
-    if (!r.ok) {
-      if (r.reason === 'not_requestable') {
-        correct(correction.cannotObtain(parsed.item, r.blockedBy));
-      } else {
-        // NOT A CORRECTION — the person did nothing wrong. A fleet that did not answer is the fleet's
-        // fault and is reported as one, because telling somebody to rephrase a sentence that was fine
-        // would be a false verdict about whose problem it is (Law 25).
-        trouble(from, 'request_refused', "couldn't file that one — try again in a moment.",
-                `door.request refused: ${r.reason || r.error}`);
-      }
-      return;
-    }
-    const note = r.replaced !== null && r.replaced !== undefined
-      ? ` (was ${r.replaced} — a request is a target, not a tally, so this replaces it)` : '';
-    // A FAMILY IS NOT ONE THING, and a person asking for one is owed that before they wonder why birch
-    // arrived. The crew picks by abundance rather than by preference (set_wood_preference counts trunks
-    // once and every later scan SORTS by the winner without filtering), so this sentence is the honest
-    // description of what the assessors do rather than a caveat.
-    const family = groupMembers(r.item)
-      ? ` ${r.item} is a family, not one block — your crew takes whichever of them is most abundant around here.` : '';
-    // A BUILDING IS CONFIRMED WITHOUT ITS NUMBER. The ledger stores 1 because rows carry quantities, and
-    // echoing that back would teach the number this desk just refused to take — a person told "a building
-    // isn't a quantity" and then told "right, 1 headframe" has been given two rules for one thing.
-    reply(building
-      ? `right — your crew will raise the ${r.item}. it goes up once, and "${FOREMAN_PREFIX} request" tells you how far along it is.`
-      : `right — ${r.quantity} ${r.item}${note}. your crew will pick it up on its next pass.${family}`);
-    return;
-  }
-
-  if (verb === 'cancel') {
-    const parsed = parseCancel(parts);
-    if (parsed === null) {
-      reply(`name what to drop: "${FOREMAN_PREFIX} cancel logs" or "${FOREMAN_PREFIX} cancel all".`);
-      return;
-    }
-    // CANCEL TAKES THE SAME PLURAL FORGIVENESS AND NOTHING MORE. `all` passes through untouched — it is
-    // the one word here that names no item. An unrecognised word is NOT refused with a spelling lecture:
-    // the ledger answers "nothing of yours matched", which is the true answer to withdrawing something
-    // never asked for, and the person may simply be wrong about what they have outstanding rather than
-    // about how it is spelled (Law 25 — the verdict has to be true about the question asked).
-    const target = parsed.item === 'all' ? 'all' : (resolveExact(parsed.item) || parsed.item);
-    const r = await door.request('cancel', { item: target }, from);
-    if (!r.ok) {
-      trouble(from, 'fleet_unreachable', "couldn't cancel that right now — try again in a moment.",
-              `door.request cancel failed: ${r.error || r.reason}`);
-      return;
-    }
-    reply(r.removed === 0
-      ? `nothing of yours matched '${target}'.`
-      : `dropped ${r.removed} request(s).`);
-    return;
-  }
-
-  // `list` — the catalogue. It was `can i get` until 2026-09-01, which spent three words and a
-  // question's grammar on a phrase nobody would guess; the roster listing that held this word moved to
-  // `where`, which answers the question a person actually cannot see the answer to. The catalogue is computed
-  // from what the fleet can actually reach, so this answer is never a list somebody forgot to update.
-  // ── THE LIST IS THE ANSWER TO SPELLING (Architect 2026-08-30) ────────────────────────────────────
-  // "i would rather a list of legal items to be given to the human to chose from and its up to them to
-  //  spell things right. we could remind them to ensure correct spelling."
-  //
-  // This verb replaces the guessing that used to happen at the request. It has to be COMPLETE to do that
-  // job: a list that omits names the desk accepts sends a person who read it carefully to a refusal, and
-  // they have no way to know the list was the incomplete thing rather than their spelling. So the
-  // families are listed alongside the goods — `logs` and `sword` are legal words a person may say, and
-  // before this they were accepted while being absent from the only place that says what is accepted.
-  //
-  // Both halves are COMPUTED, never kept: the goods from the fleet's own walk of its recipe graph, the
-  // families from the group table the assessors themselves resolve against. A capability gained tomorrow
-  // is offerable tomorrow, with nothing edited here.
-  // ── COMPLETENESS CUTS BOTH WAYS, and the second direction is the one that was wrong ──────────────
-  // A list omitting a word the desk accepts strands the person who read it; a list NAMING a word the desk
-  // refuses strands them worse, because they picked it out of the only place that claims to say what is
-  // accepted and were still told no. The catalogue's structures were being printed among the goods —
-  // eight buildings offered, one of them raisable — so seven names here were an invitation to a refusal.
-  // The three groups are split because they take three different sentences (a number, no number, a number
-  // plus a species the crew chooses), and a person cannot be expected to know which group a word is in.
-  // (THE `list` BRANCH STOOD HERE AND IS DELETED — Architect 2026-09-06: *"foreman help is now the list.
-  // so remove list."* It printed the whole catalogue in four messages over four seconds. `legalFamilies()`
-  // went with it, being its only caller (Law 16). What the verb was FOR — spelling — is now bought
-  // entirely by the refusals at Gate 2 of `request`, which name the form that works at the moment a person
-  // gets one wrong. What is genuinely lost is BROWSING: there is no longer any way to read what the crew
-  // can be asked for without asking and being corrected.)
-
-  if (INGAME_VERBS.has(verb)) {
-    // EVERY VERB HITS ALL OF THE ASKER'S BOTS AND NOTHING ELSE. No bot is named, and that is the ruling
-    // rather than a simplification: the operator's verbs have always been fleet-wide, and in here a
-    // person's "fleet" is the bots that are theirs. The delivery set is decided by the foreman from
-    // the owner each bot declared at birth, so this call carries WHO SPOKE and never WHICH BOT.
-    // NO IN-GAME VERB CARRIES A PAYLOAD ANY MORE. `move` was the only one, and it left the in-game
-    // vocabulary with the other bench verbs — so the coordinate parser and its usage-line refusal went
-    // with it (Law 16: nothing stays alive that nothing calls). `stop` and `wipe` are both bare words.
-    // THE ONE VERB THE DESK HOLDS BACK ON ITS FIRST HEARING. Placed before the crossing, not after it:
-    // an unconfirmed wipe must not reach the fleet at all, so there is nothing to undo and nothing that
-    // half-happened. The word is short because he asked for it short, and because a person about to lose
-    // their base reads one line and not a paragraph.
-    if (verb === 'wipe') {
-      const now = Date.now();
-      const armed = wipeArmed.get(from);
-      if (!armed || armed < now) {
-        wipeArmed.set(from, now + WIPE_CONFIRM_MS);
-        reply(`wipe forgets your base — your crew stops and resettles where you next stand. say wipe again to confirm.`);
-        return;
-      }
-      // SPENT ON USE, so a third `wipe` is a fresh warning rather than a second silent wipe.
-      wipeArmed.delete(from);
-    }
-
-    const r = await door.send(verb, {}, from);
-    const said = describeDoorResult(verb, r);
-    log(`${verb} for ${from} -> ${said}`);
-    reply(said);
-    return;
-  }
-
-  reply(`don't know '${verb}'. say "${FOREMAN_PREFIX} help".`);
-}
-
-// describeDoorResult — turn the fleet's verdict into a sentence for the person who asked.
-//
-// IT NEVER SAYS "DONE" FOR A DELIVERY. The door reports how many bots a verb reached, which is not the
-// same as those bots having acted on it, and the gap matters most on the verb where it is easiest to
-// paper over: a human told "started" who is watching a bot stand still has been handed a false verdict
-// they can see through (Law 25). "sent to N" is the true statement and it is no longer to read.
-//
-// EACH REFUSAL NAMES ITS OWN CAUSE. "Nothing happened" has four causes here and they send a person to
-// four different places: no bot fetched yet, the named bot is not one of theirs, the fleet is not up,
-// or the word is not one the fleet knows.
-function describeDoorResult(verb, r) {
-  if (!r.ok) return `couldn't reach the fleet: ${r.error}`;
-  // A WIPE REPORTS ON MEMORY, NOT ON DELIVERY, and it is the one verb here that succeeds while reaching
-  // zero bots. Everything below counts bodies because every other verb IS a delivery; a wipe is now done
-  // by the foreman against the player's own file, so `sent: 0` is its NORMAL result and the generic
-  // "reached nobody" underneath would report a completed wipe as a failure.
-  if (r.reason === 'wiped') {
-    return r.stopped > 0
-      ? `wiped. your ${r.stopped} bot${r.stopped === 1 ? '' : 's'} left — say "${FOREMAN_PREFIX} get" and a new crew settles where you are.`
-      : `wiped. say "${FOREMAN_PREFIX} get" and your crew settles where you are.`;
-  }
-  if (r.sent > 0) return `${verb} sent to your ${r.sent} bot${r.sent === 1 ? '' : 's'}.`;
-  switch (r.reason) {
-    // ORDERED BY WHAT THE HUMAN SHOULD DO NEXT, and 'not_yours' comes first for a reason: a person who
-    // owns no bots but is standing beside somebody else's needs to be told to fetch their own, not told
-    // the fleet is empty when they can plainly see it is not.
-    case 'not_yours':
-      return `none of those are yours — every bot out here belongs to someone else. `
-           + `say "${FOREMAN_PREFIX} get" and I'll fetch you one.`;
-    case 'not_a_contractor':
-      return `the bots out here answer to nobody — a homesteader takes no orders from in here. `
-           + `say "${FOREMAN_PREFIX} get" and I'll fetch you one of your own.`;
-    case 'no_bots':      return `no bots are up. say "${FOREMAN_PREFIX} get" and I'll fetch you one.`;
-    case 'reached_nobody': return `you have no bots out. say "${FOREMAN_PREFIX} get" and I'll fetch you one.`;
-    case 'unknown_verb': return `the fleet doesn't know '${verb}'.`;
-    // THE VERB EXISTS AND IS NOT A HUMAN'S TO SAY. Distinct from unknown_verb because it sends a person
-    // somewhere different: nothing is misspelled and nothing is broken — the word belongs to the console.
-    // The desk should never produce this (its own gate is narrower), so seeing it means the desk and the
-    // foreman have drifted, which is exactly why the foreman refuses rather than trusting the sender.
-    case 'not_ingame_verb': return `'${verb}' isn't something you can ask for in here — it's an operator command.`;
-    case 'no_asker':     return `I couldn't tell the fleet who you are, so it refused. that's my fault, not yours.`;
-    default:             return `${verb} reached nobody.`;
-  }
-}
-
-// DELETED 2026-08-30 — `matchRoster` and `nextFree`, both orphaned by the crew ruling (Law 16: nothing
-// stays alive that nothing calls). `matchRoster` resolved a short bot name a human typed; `get` no
-// longer accepts one, because a human cannot address an individual bot and a name would be an
-// instruction nothing downstream can honour. `nextFree` picked the eldest free name for a single bot;
-// the crew branch now takes the first CREW_SIZE free names in the same seniority order, in the one place
-// that needs them. The rule those two carried and the crew branch still honours: the ROSTER is read off
-// the LIVE fleet, never off the launcher's PID file, which remembers processes that died last week
-// (Invariant B) — and a name reaches `startBot` only after the live fleet has reported it FREE.
-
-function firstMeaningfulLine(out) {
-  if (!out) return null;
-  const lines = out.split('\n').map(l => l.trim()).filter(Boolean)
-    .filter(l => !/deprecat|warning|^\(node:/i.test(l));
-  return lines.length ? lines[lines.length - 1] : null;
-}
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// What the foreman does, in its utility folder
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+//   utils/get_crew.js       the one way a crew is raised (a person's `get`, and the foreman's own crew)
+//   utils/desk_verbs.js     every chat verb a person can say, and the answer
+//   utils/startup_steps.js  the startup after the world is up, as proved steps
+//   utils/admin_steps.js    the run's admin: leftover terminals, the clock, the cameras
+//   utils/run_watch.js      the watch over a working run, and the PASS/FAIL verdict at its end
+//   utils/crew_launch.js    one body launched, and every body ended
+//   utils/say.js            the log line and the alarm
+const getCrewDesk = require('./utils/get_crew');
+const deskVerbs = require('./utils/desk_verbs');
+const { foremanSteps } = require('./utils/startup_steps');
+const testModes = require('./utils/test_modes');
+const observer = require('./utils/observer');
+// The run's admin and its verdict live in the foreman's own utility folder.
+const adminSteps = require('./utils/admin_steps');
+const runWatch = require('./utils/run_watch');   // every scan the foreman runs yields each tick
+// The desk's spawn-clearance gate on `get` (armed at createBot); one module owns the world-spawn latch,
+// so the desk and a body's dig refusal cannot disagree about where spawn is (Law 16).
+const { armSpawnProtection, maskWorldReads } = require('@perception/spawn_protection');
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // The body
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-// ── THE BODY IS REQUIRED, AND IT IS SUPERVISED (Architect 2026-09-18) ────────────────────────────────
-// *"The body is needed, it’s not an optional process. Well atleast it should make a large alert and go into
-// limp mode or something maybe it could attempt to restart its body?"*
-//
-// WHAT CAN TAKE A SPECTATOR BODY OUT OF THE WORLD. Spectator removes every in-world cause: no damage, no
-// death, no collision, no mobs. What is left is the connection, and this project has recorded each of
-// these against its own clients:
-//   - its OWN EVENT LOOP FREEZING. The server drops a client that has not answered a keep-alive in ~15 s
-//     ("Timed out"). This has happened to this foreman: it went silent for ~15 s while two start_bot
-//     children booted, and it was dropped (bugsquashing, crew-fetch Run 1). The process now also carries
-//     the fleet's memory, so the loop watch below is the first line of defence.
-//   - the server stopping, restarting or crashing (ECONNRESET / socketClosed);
-//   - a second login under the same name (`duplicate_login`), which is what a second foreman process does;
-//   - chat spam (kicked the valet once; the channel is paced to the refund rate since);
-//   - a person with operator rights kicking it, or a whitelist that does not name it;
-//   - a packet the client library cannot decode after a version change (PartialReadError, chunk parsing).
-//
-// SO: LOUD ALERT, LIMP MODE, REJOIN, THEN STOP. While the body is gone the process keeps serving the
-// bots (claims, memory, broadcasts), so a crew mid-build loses nothing to a server blip. It is LIMP rather
-// than whole: with no body there are no eyes to site with and no ear to hear a person, so nothing new is
-// started. It rejoins on a widening schedule. A `duplicate_login` is not retried, because another Foreman
-// is standing in the world and fighting it would kick them back and forth. When the schedule runs out,
-// or on that refusal, the whole fleet is stopped: a fleet with no body cannot be supervised, and he ruled
-// the body is not optional.
+// ── THE BODY IS REQUIRED, AND IT IS SUPERVISED ────────────────────────────────
+// Spectator removes every in-world cause of loss; what remains is the connection — loop freeze, the
+// server stopping, `duplicate_login`, chat spam, an operator kick, a missing whitelist entry, or an
+// undecodable packet. Response: loud alert, limp mode (serves the bots, starts nothing new), rejoin on a
+// widening schedule, then stop the fleet — a fleet with no body cannot be supervised.
 const REJOIN_DELAYS_MS = [5000, 15000, 30000, 60000, 120000];
 const FLEET_STOP_GRACE_MS = 10000;
 const LOOP_FREEZE_ALERT_MS = 5000;    // a third of the ~15 s the server allows before "Timed out"
@@ -1477,33 +216,14 @@ const BODY = { present: false, joins: 0, failures: 0, lastKick: null, stopping: 
 // Greeted once per PROCESS lifetime, not per body: a rejoin must not re-introduce the server to everyone.
 const greeted = new Set();
 let bot = null;
+// The door and the body are handed to the utilities that act through them; `bot` is read at call time
+// because a rejoin replaces it.
+getCrewDesk.bind({ door, desk: foremanDesk, getBot: () => bot });
+deskVerbs.bind({ door, getBot: () => bot });
 
-// The one alarm shape: a red block a person cannot scroll past, plus the same words in the record. Long
-// lines are wrapped at word boundaries so a diagnosis stays inside the block.
-function alarm(lines) {
-  const A = '[41m[97m[1m', R = '[0m';
-  const bar = '!'.repeat(80);
-  const rows = [];
-  for (const l of lines) {
-    let row = '';
-    for (const word of String(l).split(' ')) {
-      if (row && (row + ' ' + word).length > 76) { rows.push(row); row = word; } else row = row ? `${row} ${word}` : word;
-    }
-    rows.push(row);
-  }
-  console.log(`${A}${bar}${R}`);
-  for (const r of rows) console.log(`${A}  ${r.padEnd(78)}${R}`);
-  console.log(`${A}${bar}${R}`);
-  record.note(`ALERT: ${lines.join(' ')}`);
-}
-
-// ── ONE SHUTDOWN ROAD (Architect 2026-09-18: *"how does shutting down a server work after a soak or a
-// problem? Is that another script? I want foreman to handle that."*) ─────────────────────────────────
-// Every way this process ends comes here: Ctrl-C, the terminal's `shutdown` verb (run.js at teardown), a body
-// that cannot come back, a world that stopped on its own or never came up. In order: every bot is sent
-// `stop` (which ends a bot's process) and given FLEET_STOP_GRACE_MS to leave (they save their memory to the hub on the way out, so the hub
-// is the last to go); the body leaves; a server THIS process started is stopped with its own `stop` and
-// waited on until it has saved; then the process exits. Idempotent — a second call returns the first.
+// ── ONE SHUTDOWN ROAD ─────────────────────────────────────────────────────────────────────────────
+// Every way this process ends comes here: bots sent `stop` and given FLEET_STOP_GRACE_MS to leave, the
+// body leaves, the server this process started is stopped and waited on until saved. Idempotent.
 let shuttingDown = null;
 function shutdown(why, code) {
   if (shuttingDown) {
@@ -1513,21 +233,32 @@ function shutdown(why, code) {
   BODY.stopping = true;
   shuttingDown = (async () => {
     log(`SHUTDOWN — ${why}`);
+    plan.note({ closing: why });
+    // Kept before the bots are sent home: a fleet going home is not reporting on its work.
+    runWatch.freeze(() => foremanDesk.fleetState());
     const r = foremanDesk.stopFleet(why);
     if (r && r.sent > 0) {
       log(`'stop' reached ${r.sent} bot(s); giving them ${FLEET_STOP_GRACE_MS / 1000}s to leave.`);
       const until = Date.now() + FLEET_STOP_GRACE_MS;
       while (Date.now() < until && foremanDesk.fleetState().bots.length > 0) await new Promise(res => setTimeout(res, 500));
     }
-    releaseFetched();
+    // Every body sent its last reading on the way out, so the book is whole here.
+    await foremanDesk.writeItemBook();
+    await foremanDesk.flushMemory();
+    await crewLaunch.releaseFetchedAsync();
+    // The cameras come down after the bots and before the world: a recording is finalised while its windows exist.
+    if (plan.CONFIG.record !== 'off') await adminSteps.stopCameras(why, log);
     if (bot && BODY.present) bot.quit('the foreman is shutting down');
     const s = await world.stopServer(log);
     if (!s.stopped) log(`the world was not stopped: ${s.reason}.`);
     log(`the foreman has shut down (${why}).`);
-    // The record's writer is asynchronous; without this the alarm and every line above it are lost to the
-    // exit — measured on the first unreachable-world test, whose record ended at the retries. Same call a
-    // bot makes on its own `stop` (operator_commands).
-    require('@kernel/watcher').flushNow();
+    // Sets how this process exits: 0 PASS, 2 FAIL after a working run, 1 the startup did not finish.
+    const verdictCode = runWatch.verdict(why);
+    code = Math.max(code, verdictCode);
+    // The record's writer is asynchronous; flushed before exit or the alarm and lines above it are lost.
+    await require('@kernel/watcher').flush();
+    // The console lane is drained the same way, bounded: the last lines are how the run ended.
+    await consoleLane.drained(5000);
     process.exit(code);
   })();
   return shuttingDown;
@@ -1540,8 +271,7 @@ function stopEverything(why) {
   shutdown(why, 1);
 }
 
-// A KICK THAT WILL SAY THE SAME THING ON EVERY RETRY is not retried: the server has refused this client on a
-// fact that rejoining cannot change (its version, its whitelist, a ban, account checks).
+// A kick that repeats on every retry is not retried: rejoining cannot change a version, whitelist or ban.
 const PERMANENT_KICK = /outdated (client|server)|incompatible|not white-?listed|whitelist|banned|unverified|failed to verify username/i;
 
 function bodyLost(reason) {
@@ -1572,19 +302,48 @@ function bodyLost(reason) {
   if (t.unref) t.unref();
 }
 
-// THE LOOP WATCH. A timer that should fire every second and reports when it fired late. Late by more than
-// LOOP_FREEZE_ALERT_MS means this process sat on the loop long enough to put the body's keep-alive at risk,
-// and the alert names how long. Unref'd: it must never be the reason the process stays alive (Law 8).
+// ── THE FREEZE PROFILE ───────────────────────────────────────────────────────────────────────
+// With AUREN_FOREMAN_PROFILE=1 the V8 sampling profiler runs from the first line, and the first freeze
+// the watch loop catches stops it and writes the profile beside the run's other records
+// (`fleet_logs/foreman_freeze.cpuprofile`): the samples taken during the freeze name what ran without
+// yielding. Off by default; a profile is a diagnosis, not a record every run keeps.
+let _profiler = null;
+if (process.env.AUREN_FOREMAN_PROFILE === '1') {
+  const { Session } = require('inspector');
+  _profiler = new Session();
+  _profiler.connect();
+  _profiler.post('Profiler.enable');
+  _profiler.post('Profiler.setSamplingInterval', { interval: 1000 });
+  _profiler.post('Profiler.start');
+  log('freeze profile armed: the first freeze over the alert line writes fleet_logs/foreman_freeze.cpuprofile');
+}
+function writeFreezeProfile() {
+  if (!_profiler) return;
+  const session = _profiler;
+  _profiler = null;
+  session.post('Profiler.stop', (err, result) => {
+    if (err || !result) { log(`freeze profile not written: ${err ? err.message : 'no profile'}`); return; }
+    const { RECORDS_DIR } = require('@utils/record_homes');
+    const file = path.join(RECORDS_DIR, 'foreman_freeze.cpuprofile');
+    require('fs').writeFileSync(file, JSON.stringify(result.profile));
+    log(`freeze profile written: ${file}`);
+  });
+}
+
+// Fires every second and reports firing late by more than LOOP_FREEZE_ALERT_MS. Unref'd (Law 8).
 (function watchLoop() {
   let last = Date.now();
-  const t = setInterval(() => {
+  const t = require('../js_kernel/utils/timeout_crash').every('foreman', 'report the loop of the foreman firing late', () => {
     const now = Date.now();
     const late = now - last - 1000;
     last = now;
     if (late > LOOP_FREEZE_ALERT_MS) {
+      const mem = process.memoryUsage();
+      writeFreezeProfile();
       alarm([`FOREMAN PROCESS FROZE FOR ${(late / 1000).toFixed(1)}s`,
+        `heap ${(mem.heapUsed / 1048576).toFixed(0)} of ${(mem.heapTotal / 1048576).toFixed(0)} MB, rss ${(mem.rss / 1048576).toFixed(0)} MB.`,
         `the server drops a silent client at ~15s; the body${BODY.present ? '' : ' (already gone)'} was at risk.`,
-        `something in this process ran without yielding. The fleet's memory and the body share one loop.`]);
+        `something in this process ran without yielding; AUREN_FOREMAN_PROFILE=1 names it in fleet_logs/foreman_freeze.cpuprofile.`]);
     }
   }, 1000);
   if (t.unref) t.unref();
@@ -1599,10 +358,9 @@ function connectBody() {
   wireBody();
 }
 
-// ── THE BODY PUTS ITSELF IN SPECTATOR (2026-09-18) ────────────────────────────────────────────────────
-// Its owner sets its mode, through the console the world gave this process — a launcher used to do it from
-// outside, and a stranger's launcher never did. Spectator is what removes every in-world way to lose it (no
-// damage, no collision). Read back, never trusted from the write; not fatal, because the desk still works.
+// ── THE BODY PUTS ITSELF IN SPECTATOR ────────────────────────────────────────────────────
+// Removes every in-world way to lose the body (no damage, no collision). Read back, never trusted from
+// the write; not fatal on failure.
 async function bodyToSpectator() {
   const r = await guardExternal('foreman', 'set the body to spectator', () =>
     require('@utils/rcon_link').once([`gamemode spectator ${FOREMAN_NAME}`, `data get entity ${FOREMAN_NAME} playerGameType`]));
@@ -1611,13 +369,8 @@ async function bodyToSpectator() {
 }
 
 function wireBody() {
-// ARMED HERE AND NOWHERE LATER, because `spawn_position` arrives DURING login: a listener registered from
-// the `spawn` handler below is registered after the only packet it exists to catch, and the latch would
-// read "unknown" for the desk's whole life — so every `get` would be refused for want of a centre that
-// did arrive and was not heard. That is `armSpawnProtection`'s own documented requirement.
-//
-// THE DESK NEEDS THE CENTRE FOR A DIFFERENT REASON THAN A BOT DOES. A bot asks "may I break this cell";
-// the desk asks "is this person standing somewhere a crew can work at all", which is the `get` gate below.
+// Armed here, not in `spawn` below, since `spawn_position` arrives during login and a later listener
+// would miss it.
 armSpawnProtection(bot);
 
 bot.on('error', e => log(`ERROR: ${e.message}`));
@@ -1632,16 +385,10 @@ bot.once('spawn', () => {
     alarm([`FOREMAN BODY IS BACK — limp mode over (join ${BODY.joins}, after ${BODY.failures} attempt(s)).`]);
   }
   BODY.failures = 0;
-  bodyToSpectator();
-  // THE DESK READS THE SAME MASKED WORLD ITS CREW WILL (Architect 2026-09-15: *"a spawn block shall never
-  // be a part of any decisions"*). The desk decides where a whole base goes, so it is exactly the body that
-  // must not see buildable ground inside the square — an unmasked desk sites a row the masked crew then
-  // cannot place. Its own post stays inside that square, because what the survey walks outward from is no
-  // longer the desk but the person's feet (see the `get` gate).
-  //
-  // AT SPAWN AND NOT BESIDE THE ARM: `maskWorldReads` wraps `bot.blockAt`, which mineflayer has not
-  // attached when `createBot` returns — wrapping there threw at module load and the desk never joined.
-  // Nothing here reads a block before the listener below is registered, so the later wrap leaves no window.
+  // The first join's spectator is a proved startup step (foremanSteps); a rejoin puts itself back here.
+  if (BODY.joins > 1) bodyToSpectator();
+  // The desk reads the same masked world its crew will, so it cannot site a base where the masked crew
+  // could not place. Wrapped here since mineflayer has not attached `bot.blockAt` when `createBot` returns.
   maskWorldReads(bot);
   log(`standing by at ${bot.entity.position.floored()} on the '${FOREMAN_CHANNEL}' channel.`);
 
@@ -1649,21 +396,16 @@ bot.once('spawn', () => {
   const reply = (to, text) => ch.reply(bot, to, text);
 
   ch.listen(bot, ({ from, text }) => {
-    // THE VERBATIM LINE, RECORDED BEFORE ANYTHING IS MADE OF IT. Everything after this event is the
-    // machine's reading; only this is what the person actually typed, and the gap between the two is
-    // what a reader is usually chasing (Law 20's rule for the other record, for the same reason).
+    // The verbatim line, recorded before anything is made of it — everything after is the machine's
+    // reading (Law 20).
     record.heard(from, text);
     log(`${from}: "${text}"`);
-    // One human's command must not be able to take the foreman down for the next one, so the boundary
-    // is caught HERE and reported to the person who asked. This is a Law 16 legal catch: a terminus
-    // that turns a fault into an answer, never a swallow — the fault is logged in full to the foreman's
-    // own window and the human is told plainly that it failed.
+    // Caught here and reported to the asker, never taking the foreman down (Law 16 legal catch).
     Promise.resolve()
-      .then(() => handle(from, text, (t) => { record.said(from, t); reply(from, t); }))
+      .then(() => deskVerbs.handle(from, text, (t) => { record.said(from, t); reply(from, t); }))
       .catch((e) => {
         log(`FAILED handling "${text}" from ${from}: ${e && e.stack ? e.stack : String(e)}`);
-        // A fault is part of that person's session and belongs in their transcript, not only in the
-        // window: a reader reconstructing why somebody gave up needs to see that the desk broke on them.
+        // Part of that person's session, not only the window, so a reader can see the desk broke on them.
         record.refused(from, 'handler_threw', text);
         const line = `that failed: ${String(e.message || e).slice(0, 120)}`;
         record.said(from, line);
@@ -1672,77 +414,36 @@ bot.once('spawn', () => {
   }, log);
 
   // ── THE GREETING: TWO WORDS, SAID TO THE ONE PERSON WHO NEEDS THEM ──────────────────────────────
-  // THE ASK (Architect 2026-09-05, after joining his own server for the first time): *"when someone logs
-  // in they should get a message from foreman welcoming them and how to use it. 'hello <player> use
-  // /foreman help for commands and foreman get to get bots. thats it."*
-  //
-  // WHY IT IS THE HIGHEST-VALUE LINE THE DESK SAYS. Every other sentence here answers a question somebody
-  // asked. This one reaches the person who does not know there is a question — someone who has just
-  // walked into a world with a bot standing in it and no reason to guess that it listens, or to what
-  // word. The whole in-game surface is unreachable without it, and the on-duty broadcast above could not
-  // do this job: it fires once when the FOREMAN starts, which is almost never the moment a player
-  // arrives, and it is said to an empty world.
-  //
-  // IT TEACHES THE FORM, WHICH IS WHY THE HELP PAGE NO LONGER HAS TO. `foreman_vocabulary.helpLines()`
-  // dropped its header line to fit the chat window, and this is where that line went — moved to the one
-  // moment the `foreman <command>` shape is news rather than something the reader has already used.
-  //
-  // TWO VERBS, NOT NINE, AND THE ORDER IS HIS: `help` first because it is the one that leads everywhere
-  // else, `get` second because it is the one they came to do.
-  //
-  // ONE LINE, ONE PERSON, ONCE. The outbound queue sends a line per second, so a greeting that ran to
-  // three lines would spend three seconds of a shared channel per arrival — and on a server filling up
-  // after a video, arrivals cluster. `thats it` is a specification.
+  // Reaches the person who does not know there is a question, unlike the on-duty broadcast which fires
+  // once at foreman start to an empty world. Two verbs, `help` then `get`, one line per arrival.
   bot.on('playerJoined', (player) => {
     const name = player && player.username;
-    // NOT ITSELF, AND NOT A BOT. The foreman sees its own join and every contractor's, and a crew of two
-    // arriving would otherwise produce two greetings addressed to bodies that cannot read them — noise on
-    // the one channel a person is trying to read, at the exact moment they are reading it. The roster is
-    // the fleet's own list of bot names (Law 16: BOT_SENIORITY is where that fact lives).
+    // Not itself, not a bot — the roster is the fleet's own list of bot names (Law 16: BOT_SENIORITY).
     if (!name || name === FOREMAN_NAME || Object.prototype.hasOwnProperty.call(BOT_SENIORITY, name)) return;
-    // GREETED ONCE PER FOREMAN LIFETIME, not once per join. Someone whose connection drops and returns
-    // three times in a minute is having a bad enough time without being introduced to the server on each
-    // attempt. The set is in-process and deliberately not persisted: a foreman restart is rare, and
-    // re-greeting after one is the harmless direction of that trade.
+    // The camera is placed where the crew is and is not greeted, including a late join (observer.js).
+    if (observer.isObserver(name)) {
+      observer.atSite().then(r => log(r.ok ? `camera: ${r.why}` : `camera: ${name} joined but is not placed — ${r.why}`));
+      return;
+    }
+    // Greeted once per foreman lifetime, not once per join; not persisted, so a restart re-greets.
     if (greeted.has(name)) return;
     greeted.add(name);
     record.said(name, 'greeting');
-    // THE GREETING NAMES A COMMAND THAT WORKS. It offered `foreman get` until 2026-09-09, which stopped
-    // being a command the day `get` began taking a species — the first thing a new arrival was told to
-    // say would have come straight back as a correction. The greeting is the one line everybody reads, so
-    // a stale form here is worse than none (Law 25).
+    // Names a command that currently works — the one line everybody reads, so it must stay current (Law 25).
     ch.reply(bot, name, `hello ${name} — say "${FOREMAN_PREFIX} help" for commands, "${FOREMAN_PREFIX} get contractor" for bots`);
   });
 
   // ── A CREW BELONGS TO A PERSON, SO IT LEAVES WITH THEM ──────────────────────────────────────────
-  //
-  // (Architect 2026-09-05: *"the bots should leave when the player disconnects."*)
-  //
-  // WHY THE DESK IS THE RIGHT OWNER OF THIS AND NOT THE FOREMAN. A contractor's owner is a fact the
-  // foreman holds, but *whether that owner is standing in the world* is a fact only something WITH A
-  // BODY can observe — and the foreman is the fleet's only body that is always present. The foreman has
-  // no client and cannot see a player leave. So this is not a convenience placed here; it is the one
-  // process that can see the event at all (Invariant D — the owner of a fact is whoever can sense it).
-  //
-  // THE SAME `stop` A PERSON SAYS, through the same door (Law 16). It is not a new teardown path: the
-  // relay resolves the delivery set from the owner each bot declared at birth, so this reaches exactly
-  // the leaver's crew and nothing else, and a name nobody owns bots under is a no-op rather than an
-  // error. Inventing a second way to end a contractor would be a second thing to keep in step with
-  // whatever `stop` means next.
-  //
-  // NO GRACE PERIOD, AND THAT IS A DECISION RATHER THAN A SIMPLIFICATION. A held crew would have to be
-  // released on a timer nobody watches, and during that window the bots are standing in the world owned
-  // by somebody who is not there — unreachable by them and unavailable to anybody else, which is the
-  // worst of both states. A person who drops and returns says `get` again and is served in seconds.
-  //
-  // IT SAYS NOTHING IN CHAT. The person it concerns has gone, and everybody else is being told about
-  // somebody else's housekeeping.
+  // The desk is the right owner: whether an owner is standing in the world is observable only by
+  // something with a body (Invariant D). Sends the same `stop` a person says, through the same door
+  // (Law 16). No grace period, and says nothing in chat.
   bot.on('playerLeft', (player) => {
     const name = player && player.username;
-    // NOT ITSELF, NOT A BOT. A contractor's own departure raises this event, and the crew stopping is
-    // exactly what produces those departures — so without this guard a `stop` would re-enter the door
-    // once per body it had just ended, under a name that owns nothing.
+    // A contractor's own departure raises this event too; without this guard `stop` would re-enter the
+    // door once per body it had just ended.
     if (!name || name === FOREMAN_NAME || Object.prototype.hasOwnProperty.call(BOT_SENIORITY, name)) return;
+    // The camera owns no crew, so its departure must not reach the door.
+    if (observer.isObserver(name)) { log(`camera: ${name} left — the run carries on.`); return; }
     door.send('stop', {}, name).then((r) => {
       if (!r.ok) { log(`${name} left; could not reach the fleet to release their crew: ${r.error}`); return; }
       if (r.sent > 0) log(`${name} left — released their ${r.sent} bot(s)`);
@@ -1753,10 +454,20 @@ bot.once('spawn', () => {
 });
 }
 
-// ── THE ORDER THIS PROCESS COMES UP IN (Architect 2026-09-18) ─────────────────────────────────────────
-// hub (memory restored, ports open — required at the top) → the world (started or reached, per
-// foreman_config) → the body. A world that does not come up is said in words and ends the process; a world
-// this process started that stops on its own ends the fleet, because nothing the bots do survives it.
+// THE SOAK: how long the run lasts once its crew is working, then the one shutdown road. 0 = until stopped.
+function startSoak() {
+  require('./utils/machine_hour').armPause(plan.CONFIG.machineHour, { soakEndsAt: () => plan.progressNow().soakEndsAt, shutdown, log });
+  const min = plan.CONFIG.soak;
+  if (!(min > 0)) return;
+  const endsAt = new Date(Date.now() + min * 60000);
+  plan.note({ soakEndsAt: endsAt.toISOString() });
+  log(`soak: ${min} min — everything is shut down at ${endsAt.toTimeString().slice(0, 8)}.`);
+  setTimeout(() => shutdown(`the ${min}-minute soak ended`, 0), min * 60000);
+}
+
+// ── THE ORDER THIS PROCESS COMES UP IN ─────────────────────────────────────────
+// hub → the world → the body. A world that does not come up ends the process; a world this process
+// started that stops on its own ends the fleet, since nothing the bots do survives it.
 world.onShutdownAsked((why) => shutdown(why, 0));
 world.onUnexpectedExit((reason, lines) => {
   alarm(['THE MINECRAFT SERVER STOPPED ON ITS OWN — STOPPING THE FLEET', reason, ...lines]);
@@ -1764,11 +475,50 @@ world.onUnexpectedExit((reason, lines) => {
 });
 
 (async () => {
-  const up = await world.bringUp(log);
+  const stepping = { note: plan.note, stopped: () => BODY.stopping };
+  log(`the run: ${plan.sentence()} · ${plan.overlays()}`);
+  const clear = await runSteps([adminSteps.terminalsStep()], { log, ...stepping });
+  if (!clear.ok) {
+    runWatch.startupFailed(clear.step, clear.why);
+    alarm(['NOTHING WAS STARTED — A TERMINAL FROM AN EARLIER RUN IS OPEN', clear.why]);
+    shutdown(`nothing was started: ${clear.why}`, 1);
+    return;
+  }
+  const up = await world.bringUp(log, stepping);
   if (!up.ok) {
+    runWatch.startupFailed('the world comes up', up.reason);
     alarm(['THE WORLD DID NOT COME UP — THE FOREMAN IS STOPPING', up.reason, ...(up.lines || [])]);
     shutdown(`the world did not come up: ${up.reason}`, 1);
     return;
   }
-  connectBody();
+  world.startPulse(log);
+  require('./machine_pulse').start(log, (line) => alarm([line]));
+  plan.note({ crew: plan.raisesOwnCrew() ? 'raising' : 'waiting' });
+  log(`the run, one proved step at a time (${plan.sentence()}):`);
+  // A test run is the same list, cut short by test_modes.stepsFor after the step the named test stops at.
+  const allSteps = foremanSteps({ getBot: () => bot, BODY, connectBody, door, desk: foremanDesk, startSoak, shutdown });
+  const r = await runSteps(testModes.stepsFor(plan.CONFIG.test, allSteps), { log, ...stepping });
+  if (!r.ok) {
+    if (BODY.stopping) return;
+    plan.note({ crew: 'failed' });
+    runWatch.startupFailed(r.step, r.why);
+    alarm([`THE RUN STOPPED AT: ${r.step.toUpperCase()}`, r.why]);
+    shutdown(`the run stopped at "${r.step}": ${r.why}`, 1);
+    return;
+  }
+  runWatch.startupDone();
+  // The fleet is still up, so what it found is read off the live door, never a record.
+  if (plan.isTest()) {
+    const state = await door.query();
+    const ownerKey = require('@kernel/bot_mandate').ownerKeyFor(plan.CONFIG.crew, '');
+    const held = state.ok ? getCrewDesk.existingSite(state.buildings, ownerKey) : null;
+    const found = testModes.verdict(plan.CONFIG.test, { site: held ? held.site : null, species: plan.CONFIG.crew });
+    log(`test ${plan.CONFIG.test} — what the fleet holds:`);
+    for (const line of found.lines) log(line);
+    runWatch.testDone(plan.CONFIG.test, found);
+    shutdown(`the ${plan.CONFIG.test} test finished`, found.ok ? 0 : 2);
+    return;
+  }
+  if (plan.raisesOwnCrew()) plan.note({ crew: 'working' });
+  else log('crew: contractor — nobody is raised by the foreman; a person in the world says "foreman get contractor".');
 })();

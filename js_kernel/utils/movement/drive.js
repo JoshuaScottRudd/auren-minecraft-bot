@@ -1,10 +1,7 @@
-// module: movement/drive — the continuous walker: hold forward, watch the body cross cells, decide
-// when to press jump. This is the layer the lookahead runs through and the only one that reads the
-// jump arc.
-//
-// It senses and presses buttons; the arithmetic lives in calculators/jump_calculator, in one
-// integration. Do not re-derive a tick count here — three hand-derived copies of that arc is what
-// caused the regression the calculator was written to end.
+// module: movement/drive — the continuous walker: holds forward, watches the body cross cells, and
+// decides when to press jump. The layer the lookahead runs through and the only one that reads the
+// jump arc; senses and presses buttons only, the arc arithmetic lives in calculators/jump_calculator
+// (Law 16).
 
 'use strict';
 
@@ -20,41 +17,23 @@ const { guardExternal, withCleanup } = require('@utils/external_library_guard');
 
 const RUN_POLL_MS = 50;
 const RUN_ENTER_EPS = 0.28;      // how far past a boundary counts as ENTERED, in blocks
-const RUN_STRICT_EPS = 0.4;      // the final cell's centre tolerance — matches the old per-cell test
+const RUN_STRICT_EPS = 0.4;      // the final cell's centre tolerance
 const RUN_STALL_MS = 400;
 const RUN_MIN_PROGRESS = 0.05;
 
-// horizontalSpeed(bot) → blocks per second, from the body's own velocity. Sensed, never assumed: the
-// prejump distance is wrong for a bot that is slowed (soul sand, cobweb, water) or hasted, and those are
-// exactly the cases where jumping early would put it in a wall (Invariant B).
+// horizontalSpeed(bot) → blocks per second, read from the body's own sensed velocity, not assumed, so
+// a slowed or hasted bot still gets a correct prejump distance (Invariant B).
 function horizontalSpeed(bot) {
   const v = bot && bot.entity && bot.entity.velocity;
   if (!v) return 0;
   return Math.hypot(v.x, v.z) * 20;   // b/tick → b/s
 }
 
-// riseAhead(p, cells, idx) → { height, faceDistance } | null — WHICH step the body is about to meet and
-// how far its near FACE is. The old prejump read the rise from cells[idx+1] but measured the distance to
-// cells[idx], triggering a step one cell ahead a full block early; rise and distance must come off the
-// SAME cell (jumpTriggerPlan carries the full account).
-// ── THE 0.5 IS AN AXIS-ALIGNED ASSUMPTION, AND IT IS UNDER SUSPICION (Architect 2026-08-06) ─────────
-// "we should have calculators jump diagonally up at the correct speed but im not sure if that works."
-//
-// `- 0.5` treats the step as a face met head-on. Met corner-first it is ~0.707 away, and the body's own
-// half-width toward a corner is 0.3·√2 = 0.424 rather than 0.3 — so at 45° the reported lead is ~0.33 b
-// longer than the true one, which is ~1.2 ticks at sprint against a jump window only 5 ticks wide.
-//
-// THE PART THAT MATTERS, and the reason a bare `outOfBand` count will never find it: jumpTriggerPlan
-// computes `willClear` FROM THIS SAME NUMBER, so it certifies its own bad input. Swept across poll phase
-// at 45° and 5.61 b/s, 3 of 20 phases put the leading edge inside the face while the arc is still below
-// the step — and the plan reports `clears` for all 20. The remaining 17 sit at 4.0–4.8 ticks against a
-// window that opens at 4, i.e. riding the edge, where an axial approach sits mid-window.
-//
-// NOT CORRECTED HERE, deliberately. The arithmetic above is a prediction; what settles it is whether real
-// diagonal presses fail more than real axial ones, which is why the bearing is emitted per press and
-// trace_monitor splits the OUTCOME (re-jumps, stuck-at-level) by it — never the verdict, which is blind
-// (Law 26: the model does not grade its own paper). The 0.5 is also CORRECT for the axial case, which is
-// most presses, so a blind swap to 0.707 would trade a suspected fault for a certain one.
+// riseAhead(p, cells, idx) → { height, faceDistance } | null — the step the body is about to meet and
+// how far its near face is, read off the SAME cell (jumpTriggerPlan carries the full account). The
+// `- 0.5` assumes a face met head-on; a diagonal approach reports a longer lead than true, and
+// jumpTriggerPlan certifies `willClear` from this same number — so the bearing is emitted per press,
+// letting trace_monitor split outcomes by approach angle instead of trusting the verdict blind (Law 26).
 function riseAhead(p, cells, idx) {
   const here = cells[idx];
   const dyHere = here.y - p.y;
@@ -81,8 +60,7 @@ function approachBearing(p, cell) {
 }
 
 // dropAhead(p, cells, idx) → { height, edgeDistance } | null — the mirror of riseAhead, for ground that
-// falls away instead of rising. Read for the SPRINT decision only; nothing is pressed for a descent,
-// because walking off an edge needs no input.
+// falls away instead of rising. Read for the sprint decision only; nothing is pressed for a descent.
 function dropAhead(p, cells, idx) {
   const here = cells[idx];
   const dyHere = here.y - p.y;
@@ -98,98 +76,48 @@ function dropAhead(p, cells, idx) {
   return { height: -dyNext, edgeDistance: Math.max(0, flatNext - 0.5) };
 }
 
-// One extra tick of travel, so the sprint is released the poll BEFORE the jump rather than in the same
-// one. The impulse is applied on the tick the jump is pressed, so a release racing it in the same poll
-// is a race this does not need to run.
+// One extra tick of travel: releases sprint the poll before the jump, ahead of the forward impulse
+// that lands on the jump tick.
 const SPRINT_RELEASE_MARGIN = 0.3;
 
-// ── WHY THE SPRINT LETS GO OF THE GROUND IT IS ABOUT TO LEAVE (Architect 2026-08-01) ────────────────
-// "we would have to expand the jumping calculators to account for sprint jumps or sprinting has to stop
-//  when ascending and decending… so sprint on horizontal only then walk to jump? your choice on which is
-//  more optimal."
-//
-// Chosen: sprint on the flat, release for the step, re-press on landing. The reason is not that sprint
-// jumps are slow — it is WHICH ARITHMETIC IS BEING TRUSTED. jumpTriggerPlan is already speed-aware: it
-// reads the body's SENSED speed every poll (horizontalSpeed below), so any CONSTANT pace, sprint
-// included, triggers correctly. What it does not model is Java's sprint-jump FORWARD IMPULSE — roughly
-// +0.2 b/tick along the facing on the jump tick, decaying through the arc. That impulse is not a tuning
-// detail; it decides the outcome. Integrating it out: a sprinting body covers ~1.83 blocks in the first
-// four air ticks against the model's ~1.12, so it meets the step face around tick 3.6 while the arc does
-// not clear a full block until tick 4. It clips, by about two centimetres.
-//
-// Two centimetres is exactly the margin that says DO NOT TRUST THE MODEL: the air-drag and air-control
-// constants behind that 1.83 are ones this project has never measured, so the arithmetic cannot say
-// which side of the face the body lands on — only that it is at the boundary. Expanding the calculator
-// would mean shipping an unverified physics model into the fastest, most stall-prone path, where being
-// wrong costs a clipped face plus a 400 ms stall detection plus a re-plan (Law 26 — a model must not
-// certify its own output; Law 22 gate 2 — reuse the established system rather than invent one).
-//
-// The cost of the other choice is small and BOUNDED, which is what settles it: the release fires at
-// jumpTriggerPlan's own outer window edge (~2.54 blocks out at sprint), so the most it can ever cost is
-// that stretch walked instead of sprinted — 589 ms against 453 ms, i.e. under 136 ms per step climbed,
-// and less in practice because the body coasts down rather than dropping to walking pace at once. One or
-// two steps in a 15-block arena rush is a fifth of a second. A single clipped face costs more than that
-// in stall detection alone (RUN_STALL_MS is 400).
-//
-// It is measured, not assumed: `outOfBand` counts every jump pressed that the arithmetic says will NOT
-// clear. A run that reports zero is the evidence this reasoning was right; a run that reports many is
-// the evidence it was not, and the number arrives without anyone having to ask for it (Law 25).
+// ── SPRINT AND THE JUMP STEP ────────────────────────────────────────────────
+// Sprint runs on the flat, releases before a step, and re-presses on landing — jumpTriggerPlan reads
+// sensed speed but not Java's sprint-jump forward impulse, so it cannot certify a sprinting jump
+// clears (Law 26; Law 22 gate 2). `outOfBand` counts presses the arithmetic predicts will not clear.
 
 // driveRun(bot, cells, opts) → { arrived, crossed, reason, prejumps, outOfBand, sprintDrops }.
 //
 // Walks a run of ALREADY-WALKABLE feet cells without releasing `forward` between them. It does not
-// carve, place, or bridge — a cell that turns out to be blocked ends the run and hands back to the
-// caller, whose edge primitives own that work (Law 0: this verb is "walk this run", nothing else).
+// carve, place, or bridge — a blocked cell ends the run and hands back to the caller, whose edge
+// primitives own that work (Law 0: this verb is "walk this run", nothing else).
 //
 // opts.strictFinal (default true) — the last cell must be stood on properly, centre and grounded.
 // opts.keepMoving (default false) — leave `forward` pressed on return, for a caller chaining runs.
-// opts.prejump (default FALSE) — off by default on purpose (Law 13): with it off and a single cell,
-//   this function is the old per-cell step exactly, so adopting it changes nothing until a caller asks
-//   for the new behaviour. That is what makes the live A/B one argument instead of one branch.
-// opts.sprint (default FALSE) — hand this function the SPRINT control for the run. See the header block
-//   above for why it cannot stay with the caller.
-// opts.stallMs (default RUN_STALL_MS) — how long zero progress is tolerated before the run gives up.
-//   Pass `null` to WAIVE the stall verdict entirely, for the one caller whose step legitimately makes no
-//   ground while it works.
-//
-// ── WHY A WAIVER EXISTS AT ALL, AND WHY IT IS NOT A DEFAULT (Architect 2026-09-11) ─────────────────
-// The stall guard assumes zero progress means something is wrong. That holds for every edge type but
-// one: a DOOR. A shut door has a solid bounding box, so a body walking into it makes exactly no ground
-// until the survival reflex opens it — zero progress is that step's normal working state, not its
-// failure. Before the walkers were consolidated (c7ee49a, 2026-08-01) the door step ran its own loop
-// with no progress check and simply pushed for its full 3,000 ms, which is the budget the reflex's
-// server round-trip needs; the consolidation silently cut that to 400 ms and the door has been snagging
-// ever since (bugsquashing §20.1). The waiver restores the old patience for that ONE caller without
-// giving it to the rest, because everywhere else the guard is what stops a wedged body burning its
-// whole timeout. The run is still bounded — `timeoutMs` always applies.
+// opts.prejump (default false) — gates the lookahead jump timing behind an explicit opt-in (Law 13).
+// opts.sprint (default false) — this function owns the sprint control for the run (see above).
+// opts.stallMs (default RUN_STALL_MS) — zero-progress tolerance before the run gives up; `null` waives
+//   the stall verdict, for a caller whose step legitimately makes no ground while it works — the guard
+//   otherwise assumes zero progress is wrong, which is false for a shut door until the survival reflex
+//   opens it. `timeoutMs` still bounds the run regardless.
 async function driveRun(bot, cells, opts = {}) {
   const r2 = (n) => (typeof n === 'number' && isFinite(n) ? Math.round(n * 100) / 100 : null);
   const nothing = (reason, crossed) => ({ arrived: false, crossed, reason, prejumps: 0, outOfBand: 0, sprintDrops: 0, ms: 0, dist: 0, path: 0, spd: 0, peak: 0, sprintMs: 0, stuckMs: 0, jumps: [] });
   if (!Array.isArray(cells) || !cells.length) return nothing('empty_run', 0);
   const strictFinal = opts.strictFinal !== false;
   const timeoutMs = opts.timeoutMs || Math.max(1500, cells.length * 900);
-  // `undefined` means "not asked for" and takes the default; `null` is the explicit waiver. They are
-  // distinguished rather than collapsed, so a caller cannot waive the guard by forgetting the option.
+  // `undefined` takes the default; `null` is the explicit waiver — distinguished so omission cannot
+  // accidentally waive the guard.
   const stallMs = opts.stallMs === undefined ? RUN_STALL_MS : opts.stallMs;
   const t0 = Date.now();
   let idx = 0, prejumps = 0, jumpHeld = false, outOfBand = 0, sprintDrops = 0;
-  // Starts null rather than false so the first pass always writes the control, instead of assuming the
-  // body arrived in whatever state this function would have left it in (Invariant B).
+  // Starts null so the first pass always writes the control instead of assuming prior state (Invariant B).
   let sprintHeld = null;
   let lastProgressPos = bot.entity.position.clone();
   let lastProgressAt = Date.now();
 
-  // ── LOCOMOTION TELEMETRY ────────────────────────────────────────────────────────────────────────────
-  // Emitted, never acted on: this function's decisions are unchanged by anything below. It is here rather
-  // than in the caller because only this layer polls the body mid-leg — a caller sampling before and after
-  // sees a chord and reads a curve as a slower straight line (that error is exactly what made the first
-  // CHASE speed verdict unsound, 2026-08-05).
-  //
-  // What it does NOT compute: "jumped again without gaining height". A combat leg is 400 ms and a jump arc
-  // is ~600, so the takeoff and the landing fall in DIFFERENT calls — no single leg can see the pattern.
-  // The per-leg facts (y at press, y at end, grounded, presses) go to the journal and the monitor
-  // differences consecutive rows, the same way it already reconstructs chase speed (Law 16: one reducer,
-  // extended — not a second one built beside it).
+  // ── LOCOMOTION TELEMETRY ──────────────────────────────────────────────────────
+  // Emitted, never acted on. Sampled here, not by the caller, since only this layer polls the body
+  // mid-leg; per-leg facts go to the journal and the monitor differences consecutive rows (Law 16).
   const p0 = bot.entity.position.clone();
   let lastSample = p0.clone();
   let pathLen = 0, peak = 0, sprintMs = 0, sprintSince = 0, stuckMs = 0;
@@ -216,37 +144,19 @@ async function driveRun(bot, cells, opts = {}) {
   bot.setControlState('forward', true);
 
   // withCleanup, not a guard: the releases below must run on every exit — arrival, timeout, stall, or a
-  // throw out of the leg — and nothing here is caught. An early `out(...)` verdict returns through it and
-  // is handed back below; falling out of the loop means the leg arrived.
+  // throw out of the leg. An early `out(...)` verdict returns through it and is handed back below;
+  // falling out of the loop means the leg arrived.
   const early = await withCleanup('drive', 'run leg', async () => {
     while (idx < cells.length) {
       if (Date.now() - t0 > timeoutMs) return out('timeout');
-      // ── THE COMBAT CHECKPOINT (Architect 2026-08-08) ────────────────────────────────────────────────
-      // The leg is the other unbounded span, and it is the one the callers cannot cover: navigator polls
-      // at the top of a STEP and a run crosses several cells inside one. Self-paced at 500 ms and
-      // self-bypassing while battle_stations holds the body, so combat's own rush and retreat legs — which
-      // come through this exact function — do not re-enter the gate that raised them.
-      //
-      // ORDERED AFTER THE TIMEOUT AND BEFORE THE POSITION READ so the leg's own bounds still win: a body
-      // whose time is up stops being a walk before it is offered a fight.
-      //
-      // `before` RELEASES EVERY CONTROL THIS FUNCTION HOLDS, and the promise semantics are why. On a real
-      // threat battleStations abandons this caller (Law 15) and never resolves — so the `finally` at the
-      // bottom of this function NEVER RUNS, and every key it would have released stays down for the whole
-      // fight. That finally releases three things, not one: `jump`, `forward` and `sprint`. `jumpHeld` and
-      // `sprintHeld` persist ACROSS iterations, so a body that pressed jump on the previous cell arrives
-      // at this checkpoint still holding it — which is exactly the case a `forward`-only release missed
-      // (found 2026-08-08 answering the Architect's "how wont it cause the 2 signals at a time error": it
-      // is not a signal fault, it is a Law 8 one — a lifecycle's controls outliving the lifecycle).
-      //
-      // THIS IS THE ONE CALL SITE THAT IS NOT A NATURALLY SAFE POINT. A dig checkpoint is safe by
-      // construction (nothing is in flight — see performDig); a walking body is mid-verb with keys down,
-      // so the point is MADE safe here rather than found. Anything this function starts holding later must
-      // be released here too, or the fight inherits it.
-      //
-      // The release happens on the polling pass only (twice a second), and the loop re-presses below and
-      // re-decides jump/sprint from the flags on the same iteration — so a leg that meets nothing loses a
-      // tick of press and keeps its ramp.
+      // ── THE COMBAT CHECKPOINT ────────────────────────────────────────────────
+      // The one unbounded span callers cannot cover from outside, since a run crosses several cells
+      // inside one caller poll; ordered after the timeout so a body out of time stops walking before it
+      // is offered a fight. `before` releases every control this function holds — jump, forward,
+      // sprint — because a real threat lets battleStations abandon this caller (Law 15) without
+      // resolving, so this function's own `finally` never runs. Unlike a dig checkpoint (safe by
+      // construction), this site is made safe here instead of found; anything held later must be
+      // released here too.
       await require('@api/battle_stations').combatCheckpoint(bot, 'drive', {
         before: () => {
           // Unguarded: setControlState asserts only on a bad control name or a non-boolean state, both of
@@ -255,8 +165,7 @@ async function driveRun(bot, cells, opts = {}) {
           bot.setControlState('forward', false);
           if (opts.sprint && sprintHeld) {
             bot.setControlState('sprint', false);
-            // Close the sprint accounting rather than orphaning `sprintSince`: the loop re-presses on
-            // this same pass and would overwrite it, silently dropping the interval it had accrued.
+            // Closes the sprint interval before the re-press below can overwrite `sprintSince`.
             if (sprintSince) { sprintMs += Date.now() - sprintSince; sprintSince = 0; }
             sprintHeld = false;
           }
@@ -272,20 +181,29 @@ async function driveRun(bot, cells, opts = {}) {
       lastSample = p.clone();
       const target = cells[idx];
       const isLast = idx === cells.length - 1;
+      // The floor ahead is re-read every pass: the run was checked when it started, and a peer digging
+      // the ground can take a floor while the body is on its way to it. A run whose next floor has gone
+      // stops here, and the caller replans from where the body stands.
+      const floorAhead = bot.blockAt(target.offset(0, -1, 0));
+      if (!floorAhead || floorAhead.boundingBox === 'empty') return out('floor_gone');
       const cx = target.x + 0.5, cz = target.z + 0.5;
       const dx = cx - p.x, dz = cz - p.z, dy = target.y - p.y;
       const flat = Math.hypot(dx, dz);
 
-      // Steering every pass rather than once per cell: a run bends between cells, and a body aimed at
+      // Steering every pass instead of once per cell: a run bends between cells, and a body aimed at
       // the cell it left drifts wide of the next boundary at speed.
       await guardExternal('drive', 'look toward target', () => bot.look(Math.atan2(-dx, -dz), 0, true));
 
       // ── the arrival predicate, and the whole point of this function ──
-      const entered = p.floored().equals(target)
-        || (flat <= 0.5 + RUN_ENTER_EPS && Math.abs(dy) < 1.2);
-      // The strict test is the OLD per-cell one verbatim, floored-equals included: arrival requires
-      // ground contact, because a body passing through the target Y mid-arc reports success and then
-      // falls back to a lower cell.
+      // A cell below the body is entered by LANDING on it. Counting it from above hands the steering to
+      // the next cell while the body is still a step up, so it crosses the step's corner in the air
+      // and drops two.
+      const landedOn = bot.entity.onGround && p.floored().equals(target);
+      const entered = dy < -0.5
+        ? landedOn
+        : (p.floored().equals(target) || (flat <= 0.5 + RUN_ENTER_EPS && Math.abs(dy) < 1.2));
+      // settled requires ground contact — a body passing through the target Y mid-arc without landing
+      // would otherwise report arrival and then fall back to a lower cell.
       const settled = bot.entity.onGround
         && (p.floored().equals(target) || (flat <= RUN_STRICT_EPS && Math.abs(dy) < 0.6));
       if (isLast ? (strictFinal ? settled : entered) : entered) {
@@ -295,20 +213,13 @@ async function driveRun(bot, cells, opts = {}) {
       }
 
       // ── the prejump ──
-      // Aimed at the NEXT cell's rise when there is one, otherwise this cell's. A run reads one cell
-      // further than it is walking, which is the lookahead the whole design turns on.
-      // NO BRAKE HERE, and the Architect asked for one ("we could even tap forward to slow down if the
-      // jump would hit the face of the block"). It is not omitted, it is impossible: the trigger fires at
-      // lead ≤ v×6 and the window opens at lead ≥ v×4, so every position where the body is too fast to
-      // clear is a position where the jump has ALREADY been pressed. A branch reading "too fast and not
-      // yet jumping" can never be true, and shipping it would be a dial that cannot fire (Law 16). The
-      // one case a brake would serve — a step discovered after the body is already inside the window —
-      // is a lookahead failure, and the fix for it is to see the step earlier, not to slow down at it.
+      // Aimed at the NEXT cell's rise when there is one, otherwise this cell's — the lookahead the
+      // whole design turns on. No brake: the trigger fires at lead ≤ v×6, the window opens at lead ≥
+      // v×4, so any position too fast to clear has already had the jump pressed (Law 16).
       const speed = horizontalSpeed(bot);
       if (speed > peak) peak = speed;
       const rise = riseAhead(p, cells, idx);
-      // Only consulted when there is no rise: a cell that both climbs and drops cannot exist, and asking
-      // for the drop first would let a step-down two cells out veto the sprint through a step-up.
+      // Consulted only when there is no rise — a cell cannot both climb and drop.
       const drop = rise ? null : dropAhead(p, cells, idx);
       let wantSprint = !!opts.sprint;
 
@@ -319,13 +230,11 @@ async function driveRun(bot, cells, opts = {}) {
           shouldJump = plan.jumpNow;
           if (shouldJump && !jumpHeld) {
             prejumps++;
-            // The verdict the trigger already computes and this function used to discard. A press the
-            // arithmetic says will clip the face or land short is the one thing that would prove the
-            // sprint ruling above wrong, so it is counted rather than inferred from a stall.
+            // Counts presses the arithmetic itself predicts will not clear — measured directly rather
+            // than inferred from a stall.
             if (!plan.willClear) outOfBand++;
-            // The whole press, recorded — the step, the sensed speed, the window it was aimed at, the
-            // verdict, and the bearing it was met on. A tally of failures cannot say WHICH input was
-            // wrong; these five can (Law 25: the number arrives without anyone having to ask).
+            // Records the full press — step, speed, window, verdict, bearing — so a fault can be traced
+            // to which input was wrong, not just that one occurred (Law 25).
             if (jumps.length < 16) jumps.push({
               h: r2(rise.height), face: r2(rise.faceDistance), spd: r2(speed),
               ticks: r2(plan.ticksToFace), min: r2(plan.min), max: r2(plan.max),
@@ -334,11 +243,10 @@ async function driveRun(bot, cells, opts = {}) {
             });
           }
         } else {
-          shouldJump = dy > 0.5;    // the A/B baseline: press jump on arrival, exactly as before
+          shouldJump = dy > 0.5;    // the A/B baseline: press jump on arrival
         }
-        // Inside the clearance window's outer edge — the sprint impulse must be gone before the press.
-        // plan.max is absent when no jump clears the step at all (`step_too_tall`), and there is nothing
-        // to release for in that case: the run is about to stall on a wall, not take a step.
+        // Inside the clearance window's outer edge, the sprint impulse must be gone before the press;
+        // plan.max is absent when no jump clears the step at all, and there is nothing to release for.
         if (typeof plan.max === 'number' && rise.faceDistance <= plan.max + SPRINT_RELEASE_MARGIN) wantSprint = false;
         if (shouldJump !== jumpHeld) {
           bot.setControlState('jump', shouldJump);
@@ -349,11 +257,9 @@ async function driveRun(bot, cells, opts = {}) {
           bot.setControlState('jump', false);
           jumpHeld = false;
         }
-        // A descent presses nothing, but it is still a sprint decision: a body that runs off a one-block
-        // edge at 5.61 b/s lands 1.68 blocks out against 1.30 at walking pace, and the extra third of a
-        // block is past the last cell this run validated. Landing on ground nothing checked is the
-        // predictable self-injury Law 17 forbids, so the sprint comes off while the edge is inside the
-        // distance the body would fly.
+        // A descent presses nothing but is still a sprint decision — landing beyond the last validated
+        // cell is unchecked ground, which Law 17 forbids, so sprint comes off once the edge is within
+        // the body's flight distance.
         if (drop) {
           const land = descentLandingDistance(speed, drop.height);
           if (land.blocks != null && drop.edgeDistance <= land.blocks) wantSprint = false;
@@ -363,9 +269,8 @@ async function driveRun(bot, cells, opts = {}) {
       if (opts.sprint && wantSprint !== sprintHeld) {
         bot.setControlState('sprint', wantSprint);
         if (sprintHeld === true && !wantSprint) sprintDrops++;
-        // Clocked on the CONTROL, not on the speed: what is being asked is "was sprint commanded", so a
-        // body that is commanded to sprint and does not accelerate reads as held-but-slow, which is the
-        // finding. Deriving it from velocity would hide exactly that case.
+        // Clocked on the control, not the speed — a body commanded to sprint that fails to accelerate
+        // should read as held-but-slow, not not-sprinting.
         if (wantSprint) sprintSince = Date.now();
         else if (sprintSince) { sprintMs += Date.now() - sprintSince; sprintSince = 0; }
         sprintHeld = wantSprint;
@@ -377,22 +282,19 @@ async function driveRun(bot, cells, opts = {}) {
         lastProgressPos = p.clone();
         lastProgressAt = Date.now();
       } else {
-        // Reported even when it never reaches the threshold. RUN_STALL_MS (400) cannot fire inside a
-        // combat leg because the leg's own clock is also 400 and wins — so the stall verdict is absent
-        // exactly where the Architect reported the symptom. stuckMs carries the evidence out regardless
-        // of which clock expires first, and the ARM owns the escalation (see rush.js).
+        // Reported even below the stall threshold — RUN_STALL_MS cannot fire inside a combat leg since
+        // that leg's own clock is also 400ms and wins first, so stuckMs carries the evidence out either
+        // way (the ARM owns escalation; see rush.js).
         stuckMs = Date.now() - lastProgressAt;
-        // stuckMs is still MEASURED under a waiver — the telemetry is the evidence either way, and a
-        // door that takes 900 ms to open should be readable afterwards. Only the verdict is waived.
+        // Still measured under a waiver — only the verdict is waived, so a slow door stays readable.
         if (stallMs != null && stuckMs > stallMs) return out('stalled');
       }
       await sleep(RUN_POLL_MS);
     }
   }, () => {
     if (jumpHeld) bot.setControlState('jump', false);
-    // keepMoving governs the sprint exactly as it governs `forward`, and for the same reason: a caller
-    // chaining legs wants the acceleration ramp kept, and a caller that is done wants the body stopped.
-    // Releasing sprint unconditionally here would spend that ramp on every pass of an engagement loop.
+    // keepMoving governs sprint the same as forward — a chaining caller keeps the ramp, a finished
+    // caller stops the body.
     if (!opts.keepMoving) {
       bot.setControlState('forward', false);
       if (opts.sprint) bot.setControlState('sprint', false);
@@ -404,14 +306,12 @@ async function driveRun(bot, cells, opts = {}) {
 
 // planRunSegments(path, opts) → [{ kind, edges }]. PURE — no bot, no world.
 //
-// Splits a typed-edge path into the runs that may be walked continuously and the edges that may not.
-// This is the lookahead, and it is a separate pure function precisely so the DECISION (what fuses) can
-// be tested headless while the CROSSING (whether the body makes it) is left to the arena.
+// Splits a typed-edge path into runs that may be walked continuously and edges that may not, kept
+// separate from crossing so the lookahead decision can be tested headless.
 //
-// Only `walk` fuses today, plus step-up/step-down that need no carving. Everything that alters the
-// world — bridge, pillar, dig — is its own segment and runs exactly as it does now: those primitives
-// place and dig BEFORE stepping, so a body still moving through them would be building underneath
-// itself. `maxRun` is the lookahead depth, and maxRun 1 reproduces the current behaviour edge for edge.
+// Only walk/step/stair fuse; anything that alters the world (bridge, pillar, dig) stays its own
+// segment, since those primitives place or dig before stepping and a moving body would build under
+// itself. `maxRun` is the lookahead depth.
 const RUNNABLE_EDGES = new Set(['walk', 'step', 'stair_up', 'stair_down']);
 
 function planRunSegments(path, opts = {}) {
@@ -428,6 +328,8 @@ function planRunSegments(path, opts = {}) {
   return segments;
 }
 
+// driveFlatToCell(bot, next, opts) — single-cell step for flat ground, digging through any obstacle it
+// stalls against instead of ending the step.
 async function driveFlatToCell(bot, next, opts = {}) {
   const TIMEOUT_MS = opts.timeoutMs || 1400;
   const STALL_WINDOW_MS = opts.stallWindowMs || 300;
@@ -470,6 +372,8 @@ async function driveFlatToCell(bot, next, opts = {}) {
   return arrived;
 }
 
+// stepHorizontal(bot, dx, dz, optFloorBlock) — one horizontal cell, clearing obstacles and bridging a
+// gap with a placed block where the ground does not carry across.
 async function stepHorizontal(bot, dx, dz, optFloorBlock) {
   const TIMEOUT_MS = 1500;
   const POLL_MS = 50;
@@ -481,10 +385,8 @@ async function stepHorizontal(bot, dx, dz, optFloorBlock) {
   for (const offY of [0, 1]) {
     const blk = bot.blockAt(target.offset(0, offY, 0));
     if (blk && blk.boundingBox !== 'empty') {
-      // performDig REPORTS rather than throws (its contract: false = cell not cleared), so the guard that
-      // stood here could only fire on a defect — and it hid the real failure, because the return value
-      // was never read. A refused dig now ends the step, which is what the guard was written to do and
-      // never did (Law 25).
+      // performDig reports failure instead of throwing (false = cell not cleared); a refused dig ends
+      // the step (Law 25).
       if (!await performDig(bot, blk.position, blk, 'drive')) return false;
       await sleep(100);
     }
@@ -517,13 +419,10 @@ async function stepHorizontal(bot, dx, dz, optFloorBlock) {
       watcher.warn('drive', `stepHorizontal fail: no current support to place floor against`);
       return false;
     }
-    // The one place route (Law 16) owns equip, the spawn-protection gate, the combat checkpoint, the
-    // sneak and its guaranteed release, the aim and the click. sneak: true rather than 'auto' — the
-    // crouch holds the body on the block it bridges FROM, which is a fact about the move rather than
-    // about the anchor.
-    //
-    // A refused bridge is the one placement where a phantom is dangerous rather than merely wasteful:
-    // the body would step onto a floor the client drew and the server never laid, and fall.
+    // The one place route (Law 16) owns equip, the spawn-protection gate, combat checkpoint, sneak,
+    // aim and click; sneak: true holds the body on the block it bridges from. A refused bridge is
+    // dangerous, not wasteful — the body would step onto a floor the client drew and the server never
+    // laid, and fall.
     const placed = await performPlace(bot, new Vec3(target.x, feet.y - 1, target.z), curSupport, new Vec3(dx, 0, dz), bridgeItem.name, 'drive', { sneak: true, settleMs: 100 });
     if (!placed.ok) {
       watcher.warn('drive', `bridge floor not laid toward (${target.x},${target.z}) — ${placed.reason}`);

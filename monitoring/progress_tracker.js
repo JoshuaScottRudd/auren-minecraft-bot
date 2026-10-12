@@ -1,35 +1,28 @@
 // Auren_Bot/monitoring/progress_tracker.js
-// A read-only OBSERVER of corporate HQ — answers the one question trace_monitor structurally
-// cannot: "what have the bots completed, standing and cumulative?" trace_monitor reads the
-// trace (watcher_*.json), which `up` WIPES every run, so it only ever sees the current run
-// segment. Durable "what stands" lives in corporate_headquarters*.json (HQ) — untouched by a
-// start, cleared only by an explicit flush. This tool reads THAT.
+// A read-only observer of corporate HQ — answers what the bots have completed, standing and cumulative.
+// trace_monitor reads the trace (watcher_*.json), which `up` wipes every run, so it only ever sees the
+// current run segment. Durable "what stands" lives in corporate_headquarters*.json (HQ), untouched by a
+// start and cleared only by an explicit flush; this tool reads that.
 //
-// PURELY AN OBSERVER (Architect, 2026-07-14): it never writes HQ, never alters it, and derives
-// nothing back into it. HQ is machine-to-machine state; a percentage or any human-facing gloss
-// computed here stays in memory and is printed — writing it back would contaminate HQ with an
-// observer's convenience and give the tool a stake in the data it watches (Law 6: it owns no HQ
-// section; Law 23/19: an observer that edits the record to ease its own job is no longer one).
-// Like trace_monitor it lives OUTSIDE the construct — not a fragment, no signal bus, decides
-// nothing in the SPA loop. Touches no bot.
+// Purely an observer: it never writes HQ, never alters it, and derives nothing back into it. HQ is
+// machine-to-machine state; any human-facing gloss computed here stays in memory and is only printed
+// (Law 6: it owns no HQ section; Law 23/19: an observer that edits the record to ease its own job is no
+// longer one). Like trace_monitor it lives outside the construct — not a fragment, no signal bus, decides
+// nothing in the SPA loop, and touches no bot.
 //
-// WHY no live voxel %: the "283/285 correct" count is a world-scan that exists only in the
-// trace, never persisted to HQ. HQ instead carries a binary `all_complete` plus the exact
-// `materials_missing` — a cleaner "done, or here's precisely what's left" than a bar that
-// flickers ±2 mid-build. Reading the live count would mean reading the trace too, re-coupling
-// this observer to trace_monitor's source (Law 16) — deliberately not done.
+// No live voxel percentage: a running voxel count exists only in the trace, never persisted to HQ. HQ
+// carries a binary `all_complete` plus the exact `materials_missing`, so this stays coupled to HQ alone
+// (Law 16).
 //
-// WHICH HQ file: each bot writes its OWN corporate_headquarters.<BotId>.json, a full mirror of
-// shared HQ plus its own boardroom chair. Shared rooms (structures, job board, logistics, mining,
-// exploration) are read from the FRESHEST file by `updated_at` — a coherent foreman-synced
-// snapshot. Each bot's "doing now" is read from that bot's OWN file, which is authoritative and
-// freshest for itself (Law 23 — verify against the freshest source, don't trust a stale mirror).
-// Only bots present in the freshest boardroom are shown, so a run of N bots never surfaces a
-// stale TestBot file left on disk.
+// Each bot writes its own corporate_headquarters.<BotId>.json, a full mirror of shared HQ plus its own
+// boardroom chair. Shared rooms (structures, job board, logistics, mining, exploration) are read from the
+// freshest file by `updated_at`, for a coherent foreman-synced snapshot. Each bot's "doing now" is read
+// from that bot's own file, which is authoritative for itself (Law 23). Only bots present in the freshest
+// boardroom are shown, so a stale file left on disk from a smaller run never surfaces.
 //
-// Usage:  node progress_tracker.js            (full snapshot)
-//         .\Auren_Bot\Auren_Workshop\scripts\progress.ps1   (wrapper; from the Architect's repo root)
-//         .\Auren_Workshop\scripts\progress.ps1             (same, from a download's Auren_Bot root)
+// Usage:  node progress_tracker.js                                (full snapshot)
+//         .\Auren_Bot\Auren_Workshop\scripts\progress.ps1          (wrapper; from the repo root)
+//         .\Auren_Workshop\scripts\progress.ps1                    (same, from a download's Auren_Bot root)
 // Exit codes: 0 rendered · 1 no readable HQ found.
 
 'use strict';
@@ -47,7 +40,7 @@ function loadHqFiles() {
   let names;
   try { names = fs.readdirSync(HQ_DIR); }
   catch { return []; }
-  // Named `mirrors`, not `out` — `out` is the data_out writer at module scope now, and a local array of
+  // Named `mirrors`, not `out` — `out` is the data_out writer at module scope, and a local array of
   // that name would shadow it.
   const mirrors = [];
   for (const name of names) {
@@ -63,9 +56,9 @@ function loadHqFiles() {
 }
 
 // ── Small formatters ─────────────────────────────────────────────────────────
-// An elapsed span, and nothing else. The word "ago" it used to carry is now in the FIELD NAME
-// (`hq_updated_ago`), and an unreadable stamp returns null so data_out prints its ABSENT mark rather
-// than the word "unknown" — a value the reader could mistake for something HQ wrote.
+// An elapsed span, and nothing else; the unit lives in the field name (`hq_updated_ago`). An unreadable
+// stamp returns null so data_out prints its absent mark, never a word the reader could mistake for
+// something HQ wrote.
 const ago = ms => {
   if (!ms) return null;
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -99,7 +92,7 @@ function computeSnapshot(files) {
 
   const structItems = structNames.map(name => {
     const s = structuresRaw[name];
-    // Room keys carry an owner (`headframe|Architect`); the label shows the structure, the key stays the id.
+    // Room keys carry an owner (e.g. `headframe|<player>`); the label shows the structure, the key stays the id.
     const displayName = name.includes('|') ? name.slice(0, name.lastIndexOf('|')) : name;
     const it = integrityOf(s);
     const vox = s.blueprint_paster && s.blueprint_paster.total_voxels;
@@ -107,9 +100,8 @@ function computeSnapshot(files) {
     const complete = !!(it && (it.all_complete || it.structure_complete));
     const missing = it ? items(it.materials_missing) : '';
     const need = it ? items(it.materials_needed) : '';
-    // STATE IS A TOKEN AND THE MATERIALS ARE THEIR OWN FIELD (Architect 2026-09-16). This composed
-    // `building — short: planks×64` into one cell, which welded a status to a list and forced every
-    // reader — dashboard.js included — to split a sentence back apart to use either half.
+    // State is a token and materials are their own field, so no reader needs to split a composed
+    // sentence to use either half.
     const state = complete ? 'complete' : missing ? 'short' : need ? 'needs' : 'building';
     return { name: displayName, vox: vox != null ? vox : null, locked, complete, state,
       materials: missing || need || null };
@@ -120,11 +112,8 @@ function computeSnapshot(files) {
   const bots = botIds.map(id => {
     const self = (ownFile[id] && ownFile[id].data.bot_boardroom && ownFile[id].data.bot_boardroom[id]) || boardroom[id];
     const mag = self && self.magnet;
-    // THE TASK IS FIELDS, NOT A STATUS LINE (Architect 2026-09-16). This composed
-    // `supply/wheat_seeds need 5 @ (24,65,-1)` — one cell a reader had to take apart to use any part of.
-    // `doing` is now HQ's own `type/what` token and the quantity keeps the distinction that mattered:
-    // `need` is the amount still to obtain and `batch` is a batch size, so they stay SEPARATE fields
-    // rather than one number whose meaning depended on a word beside it.
+    // The task is fields, not a status line. `doing` is HQ's own `type/what` token; `need` is the amount
+    // still to obtain and `batch` is a batch size, kept as separate fields.
     const doing = mag ? `${mag.type}/${mag.what}` : null;
     return {
       id,
@@ -143,14 +132,12 @@ function computeSnapshot(files) {
     list: jobs.map(j => `[${j.asker && j.stage ? `${j.asker}/${j.stage}` : (j.asker ?? '?')}] ${j.type}/${j.what}`).join(' · '),
   };
 
-  // EACH SITE FACT IS A NAMED FIELD AND A VALUE, never a phrase. These were sentences
-  // (`shaft: 3 segment(s) built`) that a reader had to parse to get one number back out of.
+  // Each site fact is a named field and a value, never a composed phrase a reader must parse.
   const site = [];
   const segs = hq.mining_confrence_room && hq.mining_confrence_room.built_segments;
   if (segs) site.push({ fact: 'shaft_segments_built', value: Object.keys(segs).length });
-  // Cells are the fractal mining rooms fanned off the shaft. The `cells` registry holds EVERY
-  // registered cell — including complete:false neighbours the frontier grew but hasn't dug yet —
-  // so count only complete ones; Object.keys would over-report unbuilt frontier as "built".
+  // Cells are the fractal mining rooms fanned off the shaft. The `cells` registry includes complete:false
+  // neighbours the frontier has grown but not dug; only complete cells are counted.
   const cells = hq.mining_confrence_room && hq.mining_confrence_room.cells;
   if (cells) site.push({ fact: 'mining_cells_built', value: Object.values(cells).filter(c => c && c.complete).length });
   const seeker = hq.exploration_confrence_room && hq.exploration_confrence_room.biome_seeker;
@@ -175,14 +162,9 @@ function computeSnapshot(files) {
 }
 
 // ── Render one snapshot (the CLI formatter over computeSnapshot) ──────────────
-// OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16). Field names and values only; every space, separator
-// and column width belongs to data_out. Strings that reach a value cell here are COPIED — a structure
-// name, a bot id, a job coordinate, a material list — never composed by this observer.
-//
-// DELETED, not translated: the `(read-only observer of HQ — never writes…)` banner, which is a claim
-// about what this tool is rather than a reading of HQ (it lives in the header comment above), the
-// `(none locked yet)` phrase for an empty ledger (now `structures_total 0`), and the ✅/⋯ mark per
-// structure (now the `complete` boolean it was drawn from).
+// Output is data, not prose: field names and values only, with spacing and columns owned by data_out.
+// Strings reaching a value cell are copied — a structure name, a bot id, a job coordinate, a material
+// list — never composed by this observer.
 function render(files) {
   const snap = computeSnapshot(files);
 
@@ -191,9 +173,8 @@ function render(files) {
   out.kv('bots', snap.bots.length);
   out.kv('hq_updated_ago', ago(snap.updatedAt));
 
-  // STRUCTURES — the standing "what's built" ledger. `state` and `materials` arrive already separate
-  // from computeSnapshot, so nothing is split back apart here: the one derivation emits two fields
-  // rather than one sentence, and every reader (this lens and dashboard.js) takes the half it wants.
+  // Structures: the standing what's-built ledger. `state` and `materials` arrive already separate from
+  // computeSnapshot, so each reader (this lens and dashboard.js) takes the field it wants.
   out.section('structures');
   out.kv('structures_complete', snap.structures.done);
   out.kv('structures_total', snap.structures.total);

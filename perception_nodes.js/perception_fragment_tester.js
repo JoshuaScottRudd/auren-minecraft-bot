@@ -20,8 +20,8 @@ function resolveFragment(name) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`Fragment '${base}.js' not found`);
   }
-  // Unguarded: a fragment that will not load is a coding violation, and the wrapper this used to throw
-  // replaced the real error's stack with one line — worse for the one job this file has (Law 13).
+  // Unguarded: a fragment that will not load is a coding violation, and the probe's one job is to surface
+  // the real error's stack (Law 13).
   return require(filePath);
 }
 

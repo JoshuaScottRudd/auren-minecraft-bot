@@ -211,11 +211,9 @@ real console commands — they drive a world rather than reading a record, so po
 not mind disturbing. And the camera stack expects an installation you almost certainly do not have; the
 lenses that read its records say so in one sentence rather than failing.
 
-**The one thing I have that you do not** is that my machine hosts the world, so I start and stop it in the
-same pass with `Auren_Workshop/host_and_run.js` — which rolls the world back to a snapshot, starts the
-server, and then runs `Auren_Workshop/run.js` **unchanged, as a child process**. That is the entire
-difference between my run and yours: a separate file laid on top, never a branch inside the shared one. On
-a machine without a server folder it refuses and points at `run.js`.
+**My run is your run.** I start it with the same `node start_auren.js` and the same `foreman_config.js`
+you do. The foreman sets the clock, raises the cameras if the page asks for them, watches for a bot that
+errors, dies or leaves, and says PASS or FAIL at the end — for both of us, because there is one way to run it.
 
 ---
 

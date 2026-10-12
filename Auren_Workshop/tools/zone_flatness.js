@@ -44,9 +44,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/zone
 // a site has spare blocks or must bring them in.
 // Not priced: road earthwork, the ground under the roads, trees felled (counted, not costed), flooding when a cut goes
 // below a nearby water surface.
-// WRONG TURN, and why this replaced it: ranking sites by plots that were ALREADY flat (9x9 slots under a range limit)
-// favours whatever the world happened to generate and ignores that the fleet digs. With 17x17 buildings a flat 9x9
-// says little; the question is how many blocks it takes to make the pads, and that is what is ranked.
+// Sites are ranked by the total blocks moved (cut + fill) to level every chosen pad.
 //
 // ── ONE LARGE FOOTPRINT (--footprint=WxL): a downloaded blueprint sunk to natural ground ─────────────────
 // A downloaded blueprint is entered only from BELOW: the bots dig the whole footprint out horizontally, one Y layer at
@@ -69,12 +67,8 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/zone
 // (an opened lake or lava pocket floods the basement the bots work in). Both passes rank by OFF LEVEL: the summed
 // distance from h of every footprint column (hill above, hollow below) and every ring column — how far the site and
 // its surroundings are from the ground floor the building will show.
-// WRONG TURNS. (1) Picking h as the cheapest level (the pad model's choice) sinks or raises the building against its
-// own surroundings, which the Architect ruled out. (2) Ranking by fewest blocks dug rewards a pit that is already
-// partly empty: that ranking's best site stood over a ravine to y27, with 1,240 of its 2,173 floor cells open. The
-// dig of a level site is fixed by the footprint (columns x layers), so a smaller dig mostly means a hole. (3) Counting
-// positions that passed the voxel read as "spots": positions sit every 4 blocks in both orientations, so hundreds of
-// them are the same few places shifted, and water/lava alone is no levelness test. The count is separate level plots.
+// The reported count is of separate level plots, not raw scan positions — positions sit every 4 blocks in both
+// orientations, so many are the same place shifted, and water/lava alone is not a levelness test.
 //
 // Usage (developer mode):
 //   node Auren_Workshop/tools/zone_flatness.js [--snapshots=all|label,label] [--band=4] [--buildings=10] [--building=17]
@@ -90,7 +84,6 @@ process.env.BOT_ID = process.env.BOT_ID || 'zone_flatness';
 
 const store = require('./voxel_snapshot_store');
 const { makeVoxelReader } = require('@utils/voxel_reader');
-const geo = require('@utils/site_geometry');
 
 const args = process.argv.slice(2);
 const opt = (k, fallback) => { const hit = args.find(a => a.startsWith(`--${k}=`)); return hit ? hit.slice(k.length + 3) : fallback; };
@@ -104,10 +97,10 @@ const pad = (v, n) => String(v).padEnd(n);
 const pct = (a, b) => (b ? `${Math.round((100 * a) / b)}%` : '-');
 const kilo = n => (n >= 10000 ? `${(n / 1000).toFixed(0)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(Math.round(n)));
 
-const Y_TOP = 319, Y_BOTTOM = -64, H_BINS = Y_TOP - Y_BOTTOM + 1;
-const LAND = 1, WATER = 2, LAVA = 3;                    // 0 = unloaded (the zero-filled array's own value)
-const COVER = 0;
-const WATER_SURFACE = new Set(['water', 'bubble_column', 'kelp', 'kelp_plant', 'seagrass', 'tall_seagrass', 'ice', 'frosted_ice']);
+// The surface read and the footprint passes live in shipped code (`js_kernel/utils/footprint_survey.js`), because the
+// foreman sites the builder's castle with them; this bench calls the same functions (Law 16).
+const { readSurface, summedArea, percentileFromHist, footprintPass1, footprintPass2,
+  Y_BOTTOM, H_BINS, LAND, WATER, LAVA, TOLERANCES, LEVEL_SHARE, FOOT_STRIDE, RING_LAND } = require('@utils/footprint_survey');
 const NO_RANGE = 255, AREA_RADIUS = 16, SITE_STRIDE = 8, TREE_MARGIN = 48, DOMINANT = 0.5, GRID = 4, KEEP_PER_ZONE = 3, KEEP_OVERALL = 10;
 
 const BAND = intOpt('band', 4, 0);
@@ -126,65 +119,8 @@ const FOOT = FOOTPRINT && (() => {
 })();
 const BELOW = intOpt('below', 7, 0);
 const RING = intOpt('ring', 8, 1);
-const FOOT_STRIDE = 4, RING_LAND = 0.9, TOLERANCES = [1, 2, 3, 5], LEVEL_SHARE = 0.02, SHOWN_TOLERANCE = 2;
-const STONE_YIELD = new Set(['stone', 'deepslate', 'andesite', 'diorite', 'granite', 'tuff', 'cobblestone', 'calcite', 'smooth_basalt']);
-const DIRT_YIELD = new Set(['dirt', 'grass_block', 'coarse_dirt', 'podzol', 'rooted_dirt', 'mycelium', 'mud', 'dirt_path']);
-const FALLING = new Set(['sand', 'red_sand', 'gravel', 'suspicious_sand', 'suspicious_gravel']);
+const SHOWN_TOLERANCE = 2;
 
-// ── Part 1: the surface, water bed and wood of every loaded column ─────────────────────────────────
-function readSurface(bot) {
-  const reader = makeVoxelReader(bot, { needs: ['type'] });
-  const cols = bot.world.getColumns();
-  const cxs = cols.map(c => c.chunkX), czs = cols.map(c => c.chunkZ);
-  const minCX = Math.min(...cxs), minCZ = Math.min(...czs);
-  const x0 = minCX * 16, z0 = minCZ * 16;
-  const W = (Math.max(...cxs) - minCX + 1) * 16, D = (Math.max(...czs) - minCZ + 1) * 16;
-  const N = W * D;
-  const kind = new Uint8Array(N), height = new Int16Array(N), bed = new Int16Array(N), biome = new Uint16Array(N), state = new Int32Array(N);
-  const logs = new Uint16Array(N), trunk = new Uint8Array(N);
-  const verdict = new Map(), stateName = new Map(), isLogState = new Map();
-  const classify = (x, y, z, s) => {
-    const b = reader.blockAt(x, y, z);
-    const v = !b ? COVER : WATER_SURFACE.has(b.name) ? WATER : geo.isLava(b.name) ? LAVA
-      : (geo.isGround(b) && !geo.isCanopy(b.name)) ? LAND : COVER;
-    verdict.set(s, v);
-    isLogState.set(s, !!b && b.name.endsWith('_log'));
-    if (b) stateName.set(s, b.name);
-    return v;
-  };
-  for (const { chunkX, chunkZ } of cols) {
-    for (let lz = 0; lz < 16; lz++) {
-      for (let lx = 0; lx < 16; lx++) {
-        const x = chunkX * 16 + lx, z = chunkZ * 16 + lz, i = (z - z0) * W + (x - x0);
-        let prevLog = false, logCount = 0;
-        for (let y = Y_TOP; y >= Y_BOTTOM; y--) {
-          const s = reader.stateIdAt(x, y, z);
-          if (s < 0) break;
-          const v = verdict.has(s) ? verdict.get(s) : classify(x, y, z, s);
-          if (kind[i] === WATER) {                       // below a water surface: look for the bed
-            if (v === LAND || v === LAVA) { bed[i] = y; break; }
-            continue;
-          }
-          if (v === COVER) {
-            prevLog = isLogState.get(s);
-            if (prevLog) logCount++;
-            continue;
-          }
-          kind[i] = v; height[i] = y; state[i] = s;
-          biome[i] = bot.world.getBiome({ x, y, z });
-          logs[i] = logCount;
-          trunk[i] = v === LAND && prevLog ? 1 : 0;
-          if (v === WATER) { bed[i] = Y_BOTTOM; continue; }
-          bed[i] = y;
-          break;
-        }
-      }
-    }
-  }
-  reader.dispose();
-  const biomeName = id => bot.registry.biomes[id]?.name || `biome#${id}`;
-  return { x0, z0, W, D, kind, height, bed, biome, state, stateName, logs, trunk, biomeName };
-}
 
 // ── Part 2: steps and local relief ─────────────────────────────────────────────────────────────────
 // step[i] — the largest height difference to a LAND neighbour (a shore is not a step). NO_RANGE for non-land.
@@ -241,25 +177,8 @@ function areaReliefMap({ W, D, kind, height }) {
 }
 
 // A summed-area table, so any box's total is four lookups.
-function summedArea(W, D, valueAt) {
-  const S = new Float64Array((W + 1) * (D + 1));
-  for (let z = 0; z < D; z++) {
-    let row = 0;
-    for (let x = 0; x < W; x++) {
-      row += valueAt(z * W + x);
-      S[(z + 1) * (W + 1) + x + 1] = S[z * (W + 1) + x + 1] + row;
-    }
-  }
-  return (x, z, w, d) => S[(z + d) * (W + 1) + x + w] - S[z * (W + 1) + x + w] - S[(z + d) * (W + 1) + x] + S[z * (W + 1) + x];
-}
 
 // ── Part 3: the terraform model ────────────────────────────────────────────────────────────────────
-function percentileFromHist(hist, count, p, offset = 0) {
-  const target = Math.max(1, Math.ceil(p * count));
-  let seen = 0;
-  for (let b = 0; b < hist.length; b++) { seen += hist[b]; if (seen >= target) return b + offset; }
-  return hist.length - 1 + offset;
-}
 
 // padStats — one BUILDING x BUILDING pad whose min corner is (px, pz): the sorted ground (bed under water) heights and
 // their prefix sums, so cut and fill at any level are two binary searches. null when any column is unloaded or lava.
@@ -348,139 +267,29 @@ function evaluateSite(g, padMemo, ox, oz) {
 }
 
 // ── Part 4: one large footprint ────────────────────────────────────────────────────────────────────
-// Pass 1 — surface arrays only. Every min corner of the footprint-plus-ring box at FOOT_STRIDE, both orientations.
-function footprintPass1(g, fw, fl, trunksIn) {
-  const tw = fw + 2 * RING, tl = fl + 2 * RING;
-  const ringCols = tw * tl - fw * fl;
-  const hist = new Uint32Array(H_BINS);
-  const sites = [], refused = { unloaded_or_lava: 0, water_in_footprint: 0, ring_not_land: 0 };
-  for (let oz = 0; oz + tl <= g.D; oz += FOOT_STRIDE) {
-    for (let ox = 0; ox + tw <= g.W; ox += FOOT_STRIDE) {
-      hist.fill(0);
-      let ringLand = 0, footWater = 0, blocked = false;
-      for (let z = oz; z < oz + tl && !blocked; z++) {
-        for (let x = ox; x < ox + tw; x++) {
-          const i = z * g.W + x, k = g.kind[i];
-          if (k === 0 || k === LAVA) { blocked = true; break; }
-          const inFoot = x >= ox + RING && x < ox + RING + fw && z >= oz + RING && z < oz + RING + fl;
-          if (inFoot) { if (k === WATER) footWater++; continue; }
-          if (k === LAND) { hist[g.height[i] - Y_BOTTOM]++; ringLand++; }
-        }
-      }
-      if (blocked) { refused.unloaded_or_lava++; continue; }
-      if (footWater) { refused.water_in_footprint++; continue; }
-      if (ringLand < RING_LAND * ringCols) { refused.ring_not_land++; continue; }
-      const h = percentileFromHist(hist, ringLand, 0.5, Y_BOTTOM);
-      const bottom = h - BELOW;
-      let ringOff = 0;
-      for (let b = 0; b < H_BINS; b++) if (hist[b]) ringOff += hist[b] * Math.abs(b + Y_BOTTOM - h);
-      const outside = TOLERANCES.map(t => {
-        let n = 0;
-        for (let b = 0; b < H_BINS; b++) if (hist[b] && Math.abs(b + Y_BOTTOM - h) > t) n += hist[b];
-        return n;
-      });
-      let digEstimate = 0, hill = 0, hollow = 0, highest = -Infinity, lowest = Infinity;
-      for (let z = oz + RING; z < oz + RING + fl; z++) {
-        for (let x = ox + RING; x < ox + RING + fw; x++) {
-          const s = g.height[z * g.W + x];
-          digEstimate += Math.max(0, s - bottom + 1);
-          hill += Math.max(0, s - h);
-          hollow += Math.max(0, h - s);
-          if (s > highest) highest = s;
-          if (s < lowest) lowest = s;
-          TOLERANCES.forEach((t, k) => { if (Math.abs(s - h) > t) outside[k]++; });
-        }
-      }
-      const judged = fw * fl + ringLand;
-      sites.push({
-        ox, oz, fw, fl, h, bottom, digEstimate, hill, hollow, ringOff, offLevel: hill + hollow + ringOff, groundLow: lowest, groundHigh: highest,
-        outsideShare: outside.map(n => n / judged), layersToGround: Math.max(0, highest - h), deepestHollow: Math.max(0, h - lowest),
-        layersDug: Math.max(0, highest - bottom + 1),
-        ringP10: percentileFromHist(hist, ringLand, 0.1, Y_BOTTOM), ringP90: percentileFromHist(hist, ringLand, 0.9, Y_BOTTOM),
-        ringLandShare: ringLand / ringCols, trunksInFootprint: trunksIn(ox + RING, oz + RING, fw, fl),
-      });
-    }
-  }
-  return { sites, refused };
-}
 
-// Pass 2 — every voxel of the pit (surface down to h - BELOW), its floor (one below) and the one-block shell around it.
-function footprintPass2(g, reader, site) {
-  const cat = new Map();
-  const categoryOf = (x, y, z) => {
-    const s = reader.stateIdAt(x, y, z);
-    if (s < 0) return 'unloaded';
-    if (cat.has(s)) return cat.get(s);
-    const b = reader.blockAt(x, y, z);
-    const c = !b ? 'air' : WATER_SURFACE.has(b.name) ? 'water' : geo.isLava(b.name) ? 'lava'
-      : !(geo.isGround(b) && !geo.isCanopy(b.name)) ? 'air'
-        : STONE_YIELD.has(b.name) ? 'stone' : DIRT_YIELD.has(b.name) ? 'dirt' : FALLING.has(b.name) ? 'falling'
-          : b.name.endsWith('_ore') ? 'ore' : 'other_solid';
-    cat.set(s, c);
-    return c;
-  };
-  const r = {
-    dug: 0, stone: 0, dirt: 0, falling: 0, ore: 0, other_solid: 0, caveAir: 0, water: 0, lava: 0, unloaded: 0,
-    floorOpen: 0, floorWater: 0, floorLava: 0, shellWater: 0, shellLava: 0, shellCave: 0,
-  };
-  const biomeCount = new Map();
-  const fx0 = site.ox + RING, fz0 = site.oz + RING, floorY = site.bottom - 1;
-  for (let z = fz0; z < fz0 + site.fl; z++) {
-    for (let x = fx0; x < fx0 + site.fw; x++) {
-      const i = z * g.W + x, wx = g.x0 + x, wz = g.z0 + z;
-      biomeCount.set(g.biome[i], (biomeCount.get(g.biome[i]) || 0) + 1);
-      for (let y = g.height[i]; y >= site.bottom; y--) {
-        const c = categoryOf(wx, y, wz);
-        if (c === 'air') r.caveAir++;
-        else if (c === 'water' || c === 'lava' || c === 'unloaded') r[c]++;
-        else { r.dug++; r[c]++; }
-      }
-      const f = categoryOf(wx, floorY, wz);
-      if (f === 'water') r.floorWater++;
-      else if (f === 'lava') r.floorLava++;
-      else if (f === 'air' || f === 'unloaded') r.floorOpen++;
-    }
-  }
-  for (let z = fz0 - 1; z <= fz0 + site.fl; z++) {
-    for (let x = fx0 - 1; x <= fx0 + site.fw; x++) {
-      if (x >= fx0 && x < fx0 + site.fw && z >= fz0 && z < fz0 + site.fl) continue;
-      const i = z * g.W + x, wx = g.x0 + x, wz = g.z0 + z;
-      for (let y = site.h + 1; y >= floorY; y--) {
-        const c = categoryOf(wx, y, wz);
-        if (c === 'water') r.shellWater++;
-        else if (c === 'lava') r.shellLava++;
-        else if (c === 'air' && y < g.height[i]) r.shellCave++;
-      }
-    }
-  }
-  const dominant = [...biomeCount.entries()].sort((a, b) => b[1] - a[1])[0];
-  return {
-    ...r, biome: g.biomeName(dominant[0]), biomeShare: dominant[1] / (site.fw * site.fl),
-    passes: r.water + r.lava + r.floorWater + r.floorLava + r.shellWater + r.shellLava === 0 && r.unloaded === 0,
-  };
-}
 
-function surveyFootprint(g, bot, label, person) {
+async function surveyFootprint(g, bot, label, person) {
   const logsIn = summedArea(g.W, g.D, i => g.logs[i]);
   const trunksIn = summedArea(g.W, g.D, i => g.trunk[i]);
   const orientations = FOOT.w === FOOT.l ? [[FOOT.w, FOOT.l]] : [[FOOT.w, FOOT.l], [FOOT.l, FOOT.w]];
   const all = [], refused = { unloaded_or_lava: 0, water_in_footprint: 0, ring_not_land: 0 };
   for (const [fw, fl] of orientations) {
-    const p1 = footprintPass1(g, fw, fl, trunksIn);
+    const p1 = await footprintPass1(g, fw, fl, trunksIn, { ring: RING, below: BELOW });
     all.push(...p1.sites);
     for (const k of Object.keys(refused)) refused[k] += p1.refused[k];
   }
   all.sort((a, b) => a.offLevel - b.offLevel);
   const reader = makeVoxelReader(bot, { needs: ['type'] });
   const readMemo = new Map();
-  const readSite = s => {
+  const readSite = async s => {
     const key = `${s.ox},${s.oz},${s.fw}`;
     if (readMemo.has(key)) return readMemo.get(key);
     const cx = s.ox + RING + s.fw / 2, cz = s.oz + RING + s.fl / 2;
     const bx = Math.max(0, s.ox - TREE_MARGIN), bz = Math.max(0, s.oz - TREE_MARGIN);
     const bw = Math.min(g.W, s.ox + s.fw + 2 * RING + TREE_MARGIN) - bx, bd = Math.min(g.D, s.oz + s.fl + 2 * RING + TREE_MARGIN) - bz;
     const read = {
-      ...s, ...footprintPass2(g, reader, s), zone: label,
+      ...s, ...(await footprintPass2(g, reader, s, { ring: RING })), zone: label,
       centre: { x: g.x0 + Math.floor(cx), z: g.z0 + Math.floor(cz) },
       corner: { x: g.x0 + s.ox + RING, z: g.z0 + s.oz + RING },
       fromStart: Math.round(Math.hypot(g.x0 + cx - person.x, g.z0 + cz - person.z)),
@@ -493,16 +302,18 @@ function surveyFootprint(g, bot, label, person) {
   // Per tolerance: positions that are level enough, then SEPARATE PLOTS — greedy, nearest-to-level first, a position
   // is taken only when its footprint shares no column with a footprint already taken — then which of those pass the
   // voxel read. Greedy packing is a lower bound on how many disjoint plots the zone could hold.
-  const byTolerance = TOLERANCES.map((t, k) => {
+  const byTolerance = [];
+  for (const [k, t] of TOLERANCES.entries()) {
     const level = all.filter(s => s.outsideShare[k] <= LEVEL_SHARE);
     const plots = [];
     for (const s of level) {
       const clash = plots.some(p => s.ox + RING < p.ox + RING + p.fw && p.ox + RING < s.ox + RING + s.fw && s.oz + RING < p.oz + RING + p.fl && p.oz + RING < s.oz + RING + s.fl);
       if (!clash) plots.push(s);
     }
-    const read = plots.map(readSite);
-    return { tolerance: t, levelPositions: level.length, plots: read.length, passingPlots: read.filter(s => s.passes).length, picks: read };
-  });
+    const read = [];
+    for (const s of plots) read.push(await readSite(s));
+    byTolerance.push({ tolerance: t, levelPositions: level.length, plots: read.length, passingPlots: read.filter(s => s.passes).length, picks: read });
+  }
   reader.dispose();
   return { positions: all.length, refused, byTolerance };
 }
@@ -523,10 +334,10 @@ function mergeBiomeRow(into, from) {
 }
 
 // ── The survey ─────────────────────────────────────────────────────────────────────────────────────
-function surveyZone(snap) {
+async function surveyZone(snap) {
   const t0 = Date.now();
   const bot = store.loadSnapshot(snap.name);
-  const g = readSurface(bot);
+  const g = await readSurface(bot);
   const step = stepMap(g);
   const areaRelief = areaReliefMap(g);
   const label = snap.header.label;
@@ -556,7 +367,7 @@ function surveyZone(snap) {
   }
 
   if (FOOT) {
-    const footprint = surveyFootprint(g, bot, label, person);
+    const footprint = await surveyFootprint(g, bot, label, person);
     return { snap, label, g, zone, perBiome, footprint, totalMs: Date.now() - t0, person, near: bot.snapshot.near };
   }
 
@@ -662,13 +473,14 @@ function reportFootprint(results) {
   return 0;
 }
 
-function main() {
+async function main() {
   const all = store.listSnapshots();
   const wanted = opt('snapshots', 'all');
   const chosen = wanted === 'all' ? all : wanted.split(',').map(w => all.find(s => s.name === w || s.header.label === w)).filter(Boolean);
   if (!chosen.length) { say(`zone_flatness: no snapshots to run (${all.length} saved). Capture with voxel_snapshot.js capture --near=X,Z.`); return 1; }
 
-  const results = chosen.map(snap => surveyZone(snap));
+  const results = [];
+  for (const snap of chosen) results.push(await surveyZone(snap));
   if (FOOT) return reportFootprint(results);
 
   say(`\n════ ZONES ════`);
@@ -753,4 +565,4 @@ function main() {
   return 0;
 }
 
-process.exitCode = main();
+main().then(code => { process.exitCode = code; });

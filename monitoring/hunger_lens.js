@@ -1,13 +1,6 @@
 // Auren_Bot/monitoring/hunger_lens.js
 // WHAT A RUN COST THE BOT IN FOOD, and what it would take to feed that pace forever.
 //
-// ── THE ASK (Architect 2026-09-17) ──────────────────────────────────────────────────────────────────
-// *"i want to do a hunger calculator. so make me a calculator that calculates food drain exactly by
-// taking a full 30 minute watcher trace and calculate how much time is spent moving, digging and other
-// things. everything should be there. then the bots always eat bread so then calculate how much bread is
-// needed to sustain one bot indefinitely if it moves at that pace and how many wheat plots that would
-// take. all plots are alternating rows so no penalty."*
-//
 // ── THE ONE THING THAT DECIDES EVERY NUMBER BELOW: HUNGER IS NOT A CLOCK ────────────────────────────
 // Minecraft does not drain food over TIME. It drains food over EXHAUSTION, and exhaustion is generated
 // by a fixed list of ACTS, each with a fixed price. The whole model is:
@@ -16,18 +9,16 @@
 //                            saturation already 0  ->  spend one point of the food bar instead.
 //
 // So a bot that stands still for an hour loses nothing, and a bot that walks for an hour ALSO loses
-// nothing — WALKING IS PRICED AT ZERO. Only sprinting is priced per metre. That is why this lens reports
-// the time census the Architect asked for and then prices the run off the EVENT census beside it: the
-// time census answers "where did the run go", and the event census is the only thing that answers "what
-// did it cost". Printing one without the other would let a reader conclude that half a run spent walking
-// is half a run spent eating, which is false by a factor of infinity.
+// nothing — WALKING IS PRICED AT ZERO. Only sprinting is priced per metre. This lens reports the time
+// census beside the EVENT census: the time census answers where the run went, and the event census
+// answers what it cost. Printing one without the other would let a reader conclude that half a run spent
+// walking is half a run spent eating, which is false by a factor of infinity.
 //
 // ── WHICH LINE OWNS WHICH ACT (the whitelist, and why it is a whitelist) ────────────────────────────
 // `performDig` is the fleet's ONE dig authority and it writes NOTHING on a successful swing (it warns
-// only on a refusal), so there is no per-dig event on the trace to count. The digs are recoverable
-// anyway, because every caller folds its own count into a summary line. Each source below is named with
+// only on a refusal), so there is no per-dig event on the trace to count. Each source below is named with
 // the file that emits it, and the set is chosen so NO ACT IS COUNTED TWICE — the restating lines are
-// listed in the second table and deliberately not summed:
+// listed separately, in the second table:
 //
 //   COUNTED                                            EMITTER
 //   `Dug down to (x,y,z).`                             navigator.digDownStep — 1 block, and it is the
@@ -48,11 +39,10 @@
 //   `shaft N deep, sealed N`                           stone_prospect restating the descent as a depth
 //   `Jump bearing: A axial, O oblique, D diagonal`     the same presses `prejump(s)` already carries
 //
-// ── WHAT THE TRACE CANNOT ANSWER, NAMED RATHER THAN ROUNDED AWAY ────────────────────────────────────
+// ── WHAT THE TRACE CANNOT ANSWER ────────────────────────────────────────────────────────────────────
 // `drive.js` digs a foot/head block when a step stalls and logs nothing at all, so those breaks are
 // outside every count here. They are rare (a stall, not a route) and each is worth 0.005, so the total
-// is a FLOOR by a margin far below the run's jump bill — but it is a floor, and `digs_uninstrumented`
-// says so as a field.
+// is a FLOOR by a margin far below the run's jump bill, and `digs_uninstrumented` says so as a field.
 //
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --hunger [--bot=B]
 
@@ -60,17 +50,17 @@
 
 const { relativeTime, FOREMAN_UNITS } = require('./trace_read');
 const out = require('./data_out');
-// REUSED RATHER THAN RE-DERIVED (Law 16). The moving/doing split has ONE definition in this folder and
-// it is motion_classifier's; the job clock has ONE and it is job_timeline's; strikes have ONE and it is
-// engagement_lens's. A second copy of any of them would drift the first time its source line changed.
+// Each shared measurement has ONE definition in this folder (Law 16): the moving/doing split is
+// motion_classifier's, the job clock is job_timeline's, strikes are engagement_lens's. A second copy of
+// any of them would drift the first time its source line changed.
 const { computeSplit } = require('./motion_classifier');
 const { reduceJobTimeline } = require('./job_timeline_lens');
 const { reduceEngagements } = require('./engagement_lens');
 
 // ── SECTION 1: THE EXHAUSTION MODEL ─────────────────────────────────────────────────────────────────
 // Java Edition's prices, one per act. These are the RULER every number downstream is measured with, so
-// each is printed as its own field beside the count it multiplies — a reader checks the arithmetic
-// rather than being handed its result.
+// each is printed as its own field beside the count it multiplies, so the reader can check the
+// arithmetic.
 const EXH_PER_BLOCK_BROKEN = 0.005;
 const EXH_PER_JUMP = 0.05;
 const EXH_PER_SPRINT_JUMP = 0.2;
@@ -110,10 +100,10 @@ const WHEAT_PER_BREAD = 3;
 //   + 8 neighbours, hydrated              8 x 0.75 = 6.0
 //   = 10.0
 //
-// THE ROW PENALTY IS THE ARCHITECT'S OWN CONDITION. The game halves `points` when a crop has the same
-// crop on BOTH axes (or, failing that, on a diagonal). Alternating rows break that test on one axis, so
-// the divisor is 1 and the field runs at full speed — *"all plots are alternating rows so no penalty"*.
-// It is a divisor rather than a hardcoded 10 so the penalised case is one field away.
+// THE ROW PENALTY IS A STATED PLANTING CONDITION. The game halves `points` when a crop has the same crop
+// on BOTH axes (or, failing that, on a diagonal). Alternating rows break that test on one axis, so the
+// divisor is 1 and the field runs at full speed. Kept as a divisor, not a hardcoded 10, so the penalised
+// case is one field away.
 const WHEAT_GROWTH_STAGES = 7;
 const FARMLAND_POINTS_BASE = 1.0;
 const FARMLAND_POINTS_CENTRE_HYDRATED = 3.0;
@@ -143,7 +133,7 @@ const wheatPerPlotPerHour = () => (3600 / secondsToMature()) * WHEAT_PER_HARVEST
 // share a verb, so `[NAVIGATOR] Dug down to` and `[HARVEST_EXECUTOR] Dug grass_block` cannot collide.
 const DUG_DOWN_RE = /\[NAVIGATOR\][^\n]*Dug down to \(/;
 const CARVE_RE = /carved this trip — (.+)\.$/;
-const CARVE_DIG_RE = /(dig_through|dig_climb_up|dig_climb_down)×(\d+)/g;
+const CARVE_DIG_RE = /(dig_through|dig_stair_up|dig_stair_down)×(\d+)/g;
 const CARVE_PLACE_RE = /(pillar|bridge)×(\d+)/g;
 const ANCHOR_DIG_RE = /dig: cleared (\d+), failed (\d+) \(of (\d+)\)/;
 const ANCHOR_PLACE_RE = /place: placed (\d+), failed (\d+)/;
@@ -176,16 +166,16 @@ const PILLARED_RESTATE_RE = /Pillared up to y=(-?\d+) using/;
 // 237 prejumps against 58 further presses from pillaring, a fifth of the bill sitting outside the
 // counter the navigator publishes.
 //
-// `sealed N` is the climb's OWN count of placements made, so it is the ascent measured rather than the
-// shaft depth planned. Tag-anchored for the judge-echo reason above.
+// `sealed N` is the climb's OWN count of placements made — the ascent as measured, not the shaft depth
+// planned. Tag-anchored for the judge-echo reason above.
 // Reads the climb's count out of BOTH shapes it is written in — the success line's `sealed 12)` and the
 // short-climb warn's `sealed 5 of 12` — because a climb that ran out of filler still pressed jump for
 // every block it did place, and a pattern that only knew the happy shape would price that trip at zero.
 const SEALED_RE = /\[STONE_PROSPECT_EXECUTOR\][^\n]*\bsealed (\d+)[)\s]/;
 // Jump presses this lens does NOT count, because no line publishes them: `drive`'s single-step climb
-// outside a fused run, `fillWaterColumnBelow` and `antiDrown` (both HOLD jump for a span rather than
-// pressing it per block, so neither is even a countable act), and the combat driver's hop. The fleet
-// never fought on this trace and the water reflexes fire only while submerged.
+// outside a fused run, `fillWaterColumnBelow` and `antiDrown` (both HOLD jump for a span, so neither is
+// even a countable act), and the combat driver's hop. The fleet never fought on this trace and the water
+// reflexes fire only while submerged.
 const JUMPS_UNINSTRUMENTED = 'drive_single_step,water_hold,combat_driver';
 
 const blankBot = () => ({
@@ -238,8 +228,8 @@ function reduceHunger({ seg = [], bot: botFilter = null } = {}) {
     if (l.relSec != null) maxRel = Math.max(maxRel, l.relSec);
     const bot = l.bot;
     if (!bot) continue;
-    // The foreman's own units are excluded by MEMBERSHIP rather than by name, so a third foreman-side
-    // tag added later is excluded by joining that set instead of by editing this line.
+    // The foreman's own units are excluded by MEMBERSHIP in the shared set, so a third foreman-side tag
+    // added later is excluded by joining that set, with no edit to this line.
     if (FOREMAN_UNITS.has(bot)) continue;
     if (botFilter && bot !== botFilter) continue;
     let b = per.get(bot);
@@ -297,7 +287,7 @@ function reduceHunger({ seg = [], bot: botFilter = null } = {}) {
       b.pathLines++;
       for (const part of m[1].split(',')) {
         const [t, n] = part.trim().split('×');
-        if (t === 'swim') b.swimEdgesPlanned += (+n || 0);
+        if (t === 'swim' || t === 'water_exit' || t === 'water_bank_out') b.swimEdgesPlanned += (+n || 0);
         if (t === 'walk') b.walkEdgesPlanned += (+n || 0);
       }
     }
@@ -322,11 +312,10 @@ function reduceHunger({ seg = [], bot: botFilter = null } = {}) {
     if (PILLARED_RESTATE_RE.test(r)) b.restatedPillarLines++;
   }
 
-  // ── WHICH UNITS ARE BODIES, decided by EVIDENCE rather than by a name list ──────────────────────
+  // ── WHICH UNITS ARE BODIES, decided by EVIDENCE ─────────────────────────────────────────────────
   // The merged view carries every unit that posted a line, including the proxy person — a unit with a
   // trace file, no body, and nothing to feed. Membership here is positive and measured: a unit qualifies
-  // when the record shows it acting or reporting its own health. A name list would have to be edited
-  // every time a new unit joins the fleet, and a unit forgotten on it would be priced as a starving bot.
+  // when the record shows it acting or reporting its own health.
   const withoutActs = [];
   for (const [bot, b] of [...per.entries()]) {
     const acted = b.digs || b.jumps || b.cellsCrossed || b.places || b.hpSamples;
@@ -383,8 +372,8 @@ function runHunger({ seg = [], traceName = '?', bot: botFilter = null } = {}) {
     return;
   }
   out.kv('bots', [...per.keys()].join(','));
-  // The units this lens dropped, printed rather than silently absent — a subset shown as the whole is a
-  // false verdict with a clean exit (Law 25).
+  // The units this lens dropped, printed here as a field: a subset shown as the whole is a false verdict
+  // with a clean exit (Law 25).
   out.kv('units_without_acts', withoutActs.length ? withoutActs.join(',') : null);
 
   // ── The ruler, printed before anything it measures ───────────────────────────────────────────────
@@ -401,7 +390,7 @@ function runHunger({ seg = [], traceName = '?', bot: botFilter = null } = {}) {
   out.kv('exhaustion_per_food_point', EXH_PER_FOOD_POINT);
   out.kv('food_bar_points', FOOD_BAR_POINTS);
 
-  // ── Time census: the Architect's question, answered by the folder's existing definitions ─────────
+  // ── Time census, computed from the folder's existing definitions ─────────
   out.section('time_census');
   out.kv('source_moving_doing', 'motion_classifier.computeSplit');
   const timeRows = [];
@@ -529,9 +518,9 @@ function runHunger({ seg = [], traceName = '?', bot: botFilter = null } = {}) {
   out.kv('minutes_to_mature', r2(secondsToMature() / 60));
   out.kv('wheat_per_harvest', WHEAT_PER_HARVEST);
   out.kv('wheat_per_plot_per_hour', r3(wheatPerPlotPerHour()));
-  // The two conditions the plot count is computed under, as fields rather than as a footnote. A random
-  // tick only reaches a chunk the server is simulating, and a plot only yields on the pass that harvests
-  // it — a field visited every other hour returns half of what this row says.
+  // The two conditions the plot count is computed under, as their own fields. A random tick only reaches
+  // a chunk the server is simulating, and a plot only yields on the pass that harvests it — a field
+  // visited every other hour returns half of what this row says.
   out.kv('assumes_chunk_within_simulation_distance', true);
   out.kv('assumes_harvest_and_replant_at_maturity', true);
 

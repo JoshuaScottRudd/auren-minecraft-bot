@@ -1,87 +1,68 @@
 'use strict';
 
-// WHERE THE PACKAGES LIVE IS ASKED, NEVER ASSUMED. `vec3` below resolved only when a conductor had
-// exported NODE_PATH first, so running this prototype the way a person actually runs one — directly —
-// died on a resolution error wearing the shape of a broken file. A process root resolves its own
-// modules AND registers its own alias map rather than depending on a parent having remembered (Law 16).
+// A process root resolves its own modules and registers its own alias map, so this file runs standalone
+// without depending on a parent having set NODE_PATH (Law 16).
 require('../workshop_paths').registerAliases();
-// tool: voxel_reader_v2_prototype — a PROTOTYPE reader that keeps the live map instead of re-finding it
-// on every read. Built to be measured against the shipped `voxel_reader` and thrown away if it loses.
-// It touches nothing the fleet runs: no fragment imports it; the only consumers are the two A/B benches.
+// tool: voxel_reader_v2_prototype — a reader that holds a live reference to the world map across reads
+// and answers state ids from it directly. Touches nothing the fleet runs: no fragment imports it; the
+// only consumers are the two A/B benches that measure it against the shipped `voxel_reader`.
 //
-// The motivating question: why re-search every voxel to build a map and then scan over the map, instead
-// of just keeping a live map the bot can pathfind or scan over directly?
-//
-// ── WHAT THIS PROTOTYPE IS, AND WHAT IT DELIBERATELY IS NOT ─────────────────────────────────────────
-// It is NOT a second copy of the world. That was the proposal that lost on cost: an unbounded derived
-// map costs real time to build and to classify at every chunk boundary the body crosses, forever,
-// whether or not anyone pathfinds — and every affordable version of it is BOUNDED, which reintroduces
-// the same bound a search-only approach already has: a bounded search can only report no-path-within-
-// my-limit. The 17x17x17 `bot_state` cube that pathfinding was moved off in the locomotion overhaul
-// was exactly that map, and its edge was the bot's horizon.
-//
-// It IS the honest core of the same instinct: mineflayer ALREADY keeps the live map (`bot.world`, kept
-// current by the server's block_change / multi_block_change packets). The shipped reader throws away
-// its handle on that map between every single read and re-derives it — column key, hash lookup, two
-// Vec3 allocations — millions of times over for one long route. This holds the handle.
+// ── WHAT THIS PROTOTYPE IS ──────────────────────────────────────────────────────────────────────────
+// It reads state ids through mineflayer's own live column (`bot.world`, kept current by the server's
+// block_change / multi_block_change packets), holding the column reference across reads so each read is
+// a lookup into an already-resolved column — no column key, hash lookup, or Vec3 allocation per read.
 //
 //     cache a REFERENCE to the live column   — free, and cannot go stale: that object IS mineflayer's
 //                                              column, and the server's updates land inside it.
 //     cache a DERIVED VERDICT about a cell   — costs an invalidation surface and a bound. NOT DONE HERE.
 //
-// Everything below is the first line. Nothing position-keyed is ever stored, so the mutation phase of
-// the A/B (rcon /setblock with no invalidation call between reads) passes for the same reason it passes
-// for the shipped reader: there is nothing stale to invalidate.
+// Nothing position-keyed is ever stored, so the mutation phase of the A/B bench (rcon /setblock with no
+// invalidation call between reads) passes for the same reason it passes for the shipped reader: there is
+// nothing stale to invalidate.
 //
 // ── THE THREE CHANGES UNDER TEST ────────────────────────────────────────────────────────────────────
-// (1) COLUMN MEMO. A* expands locally — consecutive reads almost always land in the same 16x16 column.
-//     Holding the last column turns the common read from "string key + Map hash" into two integer
-//     compares. Invalidated on chunkColumnUnload/Load, which is the ONE way the handle can go bad
-//     (see the note at _armInvalidation — a search yields to the pacer, so an unload CAN land mid-search).
-// (2) NO PER-READ ALLOCATION. The shipped path allocates two Vec3 per state-id read (one for the column
-//     lookup, one for the in-chunk offset) plus a third for `position` and the shell object itself —
-//     four allocations per read, ~76 million for one long route. The column lookup now takes integers
-//     directly and the in-chunk offset reuses one scratch vector. Verified safe: ChunkColumn's
-//     `getBlockStateId` reads pos.x/y/z, converts to a section index, and retains nothing.
+// (1) COLUMN MEMO. Holds the last column read; consecutive reads landing in the same 16x16 column become
+//     two integer compares in place of a string key and Map hash. Invalidated on chunkColumnUnload/Load,
+//     the one way the handle can go bad (see the note at the invalidation listener — a search yields to
+//     the cooperative pacer, so an unload can land mid-search).
+// (2) NO PER-READ ALLOCATION. The column lookup takes integers directly and the in-chunk offset reuses
+//     one scratch vector. Verified safe: ChunkColumn's `getBlockStateId` reads pos.x/y/z, converts to a
+//     section index, and retains nothing.
 // (3) A FLAGS PATH FOR THE HOTTEST QUESTION. `classifyFloorAt` answers walkable/jumpable/null from
-//     packed per-state-id bits with NO block object built at all. A* asks this once per direction per
-//     node through `classifyFloorInline`, which is the majority of every search's reads.
+//     packed per-state-id bits with no block object built at all. A* asks this once per direction per
+//     node through `classifyFloorInline`, the majority of every search's reads.
 //
-// ── (3) IS ALSO A READ-COUNT SAVING, AND THAT IS NOT AN ARTEFACT ────────────────────────────────────
-// `classifyFloorInline` walks i=1..3 for 'jumpable' and, on failure, walks i=1..2 AGAIN for 'walkable' —
-// re-reading cells it just read. The flags path counts consecutive passable cells once and breaks. Same
-// verdict, strictly fewer reads. So the A/B's read counts will NOT match between those two arms, and the
-// bench reports that rather than asserting equal work (Law 25) — route identity is what gates the timing.
+// ── (3) IS ALSO A READ-COUNT SAVING ─────────────────────────────────────────────────────────────────
+// `classifyFloorInline` walks i=1..3 for 'jumpable' and, on failure, walks i=1..2 again for 'walkable',
+// re-reading cells it just read. The flags path counts consecutive passable cells once and breaks: same
+// verdict, fewer reads. The bench reports read counts for both arms (Law 25); route identity is what
+// gates the timing.
 //
 // ── THE BORROWED SHELL (opt-in, and dangerous by default — read before using) ───────────────────────
 // `borrowBlockAt` returns a per-state-id MEMOIZED shell whose `position` is mutated in place, so a read
 // costs three field writes instead of an object plus a Vec3. Its contract: **valid only until the next
 // read**. That is legal for the siting sweep (site_geometry reads `.name`/`.boundingBox` immediately and
 // retains only strings) and ILLEGAL for A* (`classifyFloorInline` holds `floorBlock.position` across
-// three further reads, which would clobber it mid-loop). It is therefore never the default and never
-// reachable without asking — a caller that retains a borrowed shell gets a well-formed falsehood, which
-// is exactly the failure Law 26 names, so the door is opt-in and labelled rather than merely documented.
+// three further reads, which would clobber it mid-loop). A caller that retains a borrowed shell gets a
+// well-formed falsehood (Law 26), so this path is opt-in and labelled.
 //
 // PRECISELY WHEN IT BITES: shells are memoized PER STATE ID, so a retained shell is clobbered by the
-// next read **of the same state id**, not by the next read of anything. That is the more dangerous shape,
-// not the milder one — the corruption is intermittent and data-dependent, so a misusing caller passes
-// every test where the two cells happen to hold different blocks and fails the instant they match, which
-// in a stone wall or a grass field is nearly always. Do not relax the contract to "next read of the same
-// block"; the conservative statement is the usable one, and the control that pins this mechanism lives in
-// the stress bench so this paragraph cannot rot back into the wrong one.
+// next read **of the same state id**, not by the next read of anything. The corruption is intermittent
+// and data-dependent: a misusing caller passes every test where the two cells happen to hold different
+// blocks and fails the instant they match, which in a stone wall or a grass field is nearly always.
 
 // No module-alias registration here: this is a library, not an entry point. Its consumers (the benches)
-// register the aliases against Auren_Bot/ before requiring it, and registering a second time appends the
-// base path to itself — '@utils/...' then resolves to Auren_Bot/Auren_Bot/... and the load dies.
+// register the aliases against Auren_Bot/ before requiring it; a second registration would append the
+// base path to itself, so '@utils/...' would resolve to Auren_Bot/Auren_Bot/... and the load would die.
 const Vec3 = require('vec3');
 const pf = require('@utils/pathfinding_utils');
 const { isWalkableSurface } = require('@utils/movement/terrain_predicates');
 const { isWaterSource } = require('@utils/gravity_utils');
 const { STATION_TYPES } = require('@utils/fragment_utils');
 
-// Same flag set and same derivation rule as the shipped reader: verdicts come from CALLING the real
-// predicates against a prototype block, never from copying the name lists behind them. A copied
-// membership set is drift that routes a body through a wall instead of throwing.
+// Same flag set and same derivation rule as the shipped reader: verdicts come from calling the real
+// predicates against a prototype block, not from copied name lists — a copied membership set drifts and
+// routes a body through a wall instead of throwing.
 const F = {
     WALKABLE: 1 << 0, PASSABLE: 1 << 1, SOLID: 1 << 2, FULL_HEIGHT: 1 << 3,
     LEAF: 1 << 4, DOOR: 1 << 5, SCAFFOLD: 1 << 6, STATION: 1 << 7, KNOWN: 1 << 8,
@@ -125,9 +106,9 @@ function tableFor(version) {
             protos[stateId] = p;
             return p;
         },
-        // One reusable shell per state id, for borrowBlockAt. Built with the SAME key order and the same
-        // literal as the fresh path so both share one hidden class — mixing shapes here would make every
-        // downstream `.name` read polymorphic and silently undo the gain the shell exists to produce.
+        // One reusable shell per state id, for borrowBlockAt. Built with the same key order and literal
+        // as the fresh-shell path so both share one hidden class; a mismatched shape here makes every
+        // downstream `.name` read polymorphic and costs back the gain the shell exists to produce.
         shell(stateId) {
             let s = shells[stateId];
             if (s !== undefined) return s;
@@ -157,27 +138,19 @@ function tableFor(version) {
 // Interface-compatible with the shipped makeVoxelReader for needs:['type'] (blockAt / flagsAt / stats /
 // resetStats / statesSeen / fast), plus `classifyFloorAt`, `borrowBlockAt` and `dispose`.
 // ── THE SEARCH-SCOPED MEMO (opts.searchScoped) ──────────────────────────────────────────────────────
-// A* re-asks about the same cell many times over within a single search — that redundancy is the real
-// headroom, and it lives entirely INSIDE one search, which is why the memo is scoped to one search and
-// thrown away with it.
+// A* re-asks about the same cell many times within a single search. The memo answers each cell once per
+// search and is scoped and cleared with it: built lazily (only cells the search touches), unbounded
+// (grows with the search, so it imposes no horizon), free when nobody is pathfinding, and with no
+// invalidation surface because it does not outlive the question.
 //
-// This applies the live-map idea at the scope where the evidence actually puts the waste, and it is not
-// the persistent derived map that lost on cost: it is built lazily (only cells the search touches), it
-// is unbounded (grows with the search, so it imposes no horizon), it costs nothing when nobody is
-// pathfinding, and it has NO invalidation surface because it does not outlive the question.
-//
-// THE HONEST COST, STATED RATHER THAN HIDDEN: within one search a cell is now answered once and reused,
-// so a block that changes MID-SEARCH is not seen by the later reads. That is a real change in behaviour
-// and the bench measures it rather than arguing it. The argument FOR accepting it is that the current
-// search re-reads one cell repeatedly and can legally get a different answer each time — an internally
-// inconsistent search whose route is not a plan about any single world state. The memo makes the search
-// consistent with one world, which is what a route is supposed to be a statement about; the walker
-// re-senses and re-plans anyway (Law 12: interrupted chains die, the judge dispatches fresh).
+// Within one search a cell is answered once and reused, so a block that changes mid-search is not seen
+// by later reads of it. This keeps the search consistent with one world state, which is what a route is
+// a statement about; the walker re-senses and re-plans regardless (Law 12: interrupted chains die, the
+// judge dispatches fresh).
 //
 // The key is packed relative to the search origin: 11 bits dx, 11 bits dz, 9 bits y — a plain 31-bit int,
-// so the Map stays integer-keyed (string keys measured slower than the read they replace). Out-of-range
-// cells fall through to a live read rather than being packed wrong, so the memo can never answer about
-// the wrong cell — it can only decline to help.
+// so the Map stays integer-keyed. Cells outside that range read live; the memo only answers for cells
+// inside it.
 const MEMO_XZ_RANGE = 1023;   // +/- 1023 blocks from origin; a search past that reads live
 function packKey(dx, dz, y) { return ((dx + 1024) << 20) | ((dz + 1024) << 9) | (y + 64); }
 
@@ -187,9 +160,8 @@ function makeVoxelReaderV2(bot, opts = {}) {
     const table = tableFor(version);
 
     // Same construction-time check the shipped reader makes: a bench adapter or the virtual playground's
-    // bot answers blockAt and nothing else, so there is no chunk store to read numbers from. Decided up
-    // front rather than left to throw on the first read — a reader that works live and dies headless is
-    // the defect the bench exists to catch first.
+    // bot answers blockAt and nothing else, so there is no chunk store to read numbers from. Checked up
+    // front, so a worldless bot gets the slow fallback below, not a throw on its first read.
     const hasWorld = typeof bot?.world?.getColumn === 'function';
     if (!hasWorld) {
         const slow = {
@@ -208,30 +180,30 @@ function makeVoxelReaderV2(bot, opts = {}) {
     }
 
     // ── (1) THE COLUMN MEMO ─────────────────────────────────────────────────────────────────────────
-    // The whole live-map idea, at the only scale where it is free. `col` is not a copy of anything: it is
-    // mineflayer's own ChunkColumn object, the one the server's block updates are written into. Holding
-    // it cannot produce a stale read of a block, because the blocks are not what is being held.
+    // `col` holds mineflayer's own ChunkColumn object, the one the server's block updates are written
+    // into — not a copy — so holding it cannot produce a stale read of a block: the blocks are not what
+    // is being held.
     let cx = 0x7fffffff, cz = 0x7fffffff, col = null;
 
     // ── (2) THE SCRATCH VECTOR ──────────────────────────────────────────────────────────────────────
-    // One per reader, mutated in place. Safe because ChunkColumn.getBlockStateId reads x/y/z, computes a
-    // section index and an integer offset, and keeps no reference. Per-reader rather than per-module so
+    // One scratch vector per reader, mutated in place and never retained: ChunkColumn.getBlockStateId
+    // reads x/y/z into a section index and an integer offset and keeps no reference. Scoped per reader so
     // two readers on two bots in one process cannot interleave into each other's scratch.
     const scratch = new Vec3(0, 0, 0);
 
     // ── INVALIDATION: the ONE way a held column handle can go bad ───────────────────────────────────
-    // Not staleness of block data (impossible — the object is live), but IDENTITY: on unload mineflayer
-    // drops the column from the world, and a reader still holding it would answer from a region the bot
-    // can no longer see — reporting never-sensed space as solid terrain, which is the one verdict Law 23
-    // forbids most. It matters here specifically because computeAStar YIELDS to the cooperative pacer
-    // mid-search, so an unload genuinely can land between two reads of one search.
+    // Not staleness of block data — the object is live — but identity: on unload mineflayer drops the
+    // column from the world, and a reader still holding it would answer from a region outside the bot's
+    // current perception, reporting unsensed space as solid terrain, the verdict Law 23 forbids most.
+    // computeAStar yields to the cooperative pacer mid-search, so an unload can land between two reads of
+    // one search.
     const onColumnChange = () => { cx = 0x7fffffff; cz = 0x7fffffff; col = null; };
     const w = bot.world;
     w.on('chunkColumnUnload', onColumnChange);
     w.on('chunkColumnLoad', onColumnChange);
 
-    // Search-scoped memo state. `memo` is null unless the caller asked for it, so the non-memo path pays
-    // not one branch it did not opt into beyond this null check.
+    // Search-scoped memo state. `memo` is null unless the caller opts in via `opts.searchScoped`; the
+    // non-memo path costs only this one null check.
     const memo = opts.searchScoped ? new Map() : null;
     let ox = 0, oy = 0, oz = 0;   // the search origin the keys are packed relative to
 
@@ -253,8 +225,8 @@ function makeVoxelReaderV2(bot, opts = {}) {
     function stateIdAt(x, y, z) {
         if (memo === null) return liveStateIdAt(x, y, z);
         const dx = x - ox, dz = z - oz;
-        // Range guard: outside it the key would alias another cell, so read live instead of answering
-        // about the wrong place. A memo that declines is safe; a memo that mis-keys is a falsehood.
+        // Range guard: outside it the key would alias another cell. A memo that declines is safe; a
+        // memo that mis-keys is a falsehood.
         if (dx > MEMO_XZ_RANGE || dx < -MEMO_XZ_RANGE || dz > MEMO_XZ_RANGE || dz < -MEMO_XZ_RANGE || y < -64 || y > 447) {
             return liveStateIdAt(x, y, z);
         }
@@ -304,14 +276,12 @@ function makeVoxelReaderV2(bot, opts = {}) {
         },
 
         // ── (3) THE FLAGS PATH ──────────────────────────────────────────────────────────────────────
-        // Byte-for-byte the same verdict as pathfinding_utils.classifyFloorInline, derived rather than
-        // transcribed: isFloorSafe IS terrain_predicates.isWalkableSurface (the WALKABLE bit) and the
-        // clearance test IS isBlockPassable (the PASSABLE bit). No block object is built at any point.
+        // Byte-for-byte the same verdict as pathfinding_utils.classifyFloorInline: isFloorSafe IS
+        // terrain_predicates.isWalkableSurface (the WALKABLE bit) and the clearance test IS
+        // isBlockPassable (the PASSABLE bit). No block object is built at any point.
         //
-        // `floorStateId` is the caller's OWN already-read number for (x,y,z), not a cache: classifyFloor
-        // is always asked about a cell the caller just read, so re-reading it here would add a read per
-        // call and make the flags path cost MORE than the block path it replaces. Omit it and the floor
-        // is read normally.
+        // `floorStateId` is the caller's own already-read number for (x,y,z), not a cache. Passing it
+        // skips a redundant re-read of a cell the caller just read; omitted, the floor is read normally.
         classifyFloorAt(x, y, z, floorStateId) { return classify(reader, x, y, z, floorStateId); },
 
         get statesSeen() { return table.size; },

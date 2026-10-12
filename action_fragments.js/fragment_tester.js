@@ -1,44 +1,29 @@
 /**
  * fragment: fragment_tester — live single-fragment isolation harness
  *
- * WHY: exercises ONE action fragment alone, live, without running the whole autonomous
- * chain. Injects the signal the fragment would normally receive, lets it run its verb,
- * and intercepts its OUTPUT signal here instead of letting it flow on to the next
- * fragment or recursive_judge.
+ * Exercises one action fragment alone, live, without running the whole autonomous chain:
+ * injects the signal the fragment would normally receive, lets it run its verb, and intercepts
+ * its output signal here instead of letting it flow on to the next fragment or recursive_judge.
  *
- * Agnostic by design: not bound to any particular fragment — routes a payload in and
- * logs whatever routes back. Point it at any fragment by editing TARGET + PAYLOAD below
- * (the find_buildingspot values here are just a placeholder).
+ * Agnostic by design: routes a payload into whichever fragment TARGET names and logs whatever
+ * routes back (the find_buildingspot values below are a placeholder to overwrite per test).
  *
- * HOW TO RUN A TEST — two temporary edits, this file + the fragment under test:
- *   1. Here: set TARGET to the fragment's signal name and PAYLOAD to the signal it
- *      normally receives (copy a real one from a trace).
- *   2. In the fragment under test: temporarily reroute its onward call to
- *      `to: 'fragment_tester'` instead of the next fragment / recursive_judge — that
- *      reroute is the interception, landing the fragment's return signal in receive()
- *      below.
- *   3. Trigger inject() (master_core readline verb `test_fragment`), read the captured
- *      signal in the trace, then REVERT the reroute from step 2.
+ * To run a test: set TARGET to the fragment's signal name and PAYLOAD to the signal it normally
+ * receives, temporarily reroute that fragment's onward call to `to: 'fragment_tester'` in place
+ * of its usual next fragment or recursive_judge, trigger inject() (master_core readline verb
+ * `test_fragment`), read the captured signal in the trace, then revert the reroute.
  *
- * RECURSION GUARD (why this can't become a start signal): the injected signal must
- * terminate at the fragment under test, never propagate — three paths, each capped:
- *   - SUCCESS → the temporary reroute (step 2) dead-ends the chain here instead of
- *     handing off to the next fragment.
- *   - FAILURE → the fragment soft-fails to recursive_judge (Law 13). Left alone, the
- *     judge would replan and dispatch a FRESH signal from world state — a start signal
- *     cascading into the real loop. The `test: true` flag below rides in the payload so
- *     it survives through to the judge, which halts on it instead of replanning (and
- *     does not route anything back here).
- *   - receive() only LOGS the captured signal, never re-injects — a self-propagating
- *     inject would itself be a start signal, so receive() is terminal.
+ * Recursion guard: the injected signal terminates at the fragment under test on every path — a
+ * success dead-ends at the temporary reroute instead of handing off further; a failure carries
+ * the `test: true` payload flag through to recursive_judge, which halts on it instead of
+ * replanning a fresh signal from world state; receive() only logs the captured signal and never
+ * re-injects.
  */
 
 const watcher = require('@kernel/watcher');
-// The bus at MODULE SCOPE, which it could not be before 2026-09-10: the load cycle through
-// fragment_registry forced this require inside a function in every routing file. This is one of the
-// six FORWARDING routers — it calls route() with an upstream author's own from/to rather than building
-// an envelope, so it cannot use signal_utils' helpers (they stamp `from` = the caller and would rewrite
-// authorship). Every other fragment now has no contact with the bus at all.
+// One of the six forwarding routers: calls route() directly with an upstream author's own
+// from/to, since signal_utils' helpers stamp `from` as the caller and would rewrite authorship.
+// Every other fragment has no direct contact with the bus.
 const signalBus = require('@kernel/signal_bus');
 
 // ── EDIT THESE PER TEST ─────────────────────────────────────────────────────

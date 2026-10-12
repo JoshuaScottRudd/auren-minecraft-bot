@@ -1,79 +1,57 @@
 // js_kernel/bot_voice.js
 // WHAT A BOT SAYS IN OPEN CHAT: a contractor, whether it is available; a homestead, where its base is.
 //
-// ── THE TWO RULINGS THAT BUILT THIS FILE, IN ORDER, BECAUSE THE SECOND IS NOT A REVERSAL ──────────
-// 2026-09-06, morning: *"when they post to their owner. its way too much. it will block the players
-// vision… reporting is off by default and a player should type foreman where."* The bots were narrating
-// every job claim and every idle change. That file was deleted whole.
-//
-// 2026-09-06, same day: *"the bots should do a greeting. and they should tell the human if they are
-// available or not. so if they are idle parked then they are waiting for a command. so when they go to
-// idle park then they message once that they are idle. so a greeting, telling the player they are
-// working. and then when they are parked and idle. we dont want to blast a player chat but thats useful
-// to know."*
-//
-// THE TWO RULINGS AGREE, and reading them as a reversal is how this file gets rebuilt into the thing that
-// was deleted. What was cut was **narration** — a running commentary on WHAT the bot is doing, which
-// changes every job and is therefore unbounded. What is restored is **availability** — WHETHER the bot
-// can take an order, which is a two-state fact that changes on the order of minutes and that nothing else
-// in the world can tell a person. `foreman where` answers *what*; this answers *whether*, unasked,
-// because the moment a crew becomes free is the moment a person needs to know and the one moment they
-// have no reason to be asking.
+// AVAILABILITY, NOT NARRATION. A running commentary on WHAT the bot is doing changes every job and is
+// unbounded. WHETHER the bot can take an order is a two-state fact that changes on the order of minutes,
+// and nothing else in the world can tell a person that. `foreman where` answers *what*; this answers
+// *whether*, unasked, because the moment a crew becomes free is the moment a person needs to know and the
+// one moment they have no reason to be asking.
 //
 // ── AVAILABILITY IS THREE SENTENCES ────────────────────────────────────────────────────────────────
 //   greeting       said once, at birth, when the body has found its owner in the world
 //   → idle         said when the bot parks with nothing it can start, and again about once a minute
 //                  for as long as it stays parked
 //   → working      said once, when it picks work back up
-// There is no fourth availability line, and adding one is how this becomes narration again. The test for a
-// proposed line: **does it change whether this bot can take an order?** If not, it belongs in `foreman where`.
+// There is no fourth availability line. The test for a proposed line: does it change whether this bot can
+// take an order? If not, it belongs in `foreman where`.
 //
-// ── WHY A STATE MACHINE AND NOT A REPEAT-SUPPRESSOR ────────────────────────────────────────────────
-// The deleted file compared the last SENTENCE and dropped a duplicate. That is wrong for availability:
-// a bot that goes idle, works for a minute, and goes idle again has said something NEW the second time,
-// and identical text would have hidden it. So what is remembered is the last state SPOKEN, and a line is
-// emitted only on a crossing.
+// ── A STATE MACHINE, NOT A REPEAT-SUPPRESSOR ────────────────────────────────────────────────────────
+// Comparing the last SENTENCE and dropping a duplicate is wrong for availability: a bot that goes idle,
+// works for a minute, and goes idle again has said something NEW the second time, and identical text would
+// hide it. What is remembered is the last state SPOKEN, and a line is emitted only on a crossing.
 //
-// ── ONE STATE REPEATS AND ONE DOES NOT, AND THE ASYMMETRY IS THE POINT ─────────────────────────────
-// `idle` is a STANDING condition and it repeats on the floor's cadence — about once a minute for as long
-// as the bot is parked. `working` is a crossing and is said once.
+// ── ONE STATE REPEATS AND ONE DOES NOT ──────────────────────────────────────────────────────────────
+// `idle` is a STANDING condition and repeats on the floor's cadence — about once a minute for as long as
+// the bot is parked, because a body standing motionless in a world reads as broken and needs to keep
+// answering that it is still well and merely unemployed, for as long as that stays true. `working` is a
+// crossing and is said once: a body that is visibly working already answers the question the sentence
+// answers.
 //
-// WHAT THE REPEAT IS FOR, and it is not the fleet's benefit: a body standing motionless in a world is
-// read as broken, and one sentence eleven minutes ago does not survive that reading. The person needs to
-// know the crew is well and merely unemployed at the moment they are looking at it, not at the moment it
-// became true. `working again` needs no repeat for the same reason — a body that is visibly working is
-// already answering the question the sentence answers.
+// THE FLOOR IS WHAT MAKES THE REPEAT SAFE: the interval and the anti-blast cap are one number, so a
+// repeating line cannot outrun the guarantee below.
 //
-// THE FLOOR IS WHAT MAKES THIS SAFE TO REPEAT: the interval and the anti-blast cap are one number, so a
-// repeating line cannot outrun the guarantee stated below. Anything faster than the floor is the wall
-// coming back.
+// ── THE FLOOR ───────────────────────────────────────────────────────────────────────────────────────
+// A crossing is real news, but a bot that claims a job which soft-fails immediately re-crosses every board
+// re-scan (`idle_scheduler.BOARD_RESCAN_MS`), which is a fault state, not a fleet reporting itself.
+// `MIN_GAP_MS` caps this bot at one availability line a minute: at most one line per bot per minute, and
+// never wrong for longer than that.
 //
-// ── THE FLOOR, WHICH IS WHAT KEEPS A BUG FROM BECOMING A BLAST (his *"we dont want to blast a player
-// chat"*) ──────────────────────────────────────────────────────────────────────────────────────────
-// A crossing is real news, but a bot that claims a job which soft-fails immediately re-crosses every
-// board re-scan — 10 s, `idle_scheduler.BOARD_RESCAN_MS` — and that is a fault state, not a fleet
-// reporting itself. `MIN_GAP_MS` caps this bot at one availability line a minute, and the guarantee it
-// buys is statable: **at most one line per bot per minute, and never wrong for longer than that.**
-//
-// IT NEEDS NO TIMER, and that is why it is a floor rather than a rate limiter with a queue. A suppressed
-// crossing is not dropped and not remembered — `_spokenState` simply still disagrees with the world, so
-// the next caller through offers it again. Both call sites re-offer on their own cadence (`_goIdle`
-// every second while parked, the claim path on every claim), so the truth arrives on its own as soon as
-// the floor lifts. A wobble that has resolved by then correctly says nothing at all: the state it would
-// have announced is no longer the state.
+// NO TIMER IS NEEDED: a suppressed crossing is not dropped and not remembered — `_spokenState` simply
+// still disagrees with the world, so the next caller through offers it again. Both call sites re-offer on
+// their own cadence (`_goIdle` every second while parked, the claim path on every claim), so the truth
+// arrives on its own as soon as the floor lifts. A wobble that has resolved by then says nothing at all:
+// the state it would have announced is already not the state.
 //
 // ── ONLY A CONTRACTOR SPEAKS OF AVAILABILITY ───────────────────────────────────────────────────────
 // A homesteader answers to nobody by design (Law 19), nobody is standing beside it, and its availability
 // is not a question anybody is asking. The species test is the whole gate; there is no per-run switch,
-// because a switch is a second place the answer lives and the answer never varies by run.
+// because the answer never varies by run.
 //
-// ── THE ONE LINE A HOMESTEAD SPEAKS: WHERE ITS BASE IS (Architect 2026-09-11) ──────────────────────
-// *"also announce when it places its headframe in chat. where the location is set so players dont see
-// anything wrong."* A homestead sites its base at the biggest sea-level water bank in view, which can be a
-// long walk from where anybody is standing, and a crew that walks 150 blocks away without a word looks
-// like a crew that has broken. So the bot that locks the headframe says where, once, as coordinates a
-// person can type. It is one line per base, so it takes no part in the availability state machine or its
-// floor.
+// ── THE ONE LINE A HOMESTEAD SPEAKS: WHERE ITS BASE IS ──────────────────────
+// A homestead sites its base at the biggest sea-level water bank in view, which can be a long walk from
+// where anybody is standing, and a crew that walks off without a word looks like a crew that has broken.
+// So the bot that locks the headframe says where, once, as coordinates a person can type. It is one line
+// per base, so it takes no part in the availability state machine or its floor.
 //
 // ── SPEECH IS NEVER THE WORK ───────────────────────────────────────────────────────────────────────
 // Nothing here may stop, delay or fail a decision. The chat call goes through the external-library guard
@@ -105,9 +83,8 @@ let _lastSpokenAt = 0;
 // The three sentences, authored in one place so the desk's register and the bot's cannot drift apart.
 //
 // EACH ONE CARRIES THE STATE AND, WHERE THERE IS ONE, THE ACTION. `idle` without the sentence that fixes
-// it is a bot reporting a problem to somebody it has not told how to solve — and this is the one moment
-// the request form is information rather than notation, which is the same argument that took the glosses
-// off the help page. `working again` needs no action: there is nothing for the person to do.
+// it is a bot reporting a problem to somebody it has not told how to solve. `working again` needs no
+// action: there is nothing for the person to do.
 const GREETING = 'hi — yours now, and working.';
 const IDLE     = 'idle — say "foreman request 20 logs".';
 const WORKING  = 'working again.';
@@ -155,9 +132,8 @@ function greet() {
   if (_availability('working', GREETING)) watcher.summary(TAG, `greeted ${botMandate.currentOwner()}`);
 }
 
-// The two states. Named for the state rather than the event so a call site cannot mean one and say the
-// other, and deliberately not given a `reason` parameter: a reason is what the bot is doing, which is
-// `foreman where`'s question and the exact door narration came back through last time.
+// The two states, named so a call site cannot mean one and say the other, and given no `reason`
+// parameter: a reason is what the bot is doing, which is `foreman where`'s question.
 //
 // goneIdle REPEATS (the `true`), backToWork does not — see ONE STATE REPEATS AND ONE DOES NOT above.
 // `_goIdle` calls in here about once a second while parked, so the floor alone sets the cadence and the

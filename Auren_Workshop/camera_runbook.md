@@ -7,10 +7,9 @@
 > the same split CLAUDE.md draws to `fleet_runbook.md`, applied one scope further out, and for the
 > same reason: a terminal-only session should never carry the camera stack's weight.
 >
-> **Status does not live here** (Law 14 — a durable file records the persistent WHY, never the
-> transient what-is). What is currently verified, what is unproven, and what is half-built lives in
-> `Documentation/Refurbishing planning/architect_bugsquashing.md`, newest entry at the top. **A
-> cold-start session picking this work up should read that entry's OPEN ITEMS first**, then use this
+> **Status does not live here** (a runbook holds procedure; the records hold state). What is currently verified, what is unproven, and what is half-built lives in
+> `Documentation/Refurbishing planning/architect_worklog.md`, appended at the bottom. **A
+> cold-start session should find the latest camera-related entries and their unresolved limitations**, then use this
 > file to drive the machinery.
 
 ---
@@ -92,8 +91,8 @@ Idempotent; re-running it is safe and is the repair path.
 ## 3. Cold start: watching a live run
 
 **The automated route is a FIELD on the config page — `fleet_runbook.md` §3, and it is what to reach
-for.** A run with `record: 'cameras'` on `run_config.js` raises the crew, waits until every window is
-standing in the world, and only then starts the fleet — `node Auren_Workshop/run.js` performs it, and
+for.** A run with `record: 'cameras'` on `foreman_config.js` has the foreman raise the camera crew as a startup
+step, before the world spawn and the crew — `node start_auren.js` performs it, and
 `node Auren_Workshop/fleet_control.js down` closes the cameras and the world together
 (`record_overlay.js stop` owns the camera half and `down` delegates to it). It turns framing on for its
 own run, so `mode.framing` below can stay off. The **Architect's eye** — the seat a human flies — is NOT
@@ -204,8 +203,8 @@ behind it to read.
 
 ```
 node Auren_Workshop/tools/lanista_conductor.js ladder watch --architect
-# the same, as a configured run: record: 'cameras' on run_config.js (the Architect's eye is a camera_configure setting)
-node Auren_Workshop/run.js
+# the same, as a configured run: record: 'cameras' on foreman_config.js (the Architect's eye is a camera_configure setting)
+node start_auren.js --record cameras
 .\Auren_Workshop\scripts\start_cameras.ps1 -Framing -Architect
 ```
 

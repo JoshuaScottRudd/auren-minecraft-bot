@@ -8,7 +8,7 @@
 // WHY here and not duplicated per-phase (Law 16): every farming phase needs the
 //   IDENTICAL cell list, transposed the IDENTICAL way. Reuses
 //   blueprint_survey.transposeVoxelsForCandidate against the site's locked
-//   build_center instead of a second voxel-transpose implementation.
+//   transpose_origin instead of a second voxel-transpose implementation.
 // invariants:
 //  - Throws (Law 13 coding violation) if the farmland site hasn't been locked yet —
 //    a farming verb dispatched before set_buildspot ran is a planning bug, not a
@@ -48,17 +48,22 @@ function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
     throw new Error('[farmland_site] CODING VIOLATION: bot must be initialized before getFarmlandCells().');
   }
   const setBuildspot = hq.readBuildingChair(roomKey, 'set_buildspot');
-  if (!setBuildspot?.build_center || typeof setBuildspot.build_center.x !== 'number') {
-    throw new Error(`[farmland_site] CODING VIOLATION: No locked build_center for farm instance "${roomKey}". set_buildspot must run before any farming verb.`);
+  if (!setBuildspot?.transpose_origin || typeof setBuildspot.transpose_origin.x !== 'number') {
+    throw new Error(`[farmland_site] CODING VIOLATION: No locked transpose_origin for farm instance "${roomKey}". set_buildspot must run before any farming verb.`);
   }
   // WHICH blueprint geometry this instance is — read from the blueprint_paster chair set_buildspot stamped
-  // when it locked the site, so the reader is no longer wired to one farm blueprint. Falls back to the
-  // phase-1 default for a chair locked before the per-instance blueprint_name existed.
+  // when it locked the site. THERE IS NO FALLBACK: since the tine row became four direction blueprints
+  // a guess is a guess about WHICH WAY the row reaches, and three guesses in four would lay
+  // the dirt on the wrong side of the bank while every reader agreed with itself. An unstamped chair is
+  // a coding violation, not a default (Law 13).
   const paster = hq.readBuildingChair(roomKey, 'blueprint_paster');
-  const blueprintName = paster?.building_name || FARM_BLUEPRINT_NAME;
+  const blueprintName = paster?.building_name;
+  if (!blueprintName) {
+    throw new Error(`[farmland_site] CODING VIOLATION (Law 13): farm instance "${roomKey}" has a locked transpose_origin but no blueprint_paster.building_name, so which direction its row reaches is unknown. site_chairs stamps both together.`);
+  }
   const building = loadBuilding(blueprintName);
 
-  const voxels = transposeVoxelsForCandidate(building, setBuildspot.build_center, setBuildspot.rotation || 0);
+  const voxels = transposeVoxelsForCandidate(building, setBuildspot.transpose_origin);
 
   let waterCell = null;
   const dirtCells = [];
@@ -69,8 +74,8 @@ function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
     else if (v.type === 'growing') growingSlots.add(slotKey(v.x, v.y, v.z));
   }
   // A ROW CELL IS DIRT WITH A CROP SLOT ON IT. Not every dirt voxel is one: a wheat_tine_row's land block is dirt
-  // with air above — the next row's stand — and tilling it would turn the walkway into farmland (Architect
-  // 2026-09-15, the trident). The crop slot is what makes soil a field cell, so that is what is read.
+  // with air above — the next row's stand — and tilling it would turn the walkway into farmland. The crop
+  // slot is what makes soil a field cell, so that is what is read.
   const rowCells = dirtCells.filter(c => growingSlots.has(slotKey(c.x, c.y + 1, c.z)));
   // waterCell is OPTIONAL. A blueprint MAY declare its own water voxel (a source the builder places by bucket);
   // a wheat_tine_row does NOT — the wheat_trident_scanner only ever sites plots into open NATURAL
@@ -87,19 +92,17 @@ function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
 // an obstructed crop slot, hoe dirt→farmland, sow air→wheat, reap mature. One classifier so census
 // and executor never diverge.
 //
-// WHY 'clear' exists. The crop slot is a blueprint 'growing' voxel, and 'growing' is declared
-// external — so blueprint_survey never places it, never digs it, and never even COMPARES it.
-// Nothing owned what sits there. Minecraft refuses to hoe dirt under a non-air block, so any
-// obstruction deadlocked its cell permanently: a lone 'till' the hoe would always refuse, the
-// executor counting the refusal as a success, and five identical no-ops tripping the Law 13
-// five-identical-outcomes halt. "External" named a SUPPLIER and forgot the case where the slot is
-// already occupied.
+// WHY 'clear' exists. The crop slot is a blueprint 'growing' voxel, declared external, so
+// blueprint_survey never places it, digs it, or compares it — nothing else owns what sits there.
+// Minecraft refuses to hoe dirt under a non-air block, so any obstruction would deadlock its cell
+// permanently: a lone 'till' the hoe always refuses, the executor counts the refusal as a success, and
+// five identical no-ops trip the Law 13 five-identical-outcomes halt.
 //
 // WHY the obstruction test is `age === null` and not `aname !== 'wheat'`: getWheatAge is the single
-// owner of "is this our crop and what stage is it" — it is name-checked at source, so a carrot at
-// age 7 can no longer pass as ripe wheat here. The extra `aname !== 'wheat'` guard on the
-// dig is deliberate belt-and-braces: a wheat block whose age is somehow unreadable must never be
-// dug as an obstruction. Never clearing our own crop is worth one redundant string compare.
+// owner of whether this is our crop and what stage it is, name-checked at source, so a carrot at age 7
+// never passes as ripe wheat here. The extra `aname !== 'wheat'` guard on the dig is redundant belt and
+// braces: a wheat block whose age is unreadable must never be dug as an obstruction — never clearing our
+// own crop is worth one extra string compare.
 function classifyCell(bot, c, growingSlots) {
   const ground = bot.blockAt(new Vec3(c.x, c.y, c.z));
   const above  = bot.blockAt(new Vec3(c.x, c.y + 1, c.z));
@@ -134,9 +137,8 @@ function classifyCell(bot, c, growingSlots) {
 //
 // `blocked` is a SEPARATE axis, not a fifth bucket: an obstructed cell is still counted as untilled
 // or emptyTilled by its ground state, and blocked says the crop slot above it is stoppered. It is
-// reported because a buried field is otherwise invisible in the digest (Law 6) — "untilled" alone
-// and "untilled, all blocked by rock" are the same count telling different stories, and only one
-// of them explains why nothing moves.
+// reported because a buried field is otherwise invisible in the digest (Law 6): the same untilled count
+// can mean an open field or one entirely blocked by rock, and only the blocked count distinguishes them.
 function getFarmState(bot, roomKey = FARM_BLUEPRINT_NAME) {
   const { rowCells, growingSlots } = getFarmlandCells(bot, roomKey);
   let untilled = 0, emptyTilled = 0, growing = 0, mature = 0, blocked = 0;
@@ -159,8 +161,8 @@ function getFarmState(bot, roomKey = FARM_BLUEPRINT_NAME) {
 }
 
 // getFieldPlan(bot, roomKey) -> per-cell corrective plans the executor applies from a reaching anchor. Every
-// cell whose crop slot is obstructed yields a 'clear', so a stray block can no longer sit in a
-// slot that no fragment owns.
+// cell whose crop slot is obstructed yields a 'clear', so a stray block never sits unaddressed in a
+// slot no fragment owns.
 function getFieldPlan(bot, roomKey = FARM_BLUEPRINT_NAME) {
   const { rowCells, growingSlots } = getFarmlandCells(bot, roomKey);
   const plan = [];

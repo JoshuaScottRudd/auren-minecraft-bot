@@ -16,19 +16,17 @@ const { guardExternalSync } = require('@utils/external_library_guard');
 // Unknown verbs are a coding violation — both surfaces validate against VERBS
 // before calling, so an unknown verb here means a caller bug (Law 13: throw).
 // `args` is the operator's authored data for verbs that take some (only `move` today). It travels
-// the same one pathway as the verb itself rather than a second channel (Law 16), and it is the
-// operator's input — never sensed, never defaulted (Law 23: the fragment validates it).
+// the same one pathway as the verb itself (Law 16), and it is the operator's input — never sensed,
+// never defaulted (Law 23: the fragment validates it).
 //
 // `origin` says WHERE the command entered the fleet — the operator's terminal, or a human speaking
-// inside the world. It is RECORDED, never used to refuse anything.
+// inside the world. It is recorded only; nothing refuses on it.
 //
-// It is not a permission, and an earlier revision of this file wrongly made it one. The operator
-// verbs mean the same thing to both species: `stop` ends a homesteader and a contractor alike, and
-// the operator must be able to send it from the console either way. What separates the two is that a
-// contractor ADDITIONALLY mounts the foreman's ear and the sign desk — capability added, not capability
-// withheld — so there is nothing here to gate. The stamp exists so the watcher trace can say
-// truthfully where a verb came from (Law 25), and so a future multi-human fleet has a seam to tell
-// one human's request from another's.
+// Not a permission: the operator verbs mean the same thing to both species — `stop` ends a homesteader
+// and a contractor alike, and the operator can send it from the console either way. A contractor
+// additionally mounts the foreman's ear and the sign desk (capability added, not withheld), so there is
+// nothing here to gate. The stamp lets the watcher trace say truthfully where a verb came from (Law 25),
+// and gives a future multi-human fleet a seam to tell one human's request from another's.
 async function execute(verb, args = {}, origin) {
   botMandate.validateOrigin(verb, origin);   // must SAY where it came from; nothing is refused on it
 
@@ -38,7 +36,7 @@ async function execute(verb, args = {}, origin) {
       // The dispatcher cancels it too, but that only fires once a plan cycle actually reaches it —
       // this closes the window between the start signal and the first dispatch.
       require('@action/await_aggro.js').stop();      // one occupant per scope (Law 4)
-      // AWAITED, AND REPORTED FROM THE OUTCOME (2026-09-10). The injector carries a placement gate that
+      // AWAITED, AND REPORTED FROM THE OUTCOME. The injector carries a placement gate that
       // can refuse — a body must be standing with the person who raised it before it plans — so a line
       // printed beside the call would tell an operator their verb had taken effect when it had not
       // (Law 25). This is the operator's own verb, so the answer belongs to whoever typed it.
@@ -52,18 +50,16 @@ async function execute(verb, args = {}, origin) {
       // monster to aggro, fights it through the ordinary battleStations gate, and does nothing else.
       // No job board and no dispatcher.
       //
-      // The verb keeps the name `sentry` while the fragment is now `await_aggro`, deliberately: the
-      // verb is the operator's vocabulary, whereas the fragment name has to state its one verb (Law
-      // 0/7). Renaming the verb would break external usage for no gain; renaming the fragment is what
-      // made the single-fragment shape obvious.
+      // The verb keeps the name `sentry` while the fragment is `await_aggro`: the verb is the
+      // operator's vocabulary, the fragment name states its one verb (Law 0/7). Renaming the verb would
+      // break external usage for no gain.
       //
-      // Deliberately NOT a start_injector-style watcher flush: the arena is often armed on a bot that
-      // has already been running, and wiping the trace would delete the evidence of how it got here.
+      // No watcher flush here, unlike start_injector: the arena is often armed on a bot that is already
+      // running, and wiping the trace would delete the evidence of how it got here.
       //
-      // The bot stays exactly where it is. Positioning it (and re-kitting it after a death — a death
-      // drops the inventory, so fight two is bare-handed otherwise) belongs to the arena director over
-      // RCON: where the fight happens is an AUTHORED input to the bench, never a decision made by the
-      // system under test (Law 26 / the playground's governing line).
+      // The bot stays exactly where it is. Positioning it (and re-kitting it after a death, since a
+      // death drops the inventory) belongs to the arena director over RCON: where the fight happens is
+      // an AUTHORED input to the bench, not a decision the system under test makes (Law 26).
       const bot = global.bot;
       if (!bot || !bot.entity || !bot.entity.position) {
         watcher.warn('operator_commands', 'sentry — bot not spawned/positioned yet; wait for chunks and retry.');
@@ -80,22 +76,19 @@ async function execute(verb, args = {}, origin) {
     case 'respawn': {
       // THE BODY COMES BACK, AND THIS IS THE ONLY WAY IN FROM OUTSIDE.
       //
-      // WHY IT HAD NO OWNER UNTIL NOW, because the gap is not obvious from any one file: `master_core`
-      // runs with `respawn: false`, so the client never sends the packet on its own — that gating is
-      // deliberate and load-bearing (death_manager's ACT 1 header has the reason: a corpse cannot walk,
-      // mine or place, so a death is a hard stop by physics rather than by a check arriving in time).
-      // The single sender is `death_manager`, which is a FRAGMENT dispatched by the planning recursion.
-      // A bench bot is in SENTRY mode, where the recursion is off — so nothing dispatches death_manager
-      // and the body stays a corpse until the world is rolled back. Neither `await_aggro` nor
-      // `lanista_ladder` sends the packet themselves, and RCON cannot — the respawn packet is the
-      // CLIENT's to send, so no server-side command can stand a corpse up.
+      // `master_core` runs with `respawn: false`, so the client never sends the packet on its own: a
+      // corpse cannot walk, mine or place, so a death is a hard stop by physics (death_manager's ACT 1
+      // header has the reason). The single sender is `death_manager`, a FRAGMENT dispatched by the
+      // planning recursion. A bench bot in SENTRY mode has the recursion off, so nothing dispatches
+      // death_manager and the body stays a corpse until the world is rolled back. Neither `await_aggro`
+      // nor `lanista_ladder` sends the packet, and RCON cannot — the respawn packet is the CLIENT's to
+      // send, so no server-side command can stand a corpse up.
       //
       // NOT A SECOND DEATH RECOVERY (Law 16). death_manager does three acts — respawn, teleport to a
-      // recovery point, re-kit — and owns death recovery under autonomy, unchanged. This verb does ACT 1
-      // ONLY and stops: the arena director already owns where a bench body stands and what it holds (the
-      // sentry verb's own header says so), so teleport and kit here would be a second answer to a
-      // question that already has one. Both call `bot.respawn()` because that is mineflayer's API, not a
-      // system being reimplemented.
+      // recovery point, re-kit — and owns death recovery under autonomy. This verb does ACT 1 only and
+      // stops: the arena director owns where a bench body stands and what it holds (see the sentry verb
+      // above), so teleport and kit here would answer a question that already has one. Both call
+      // `bot.respawn()` because that is mineflayer's API.
       //
       // A LIVE BOT IS A NO-OP, NOT AN ERROR. A caller running an unconditional "respawn if dead" step
       // cannot know the answer without asking — so asking must be free. The response states which of the
@@ -113,7 +106,7 @@ async function execute(verb, args = {}, origin) {
         return;
       }
       // Environmental: mineflayer refuses the click when the client is mid-transition. The caller is
-      // told rather than retried — it re-asks, and its own ceiling is the judge.
+      // told, not retried — it re-asks, and its own ceiling is the judge.
       const sent = guardExternalSync('operator_commands', 'respawn click', () => bot.respawn());
       if (!sent.ok) {
         watcher.warn('operator_commands', `respawn — the click was refused (${sent.reason}). The body is still down.`);
@@ -147,24 +140,23 @@ async function execute(verb, args = {}, origin) {
       // THE SCOPED TWIN OF flush, AND THE ONLY DESTRUCTIVE VERB A HUMAN IN THE WORLD MAY SAY.
       //
       // flush erases every owner's memory and the foreman's shared mirror with it; wipe strikes only the
-      // rows stamped with THIS body's owner. The scope is not an argument and is not checked — it is read
-      // from this process's own mandate, so the verb cannot address a foreign row because there is no way
-      // to spell one (Law 27). See wipe_system.js for why the removal is a tombstone rather than a delete.
+      // rows stamped with THIS body's owner. The scope is read from this process's own mandate, so the
+      // verb cannot address a foreign row because there is no way to spell one (Law 27). See
+      // wipe_system.js for why the removal is a tombstone.
       const { wipe } = require('@kernel/wipe_system.js');
       await wipe();
       return;
     }
     case 'surveylayout': {
-      // Fire lock_all_buildspots' DRY-RUN base-layout survey at the live fleet WITHOUT starting
+      // Fires lock_all_buildspots' DRY-RUN base-layout survey at the live fleet WITHOUT starting
       // autonomy: it surveys every blueprint's nearest spot and logs the full "WHY HERE" report to
-      // watcher_<BotId>.json (under 'lock_all_buildspots'), LOCKING/BUILDING NOTHING. This is the
-      // pre-flight for site selection — every blueprint must lock in at the start, so whenever a new
-      // blueprint is added this verb re-surveys the whole layout to confirm each spot still sites and
-      // to read WHERE/WHY before committing. Exposed on the operator-command path (not the readline
-      // test verb test_locklayout) because a windowed/detached bot has no writable stdin. The survey
-      // report is emitted BEFORE the verdict, so a bad/too-strict layout still logs its "where would
-      // this go / why not". Unguarded: run() already REPORTS the environmental verdict in `ok`/`transient`
-      // — a throw out of it is the coding-violation path, and catching it here turned a defect into a
+      // watcher_<BotId>.json (under 'lock_all_buildspots'), LOCKING/BUILDING NOTHING. The pre-flight for
+      // site selection, so whenever a new blueprint is added this verb re-surveys the whole layout to
+      // confirm each spot still sites and to read WHERE/WHY before committing. Exposed on the
+      // operator-command path, not the readline test verb test_locklayout, because a windowed/detached
+      // bot has no writable stdin. The survey report is emitted BEFORE the verdict, so a bad/too-strict
+      // layout still logs where it would go and why not. Unguarded: run() already REPORTS the
+      // environmental verdict in `ok`/`transient`, so catching a throw here would turn a defect into a
       // warn line on the one verb an operator runs to find defects (Law 13).
       const bot = global.bot;
       if (!bot || !bot.entity || !bot.entity.position) {
@@ -176,27 +168,27 @@ async function execute(verb, args = {}, origin) {
       return;
     }
     case 'stop': {
-      // RENAMED FROM `exit` 2026-09-01 (Architect: *"stop and exit become one. if you want the bots to
-      // stop immediatley you type stop and the bots exit. that is the only way to interrrupt the bots."*).
-      // One word, one act — there was only ever one command here, and `exit` named the mechanism (the
-      // process leaves) where `stop` names what the person wants (the work ends now).
+      // `stop` and `exit` are one command: `exit` named the mechanism (the process leaves), `stop`
+      // names what the person wants (the work ends now).
       //
-      // NO SOFTER INTERRUPT EXISTS, AND THAT IS THE RULING RATHER THAN A GAP. A "park" verb was designed
-      // and dropped in the same breath that raised it: *"i was thinking of adding parking so you stop the
-      // bots and they go back home and wait but the bots are designed to be autonomous. if you intervene
-      // with the bots then it should be drastic."* A parked bot is still a bot with a planner, and the
-      // only reason a human reaches for an interrupt is that autonomy is doing something they want ended.
+      // No softer interrupt exists. A parked bot is still a bot with a planner, and the only reason a
+      // human reaches for an interrupt is that autonomy is doing something they want ended.
       //
-      // Deliberate shutdown gets the same care as a crash: drop the magnet so
-      // peers don't see a ghost worker, and persist in-memory state (the 2s HQ
-      // debounce and watcher buffer would otherwise lose the tail).
-      // All three are ours, and a throw out of any of them is a defect the operator needs to see rather
-      // than a hazard of shutting down (Law 13). The guards were also self-defeating: a flush that threw
-      // left the operator believing the state had been written.
-      require('@thinking/dispatcher.js').clearMagnet();
-      watcher.flushNow();
-      require('@kernel/corporate_headquarters').flushNow();
-      process.exit(0);
+      // Deliberate shutdown gets the same care as a crash: drop the magnet so peers don't see a ghost
+      // worker, and persist in-memory state (the 2s HQ debounce and watcher buffer would otherwise lose
+      // the tail). A throw out of any of these is a defect the operator needs to see, not a hazard of
+      // shutting down (Law 13).
+      //
+      // Goes through the one shutdown path shared with the two death paths (`@utils/body_end`), so a
+      // stop and a crash cannot disagree about what a body owes the disk on its way out.
+      //
+      // The operator's stop drains the record before exiting, without an additional deferred beat.
+      // The cause is what the sender said it was, falling back to the verb's own name only when nobody
+      // said (a person at a readline IS the cause, and has none to give). `args.why` is set when the
+      // FOREMAN ends the fleet — a crash, a lost body, a soak that ran out — so those are attributed to
+      // their real cause instead of an operator who typed nothing.
+      const stopWhy = typeof args.why === 'string' && args.why ? `fleet stop — ${args.why}` : 'operator stop';
+      await require('@utils/body_end').endBody(stopWhy, { immediate: true });
       return;
     }
     default:

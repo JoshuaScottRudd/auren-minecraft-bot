@@ -9,17 +9,11 @@ INDEX
 4. Descent ........................ descentLandingDistance()
 5. Module Exports
 
-Pure and stateless — no bot, no world, no logging. Sliced out of calculator_utils, which had grown past
-its own 1K rule; combat arithmetic stayed there, vertical motion came here.
+Pure and stateless — no bot, no world, no logging. Holds vertical motion arithmetic, kept separate from
+the combat arithmetic in calculator_utils.
 
-THE ONE INTEGRATION OF JAVA'S JUMP. Three hand-derived tick counts of this arc existed before it did —
-calculator_utils' JUMP_TICKS_TO_FALLING_EDGE, the old movement_utils' JUMP_RISE_TICKS, combat_monitor's
-jumpToImpactTicks — one capability with three implementations, free to drift (Law 16). Anything wanting a
-jump tick count reads it off jumpArc() and does not write its own.
-
-THE WRONG TURN, so it is not retaken: the regression was first suspected to be a rise-margin problem in
-the tick-count constant itself. The arc disproves it — the body clears with margin and stays above the
-step for several ticks after. The real defect was geometric (see jumpTriggerPlan).
+THE ONE INTEGRATION OF JAVA'S JUMP: the single source of this arc's tick counts (Law 16). Anything
+wanting a jump tick count reads it off jumpArc() and does not write its own.
 ============================================================
 */
 
@@ -105,11 +99,7 @@ function jumpSpeedBand(faceDistance, stepHeight, opts = {}) {
 
 // jumpTriggerPlan(faceDistance, speedBps, stepHeight) → the whole decision for one poll.
 //   faceDistance — body POSITION to the vertical plane of the step's near face. Not to the cell centre.
-//
-// THE DEFECT IT REPLACES, since the code that had it looked right: the old prejump computed its distance
-// against the cell being walked to, but read its RISE one cell further ahead. When the rise was in that
-// further cell the two disagreed by a block, so the jump fired too far out, came back down before the
-// face, hit it, and jumped again. Rise and distance must come off the SAME cell.
+//   Rise and distance are read off the SAME cell, or the two disagree and the jump fires at the wrong point.
 //
 // Apex over the face is the robust choice: it sits at tick 6 of a 4..8 window, and poll granularity and
 // control latency both eat the LATE side, which has the slack.
@@ -129,8 +119,7 @@ function jumpTriggerPlan(faceDistance, speedBps, stepHeight, opts = {}) {
   const max = BODY_HALF_WIDTH + vTick * window.last;
   const ticksToFace = lead > 0 ? (vTick > 0 ? lead / vTick : Infinity) : 0;
 
-  // Pressed against the step: jumping is still correct — it is the old per-cell behaviour, which works
-  // and is merely slow — so this reports honestly rather than refusing (Law 25).
+  // Pressed against the step, jumping is still correct, though slower; this reports honestly (Law 25).
   if (!(lead > JUMP_FACE_EPS)) {
     return { jumpNow: true, willClear: true, ticksToFace: 0, ideal, min, max, band, tooFast: false, tooSlow: false, reason: 'at_face' };
   }
@@ -149,9 +138,9 @@ function jumpTriggerPlan(faceDistance, speedBps, stepHeight, opts = {}) {
 // 4. Descent
 // ============================================================
 
-// descentLandingDistance(speedBps, dropHeight) → { ticks, blocks } past the edge. The easy half: nothing
-// is pressed, so the body always clears what it stepped off at any normal walking pace. Present so a
-// descent lookahead can be arithmetic rather than a guess.
+// descentLandingDistance(speedBps, dropHeight) → { ticks, blocks } past the edge. Nothing is pressed, so
+// the body always clears what it stepped off at any normal walking pace; this gives a descent lookahead
+// an exact number.
 function descentLandingDistance(speedBps, dropHeight = 1) {
   const arc = fallArc(16);
   let ticks = -1;

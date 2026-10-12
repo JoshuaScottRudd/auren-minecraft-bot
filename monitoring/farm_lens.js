@@ -1,15 +1,11 @@
 // Auren_Bot/monitoring/farm_lens.js
-// HOW THE FARM WENT — the wheat field measured as closely as build_lenses measures the headframe.
-//
-// WHY A FILE OF ITS OWN. build_lenses keys everything by build SITE and reads one scan shape
-// (`"name" — x/y structure placed`). The farm is sixteen row sites that make ONE structure, it is tended as well
-// as built, and its progress lives in lines no building writes: the census, the per-row tend report, the seed
-// picks. Folding it into the site map would print sixteen near-identical site blocks and still miss the crop.
-// So the farm gets one reducer here, and build_lenses.runMilestones prints it after the structures — `--farm`
-// prints it alone.
+// HOW THE FARM WENT — the wheat field's own reducer, kept apart from build_lenses' per-site scan because
+// the farm is sixteen row sites making ONE structure, tended as well as built, with progress carried in
+// lines no building writes: the census, the per-row tend report, the seed picks. build_lenses.runMilestones
+// prints this after the structures; `--farm` prints it alone.
 //
 // EVERY NUMBER IS READ OFF A LINE THE FLEET WROTE; nothing is inferred from a gap. The lines, and who writes them:
-//   ROWS SITED        set_buildspot        `Locked wheat_tine_row#k build site — build_center (x,y,z)`
+//   ROWS SITED        set_buildspot        `Locked wheat_tine_row#k build site — transpose_origin (x,y,z)`
 //   GATED             job_board            `🚧 GATED <gate> (n): <why> → farm_tend#cluster [detail], …`
 //   CLAIMED           dispatcher           `Claimed [band] farm/farm_tend …` / `supply/wheat_seeds` / `supply/dirt`
 //   CENSUS            farming_integrity    `farm census "wheat_farm" — L/S row(s) laid of N · structure P/T placed, …`
@@ -20,23 +16,21 @@
 //   PREP              land_prep            hoe crafted/retrieved, seeds and bone meal pulled from a chest
 //   BUILT             job_board            `🏁 STRUCTURE BUILT: 'wheat_farm'` (+ STANDING / UN-BUILT)
 // A milestone that has not happened is printed as a BOOLEAN FIELD set false in `farm_milestones`, never
-// omitted (Law 25) — the latest reading that used to ride alongside the old "NOT YET" phrase is in
-// `farm_census_latest`, which prints on every run whether or not the milestone landed.
+// omitted (Law 25); `farm_census_latest` prints the latest reading on every run regardless.
 //
-// Seam as build_lenses: inputs as ARGUMENTS, render through data_out, RETURN an empty array. The array
-// return is kept because build_lenses.runMilestones iterates renderFarm's result; there are no longer any
-// lines in it, since every field goes straight to data_out.
+// Seam as build_lenses: inputs as ARGUMENTS, render through data_out, RETURN an empty array — kept because
+// build_lenses.runMilestones iterates renderFarm's result, even though every field now goes to data_out.
 //
-// OUTPUT IS DATA, NOT PROSE (Architect 2026-09-16). Field names and values only — no sentence is composed
+// OUTPUT IS DATA, NOT PROSE. Field names and values only — no sentence is composed
 // here. Values that are strings are COPIED: a gate's own `why` clause, a row key, a seed-pick outcome, a
-// bot id, a structure name, a timestamp. See data_out.js for the rule and the reason.
+// bot id, a structure name, a timestamp. See data_out.js for the rule.
 
 'use strict';
 
 const { relativeTime, PASSIVE_LINE } = require('./trace_read');
 const out = require('./data_out');
 
-const LOCK_RE = /Locked (\S+) build site — build_center \(([^)]+)\)/;
+const LOCK_RE = /Locked (\S+) build site — transpose_origin \(([^)]+)\)/;
 const GATED_RE = /🚧 GATED (\S+) \((\d+)\): (.+)$/;
 const CLAIM_RE = /Claimed \[[^\]]*\] (farm\/farm_tend|supply\/wheat_seeds|supply\/dirt)\b/;
 const CENSUS_RE = /farm census "([^"]+)" — (\d+)\/(\d+) row\(s\) laid of (\d+) · structure (\d+)\/(\d+) placed, (\d+) to dig · crop cells (\d+): (\d+) growing, (\d+) mature, (\d+) tilled unsown, (\d+) untilled, (\d+) blocked/;
@@ -44,32 +38,20 @@ const ROWS_RE = /\] 📊 {2,}rows: (.+)$/;
 const TEND_RE = /farm_executor: (\S+) struct\(place=(\d+),dig=(\d+)\) cleared=(\d+) tilled=(\d+) planted=(\d+) harvested=(\d+) drops=(\d+)(?: bonemealed=(\d+))?(.*)$/;
 const VISIT_RE = /farm_manager: cluster visit serviced (\d+) plot\(s\) — worked=(\d+) refused=(\d+)( \[STUCK)?/;
 const SEED_PICK_RE = /Seed pick done: \+(\d+) wheat_seeds in (\d+)\/(\d+) punch\(es\) \(total \d+\) — (.+)\.$/;
-// ── WHERE SEEDS COME FROM, AND THE ONE THAT STOPS THEM (Architect 2026-09-16) ────────────────────────
-// *"how many total seeds were gotten in the whole run"* — which this lens could not answer: it counted
-// PICKING and nothing else, so a reader took the cluster line's `1 reachable` for the run's whole yield.
-// That reading was wrong twice over: `reachable` is a STOCK at one instant, already net of everything the
-// field had sown, and picking is not the only inflow.
-//
-// SEED_DROP_RE is drop_collector banking a loose seed — a real second inflow. It carries NO quantity (the
-// line is bare), so it is counted as EVENTS and rendered as events; the `Spotted wheat_seeds×N` line that
-// precedes it has the number, but a spot is not a pickup and pairing them would be inventing a total.
-// NOT SUMMED WITH THE PICK TOTAL, deliberately: seed_picker's `+N` is an inventory delta measured across
-// its own trip, so seeds its punches dropped and this collector banked are already inside that number.
-// Adding them would double-count, and one confidently wrong total is what this block exists to prevent.
+// ── WHERE SEEDS COME FROM, AND THE ONE THAT STOPS THEM ────────────────────────
+// SEED_DROP_RE is drop_collector banking a loose seed — a second inflow beside seed_picker's punches. It
+// carries no quantity (the line is bare), so it is counted and rendered as events, never summed with the
+// pick total: seed_picker's `+N` is an inventory delta already net of whatever its own punches dropped and
+// this collector banked, so adding them would double-count.
 //
 // SEED_ORDER_BLOCKED_RE is job_board refusing to post the field's seed order at all for want of a
-// registered home chest. It fired 44 times in the 2026-09-16 run — the field wanted 32 seeds and no order
-// was ever placed — which is a different fault from "the order was placed and went unfilled" and wants a
-// different fix. Nothing surfaced it, so the seed shortage read as slow gathering.
+// registered home chest — a different fault from an order placed and left unfilled.
 const SEED_DROP_RE = /Picked up wheat_seeds\b/;
 const SEED_ORDER_BLOCKED_RE = /farm wants (\d+) seeds but no home chest is registered/;
-// How long a repeated condition must stay silent before the lens will call it CLEARED rather than merely
-// quiet. Two minutes: long enough that a gap between sweeps cannot pass for a resolution, short enough that
-// a condition which really did end early in a 30-minute run is named as ended.
+// Seconds a repeated condition must stay silent before it counts as CLEARED.
 const BLOCK_CLEARED_MARGIN_SEC = 120;
 const PUNCH_FAIL_RE = /\[SEED_PICKER\] punch did not clear grass/;
-// Needles into farm_executor's own tail and seed_picker's own outcome clause. Regexes rather than quoted
-// phrases so a PATTERN is never indistinguishable from authored prose (Architect 2026-09-16).
+// Needles into farm_executor's own tail and seed_picker's own outcome clause.
 const NO_SEEDS_RE = /\[no seeds\]/;
 const NO_HOE_RE = /\[no hoe\]/;
 const STOPPED_SHORT_RE = /^stopped short/;
@@ -109,9 +91,8 @@ function reduceFarm(seg, botFilter) {
   const zero = () => ({ place: 0, dig: 0, cleared: 0, tilled: 0, planted: 0, harvested: 0, drops: 0, bonemealed: 0, visits: 0 });
   f.tend.totals = zero();
 
-  // ONE CLOCK FOR THE WHOLE FLEET. A line's [Nm Ss] tag counts from its own bot's birth, so two bots' tags are two
-  // clocks, and a delta between events on different bots (the headframe built by one, the first farm claim by the
-  // other) came out negative. Every time here is wall-clock seconds from the first stamped line in the run.
+  // ONE CLOCK FOR THE WHOLE FLEET: every time here is wall-clock seconds from the first stamped line in
+  // the run, not each bot's own [Nm Ss] tag, so a delta between two bots' events stays comparable.
   let baseMs = null;
   for (const l of seg) { const ms = l.iso ? Date.parse(l.iso) : NaN; if (!Number.isNaN(ms)) { baseMs = ms; break; } }
   for (const l of seg) {
@@ -143,9 +124,8 @@ function reduceFarm(seg, botFilter) {
       const c = f.census;
       if (!c.first) c.first = r;
       const best = c.rowsLaid.length ? c.rowsLaid[c.rowsLaid.length - 1].laid : 0;
-      // A row is recorded LAID the first time the census count rises past every earlier reading. Two bots scan
-      // the same field, so a lower count from a later line is a stale view, not a row coming undone — that
-      // event is job_board's UN-BUILT line, read separately below.
+      // A row counts LAID the first time the census count rises past every earlier reading; a lower later
+      // count is a stale scan from the other bot, not a row undone — that event is UN-BUILT, read below.
       if (r.laid > best) c.rowsLaid.push({ t, laid: r.laid, of: r.sitedRows, by: l.bot });
       if (!c.firstPlaced && r.placed > 0) c.firstPlaced = r;
       if (!c.firstSown && (r.growing + r.mature) > 0) c.firstSown = r;
@@ -179,9 +159,7 @@ function reduceFarm(seg, botFilter) {
     } else if ((m = l.raw.match(SEED_PICK_RE))) {
       const s = f.seeds;
       s.picks++; s.gained += +m[1]; s.punches += +m[2];
-      // The outcome is a TOKEN, not a sentence. Two of these three used to be phrases this lens wrote
-      // for a condition it recognised by prefix; they are now names for the same three branches, and the
-      // needles that pick the branch are regexes like every other pattern in this file.
+      // outcome is a token naming which of three branches the pick line's tail matched.
       const outcome = STOPPED_SHORT_RE.test(m[4]) ? 'stopped_short'
         : PUNCH_BUDGET_RE.test(m[4]) ? 'punch_budget_spent'
         : 'order_filled_early';
@@ -216,29 +194,23 @@ function reduceFarm(seg, botFilter) {
 
 function renderFarm(f, { verbose = false } = {}) {
   const { names } = f;
-  // A time that never happened is a null, which data_out prints as its ABSENT mark — never as 0m 0s, which
-  // would read as "at the very start of the run".
+  // A time that never happened is null; data_out prints its ABSENT mark, not 0m 0s.
   const at = t => (t == null ? null : relativeTime(t));
-  // A negative gap is two bots' boards seeing one event at different moments (on a continued world one bot finds the
-  // headframe STANDING and works the farm before the other's board writes BUILT), so no delta is printed for it.
+  // A negative gap (two bots' boards seeing one event at different moments) prints no delta.
   const since = (t, from) => (from != null && t != null && t >= from ? relativeTime(t - from) : null);
 
   out.kv('structure', names.structure);
   out.kv('rows_in_design', names.rows);
   out.kv('alpha_structure', names.alpha);
 
-  // A reading taken off the FIRST census of the run is not an event of this run — on a carried world it is the state
-  // the field was found in. It is carried under its own `census_found` event token, never as a `first_*` one, or a
-  // standing farm reads as one built in 14s.
+  // The first census of the run is the state the field was found in, not an event of the run — carried
+  // under its own `census_found` token, not a `first_*` one.
   const c = f.census;
   const found = r => c.first && r && r.t === c.first.t;
 
-  // THE TIMELINE IS SORTED BY FLEET TIME, NOT PRINTED IN THE ORDER IT IS ASSEMBLED. Each event is found by its own
-  // reducer field, so printing field by field put a 2m 19s claim above a 0m 14s census reading. Rows collect as
-  // [t, event, detail, bot, since_prev_row_laid] and print in time order.
-  //
-  // `event` values are tokens, `detail` and `bot` are values read off the record. What a milestone MEANS, and
-  // whether it happened at all, is no longer written here: the boolean is in farm_milestones below.
+  // THE TIMELINE IS SORTED BY FLEET TIME, not the order events are assembled in. Rows collect as
+  // [t, event, detail, bot, since_prev_row_laid] and print in time order; `event` is a token, `detail` and
+  // `bot` are values read off the record. Whether a milestone happened at all is in farm_milestones below.
   const rows = [];
   const event = (t, name, detail = null, bot = null, gap = null) => { if (t != null) rows.push([t, name, detail, bot, gap]); };
 
@@ -257,8 +229,7 @@ function renderFarm(f, { verbose = false } = {}) {
   if (c.first) event(c.first.t, 'census_found', c.first.laid, c.first.bot);
   if (c.firstPlaced && !found(c.firstPlaced)) event(c.firstPlaced.t, 'first_block_placed', c.firstPlaced.placed, c.firstPlaced.bot);
 
-  // Every row that came in DURING the run, in order. Collapsed past eight rows unless --all, keeping the first and
-  // last three, because the pace between rows is the question and the middle of a steady run repeats it.
+  // Rows laid during the run, in order; collapsed past eight unless --all, keeping the first and last three.
   const laid = c.rowsLaid.filter(r => !(c.first && r.t === c.first.t));
   const shown = verbose || laid.length <= 8 ? laid : [...laid.slice(0, 3), null, ...laid.slice(-3)];
   let prev = null;
@@ -283,8 +254,7 @@ function renderFarm(f, { verbose = false } = {}) {
   out.table(['at', 'event', 'detail', 'bot', 'since_prev_row_laid'],
     rows.map(r => [at(r[0]), r[1], r[2], r[3], r[4]]));
 
-  // What HAPPENED and what did not, as booleans. This replaces the NOT YET lines, each of which was a
-  // sentence about an absence; an absence is `false` (Law 25 — the reading is still printed, below).
+  // What happened and what did not, as booleans — an absence is `false`, still printed below (Law 25).
   out.section('farm_milestones');
   out.kv('rows_sited', f.sited.count > 0);
   out.kv('farm_tend_claimed', !!tendClaim);
@@ -298,8 +268,7 @@ function renderFarm(f, { verbose = false } = {}) {
   out.kv('farm_unbuilt_events', f.unbuilt.length);
   out.kv('census_lines_seen', c.latest ? true : false);
 
-  // The deltas the timeline used to carry as `⇒ 3m 2s after the headframe was built`. Same numbers, named
-  // by their two endpoints instead of by a clause.
+  // Deltas named by their two endpoints, not composed into a clause.
   out.section('farm_intervals');
   out.kv('claim_after_alpha_built', tendClaim && f.alphaBuilt ? since(tendClaim.first, f.alphaBuilt.t) : null);
   out.kv('built_after_alpha_built', f.built && f.alphaBuilt ? since(f.built.t, f.alphaBuilt.t) : null);
@@ -386,8 +355,7 @@ function renderFarm(f, { verbose = false } = {}) {
   out.kv('refused', f.cluster.refused);
   out.kv('stuck', f.cluster.stuck);
 
-  // supply/dirt is every structure's dirt and not only the farm's — that qualification is a sentence about
-  // the number and was deleted; the job id in the `job` column is what says which order it is.
+  // supply/dirt is every structure's dirt, not only the farm's; the job id in the `job` column says which order it is.
   const CLAIM_KEYS = ['farm/farm_tend', 'supply/wheat_seeds', 'supply/dirt'];
   out.section('farm_jobs_claimed');
   out.table(['job', 'claims', 'first_at', 'first_by'],
@@ -412,9 +380,8 @@ function renderFarm(f, { verbose = false } = {}) {
   out.kv('punches', S.punches);
   out.kv('punches_cleared_nothing', S.punchFails);
   out.kv('seeds_pulled_from_chest', S.pulled);
-  // Events, not a quantity — the pickup line carries no number. Not added to the pick total: see
-  // SEED_DROP_RE's header for why summing them would double-count. The sentence that used to say so on
-  // the terminal is deleted; the field name says it is a pickup count and the comment holds the reason.
+  // Events, not a quantity — the pickup line carries no number, and it is not summed with the pick total
+  // (see SEED_DROP_RE above).
   out.kv('loose_seed_pickups', S.drops);
 
   if (S.outcomes.size) {
@@ -425,16 +392,11 @@ function renderFarm(f, { verbose = false } = {}) {
     out.zero('farm_seed_pick_outcomes');
   }
 
-  // ── A COUNT WITHOUT ITS WINDOW IS A TRAP, AND THIS ONE SPRANG (Architect 2026-09-16) ──────────────
-  // This printed `SEED ORDER BLOCKED 44×` and nothing else, and it was read — by the session that wrote
-  // it — as "no seed order was ever placed all run". Every one of those 44 sweeps fell between 0m 0s and
-  // 4m 57s, before the crew had built and registered a chest to deliver to. The window and the cleared
-  // flag are what stop that misreading, so both are fields; the sentences that used to explain them
-  // ("then CLEARED and never returned", "STILL BLOCKED at the end of the run", and the reason line) are
-  // DELETED rather than reworded — the reader draws the conclusion from first_at, last_at and cleared.
+  // ── A COUNT NEEDS ITS WINDOW ────────────────────────────────────────────────
+  // first_at, last_at and cleared let the reader see when the block held and whether it resolved, rather
+  // than reading a bare post count as never having placed an order all run.
   if (S.blocked) {
-    // "Cleared" means the condition stopped recurring well before the record ends — not merely that one
-    // more line followed it. The margin is what separates "it resolved" from "it happened to be quiet".
+    // "cleared" means the condition stayed quiet past the margin, not merely that one more line followed it.
     out.section('farm_seed_order_blocked');
     out.kv('posts', S.blocked);
     out.kv('seeds_wanted', S.blockedWant);
@@ -445,12 +407,10 @@ function renderFarm(f, { verbose = false } = {}) {
     out.zero('farm_seed_order_blocked');
   }
 
-  // ── A GAUGE, AND IT SAYS SO IN ITS FIELD NAME (Architect 2026-09-16) ──────────────────────────────
-  // `reachable` is inventory_lens.reachableByFleet at ONE INSTANT — stock on hand, already net of every
-  // seed the field has put in the ground. It read `1 reachable` here and was reported as "the run only
-  // ever got 1 seed", when the run had gained 21 by picking and sown 30. A level and a total are different
-  // kinds of number, so the field name carries which kind this is (`..._at_last_sweep`) and the old
-  // parenthetical gloss plus the pointer back to the pick line are deleted.
+  // ── A GAUGE, AND ITS FIELD NAME SAYS SO ─────────────────────────────────────
+  // `reachable` is inventory_lens.reachableByFleet at one instant — stock on hand, already net of every
+  // seed sown so far. A level and a total are different kinds of number, so the field name carries which
+  // kind this is (`..._at_last_sweep`).
   if (S.latestOrder) {
     out.section('farm_seed_stock');
     out.kv('last_sweep_at', at(S.latestOrder.t));
@@ -483,8 +443,6 @@ function runFarm({ seg = [], traceName = '?', bot: botFilter = null, verbose = f
   out.kv('record', traceName);
   out.kv('span', relativeTime(f.maxRel));
   if (botFilter) out.kv('bot_filter', botFilter);
-  // DELETED: "(context only — never flags, never wakes)". That is a claim about what this lens is for,
-  // which is documentation, not a reading — it lives in the header comment above and in LENSES.md.
   renderFarm(f, { verbose });
 }
 

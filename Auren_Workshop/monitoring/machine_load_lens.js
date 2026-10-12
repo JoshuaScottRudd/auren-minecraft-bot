@@ -11,14 +11,12 @@
 // one (Law 25 — the asker's question was about lag spikes, and the honest answer names which half of that
 // this instrument actually holds).
 //
-// PERCENTILES, NOT AVERAGES, AND THAT IS THE WHOLE POINT. A spike is by definition the tail: a run that
-// averages 30% GPU while touching 100% four times has the exact problem being hunted, and its mean hides
-// it perfectly. So every column reports p50/p95/max, and the max is the number that decides.
+// PERCENTILES, NOT AVERAGES. Each column reports p50/p95/max, and the max is the number that decides — a
+// brief spike to 100% is what it exists to surface.
 //
-// JITTER IS THE ONE STALL SIGNAL. The sampler asks for a row on a fixed cadence and does nothing else, so a
-// row that lands late means the machine starved something that was ready to run. It is reported separately
-// from the load columns because it is a different KIND of evidence — a scheduling fact rather than a
-// utilisation reading — and because it is the only column here that can catch a stall a GPU at 45% cannot.
+// JITTER IS THE STALL SIGNAL. The sampler asks for a row on a fixed cadence and does nothing else, so a
+// row that lands late means the machine starved something ready to run. It is reported separately from
+// the load columns as a scheduling fact, and it can catch a stall a load reading alone cannot.
 
 const fs = require('fs');
 const path = require('path');
@@ -27,13 +25,13 @@ const paths = require('../workshop_paths');
 const RECORD_DIR = paths.fleetLogs('machine_load');
 
 // ── Statistics ───────────────────────────────────────────────────────────────────────────────────────
-// Absent values are DROPPED rather than counted as zero: a machine with no GPU would otherwise report a
-// beautifully idle card it does not have.
+// Absent values are dropped, not counted as zero — a machine with no GPU does not report an idle card it
+// does not have.
 function summarise(values) {
   const present = values.filter(v => typeof v === 'number' && Number.isFinite(v)).sort((a, b) => a - b);
   if (!present.length) return null;
   const at = f => present[Math.min(present.length - 1, Math.floor(f * present.length))];
-  return { samples: present.length, p50: at(0.5), p95: at(0.95), max: present[present.length - 1] };
+  return { samples: present.length, min: present[0], p50: at(0.5), p95: at(0.95), max: present[present.length - 1] };
 }
 
 function readRows(file) {
@@ -42,8 +40,8 @@ function readRows(file) {
   try { raw = fs.readFileSync(file, 'utf8'); } catch (e) { return rows; }
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
-    // A torn final row (the sampler was killed mid-append) is SKIPPED, never patched: the throw-on-bad-form
-    // half of the interface. Guessing at half a row would put an invented number into a percentile.
+    // A torn final row (the sampler was killed mid-append) is skipped, never patched, so no invented
+    // number enters a percentile.
     try { rows.push(JSON.parse(line)); } catch (e) { /* torn row */ }
   }
   return rows;
@@ -58,19 +56,22 @@ function listLabels() {
 }
 
 // ── The machine-facing lens: returns, prints nothing, never exits ────────────────────────────────────
-function reduceMachineLoad({ label } = {}) {
+function reduceMachineLoad({ label, fromMs = null, toMs = null } = {}) {
+  if ((fromMs !== null && !Number.isFinite(fromMs)) || (toMs !== null && !Number.isFinite(toMs))) {
+    throw new Error('machine_load_lens: a requested time boundary is not a valid timestamp.');
+  }
   const chosen = label || listLabels().sort().pop() || null;
   if (!chosen) return { found: false, label: null, reason: 'no machine-load record has been written' };
   const file = path.join(RECORD_DIR, `machine_load_${chosen}.jsonl`);
-  const rows = readRows(file);
+  const rows = readRows(file).filter(row => (fromMs === null || row.at >= fromMs)
+    && (toMs === null || row.at <= toMs));
   if (!rows.length) return { found: false, label: chosen, reason: 'the record exists but holds no samples' };
 
   const column = key => summarise(rows.map(r => r[key]));
   const intervals = rows.map(r => r.since_previous_ms).filter(v => typeof v === 'number');
   const expected = intervals.length ? summarise(intervals).p50 : null;
-  // A stall is measured against what the cadence ACTUALLY was rather than what was requested: the sampler
-  // may have been asked for 1000 ms and be running at 1030, and calling that 30 ms of stall every row would
-  // bury the real ones. The excess over the observed median is what a late row cost.
+  // A stall is measured against the cadence actually observed, not the cadence requested: the sampler may
+  // be asked for 1000ms and run at 1030. The excess over the observed median is what a late row cost.
   const stalls = expected ? intervals.map(v => v - expected).filter(v => v > 0) : [];
 
   return {
@@ -95,8 +96,8 @@ function reduceMachineLoad({ label } = {}) {
 }
 
 // ── The human-facing lens: renders, returns the reduction, never exits ───────────────────────────────
-function runMachineLoad({ label } = {}) {
-  const r = reduceMachineLoad({ label });
+function runMachineLoad({ label, fromMs = null, toMs = null } = {}) {
+  const r = reduceMachineLoad({ label, fromMs, toMs });
   if (!r.found) {
     console.log(`\nMACHINE LOAD — nothing to read (${r.reason}).`);
     const labels = listLabels();
@@ -123,6 +124,7 @@ function runMachineLoad({ label } = {}) {
   line('GPU clock', r.gpuClockMhz, ' MHz');
   line('CPU busy', r.cpuPercent, '%');
   line('System RAM free', r.memoryFreeGb, ' GB');
+  if (r.memoryFreeGb) console.log(`  ${'RAM free lowest'.padEnd(18)} ${r.memoryFreeGb.min} GB`);
   if (r.memoryTotalGb) console.log(`  ${'RAM installed'.padEnd(18)} ${r.memoryTotalGb} GB`);
 
   console.log('\n  STALLS — how late a sample landed when the machine was busy elsewhere');

@@ -3,27 +3,19 @@
 // computes, and the renderers that put it on a line. Pure functions over values — nothing here reads
 // a file, a flag, or the clock.
 //
-// ── WHY THE SUMMARY AND THE RENDERING LIVE TOGETHER ──────────────────────────────────────────────
-// Every consumer does the pair in one breath — reduce a sample to n/min/max/median, then render it to
-// a fixed width. Splitting them would put two halves of one act in two files and buy nothing, since
-// neither half has a consumer that wants only the other. `stat` is here because a formatted cell is
-// what a statistic is FOR in this layer; it is not a general statistics library and must not become one.
+// The summary and its rendering live together: every consumer does both in one breath — reduce a sample
+// to n/min/max/median, then render it to a fixed width. `stat` exists to produce a formatted cell for
+// this layer; it is not a general statistics library.
 //
-// ── ON THE NAME ───────────────────────────────────────────────────────────────────────────────────
-// Not `fmt.js`: Law 7 admits no abbreviations, and a short name is exactly where a shared utility
-// module tempts one — `fmt` tells a cold reader nothing about what the file does.
+// Named in full — Law 7 admits no abbreviations, and a short name is exactly where a shared utility
+// module tempts one.
 //
-// ── WHY IT EXISTS ─────────────────────────────────────────────────────────────────────────────────
-// Formatting is the least interesting code in this layer and the easiest to silently duplicate — each
-// monitoring tool tends to grow its own copy of the same handful of formatters. That is the failure
-// this file exists to stop: two tools rendering the same measurement to different precision makes two
-// reports disagree about a number they both read from the same file.
+// Centralising formatting here keeps every monitoring tool reading the same measurement to the same
+// precision, from the same file.
 //
-// ── THE ONE RULE ─────────────────────────────────────────────────────────────────────────────────
-// A formatter renders a value it was given; it never decides what the value MEANS. `stat` returns null
-// for an empty set rather than zero, because "no samples" and "measured zero" are different findings
-// and only the caller knows which one matters — a formatter that returned 0 here would be inventing a
-// measurement (Law 25). Every renderer below prints an em-dash for absent rather than a number.
+// A formatter renders a value it was given; it never decides what the value means. `stat` returns null
+// for an empty set: "no samples" and "measured zero" are different findings and only the caller knows
+// which one matters (Law 25). Every renderer below prints an em-dash for an absent value.
 
 'use strict';
 
@@ -32,13 +24,11 @@
 const ABSENT = '—';
 
 // ── Numbers ──────────────────────────────────────────────────────────────────
-// Keep only real numbers. Journals and traces carry nulls for fields a row could not fill, and a null
-// in an average silently becomes a zero and drags the mean down — the failure this exists to stop.
+// Keep only real numbers: a null in an average silently becomes a zero and drags the mean down.
 const finiteNumbers = xs => xs.filter(x => typeof x === 'number' && Number.isFinite(x));
 
-// n/min/max/med/mean over a sample, or null when there is nothing to describe. Median by the lower
-// mid-element rather than an interpolated mid-pair: every consumer here reports observed values, and
-// an interpolated median is a number no run actually produced.
+// n/min/max/med/mean over a sample, or null when there is nothing to describe. Median is the lower
+// mid-element of the sorted sample — every consumer here reports values a run actually produced.
 function stat(xs) {
   const v = finiteNumbers(xs).sort((a, b) => a - b);
   if (!v.length) return null;
@@ -64,16 +54,15 @@ const percent = (x, total) => (!total ? ABSENT : `${Math.round((x / total) * 100
 const relativeTime = sec => `${Math.floor(sec / 60)}m ${sec % 60}s`;
 
 // Milliseconds → the same `12m 46s` shape. Journal `t` is ms since the journal opened, so it reads as
-// run-elapsed and lines up with the trace stamps above — which is the whole reason both exist.
+// run-elapsed and lines up with the trace stamps above.
 const elapsed = t => (typeof t !== 'number' ? '?' : `${Math.floor(t / 60000)}m ${Math.round((t % 60000) / 1000)}s`);
 
 // Milliseconds → `1.4s`, for durations short enough that minutes are noise.
 const secondsFromMillis = v => (v == null ? ABSENT : `${(v / 1000).toFixed(1)}s`);
 
 // ── Tables ───────────────────────────────────────────────────────────────────
-// Pad AND truncate, so one long cell can never shift a column and turn an aligned table into an
-// unreadable one. Truncation is deliberate: a monitoring table is scanned, and a wrapped row is worse
-// than a clipped one.
+// Pad and truncate, so one long cell can never shift a column and turn an aligned table into an
+// unreadable one. A monitoring table is scanned; truncation keeps each row exactly one line.
 const padRight = (s, n) => String(s == null ? ABSENT : s).padEnd(n).slice(0, n);
 const padLeft = (s, n) => String(s == null ? ABSENT : s).padStart(n).slice(0, n);
 

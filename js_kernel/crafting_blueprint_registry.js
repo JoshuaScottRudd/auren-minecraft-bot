@@ -1,29 +1,14 @@
 // js_kernel/crafting_blueprint_registry.js
 // The ONE route to crafting_blueprints.json (Law 16). Every fragment that needs a recipe asks here;
-// nothing else opens the file. Before this there were five independent routes to it — two live
-// fs.readFileSync sites (craft_handler.resolveBlueprint, supply_manager._loadBlueprints) and three
-// bare require()s — so the same document was reachable four different ways with four different
-// failure modes.
+// nothing else opens the file.
 //
 // The snapshot/hash/drift-warn mechanism lives in @kernel/snapshot_registry and is shared with
 // blueprint_registry — read the WHY there. This file owns only the recipe-document shape and accessors.
-//
-// WHY THIS FILE EXISTS. building_blueprints.json got the snapshot treatment first; the same crash was
-// still live here — the two readFileSync sites re-read the file on every craft plan and every supply
-// plan, and Law 13 correctly makes an unreadable declared file a throw. Deleting the file to upload a
-// new version crashes the next craft. Fixing one file and leaving its twin armed is fixing the
-// incident, not the fault.
-//
-// A NOTE ON THE require() ROUTES. Node caches a required JSON file, so those three were already
-// effectively boot snapshots and never crashed. They were still worth converting: a snapshot nobody
-// declared is a snapshot nobody can see. Going through the registry means an edit to this file is now
-// REPORTED at warn level like any other, instead of silently having no effect — which is the same
-// unverified-belief failure the hash exists to defeat (Law 26).
 
 'use strict';
 
 const { createSnapshotRegistry } = require('@kernel/snapshot_registry');
-const { group_to_item } = require('@utils/fragment_utils');
+const { group_to_item, GATHERED_GROUPS } = require('@utils/fragment_utils');
 
 const CRAFTING_BLUEPRINTS_PATH = require.resolve('@kernel/crafting_blueprints.json');
 
@@ -39,6 +24,11 @@ const registry = createSnapshotRegistry({
       return 'is not an object map of item → recipe';
     }
     if (Object.keys(parsed).length === 0) return 'contains no recipes';
+    // Every smelt names the items a furnace may be loaded with (`inputs`): the whitelist smeltInputsFor serves.
+    for (const [item, r] of Object.entries(parsed)) {
+      if (!Array.isArray(r?.requires) || !r.requires.includes('furnace')) continue;
+      if (!Array.isArray(r.inputs) || r.inputs.length === 0) return `furnace recipe "${item}" names no \`inputs\` list`;
+    }
     return null;
   },
 });
@@ -60,59 +50,83 @@ function tryGetRecipe(itemName) {
 // wherever the caller's `haveEnough` predicate says the ingredient is already in hand (see the note above
 // the function).
 //
-// WHY IT LIVES WITH THE DATA AND IS DERIVED RATHER THAN AUTHORED: the answer is already written in
-// every recipe's `requires`, so a hand-kept list of "rows that need a table" would be a second copy of
-// the recipe document, stale from the first recipe change and reporting nothing while it is wrong. Two
-// consumers ask this question — the gate that decides whether a supply job may be offered, and the
-// fulfiller that asserts one was never offered unstationed — and they must get the SAME answer or the
-// gate holds work the fulfiller would have done, or worse, passes work it then crashes on (Law 16: one
-// implementation; Law 25: the gate and the fulfiller measuring one world).
+// DERIVED FROM THE DATA, NOT HAND-KEPT: the answer is already written in every recipe's `requires`, so a
+// separate list of "rows that need a table" would be a second copy of the recipe document, going stale on
+// the first recipe change. Two consumers ask this question — the gate that decides whether a supply job
+// may be offered, and the fulfiller that asserts one was never offered unstationed — and they must get
+// the SAME answer, or the gate holds work the fulfiller would have done, or passes work it then crashes
+// on (Law 16: one implementation; Law 25: the gate and the fulfiller measuring one world).
 //
-// THE TREE, NOT THE TOP RECIPE, AND THAT IS THE LOAD-BEARING PART. A caller asking only the top recipe
-// gets a gate whose reach is shorter than the walk the fulfiller performs, and the gap is exactly where
-// an unstationed craft slips through: `furnace` needs a table and so does the `stone_axe` two steps
-// above it. Matching the fulfiller's own recursion is what makes the assertion downstream provable
-// rather than hopeful.
+// THE TREE, NOT THE TOP RECIPE, IS THE LOAD-BEARING PART. A caller asking only the top recipe gets a gate
+// whose reach is shorter than the walk the fulfiller performs, and the gap is exactly where an
+// unstationed craft slips through: `furnace` needs a table and so does the `stone_axe` two steps above
+// it. Matching the fulfiller's own recursion is what makes the assertion downstream provable.
 //
-// `inventory` IS NOT A STATION — it is the recipes' word for "no station, 2x2 in the pocket", the
-// default case, and admitting it would gate every plank craft on a station that cannot exist.
+// `inventory` names no station — it is the recipes' word for a bare 2x2 craft in the pocket, the default
+// case, and admitting it would gate every plank craft on a station that cannot exist.
 
 // A RECIPE NAMES A GROUP; ONLY THE GROUP'S MEMBERS CARRY RECIPES. `tryGetRecipe` answers about the exact
 // token, which is right for a lookup and wrong for a WALK: a recipe asks for `planks`, no recipe is filed
 // under `planks`, and a walk that stops there never learns the log conversion is in the tree. Every
-// consumer that walks the recipe graph needs this resolution, so it lives once beside the data rather than
-// as a private copy per walker — two walkers already disagreed at a group token and the disagreement was
-// invisible from either side (Law 16).
+// consumer that walks the recipe graph needs this resolution, so it lives once beside the data, shared by
+// every walker (Law 16).
 //
 // FIRST MEMBER CARRYING A RECIPE WINS, matching the group's own preference order, so the member this walk
 // prices is the member a spend would actually consume.
+//
+// ── AND THE SAME SEAM RUNS THE OTHER WAY: A MEMBER WHOSE RECIPE IS FILED UNDER ITS GROUP ────────────
+// `spruce_trapdoor` carries no recipe of its own; `trapdoor` does, because one recipe serves every
+// species and the species is chosen at craft time from the planks the bot holds. A walk that asks about
+// the member and stops at "no recipe" calls a CRAFTED item RAW, so the fleet posts a gather for a block
+// no scan can find and no dig can produce. The fleet's own blueprints stay in group vocabulary (`planks`,
+// `door`); a DOWNLOADED blueprint is written in concrete block names, so every wood shape in one arrives
+// under a member name.
+//
+// A GROUP ONLY ANSWERS IF ITS OWN NAME CARRIES A RECIPE. Most groups are classifications, not recipes
+// (`structural_fill`, `scaffold_block`, `natural_block` all contain planks), and returning the first
+// group that merely CONTAINS the token would answer with whichever classification happened to be typed
+// first. Requiring the recipe is what makes the answer about production.
+//
+// DIRECT FIRST, ALWAYS. `stone` is both a recipe key and the name of the natural-rock scan group, and
+// those are different questions about the same word (Law 7); the direct hit settles it before the group
+// map is consulted at all.
 function recipeForToken(token) {
   const item = String(token).trim().toLowerCase();
   const direct = registry.data()[item];
   if (direct) return direct;
+  // ── A GROUP THE WORLD SUPPLIES HAS NO RECIPE, WHATEVER ONE MEMBER'S ENTRY SAYS ─────────────────
+  // Asked AFTER the direct lookup so an authored entry under the group's own name still wins — a
+  // deliberate statement about the whole set. `fragment_utils.GATHERED_GROUPS` names which groups these are.
+  if (GATHERED_GROUPS.has(item)) return null;
   const members = group_to_item[item];
-  if (!Array.isArray(members)) return null;
-  for (const member of members) {
-    const viaMember = registry.data()[member];
-    if (viaMember && viaMember.ingredients) return viaMember;
+  if (Array.isArray(members)) {
+    for (const member of members) {
+      const viaMember = registry.data()[member];
+      if (viaMember && viaMember.ingredients) return viaMember;
+    }
+    return null;
+  }
+  for (const [group, list] of Object.entries(group_to_item)) {
+    if (!Array.isArray(list) || !list.includes(item)) continue;
+    const viaGroup = registry.data()[group];
+    if (viaGroup && viaGroup.ingredients) return viaGroup;
   }
   return null;
 }
 
 const NO_STATION = 'inventory';
-// `haveEnough(ingredient, quantity)` STOPS THE WALK AT WHAT IS ALREADY HELD, and passing it is what makes
-// this answer "which stations does the work STILL need" instead of "which stations does this recipe tree
-// mention". An ingredient already in hand will never be crafted, so the station its branch names is not a
-// requirement of anything that is going to happen. A torch is a 2x2 craft whose `charcoal` branch names a
-// furnace: walked unconditionally, a bot holding charcoal is refused a torch over a furnace it has no
-// reason to visit; walked with the predicate, the branch is skipped and the torch is a 2x2 craft again.
+// `haveEnough(ingredient, quantity)` STOPS THE WALK AT WHAT IS ALREADY HELD, so this answers which
+// stations the work STILL needs, not every station the recipe tree mentions. An ingredient already in
+// hand will never be crafted, so the station its branch names is not a requirement of anything that is
+// going to happen. A torch is a 2x2 craft whose `charcoal` branch names a furnace: walked unconditionally,
+// a bot holding charcoal is refused a torch over a furnace it has no reason to visit; walked with the
+// predicate, the branch is skipped and the torch is a 2x2 craft again.
 //
 // EVERY CALLER MUST PASS THE SAME PREDICATE OR NONE OF THEM MAY (Law 16). Two callers ask this question —
 // the gate that decides whether to post the job, and the fulfiller's Law 13 assertion that the gate did
 // its job. If they disagree about the reach of the walk, the wider one throws on precisely the work the
-// narrower one just cleared, which is a crash manufactured by the disagreement rather than by any fault
-// in the work. Omitting it walks the whole tree, which is correct only for a caller asking about the
-// recipe in the abstract, with no pocket in the question.
+// narrower one just cleared. Omitting the predicate walks the whole tree, correct only for a caller asking
+// about the recipe in the abstract, with no pocket in the question.
 function stationsRequiredFor(itemName, haveEnough, _seen) {
   if (!_seen) _seen = new Set();
   const stations = new Set();
@@ -135,4 +149,11 @@ function stationsRequiredFor(itemName, haveEnough, _seen) {
   return stations;
 }
 
-module.exports = { getRecipes, tryGetRecipe, recipeForToken, stationsRequiredFor };
+// THE ITEMS A FURNACE MAY BE LOADED WITH TO MAKE `output` — the recipe's own `inputs` list, and nothing
+// else. Counting, fetching and loading a smelt all read this list. null when `output` is not smelted.
+function smeltInputsFor(output) {
+  const r = tryGetRecipe(output);
+  return (r && Array.isArray(r.requires) && r.requires.includes('furnace')) ? r.inputs : null;
+}
+
+module.exports = { getRecipes, tryGetRecipe, recipeForToken, stationsRequiredFor, smeltInputsFor };

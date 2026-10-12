@@ -1,51 +1,51 @@
 // fragment: ground_salvage_executor — go pick up the useful thing lying in the yard, or say why not.
 //
-// ── THE SEAT ─────────────────────────────────────────────────────────────────────────────────────────
-// ground_drop_scanner owns WHAT IS WORTH HAVING (valuable, on the ground, inside the base radius) and the
-// board owns WHETHER IT IS OFFERED. This owns WHETHER THE WALK IS AFFORDABLE and does the walking. The
-// split is forced rather than stylistic: job_board's sweep is synchronous and a route price is async —
-// the same constraint that shaped the retired death_pile_executor, and the one part of that design worth
-// carrying forward.
+// ── THE SEAT ─────────────────────────────────────────────────────────────────────────────────────
+// ground_drop_scanner owns what is worth having (valuable, on the ground, inside the base radius)
+// and the board owns whether it is offered. This owns whether the walk is affordable and does the
+// walking — a split forced by job_board's sweep being synchronous while a route price is async.
 //
-// ── WHAT THIS REPLACES, AND WHAT IT DELIBERATELY DROPS ──────────────────────────────────────────────
-// Replaces death_pile_executor + death_pile_recorder + death_pile_ledger with a flat drop scan. Three of
-// their four gates survive here in some form; one is gone on purpose:
+// ── THE GATES ────────────────────────────────────────────────────────────────────────────────────
+//   REACHABLE — through drop_collector.priceRouteTo (Law 16: the same search that will do the
+//               walking answers whether it can).
+//   IN TIME   — a dropped item despawns on the server's five-minute clock, so arriving late is
+//               still arriving at bare ground.
+//   WORTH IT  — decided by the scanner before the job is ever posted (same STOCK_THRESHOLDS, same
+//               group-aware match), so a worthless drop costs no dispatch at all.
 //
-//   REACHABLE   — kept, unchanged, still through drop_collector.priceRouteTo (Law 16: the same search
-//                 that will do the walking answers whether it can).
-//   IN TIME     — kept. A dropped item despawns on the server's five-minute clock whether a bot died or
-//                 not, so arriving late is still arriving at bare ground.
-//   WORTH IT    — MOVED, not dropped. The old fragment priced the pile's contents against the fleet's
-//                 stock deficit after a claim; the scanner now asks the same question (same
-//                 STOCK_THRESHOLDS, same group-aware match) BEFORE the job is ever posted, so a
-//                 worthless drop costs no dispatch at all rather than a dispatch and a decline.
-//   THE LEDGER  — GONE, and this is the whole point of the change. It held "a bot died here" as
-//                 remembered state and re-offered graves the world had already reaped. A live entity scan
-//                 cannot produce a ghost (ground_drop_scanner's header carries the argument in full).
+// ── MEMORY (Law 8) ───────────────────────────────────────────────────────────────────────────────
+// A drop this body found no route to stays in `bot.entities` for its full five minutes, so a board
+// that re-offered it every sweep would re-price the same impossible route until it despawned. A
+// module-scope Map keyed by entity id, not position, holds the refusal: an id belongs to one item
+// stack for its whole life and is never reissued while that stack exists, so a refusal expires when
+// the drop ceases to exist, with nothing here needing to reap it (Law 9: temporary state belongs in
+// a module variable). The stale sweep below is a leak guard, not a lifetime.
 //
-// ── THE ONE THING A LIVE SCAN STILL NEEDS A MEMORY FOR (Law 8) ──────────────────────────────────────
-// A drop that is genuinely unreachable stays in `bot.entities` for its full five minutes, so a board that
-// re-offered it every sweep would re-price the same impossible route until it despawned — a message with
-// no termination point, which is the same infinite offer the ledger's refusal rows existed to end.
+// Worth is derived, never authored: STOCK_THRESHOLDS already publishes what an item is worth to the
+// fleet — under `deficit_below` is worth fetching, at or above `dump_threshold` is worth nothing,
+// since the dump would bank it ten seconds after it was carried home. The deficit is the worth,
+// per-bot and per-moment.
 //
-// So the refusal survives, in the smallest form that works: a module-scope Map keyed by ENTITY ID, not by
-// position. That key is what makes it self-cleaning rather than a second ledger — an id belongs to one
-// item stack for its whole life and is never reissued while that stack exists, so a refusal expires by
-// the drop ceasing to exist rather than by anything here reaping it. No file, no office, no broadcast
-// (Law 9: temporary state belongs in a module variable). The stale sweep below is a leak guard, not a
-// lifetime: nothing consults an entry older than the despawn window because the entity behind it is gone.
+// A refusal is keyed to the entity id, so it expires when the item does.
 
 'use strict';
 
 const watcher = require('@kernel/watcher');
 const { routeToJudge } = require('@utils/signal_utils');
-const {
-  RETRIEVAL_ARRIVAL_MARGIN_MS,
-  RETRIEVAL_MS_PER_COST_UNIT,
-  ITEM_DESPAWN_MS,
-} = require('@thinking/architect_config');
-
 const TAG = 'ground_salvage_executor';
+
+// Vanilla despawn for a dropped item. NOT a tunable — a fact about the server.
+const ITEM_DESPAWN_MS = 5 * 60 * 1000;
+
+// How much of that clock must remain AFTER the estimated arrival for the trip to be worth starting.
+// Arriving with seconds left means arriving to bare ground: the sweep takes time and the route estimate
+// is an estimate. Raise it if bots keep arriving to piles that just vanished.
+const RETRIEVAL_ARRIVAL_MARGIN_MS = 45 * 1000;
+
+// Route cost → milliseconds, for the despawn comparison. Deliberately PESSIMISTIC: over-estimating travel
+// fails SAFE (refuse a trip that would have just made it) where under-estimating fails EXPENSIVE (walk
+// the whole way to bare ground). Law 13 default-stopped, applied to an estimate.
+const RETRIEVAL_MS_PER_COST_UNIT = 400;
 
 const SWEEP_DRY_PASSES = 2;
 const SWEEP_MAX_PASSES = 6;   // runaway guard, not a tuning dial: the dry-pass judge is the real terminator
@@ -60,18 +60,18 @@ function noteRefusal(id, reason, now) {
   for (const [k, v] of _refused) if (now - v.at > ITEM_DESPAWN_MS) _refused.delete(k);
 }
 
-// isRefused(id) — read by job_board's sweep so a declined drop stops being offered. Exported rather than
-// duplicated there because the decision and its memory belong to the same seat (Invariant D).
+// isRefused(id) — read by job_board's sweep so a declined drop stops being offered. Exported
+// because the decision and its memory belong to the same seat (Invariant D).
 function isRefused(id) {
   return _refused.has(id);
 }
 
-// Two consecutive empty passes, or the pass ceiling. Returns what came back so the verdict reports the
-// TRUE haul rather than the intent (Law 25) — arriving to bare ground is a real outcome, not a failure.
+// Two consecutive empty passes, or the pass ceiling. Returns what came back so the verdict reports
+// the true haul (Law 25) — arriving to bare ground is a real outcome, not a failure.
 //
-// TWO, NOT ONE: a single empty pass happens legitimately when the bot arrives a step short and the next
-// pass closes it. Two consecutive is the judge that separates "still working" from "circling", which
-// neither an empty-box test nor a timeout catches early (Law 11 — one judge per loop).
+// Two, not one: a single empty pass happens legitimately when the bot arrives a step short and the
+// next pass closes it. Two consecutive is the judge that separates still-working from circling,
+// which neither an empty-box test nor a timeout catches early (Law 11 — one judge per loop).
 async function sweepHere(bot) {
   const { collectNearby } = require('@api/drop_collector.js');
   let picked = 0, dry = 0, passes = 0;
@@ -113,8 +113,8 @@ module.exports = {
       return routeToJudge(TAG, { ...payload, readable });
     };
 
-    // The dispatcher routes the whole job object, so the drop identity rides on payload.job rather than
-    // the magnet (a deliberate field whitelist). Missing means the board posted a malformed job: a coding
+    // The dispatcher routes the whole job object, so the drop identity rides on payload.job — a
+    // field whitelist, not the magnet. Missing means the board posted a malformed job: a coding
     // violation, never soft-handled (Law 13).
     const job = payload.job || {};
     const dropId = job.drop_id;
@@ -136,22 +136,17 @@ module.exports = {
     const { priceRouteTo } = require('@api/drop_collector.js');
     const priced = await priceRouteTo(bot, at, ITEM_DESPAWN_MS);
     if (!priced.reachable) {
-      // A complete search PROVED no route; an incomplete one only ran out of clock. Both decline this
-      // dispatch, and only the PROOF is worth remembering — banning a target on an incomplete search bans
-      // a place nothing ever finished looking for (pathfinding_utils' verdict table).
-      if (!priced.complete) {
-        return finish(`${TAG}: could not finish pricing drop ${dropId} (${job.what}) before the clock — not refused, the next sweep re-asks`);
-      }
-      noteRefusal(dropId, 'no route', now);
-      return finish(`${TAG}: DECLINED drop ${dropId} (${job.what}) — no route to it exists in the world this bot can see; it will not be offered again while it lasts`);
+      // A DROP THIS BODY COULD NOT GET A ROUTE TO IS LEFT, whichever way the search ended — proved
+      // unreachable, or out of clock. It is an ordinary outcome of picking things up off the ground: the
+      // body gives this drop up for as long as it lasts and takes the next job.
+      noteRefusal(dropId, priced.complete ? 'no route' : 'not priced in time', now);
+      return finish(`${TAG}: DECLINED drop ${dropId} (${job.what}) — ${priced.complete ? 'no route to it exists in the world this bot can see' : 'no route to it was found before the clock'}; it will not be offered again while it lasts`);
     }
 
     // ── GATE 2: can it get there before the drop despawns ──
-    // Measured against the FULL despawn window rather than a remaining one, and that is a real weakness
-    // stated rather than hidden: a live scan knows an item exists, never when it hit the ground, so the
-    // clock here is the most optimistic reading of it. The old ledger knew the drop moment because a
-    // death is an event it recorded — this design traded that one fact for the ghost-freedom the header
-    // argues is worth more. The margin below is what absorbs the difference.
+    // Measured against the full despawn window, not a remaining one — a live scan knows an item
+    // exists, never when it hit the ground, so this clock is the most optimistic reading available.
+    // The margin below absorbs the difference.
     const travelMs = priced.cost * RETRIEVAL_MS_PER_COST_UNIT;
     if (travelMs + RETRIEVAL_ARRIVAL_MARGIN_MS > ITEM_DESPAWN_MS) {
       noteRefusal(dropId, 'too far', now);
@@ -165,7 +160,7 @@ module.exports = {
     // inner API's clause already covers the whole nest, and a second one would be the duplicate failure
     // handling Law 15 explicitly forbids an outer API from adding.
     const dispatcher = require('@locomotion/locomotion_dispatcher');
-    await dispatcher.goTo(at);
+    await dispatcher.goTo({ ...at, leg: 'work' });
 
     const { picked, passes } = await sweepHere(bot);
 

@@ -1,57 +1,24 @@
 // locomotion_course — the drill ground. Sites a COURSE the terrain already contains, puts the body at
 // its start, asks locomotion to walk it, and reads back how the body actually moved.
 //
-// ── WHAT IT IS FOR (Architect 2026-08-01) ───────────────────────────────────────────────────────────
-// "so lanista is aware of the pathfinding between 2 locations and can place 2 locations within raycast…
-//  can we make a locomotion tester that uses the same lanista system? so it finds 2 locations at
-//  distances we desire, skips raycast because we arent pitting entities against each other… then
-//  pathfind to see the edges and. we can set the edge requirements.. so for example to test sprint jump,
-//  we say 2 flat moves then one jump move required so bot can reach full speed before jumping… it will
-//  use the exact same pathfinding as the bot so how it will work is that it will find a result, pick it,
-//  teleport bot to point a and then command to go to point b and monitor the bots movement and give us
-//  data."
+// A course is a route whose A* edge sequence matches a named drill (sprint_jump, flat_run, …), sited by
+// the same siting seams lanista uses for a fight pair, then walked and read back off the world. lanista
+// sites a PAIR for a sightline; this sites a ROUTE for a move sequence — a sibling file, not a flag on
+// lanista, since the two ask different questions of the siting step.
 //
-// ── WHY IT IS A SIBLING OF lanista AND NOT A FLAG ON IT ─────────────────────────────────────────────
-// Same shape, different verb, and the difference is which question the SITING asks. lanista sites a
-// PAIR — two boxes that can reach each other AND see each other — because a fight needs a sightline.
-// This sites a ROUTE — two boxes whose path between them contains a named sequence of moves — because a
-// locomotion test needs the moves under test to actually occur. The raycast is not merely skipped here,
-// it is meaningless: nothing is being pitted against anything.
+// Reused whole (Law 16): arena_sites.findBotSpawn/findOpponentSpawns for the start and finish boxes;
+// @utils/pathfinding_utils, the construct's own A*, so a sited course matches what the bot itself would
+// plan; camera_scout for the world read; rcon_link for the console; fleet_control.js `move` for the leg,
+// which teleports, verifies the landing, and sends the verb; combat_recorder as the instrument. The one
+// new piece here is the edge-sequence gate, below.
 //
-// Threading that through lanista would put a `mode: 'locomotion'` branch through its siting and its
-// summon path — a second lane inside a file whose whole point is that it has one verb. Two verbs, two
-// files, one set of shared seams underneath. (lanista was cut down to that one verb on 2026-08-06; this
-// file inherited combat_recorder from it and is now the recorder's only caller.)
+// The virtual half (siting) is pure world reads and needs no fleet (`--dry`). The live half (the leg) is
+// read off the world, never predicted — this file records where the body was, not where it should be
+// (Law 26).
 //
-// ── WHAT IS REUSED, AND WHY EACH (Law 16 — none of this is re-implemented here) ─────────────────────
-//   arena_sites.findBotSpawn / findOpponentSpawns — Q1 and Q2, unchanged. "A place a body fits" is the
-//                       same question for a walker as for a fighter, so it is the same code.
-//   @utils/pathfinding_utils — the CONSTRUCT'S OWN A*, imported not transcribed. The whole premise is
-//                       "the exact same pathfinding as the bot"; a second pathfinder here would site
-//                       courses whose edges the bot then plans differently, and every result would be
-//                       measuring the disagreement instead of the movement.
-//   camera_scout      — the world model and the position feed (the fleet's one read-only observer).
-//   js_kernel/utils/rcon_link — the server console.
-//   fleet_control.js `move` — the leg itself. It already teleports, VERIFIES the landing, and dispatches
-//                       the verb; re-writing that here would be a second way to start a walk, and the
-//                       two would drift the first time only one got a fix.
-//   combat_recorder   — the instrument. The bot emits nothing new for this bench either.
-//
-// The only genuinely new thing in this file is the EDGE-SEQUENCE GATE, because no existing code asks
-// "does the route between these two cells contain two flat moves followed by a step up".
-//
-// ── WHERE THE VIRTUAL HALF ENDS AND THE LIVE HALF BEGINS ────────────────────────────────────────────
-// Everything before the teleport is a decision over authored world reads: which cells, which route,
-// whether its edges match the drill. That half needs no fleet at all (`--dry`). Everything after is the
-// body crossing real ground, and it is READ, never computed — this file never predicts where the bot
-// should be, only records where it was (Law 26: author the inputs, read the outputs; a bench that
-// modelled the walk would be grading its own paper).
-//
-// ── WHAT IT CANNOT PROVE (Law 25) ───────────────────────────────────────────────────────────────────
-// It measures ONE body on ONE server at whatever latency the day supplies. A stop count is a fact about
-// this run, not a constant. It cannot say a route is impossible — only that this attempt did not finish.
-// And it says nothing about whether the bot SHOULD have taken that route: the route is A*'s, and A* is
-// under test here only in the sense that its edge labels must match what the body then does.
+// It measures one body on one server at whatever latency the day supplies (Law 25): a stop count is a
+// fact about this run, not a constant, and a course the terrain cannot host says nothing about whether
+// A*'s route was the right one — only that the edge labels match what the body then did.
 //
 // Usage:
 //   node locomotion_course.js --list
@@ -81,24 +48,14 @@ const { createRecorder, makeRunId, ARENA_LOG_DIR } = require('./combat_recorder'
 const { createScout } = require('../camera/camera_scout');
 
 // ── THE DRILL TABLE — every course the bench knows, in one place ────────────────────────────────────
+// A course is a predicate over an edge sequence, matched against A*'s own route, not a terrain shape,
+// so a new drill is a new row here and composes with whatever ground the world supplies.
 //
-// "then be able to dynamically set what kinds of moves we want to test."
-//
-// A course is a PREDICATE OVER AN EDGE SEQUENCE, never a description of terrain. That distinction is
-// what makes it dynamic: adding a drill is adding a row here, and it composes with any ground the world
-// happens to have, because the sequence is matched against A*'s own route rather than against a shape
-// somebody had to find first.
-//
-//   require   — contiguous sub-sequences, ANY of which satisfies the drill. Contiguous on purpose: the
-//               Architect's sprint-jump needs the two flat moves IMMEDIATELY before the step up, because
-//               their whole job is letting the body reach speed. A "contains these somewhere" test would
-//               accept a route that walks, turns a corner, stops at a wall, and then steps up.
-//   occurrences — how many times it must appear. More occurrences is a longer drill, not a stricter one.
-//   forbid    — edge types that disqualify a route outright. Every carve edge is forbidden by default:
-//               a route that digs is a route whose timing measures a pickaxe, not a walk.
-//   minSteps/maxSteps — route length in edges. The floor keeps a "course" from being three cells long;
-//               the ceiling keeps one run from being a cross-country expedition nobody can read.
-const CARVE_AND_SWIM = ['dig_through', 'dig_down', 'bridge', 'pillar', 'dig_climb_up', 'dig_climb_down', 'swim'];
+//   require   — contiguous sub-sequences, ANY of which satisfies the drill.
+//   occurrences — how many times a required sub-sequence must appear.
+//   forbid    — edge types that disqualify a route outright; defaults to CARVE_AND_SWIM.
+//   minSteps/maxSteps — route length bounds, in edges.
+const CARVE_AND_SWIM = ['dig_through', 'dig_down', 'bridge', 'pillar', 'dig_stair_up', 'dig_stair_down', 'swim'];
 
 const COURSES = {
   sprint_jump: {
@@ -136,40 +93,32 @@ const COURSES = {
 // ── THE RUN CARD — everything a run varies by, at the top ───────────────────────────────────────────
 const RUN = {
   course: 'sprint_jump',
-  lookahead: [3],           // the fleet default; several depths run the A/B over the SAME sited course
-  repeat: 1,                // legs per depth. Latency is noisy; one leg is an anecdote
-  arrivalTolerance: 2.0,    // blocks. The verb's own goal tolerance is 1.5; this is the observer's
+  lookahead: [3],           // lookahead depths to run; several run the A/B over one sited course
+  repeat: 1,                // legs per depth
+  arrivalTolerance: 2.0,    // blocks — the observer's arrival radius (the verb's own tolerance is 1.5)
   legTimeoutMs: 45000,
-  settleMs: 1200,           // after a leg, before the next teleport — let the body come to rest
-  maxRadius: 64,            // how far the siting sweep may look for the start box
-  candidateCap: 60,         // how many band cells to pathfind before giving up on this course
-  reachMaxNodes: 20000,     // the LIVE navigator's budget is 200000; a course is short, this is generous
+  settleMs: 1200,           // pause after a leg, before the next teleport
+  maxRadius: 64,            // search radius for the start box
+  candidateCap: 60,         // band cells probed before giving up on this course
+  reachMaxNodes: 20000,     // node budget for the route search
 };
 
-// ── WHAT THE OBSERVER ACTUALLY RECEIVES, and what that forces (first live run, 2026-08-01) ──────────
+// ── WHAT THE OBSERVER ACTUALLY RECEIVES ─────────────────────────────────────────────────────────────
+// The scout sees another player only through move packets. Three fields look like measurements but are
+// not, and are read as null here, never as a false zero (Law 25):
 //
-// The scout sees another player ONLY through move packets, and three fields that look like measurements
-// are not. All three were read as measurements by the first version of this lens, and all three produced
-// well-formed falsehoods — the class of mistake no form check catches (Law 26) and the class Law 25 bars
-// outright from an outcome signal:
+//   bot.v        always {0,0,0} for an observed player — mineflayer fills it only from an explicit
+//                velocity packet, never from ordinary walking.
+//   bot.ground   always true for an observed player — never updated, so a jump counter built on it
+//                cannot distinguish a jump from a body that never left the ground.
+//   sample rate  the recorder samples at 20 Hz against a ~10 Hz server move rate, so roughly half the
+//                samples repeat the previous position.
 //
-//   bot.v        ALWAYS {0,0,0}. mineflayer fills an entity's velocity only from an explicit
-//                entity-velocity packet (knockback, explosions); ordinary walking never writes it. Read
-//                as speed, it reported a leg at max 0.00 b/s while that leg travelled 11.36 blocks.
-//   bot.ground   ALWAYS true. Never updated for an observed player, so every jump counter built on it
-//                returned 0 — indistinguishable in the output from a body that genuinely never jumped.
-//                Those fields are now reported as null, never as zero.
-//   sample rate  The recorder samples at 20 Hz; the server moves a player at about 10. So half the
-//                frames repeat the previous position, and a per-sample speed reads 0, 2×, 0, 2× on a
-//                body walking a perfectly steady line: 98.2% of the first leg was reported "stopped".
-//
-// So the lens works on PACKET FRAMES — samples where the position actually changed — not on samples.
-// That removes the alias structurally instead of smoothing it away, and it makes the stop detector
-// exact rather than thresholded: Minecraft sends no move packet for a body that is not moving, so a gap
-// in the packet series IS the stop. Nothing is inferred from a speed dipping under a number somebody
-// picked.
-const STOP_MIN_MS = 300;    // 3× the ~100 ms cadence — below this a gap is network jitter, not a stop
-const SPEED_WINDOW_MS = 250; // over packet frames, so this spans real arrivals rather than sampling phase
+// The lens works on PACKET FRAMES — samples where the position actually changed — not on raw samples:
+// Minecraft sends no move packet for a body that is not moving, so a gap in the packet series IS the
+// stop, with nothing inferred from a speed threshold.
+const STOP_MIN_MS = 300;    // gap length, in ms, that counts as a stop
+const SPEED_WINDOW_MS = 250; // packet-frame window a per-sample speed is averaged over
 
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -185,13 +134,9 @@ const round1 = n => (n == null ? null : Math.round(n * 10) / 10);
 const round2 = n => (n == null ? null : Math.round(n * 100) / 100);
 
 // ── The edge-sequence gate — the one new predicate in this file ─────────────────────────────────────
-//
-// Pure, and separated from every world read on purpose: it is the only piece here worth a unit test, and
-// a function that takes a bot cannot have one.
-//
-// Returns { ok, why, found } — `why` names the FIRST failing clause rather than a boolean, because the
-// interesting output of a siting sweep is the histogram of refusals ("47 routes, 41 too short, 6 with no
-// step-up"), and a bare false cannot produce one.
+// Pure function, kept apart from every world read so it stays unit-testable.
+// Returns { ok, why, found }; `why` names the first failing clause so a siting sweep can report a
+// refusal histogram instead of a bare pass/fail count.
 function matchCourse(edgeTypes, course) {
   const forbid = new Set(course.forbid || CARVE_AND_SWIM);
   const bad = edgeTypes.find(e => forbid.has(e));
@@ -202,9 +147,7 @@ function matchCourse(edgeTypes, course) {
   if (edgeTypes.length > maxSteps) return { ok: false, why: 'too_long', found: 0 };
 
   const want = course.occurrences || 1;
-  // Occurrences are counted NON-OVERLAPPING: after a match the cursor jumps past it. Overlapping counts
-  // would let ['walk','walk','walk'] satisfy "two runs of walk,walk", which is one run of three cells and
-  // not the two separate accelerations the drill is asking for.
+  // Matches counted non-overlapping: the cursor jumps past each hit before scanning for the next.
   let found = 0;
   for (let i = 0; i < edgeTypes.length;) {
     const hit = (course.require || []).find(seq =>
@@ -216,18 +159,13 @@ function matchCourse(edgeTypes, course) {
 }
 
 // ── The route seam ──────────────────────────────────────────────────────────────────────────────────
-//
-// lanista's reachabilityFor answers "can it get there". This needs the same search but keeps the EDGE
-// SEQUENCE, which that one discards. Same adapter, same three-verdict honesty, one extra field — kept
-// here rather than widened over there because lanista's gate is a siting criterion whose callers do not
-// want a route, and handing every one of them a path array would be a wider contract for one consumer.
-//
-// FLOOR CELLS: the pathfinder is indexed on the block stood ON, and a box's `y` is the feet cell. The -1
-// is applied here, once, at the only place that knows both conventions.
+// Same adapter and three-verdict shape as lanista's reachabilityFor, plus the edge sequence that gate
+// discards (Law 16). Converts feet-cell boxes to the floor cells the pathfinder is indexed on, once, at
+// the only place that knows both conventions.
 function routerFor(scout, maxNodes) {
   const adapter = {
     blockAt: pos => scout.blockAt({ x: pos.x, y: pos.y, z: pos.z }),
-    inventory: { items: () => [] },     // an observer carries nothing, and the placing edges are disabled
+    inventory: { items: () => [] },     // observer carries nothing; placing edges disabled
   };
   return {
     async route(fromFeet, toFeet) {
@@ -236,8 +174,7 @@ function routerFor(scout, maxNodes) {
       if (adapter.blockAt(new Vec3(start.x, start.y, start.z)) === null) return { known: false, why: 'start_unloaded' };
       if (adapter.blockAt(goalFloor) === null) return { known: false, why: 'goal_unloaded' };
       const res = await pathfinding.computeAStar(adapter, start, { type: 'position', pos: goalFloor }, {
-        // Same reason as lanista's reachability gate: `adapter` is a read-only stub, not a body. See the pacer's
-        // combat-gate header in voxel_scan_throttle.
+        // same predicate lanista's reachability gate asks — adapter is a read-only stub (Law 16)
         allowWorldAlteration: false, maxNodes, combatGate: false,
       });
       if (res && !res.partial) {
@@ -253,10 +190,8 @@ function routerFor(scout, maxNodes) {
 }
 
 // ── The siting sweep (the VIRTUAL half) ─────────────────────────────────────────────────────────────
-//
-// Q1 for the start, Q2 for the candidate finishes, then the route gate on each in nearest-first order.
-// Nearest-first plus first-match means the chosen course is the CLOSEST one that satisfies the drill,
-// which is what makes a re-run on the same origin reproducible.
+// Finds the start box (Q1), sweeps candidate finishes (Q2), and returns the closest one whose route
+// matches the drill — nearest-first and first-match, so a re-run on the same origin is reproducible.
 async function siteCourse(scout, origin, course, opts = {}) {
   const reader = arena.readerFromScout(scout);
   const cache = arena.createSiteCache();
@@ -283,8 +218,7 @@ async function siteCourse(scout, origin, course, opts = {}) {
     if (probed >= cap) { note('candidate_cap'); break; }
     probed++;
     const r = await router.route(A, B);
-    // Three verdicts, and unknown is never folded into unreachable: a search that ran out of budget
-    // proved nothing, and retiring ground for being far away would silently narrow every drill (Law 23).
+    // unknown stays distinct from unreachable — a budget-exhausted search proved nothing (Law 23).
     if (!r.known) { note(`unknown:${r.why}`); continue; }
     if (!r.reachable) { note('unreachable'); continue; }
     const m = matchCourse(r.edgeTypes, course);
@@ -310,14 +244,9 @@ function edgeHistogram(edgeTypes) {
 }
 
 // ── The leg (the LIVE half) ─────────────────────────────────────────────────────────────────────────
-//
-// dispatchMove shells out to fleet_control's `move`, which already teleports the body to A, VERIFIES it
-// landed (an RCON tp that silently missed would otherwise read as a mysteriously long walk), and sends
-// the verb. Reused whole rather than re-implemented: a second way to start a walk is a second thing to
-// keep in sync, and this one is already the operator's documented route.
-//
-// It returns when the VERB IS SENT, never when the bot arrives — Law 25 applies to the child too, and
-// its own header says so. Arrival is this file's to observe, below, off the world.
+// Shells out to fleet_control's `move`, which teleports the body to A, verifies the landing, and sends
+// the verb (Law 16). Resolves when the verb is SENT, not when the bot arrives (Law 25); arrival is
+// observed separately, below, off the world.
 function dispatchMove({ from, to, lookahead, prejump, bot }) {
   const script = paths.workshop('fleet_control.js');
   const args = [script, 'move',
@@ -336,9 +265,7 @@ function dispatchMove({ from, to, lookahead, prejump, bot }) {
   });
 }
 
-// observeArrival — the only verdict, and it is read off the world rather than off the bot's trace. A
-// trace-derived arrival would let the construct's account of itself decide whether the construct passed
-// (Law 26), and the whole reason this bench exists is that the account and the body can disagree.
+// The only pass/fail verdict, read off the world, not the bot's own trace (Law 26).
 async function observeArrival(scout, botName, to, timeoutMs, tolerance) {
   const until = Date.now() + timeoutMs;
   let best = Infinity, lastSeen = null;
@@ -356,23 +283,12 @@ async function observeArrival(scout, botName, to, timeoutMs, tolerance) {
 }
 
 // ── The lens ────────────────────────────────────────────────────────────────────────────────────────
+// Reduces combat_recorder's stream into locomotion numbers; combat numbers are `trace_monitor --combat`'s
+// job over the bot's own journal (Law 16).
 //
-// The reducer over combat_recorder's stream — and since 2026-08-06 the ONLY one, because combat_monitor
-// was deleted with the observer stack and lanista was simplified to a tool that records nothing. What
-// follows was written when there were two; it still names the split correctly, and the half this file
-// does not do is now done by `trace_monitor --combat` over the bot's own journal. It answers "what were
-// the combat numbers" — strike distance, cadence, knockback. It cannot answer "how many times did the
-// body come to a full stop crossing this ground", and a locomotion block bolted into it would be a
-// second lane inside a tool whose discipline is combat triage.
-//
-// THE HEADLINE NUMBER IS STOPS, and that is not an arbitrary choice — it is the Architect's complaint
-// stated as a measurement: "right now the bot go to edge of block. stops, then jump moves forward." A
-// stop is what the voxel-transition layer exists to remove, so stops-per-cell is the one number the A/B
-// turns on. Mean speed is a consequence of it and is reported second for that reason.
-//
-// Everything here is computed from what the server sent. Nothing is predicted, and no value is compared
-// against a model — this is a lens, not an alarm (calibration, in combat_monitor's vocabulary). A
-// threshold invented before the first reading would be a guess wearing an alarm's authority.
+// Stops-per-cell is the headline number; mean speed is a consequence of it and reported second. Every
+// value here is computed from what the server sent, never predicted or compared against a model — a
+// lens, not an alarm.
 async function reduceLeg(file, window) {
   const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
   const samples = [];
@@ -420,21 +336,14 @@ async function reduceLeg(file, window) {
     const v = speedAt(i);
     if (v !== null) speeds.push(v);
 
-    // A GAP IN THE PACKET SERIES IS THE STOP. Exact, not thresholded: the server sends no move packet
-    // for a body that is not moving, so the absence IS the measurement. This replaced a speed-under-a-
-    // number test, which could not tell a stopped body from the sampling phase.
+    // A gap in the packet series is the stop — exact, not thresholded: no move packet means no motion.
     const gap = cur.t - prev.t;
     if (gap >= STOP_MIN_MS) stops.push({ from: prev.t, to: cur.t, ms: gap, at: prev.bot.p });
 
-    // ASCENTS, not jumps. `onGround` is dead for an observed player, so a takeoff cannot be seen — but
-    // the thing the prejump claim is actually about can: when the body started rising, was it MOVING?
-    // A rise begun at walking pace is a step taken in stride; a rise begun from rest is the old
-    // behaviour, arrived-stopped-hopped. That is the same distinction without the unavailable field.
+    // Ascents, not jumps — onGround is dead for an observed player. Records whether the body was moving
+    // when it started to rise: in stride, versus from rest.
     if (dy > 0.3 && (prev.bot.p.y - pkts[Math.max(0, i - 2)].bot.p.y) <= 0.3) {
-      // Entry speed is ZERO when a stop-length gap sits immediately before the rise, never the stale
-      // speed from before that gap. Without this the body walks in at 5.6 b/s, stands at the step for
-      // 600 ms, rises — and the ascent is credited with the 5.6 it had before it stopped, which is the
-      // seam being scored as its own opposite.
+      // Entry speed reads zero when a stop-length gap precedes the rise, not the stale pre-stop speed.
       const atRest = (cur.t - prev.t) >= STOP_MIN_MS;
       ascents.push({ t: cur.t, bps: atRest ? 0 : round2(speedAt(i - 1) || 0), at: cur.bot.p });
     }
@@ -447,9 +356,7 @@ async function reduceLeg(file, window) {
 
   return {
     samples: samples.length, malformed, packets: pkts.length,
-    // The instrument's own resolution, reported rather than hidden (Law 6): if the packet cadence
-    // collapses, every number below is measured over fewer arrivals and the reader is owed that. ~100 ms
-    // is normal. It is also the floor on what a stop can be — this lens cannot see one shorter.
+    // Median inter-packet gap (Law 6) — also the floor on how short a stop can be measured.
     medianGapMs: gapSorted[Math.floor(gapSorted.length / 2)] || null,
     elapsedMs, travelled: round2(travelled), rise: round2(rise), drop: round2(drop),
     meanBps: round2(elapsedMs > 0 ? travelled / (elapsedMs / 1000) : 0),
@@ -457,29 +364,23 @@ async function reduceLeg(file, window) {
     stops: stops.length, stoppedMs, stoppedPct: round1(elapsedMs > 0 ? (stoppedMs / elapsedMs) * 100 : 0),
     longestStopMs: stops.reduce((a, s) => Math.max(a, s.ms), 0),
     ascents: ascents.length,
-    // An ascent begun below walking pace is the seam: the body reached the step, stopped, then rose.
+    // Ascents begun below walking pace — the body reached the step, stopped, then rose.
     standingAscents: ascents.filter(a => a.bps < 1.5).length,
     ascentEntryBps: ascents.map(a => a.bps),
-    // Named dead rather than reported as zero. A 0 here would be indistinguishable from a real
-    // measurement of a body that never left the ground (Law 25).
+    // Named dead, never reported as zero (Law 25) — unavailable for an observed player.
     jumps: null, airbornePct: null, unavailable: ['onGround', 'velocity'],
   };
 }
 
 // ── The runner ──────────────────────────────────────────────────────────────────────────────────────
-
-// An ARM is a named settings combination, not just a depth: fusing cells and jumping early are two
-// independent changes and the first A/B could not attribute a slow leg to either. `la3` and `la3np`
-// differ by exactly one flag, which is what makes the difference between them evidence.
+// An arm is a named settings combination, not just a lookahead depth — `la3` and `la3np` differ by
+// exactly one flag, so a difference between them is attributable evidence.
 async function runLeg(ctx, site, arm, index) {
   const { scout, bot } = ctx;
   const { lookahead, prejump, name: armName } = arm;
   const label = `${ctx.courseName}-${armName}-${index}`;
   const recorder = createRecorder({ scout, runId: makeRunId(label), botName: bot, label });
-  // The recorder stamps every sample in ms since IT started, so the window below must be measured on the
-  // same clock. Taken here rather than derived from Date.now() at dispatch: a few ms of drift would be
-  // harmless, but a clock the reducer cannot reproduce is the kind of thing that quietly shifts a window
-  // by a second the day something slow gets added between the two.
+  // Recorder's own clock zero — the measurement window below is stated on the same clock it samples on.
   const recorderT0 = Date.now();
   let dispatchT = null;
   try {
@@ -497,9 +398,8 @@ async function runLeg(ctx, site, arm, index) {
 
     const arrival = await observeArrival(scout, bot, site.B, RUN.legTimeoutMs, RUN.arrivalTolerance);
     recorder.mark('course_leg_end', arrival);
-    // The measurement window opens at the DISPATCH mark, not at the recorder's first sample: everything
-    // before it is the teleport and the verb's flight, which are the bench's own latency and not the
-    // bot's movement. Attributing them to locomotion would flatter or damn it for the harness's cost.
+    // Window opens at the dispatch mark, not the recorder's first sample — excludes the teleport and
+    // the verb's own flight, which are bench latency, not the body's movement.
     const window = { from: dispatchT, to: dispatchT + arrival.elapsedMs };
     recorder.close();
     const metrics = await reduceLeg(recorder.file, window);
@@ -532,9 +432,7 @@ function renderLegs(legs, site, courseName) {
   console.log('  between move packets, which is the resolution floor: no stop shorter than it is visible.');
   console.log('  onGround and velocity are DEAD for an observed player — no jump or airborne figure exists.');
 
-  // The A/B, and it is stated as a DELTA rather than a verdict. Which depth is better is the Architect's
-  // reading of these numbers; this file's job ends at making them comparable (Law 24 — the report lands
-  // on a recommendation, and the recommendation is in the scratchpad, not printed as a pass/fail here).
+  // Reports the A/B as a delta, never a verdict — this file's job ends at making arms comparable (Law 24).
   const depths = [...new Set(legs.filter(l => l.dispatched && l.metrics && !l.metrics.empty).map(l => l.arm))];
   if (depths.length > 1) {
     console.log('  A/B — same course, same body, one setting apart:');
@@ -567,8 +465,8 @@ async function main() {
     return 1;
   }
   const botName = opt('bot', 'AurenBot');
-  // An arm is `<depth>` or `<depth>np` (no prejump). `--arms=1,3,3np` is the three-way that separates
-  // the two changes; `--lookahead=` is kept as the plain-depth spelling.
+  // Arm spelling: `<depth>` or `<depth>np` (no prejump), e.g. `--arms=1,3,3np`; `--lookahead=` is the
+  // plain-depth alias.
   const armSpec = opt('arms', null) || opt('lookahead', RUN.lookahead.join(','));
   const arms = String(armSpec).split(',').map((tok) => {
     const t = tok.trim();
@@ -610,9 +508,8 @@ async function main() {
     });
 
     if (!site.found) {
-      // A course the terrain cannot host is a TERRAIN result, not a failure. Reported with its refusal
-      // histogram so "this ground has no step-ups" is distinguishable from "the search ran out of budget"
-      // (Law 25 — a shortfall is carried forward honestly, never dressed as a result).
+      // A course the terrain cannot host is a terrain result, not a failure — reported with its refusal
+      // histogram (Law 25).
       log('site', `no '${courseName}' course here. Stage: ${site.stage}.`);
       if (site.rejects) {
         log('site', `probed ${site.probed}/${site.offered} candidates — ${site.rejects.map(([w, n]) => `${w}×${n}`).join(', ')}`);

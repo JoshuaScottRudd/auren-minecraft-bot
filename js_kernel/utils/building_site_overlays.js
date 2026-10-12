@@ -5,7 +5,6 @@
 // world-reading geometry each overlay contributes — each independently testable against a mock bot.
 //
 // shaft overlay (payload.require_shaft):
-//   The shaft-safety scan formerly lived in a separate perception fragment (miningshaft_scanner).
 //   The ONLY reason the bot scans for a mineshaft is to pick the headframe's location, so that scan
 //   folds into the site search: every surface candidate's column is checked for a safe diagonal-
 //   staircase descent AS IT IS FOUND (evaluateStaircasePrism), instead of a second full pass. It
@@ -13,10 +12,6 @@
 //   Law 16) and hazard-checks the exact volume it will carve. A copy is "good by default" and only
 //   disqualified by a proven hazard (fluids in/adjacent, a gravity block whose column conducts fluid,
 //   unknown/unloaded blocks) — never by its contents (stone/dirt/ore are all fine to dig).
-//
-// (A third overlay, the water-site farmland search, was retired — Law 16. The wheat farm is now
-// sited by the wheat_plot_scanner's shoreline BFS, not find_buildingspot, so the whole
-// require_water_site path and its blueprint were removed.)
 
 'use strict';
 
@@ -42,11 +37,9 @@ function overlapsExisting(startX, endX, startZ, endZ, existingBoxes) {
   return null;
 }
 
-// CLEARABLE moved on again — to @utils/site_geometry, and re-exported here so every existing consumer
-// is untouched. It left because this module reaches the watcher and @perception, which makes it
-// unimportable from outside the construct; the arena bench needs THIS set, not a similar one, and a
-// second near-copy of it is precisely the Law 16 fault the first move was fixing. Its rationale and
-// membership travelled with it verbatim.
+// CLEARABLE is re-exported here from @utils/site_geometry so every existing consumer is unaffected:
+// this module reaches the watcher and @perception, so it is unimportable from outside the construct,
+// while the arena bench needs this exact set (Law 16).
 
 // overheadClear — walk the column above a build floor at (x,z), from groundY+1 through groundY+buildingH+1,
 // and decide whether the site carves into terrain. Every CLEARABLE block (air, trees, plants) is free — a
@@ -54,9 +47,7 @@ function overlapsExisting(startX, endX, startZ, endZ, existingBoxes) {
 // that must be DUG; up to `maxScrape` such layers are tolerated (a small mound the build flattens), but the
 // (maxScrape+1)th proves the floor is buried in a slope/mountain and the site is rejected.
 //   maxScrape=0 (surface base, the default): ANY solid block overhead rejects — the base wants open sky
-//     above its floor (unchanged from when this lived in find_buildingspot). (maxScrape>0 once served the
-//     retired water-site farm's sea-level bank scrape; every live caller now passes 0, but the knob stays
-//     generic in case a future overlay needs a bounded-scrape site.)
+//     above its floor. The knob stays generic for a future overlay that needs a bounded-scrape site.
 // Returns { clear:true, scraped } or { clear:false, blockName, y, scraped }.
 function overheadClear(bot, x, z, groundY, buildingH, maxScrape = 0) {
   let scraped = 0;
@@ -74,26 +65,23 @@ function overheadClear(bot, x, z, groundY, buildingH, maxScrape = 0) {
 // STAIRCASE-SAFETY OVERLAY — the diagonal-descent replacement for the old vertical shaft scan.
 // ─────────────────────────────────────────────────────────────────────────────
 const STAIRCASE_SAFETY = {
-  // ONE depth knob (Law 16 — collapsed from the old TARGET_Y + MAX_LOWEST_SAFE_Y pair). The
-  // descent must be hazard-free all the way to this Y; a site whose descent hits lava/water before
-  // reaching it is rejected outright — the floor must be reached, no partial descents.
+  // ONE depth knob (Law 16). The descent must be hazard-free all the way to this Y; a site whose
+  // descent hits lava/water before reaching it is rejected outright — the floor must be reached, no
+  // partial descents.
   //
   // This is a FLOOR ON THE WHOLE MINE, not merely on the staircase: cell floors are derived from the
   // copies this descent emits (mining_cell_graph.getDeepestSegmentMarkers), so no cell — and nothing
   // dug — sits below the deepest copy. It is set to hold the mine clear of the DEEPSLATE BLEND BAND,
-  // which thickens from y≈8 down to y=0: deepslate is slower to mine and wants its own tooling and
-  // handling, so the stone/deepslate boundary is a design decision rather than something the descent
-  // should wander into on its own.
+  // which thickens from y≈8 down to y=0: deepslate is slower to mine and wants its own tooling.
   //
   // The descent steps 3 Y at a time and the phase depends on surface Y, so the deepest voxel lands at
-  // this Y, +1, or +2. The value is therefore the floor the mine never passes, not the exact depth it
-  // reaches — which is the property worth having on a keep-out band.
+  // this Y, +1, or +2. The value is the floor the mine never passes, not the exact depth it reaches —
+  // the property worth having on a keep-out band.
   //
-  // Tuning: RAISE this if live runs show too few qualifying sites — a shallower floor is a shorter
-  // descent with fewer chances to hit a fluid, so more sites pass. The cost is paid in cell floors:
-  // they are spaced 6 apart around mining_cell_graph.STRADDLE_FLOOR_Y, so a floor climbing past one
-  // deletes it from the bottom up.
-  REQUIRED_DEPTH_Y: 10,
+  // Set to hold the mine's deepest cell floor near iron's densest band: the deepest copy at 14 seeds
+  // the prime cell floor at 14–16 (nearest mining_cell_graph.STRADDLE_FLOOR_Y), with the cell interior
+  // running 15–19.
+  REQUIRED_DEPTH_Y: 14,
   PRISM_MARGIN:     1,   // shell of blocks around the staircase envelope checked for fluids —
                         // a fluid one block outside the carved volume still floods in
 };
@@ -109,17 +97,15 @@ const SUFFICIENT_STAIRCASE_MATCHES = 5;
 // conduct, and the descent's natural vertical steps, are not hazards.
 
 // getBiomeName — returns the stripped biome name (no 'minecraft:' prefix) at the given position, or
-// null if the chunk is not loaded. Used to gate staircase candidates onto the settle-able
-// ACCEPTABLE_BIOMES set (require_shaft mode), and to stamp informational biome on farmland candidates.
-// ⚠ FLAGGED — SEPARATE BUG, not fixed here (Invariant B).
-// The header claim "null if the chunk is not loaded" is FALSE. prismarine-world's worldsync.js
-// implements `getBiome(pos) { const chunk = this.getColumnAt(pos); if (!chunk) return 0; ... }` — an
-// unloaded chunk returns biome id **0**, not null and not a throw. So `biomeId == null` never fires,
-// and this function reports biome 0's NAME as though it were sensed. evaluateStaircasePrism then runs
-// `acceptableBiomes.has(biome)` against a biome nobody ever looked at. Fixing it needs a real
-// chunk-presence gate (bot.blockAt(pos) !== null).
+// null when the read itself fails. Gates staircase candidates onto the settle-able ACCEPTABLE_BIOMES
+// set (require_shaft mode), and stamps informational biome on farmland candidates.
+//
+// An unloaded chunk is not distinguished from a loaded one reading biome id 0: prismarine-world's
+// getBiome returns 0, not null, for an unloaded chunk, so this can report biome 0's name as a sensed
+// value instead of null (Invariant B).
+//
 // getBiome is a genuine third-party boundary (chunk.getBiome / bot.world), so it keeps one — through
-// the guard, which reports rather than swallowing (Law 16). null here means "unknown".
+// the guard, which reports the failure instead of swallowing it (Law 16).
 function getBiomeName(bot, x, y, z) {
   const read = guardExternalSync('building_site_overlays', `getBiome at (${x},${y},${z})`, () => bot.world.getBiome(new Vec3(x, y, z)));
   if (!read.ok || read.value == null) return null;
@@ -177,7 +163,7 @@ function checkCopyHazards(bot, segment) {
   return { safe: true, failureReason: null };
 }
 
-// evaluateStaircasePrism — project the diagonal staircase from a CANDIDATE build center and hazard-
+// evaluateStaircasePrism — project the diagonal staircase from a CANDIDATE transpose origin and hazard-
 // walk its copies top-down (shallowest first), accepting the safe prefix. The headframe↔staircase
 // join is resolved candidate-backed (no chair yet) through transposeAttachPoints, so this uses the
 // SAME join the locked site will. Returns { ok:false, reason } for no attach point / biome mismatch /
@@ -185,21 +171,27 @@ function checkCopyHazards(bot, segment) {
 // safeCopies, haltReason }.
 //
 // acceptableBiomes: a Set of settle-able biome names (ACCEPTABLE_BIOMES). When passed, the build
-// center's own biome must be a member — this is where "only settle in plains/forest" is enforced per
-// candidate, the same gate exploration uses to decide when to stop seeking (one set, Law 16). A
-// candidate in a rejected biome is out before any hazard work.
-function evaluateStaircasePrism(bot, headframeBuilding, buildCenter, acceptableBiomes) {
-  const surfY = buildCenter.y; // ground the headframe sits on = top of the descent
-
+// center's own biome must be a member, the same gate exploration uses to decide when to stop seeking
+// (one set, Law 16). A candidate in a rejected biome is out before any hazard work.
+function evaluateStaircasePrism(bot, headframeBuilding, transposeOrigin, acceptableBiomes) {
   if (acceptableBiomes) {
-    const biome = getBiomeName(bot, buildCenter.x, surfY, buildCenter.z);
+    const biome = getBiomeName(bot, transposeOrigin.x, transposeOrigin.y, transposeOrigin.z);
     if (!acceptableBiomes.has(biome)) return { ok: false, reason: 'biome_mismatch', biome };
   }
-
   // Headframe attach A in world for THIS candidate — the staircase's first copy lands here.
-  const headAWorld = transposeAttachPoints(headframeBuilding, buildCenter).A;
+  const headAWorld = transposeAttachPoints(headframeBuilding, transposeOrigin).A;
   if (!headAWorld) return { ok: false, reason: 'no_attach_point' };
+  const r = evaluateStaircaseFrom(bot, headAWorld, transposeOrigin.y);
+  return r.ok ? { ...r, startX: transposeOrigin.x, startZ: transposeOrigin.z } : r;
+}
 
+// evaluateStaircaseFrom — THE DESCENT ITSELF, from the world point its first copy's inbound joint lands
+// on. The headframe's check above resolves that point through the headframe's attach A; a STANDALONE
+// mineshaft, built with no headframe attach point, names the point directly. One hazard walk for both
+// (Law 16). `surfY` is the ground the descent starts from. On success it also carries `prism` — the
+// staircase's horizontal reach {minX,maxX,minZ,maxZ} and its copy count — so a siter can keep the whole
+// diagonal, not just its mouth, clear of other buildings.
+function evaluateStaircaseFrom(bot, headAWorld, surfY) {
   // Project the descent to the required floor; hazard-walk the copies shallow → deep.
   const proj = projectStaircase({ headAWorld, lowestSafeY: STAIRCASE_SAFETY.REQUIRED_DEPTH_Y });
   if (proj.segments.length === 0) {
@@ -218,19 +210,33 @@ function evaluateStaircasePrism(bot, headframeBuilding, buildCenter, acceptableB
   }
 
   // Reach the floor, no matter what: the ENTIRE descent to REQUIRED_DEPTH_Y must be clean. A hazard
-  // anywhere short of the deepest projected copy means we can't safely reach the required depth, so
-  // the site is out (this replaced the old numeric lowestSafeY > MAX gate — a single fluid strike now
-  // rejects the site rather than accepting a partial, too-shallow descent). safeCopies===0 folds in.
+  // anywhere short of the deepest projected copy means the required depth cannot be safely reached, so
+  // the site is out; a single fluid strike rejects the whole site. safeCopies===0 folds in.
   if (safeCopies < proj.segments.length) {
     return { ok: false, reason: 'unsafe_descent', depthReached: surfY - lowestSafeY, lowestSafeY, haltReason };
   }
 
   return {
     ok: true,
-    startX: buildCenter.x, startZ: buildCenter.z,
+    startX: headAWorld.x, startZ: headAWorld.z,
     surfaceY: surfY, lowestSafeY, depthReached: surfY - lowestSafeY, safeCopies,
     haltReason,
+    prism: staircaseReach(proj),
   };
+}
+
+// staircaseReach(proj) — the horizontal box every voxel of a projected descent falls in.
+function staircaseReach(proj) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const seg of proj.segments) {
+    for (const v of seg.voxels) {
+      if (v[0] < minX) minX = v[0];
+      if (v[0] > maxX) maxX = v[0];
+      if (v[2] < minZ) minZ = v[2];
+      if (v[2] > maxZ) maxZ = v[2];
+    }
+  }
+  return { minX, maxX, minZ, maxZ, copies: proj.segments.length };
 }
 
 module.exports = {
@@ -241,4 +247,6 @@ module.exports = {
   SUFFICIENT_STAIRCASE_MATCHES,
   getBiomeName,
   evaluateStaircasePrism,
+  evaluateStaircaseFrom,
+  STAIRCASE_SAFETY,
 };

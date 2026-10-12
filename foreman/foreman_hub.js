@@ -18,81 +18,37 @@ const fs = require('fs');
 const path = require('path');
 const { createEnvelope, parseEnvelope, pickBuildingEntry, isBuildingTombstone, BUILDING_ROOM_SEPARATOR } = require('./message_schema');
 const brain = require('./foreman_brain');
-// What the world is doing (started, reached, failed, stopping) — the foreman's own hold on it, reported in
-// fleetState so a caller on the socket door (run.js) can ask instead of guessing.
+// The foreman's own hold on world status (started, reached, failed, stopping), reported in fleetState.
 const foremanWorld = require('./foreman_world');
 
-// The operator vocabulary comes from the shared envelope contract, never a local copy (Law 16 — see
-// OPERATOR_VERBS there for the silent failure a per-process copy caused).
+// Operator vocabulary (Law 16).
 const { OPERATOR_VERBS, INGAME_VERBS, COMMAND_ORIGIN: ORIGIN, VALID_ORIGINS, INGAME_DOOR_PORT_OFFSET,
   roomKeyOwner } = require('./message_schema');
 
-// The species vocabulary, from the Architect's table rather than a local literal. This is the only
-// thing the foreman takes from the config graph: it routes on a species and a second spelling of
-// 'contractor' here would silently route in-game commands to nobody (Law 16).
+// Species vocabulary, shared with architect_config (Law 16).
 const { BOT_MODES } = require('../Thinking_fragments/architect_config');
 
-// THE @-ALIASES AND THE MODULE HOMES, registered here for the same reason every other entry point in the
-// tree registers them: this is a process root, and a process root is the only place that can. The foreman
-// resolved everything relatively while it needed nothing from the kernel; the request rules changed that,
-// and they reach `@utils/...` and `@kernel/...` four levels down where no relative path from this file
-// can help. Bare `module-alias/register` is not used because it walks up from the module's INSTALL dir and
-// can land on a package.json carrying no _moduleAliases, registering nothing silently — the explicit form
-// names the package.json that owns them (the reasoning preflight and fleet_revive both spell out).
-//
-// The module homes come from the one file that answers where packages live on this machine, so an foreman
-// started BY HAND resolves the same as one started by the launcher, which passes NODE_PATH in. A process
-// that only works when its parent remembered to set an environment variable fails in the hand-started case
-// nobody tests (Law 16 — one resolver, asked by everyone).
+// Registers @-aliases and module homes for this process root (Law 16).
 require('../js_kernel/utils/node_module_homes').bootstrapModulePath();
 require('module-alias')(path.resolve(__dirname, '..'));
 
-// The request rules, taken as PURE FUNCTIONS over this process's own map — never the ledger's HQ-backed
-// calls. The foreman has no corporate_headquarters and must not acquire one: it has no BOT_ID, so the
-// file it opened would carry a name no bot answers to and no reader could explain (Invariant D, Law 6).
-// The requirements live in memory here exactly as the station map does, and reach disk only inside the
-// bots that receive the broadcast.
-//
-// REQUIRED AT LOAD, NOT INSIDE THE HANDLER, and that placement is what killed the fleet rather than the
-// module. This process resolved no @-aliases, so the lone `@kernel/...` written inside handleRequestCommand
-// resolved nowhere — and being inside a handler, the miss could not surface until a human in the world said
-// the word `request`, at which point MODULE_NOT_FOUND took down the coordinator, every bot's link and the
-// in-game door together, on one sentence from a stranger. A require belongs where a missing module is a
-// startup failure: loud, before anything is raised, with nothing depending on it yet (Law 13 — a coding
-// violation must not wait for a visitor to find it).
-//
-// The ledger reaches the item-name normaliser and the requestable catalogue, which is why the aliases and
-// the module homes are bootstrapped above rather than this file resolving relatively as it once did. It
-// does NOT reach corporate_headquarters: that require is lazy inside the ledger's own storage wrapper, so
-// loading the rules here costs this process nothing and cannot give it an HQ.
+// Request rules, used as pure functions over this process's own map (Invariant D, Law 6). Required at
+// load, not inside the handler, so a missing module is a startup failure (Law 13).
 const requestLedger = require('@kernel/request_ledger');
+// The fleet's one item book: every body's moves land here (item_book says what a move is).
+const itemBook = require('./item_book');
+itemBook.start();
 
-// ── ONE PROCESS WITH THE FOREMAN (Architect 2026-09-18) ──────────────────────────────────────────
-// *"What I want is one body that isn’t a bit a single process controls… you have to justify to me why each
-// of these merit seperate processes"* None earned it, so this file is no longer started on its own:
-// `foreman/foreman.js` requires it first thing, and the port is opened as a side effect of that require.
-// The port therefore comes from the environment every launcher already stamps (FOREMAN_PORT), never from
-// argv. The foreman's argv is not this file's to read, and a flag of the desk's read as a port number
-// would open the fleet on a port nobody dials.
+// ── ONE PROCESS WITH THE FOREMAN ──────────────────────────────────────────
+// Required by foreman/foreman.js; not started on its own. PORT comes from FOREMAN_PORT, not argv.
 const PORT = parseInt(process.env.FOREMAN_PORT, 10) || 3001;
 const INGAME_DOOR_PORT = PORT + INGAME_DOOR_PORT_OFFSET;
 
-// Combined fleet trace: every line printed here (bot logs forwarded from both bots + the foreman's
-// own events) is also persisted to one file, mirroring the console so both bots can be reviewed
-// after the fact in a single place. Lives beside the per-bot watcher files, in the records room the
-// watcher itself writes to — asked of `record_homes` rather than spelled, because a writer holding its
-// own copy of that path is how a reader ends up reporting an empty run out of the wrong directory
-// (Law 16).
-// APPEND-ONLY, and holding ONLY the foreman's own lines (Architect 2026-08-12). Both properties were
-// decided the day a power cut returned all three traces as pure NUL bytes at exactly the right length —
-// the whole-file rewrite's data sat in the page cache while NTFS journalled only the rename. The full
-// reasoning lives once, in js_kernel/watcher.js's _writeWatcherFile; this is the same writer, smaller.
-// The 20000-line ring cap went with the rewrite: a ring needs to re-serialise the whole story to drop
-// its head, and there is nothing to cap for — `fleet_control up` clears the story files at every run, so
-// growth is bounded by one run's length (a 39-minute soak wrote 1.5 MB).
+// Combined fleet trace file: forwarded bot logs + the foreman's own events, for reviewing the whole
+// fleet after a run. Path from record_homes (Law 16). Append-only, foreman's own lines only.
 const COMBINED_LOG_FILE = require('../js_kernel/utils/record_homes').traceFile('fleet');
 const { guardExternalSync } = require('@utils/external_library_guard');
-const COMBINED_FLUSH_MS = 1000;   // matches the bots' cadence; see watcher.js for why it is not 40
+const COMBINED_FLUSH_MS = 1000;   // matches the bots' cadence
 let _unwritten = [];
 let _combinedWriteScheduled = false;
 
@@ -104,14 +60,10 @@ function persistCombined(line) {
     _combinedWriteScheduled = false;
     const chunk = _unwritten;
     _unwritten = [];
-    // `fs.appendFile` is a THIRD-PARTY call and can throw synchronously before its callback ever runs
-    // (a bad path, EMFILE). Both failure routes put the lines back rather than dropping them. The
-    // hand-written `try` this replaces was silent, so a persistently failing append looked identical
-    // to a working one (found 2026-09-10, when the catch-shape gate was first allowed to see this file).
+    // `fs.appendFile` is third-party and can throw synchronously (Law 16 guard).
     const appended = guardExternalSync('foreman_hub', 'fs.appendFile(combined trace)', () => {
       fs.appendFile(COMBINED_LOG_FILE, chunk.map(l => JSON.stringify(l)).join('\n') + '\n', (err) => {
-        // Put the lines BACK on a failed append rather than dropping them — the next flush retries.
-        // Unshifted, so a retry cannot re-order the story it is trying to preserve.
+        // Failed lines go back, unshifted, for the next flush to retry.
         if (err) _unwritten = chunk.concat(_unwritten);
       });
     });
@@ -123,26 +75,11 @@ function persistCombined(line) {
 // Per-bot state: { bot_id: { ws, boardroom_chair, connected_at, last_sync } }
 const botClients = new Map();
 
-// Merged logistics station map across all bots (Phase 6). A station id is a unique world
-// voxel, so entries from different bots never collide except when two bots edited the SAME
-// voxel — resolved last-writer-wins by the entry's `updated_at` stamp. Pure relay/merge, no
-// interpretation (Law 3): the foreman never inspects station contents, only freshness.
-//
-// A REMOVAL RIDES IN AS AN ENTRY, never as a missing key. The loop below reads incoming keys only, so
-// an absent key is no-news and this map would otherwise keep a dug-up station for the life of the run
-// and reinstall it on every bot at the next broadcast — which is what it did. station_registry marks a
-// removed station with `removed_at` and stamps it fresh; the foreman relays it like any other row
-// (still no interpretation — it does not read the flag), and each bot's registry drops it on read.
+// Merged logistics station map across all bots, keyed by voxel, last-writer-wins by `updated_at` (Law
+// 3). A removal rides in as an entry with `removed_at`, written by station_registry.
 let mergedStations = {};
 
-// STANDING REQUESTS — what each human has asked their crew for, held here for the same reason the
-// station map is: the foreman is not a bot, has no HQ of its own, and it is the one process
-// that sees every crew (§8.3 — the foreman owns the fact, the bot owns whether it cares).
-//
-// NO MERGE FUNCTION AND NO LAST-WRITER-WINS. Stations are merged because many bots observe them; a
-// request has exactly ONE author — the person who spoke it — so there is nothing to reconcile. The
-// foreman is the sole writer and the bots are readers, which is the whole point of moving the fact
-// here rather than letting crews each keep a copy.
+// Standing requests: what each human has asked their crew for. The foreman is the sole writer.
 let standingRequests = {};
 
 function mergeStationsInto(incoming) {
@@ -156,10 +93,7 @@ function mergeStationsInto(incoming) {
   }
 }
 
-// Merged fleet structures (building_confrence_room entries) across all bots.
-// First-writer-wins per structure via the shared pickBuildingEntry contract —
-// the fleet has ONE home; a later duplicate buildspot never displaces it.
-// Pure merge, no interpretation (Law 3).
+// Merged fleet structures across all bots, first-writer-wins via pickBuildingEntry (Law 3).
 let mergedBuildings = {};
 
 function mergeBuildingsInto(incoming) {
@@ -170,18 +104,14 @@ function mergeBuildingsInto(incoming) {
   }
 }
 
-// ── A BOT CANNOT SET A POINT (Architect 2026-09-18: *"Bots can't set their own points now"*) ──────────
-// The foreman is the one writer of where a building stands (`lockSite` below), so a bot's copy of a building
-// is accepted only when its location is the one the foreman wrote. A bot legitimately re-sends the rows it
-// received (every broadcast echoes back), and those pass. What does not pass is a bot establishing a
-// location the foreman never set, moving one, or striking one: each of those rows is dropped whole, and the
-// drop is reported, because a bot writing a location is a code fault rather than a disagreement (Law 13).
-// Reported once per bot and room, so a bot that keeps echoing the same bad row does not flood the stream.
+// ── A BOT CANNOT SET A POINT ──────────────────────────────────────────────────
+// The foreman is the one writer of a building's location (`lockSite` below). A row that sets, moves, or
+// strikes a location the foreman did not set is dropped and reported once per bot and room (Law 13).
 const _refusedLocation = new Set();
 function sameLocation(a, b) {
   const x = a && a.set_buildspot, y = b && b.set_buildspot;
   if (!x || !y) return false;
-  const p = x.build_center || {}, q = y.build_center || {};
+  const p = x.transpose_origin || {}, q = y.transpose_origin || {};
   return x.locked_at === y.locked_at && p.x === q.x && p.y === q.y && p.z === q.z;
 }
 function botBuildingsOnly(incoming, botId) {
@@ -207,19 +137,14 @@ function botBuildingsOnly(incoming, botId) {
   return kept;
 }
 
-// lockSite(rows) — THE ONE WRITER OF A LOCATION. Called by the desk after its survey, before any body exists.
-// Each row becomes the two chairs `site_chairs` builds, written straight into the fleet's memory, saved to
-// the owner's file and broadcast, so a body spawned next receives its base on registration.
+// lockSite(rows) — the one writer of a location, called by the desk before any body exists. Each row
+// becomes the two chairs `site_chairs` builds, saved to the owner's file and broadcast.
 //
-// ONE BASE HAS ONE SITE. A room already holding a live location at the same centre is left as it is (the
-// desk handed back an existing base); at a different centre it is refused, because moving a base is not a
-// thing a survey may do by accident. A struck (wiped) room is re-established — the later event wins.
+// ONE BASE HAS ONE SITE: a matching centre is accepted, a different centre is refused (Law 13).
 //
-// THE OWNER HALF OF THE KEY IS THE DESK'S TO STATE. A survey row names the structure only ('headframe'); the
-// memory is keyed `<structure>|<owner>` (`bot_mandate.buildingRoomKey`), and a body used to add its own half at
-// the write. The hub has no mandate, so the desk passes the crew's key (`bot_mandate.ownerKeyFor`) and it is
-// joined here, once. A row that already carries a separator is refused: two halves stated twice is a wiring fault.
-function lockSite(rows, ownerKey) {
+// The owner half of the key is the desk's (`bot_mandate.ownerKeyFor`), joined here once with the row's
+// plain structure name (`bot_mandate.buildingRoomKey`).
+async function lockSite(rows, ownerKey) {
   if (!Array.isArray(rows) || rows.length === 0) {
     throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): lockSite needs the rows the desk sited, got ${JSON.stringify(rows)}.`);
   }
@@ -235,9 +160,9 @@ function lockSite(rows, ownerKey) {
     }
     const key = `${row.roomKey}${BUILDING_ROOM_SEPARATOR}${ownerKey}`;
     const held = mergedBuildings[key];
-    const bc = row.candidate && row.candidate.build_center;
-    if (held && !isBuildingTombstone(held) && held.set_buildspot && held.set_buildspot.build_center) {
-      const h = held.set_buildspot.build_center;
+    const bc = row.candidate && row.candidate.transpose_origin;
+    if (held && !isBuildingTombstone(held) && held.set_buildspot && held.set_buildspot.transpose_origin) {
+      const h = held.set_buildspot.transpose_origin;
       if (bc && h.x === bc.x && h.y === bc.y && h.z === bc.z) { already.push(key); continue; }
       throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): '${key}' is already sited at (${h.x},${h.y},${h.z}); `
         + `the desk asked for (${bc && bc.x},${bc && bc.y},${bc && bc.z}). One base has one site — the desk hands an existing base back, it never surveys over it.`);
@@ -247,42 +172,24 @@ function lockSite(rows, ownerKey) {
   }
   log(`Sited: locked [${locked.join(', ') || 'nothing new'}]${already.length ? `, already held [${already.join(', ')}]` : ''}.`);
   savePlayerMemory();
-  ownerMemory.flushNow();
+  await ownerMemory.flushNow();
   broadcastBoardroom();
   return { locked, already };
 }
 
-// ── THE FLOOR UNDER BOTH MIRRORS (Architect 2026-09-05) ─────────────────────────────────────────────
-//
-// *"each player must have a permanent corpoate hq on my computer that stays forever that they control."*
-//
-// The two maps above are a LIVE MIRROR and were never anything else: plain `let x = {}`, empty on every
-// foreman start, repopulated only by whatever bots happened to reconnect and re-send. That was survivable
-// while bodies were permanent and their own files carried the memory. It stops being survivable the moment
-// a visitor is handed a fresh pair of bodies, because then the only durable copy of that person's house
-// lives in a file named after a bot somebody else is about to be given.
-//
-// `owner_memory` is the disk under these two maps and nothing more — it does not merge, decide or
-// interpret (Law 3). It splits the rows that are already owner-keyed into one file per player, and hands
-// them back at startup. See its header for why the foreman owns this and the bots do not.
+// ── THE FLOOR UNDER BOTH MIRRORS ─────────────────────────────────────────────
+// mergedBuildings/mergedStations are a live mirror only, empty on every foreman start. `owner_memory` is
+// the durable disk copy beneath them, one file per player (Law 3).
 const ownerMemory = require('./owner_memory');
 
-// SAVED ON EVERY MERGE, DEBOUNCED INSIDE THE MODULE. Called from the two places a row can change and from
-// the broadcast that knows who is live — never on a timer of its own, because a second scheduler is a
-// second thing to keep alive (the same reasoning the connection audit rides the warden's cycle).
-// EVERY OWNER WHO HAS EVER WIPED IN THIS PROCESS'S LIFETIME, and it is deliberately never cleared. The
-// set answers one question — "may this owner's file be written empty?" — and the answer stays yes once
-// they have wiped, because every later save must keep telling the truth about a player who now has
-// nothing. Forgetting a name here would mean the wipe held until the next unrelated save and then quietly
-// stopped holding. It is bounded by the number of distinct people who wipe between foreman restarts.
+// Saved on every merge, debounced inside owner_memory.
+// wipedOwners: every owner who has wiped, so a later save may write their file empty.
 const wipedOwners = new Set();
 
 function savePlayerMemory() {
   const chairsByOwner = {};
   for (const [id, client] of botClients) {
-    // THE OWNER FILTER IS WHAT MAKES A CHAIR FILEABLE. A homesteader answers to nobody, so it has no
-    // player file to belong in; only a contractor's chair carries a person's name (bot_mandate refuses
-    // an ownerless contractor at boot, so a client with an owner is a contractor by construction).
+    // Only a contractor's chair carries an owner name (bot_mandate).
     if (!client.owner || !client.boardroom_chair) continue;
     if (!chairsByOwner[client.owner]) chairsByOwner[client.owner] = {};
     chairsByOwner[client.owner][id] = client.boardroom_chair;
@@ -290,18 +197,10 @@ function savePlayerMemory() {
   ownerMemory.save(mergedBuildings, mergedStations, chairsByOwner, (m) => log(m), wipedOwners);
 }
 
-// READ AT REQUIRE TIME, APPLIED AT LISTEN TIME. Reading here keeps the load beside the module that owns
-// it; the `Object.assign` further down is what actually fills the two maps, and it is placed with the
-// startup banner so the ordering against the first bot registration is visible in one place rather than
-// implied by module order.
+// Read at require time; applied to the two maps at listen time (see the startup banner below).
 const _restored = ownerMemory.loadAll((m) => log(m));
 
-// DEATH PILES ARE NO LONGER RELAYED (2026-08-12). The mirror and its LWW merge were deleted with the
-// ledger that fed them: salvage is now each bot's own live scan of its own entity table, and an entity
-// table is not shareable state. Relaying "there is an item at (x,y,z)" would hand a peer a claim it cannot
-// verify and that may already be false (Law 23), which is the ghost-offer failure the whole swap removed.
-// Kept as a note rather than a silent deletion because "why doesn't the foreman share drops" is a
-// question a successor will ask, and the answer is a decision, not an omission.
+// Salvage (death piles) is not relayed: each bot scans its own entity table live (Law 23).
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] [FOREMAN] ${msg}`;
@@ -351,34 +250,13 @@ function broadcastBoardroom() {
         chairsForBot[chairId] = chair;
       }
     }
-    // Send the full merged station map to every bot (including entries it originated —
-    // its own LWW merge keeps its fresher local copy, so re-sending is idempotent). This
-    // is what lets a second bot see the first's chests, furnace orders, and cooked output.
-    // Merged fleet structures ride along the same way (first-writer-wins on both sides,
-    // so re-sending a bot its own entry is idempotent too).
-    // THE CONNECTED ROSTER — ground truth on who is actually here, and the foreman is the only
-    // party that holds it. It is sent on EVERY broadcast, not just on a disconnect event, because
-    // the event cannot be relied on: killing the server window takes the foreman down with the
-    // bots, so no 'close' handler ever runs anywhere, and every bot's disk keeps a chair for a peer
-    // that no longer exists. A peer chair carries a magnet, and a magnet carries chest_locks — so a
-    // dead bot goes on holding chests for the rest of the world's life.
-    // Measured 2026-07-21: after the fleet was closed, a single-bot continue run read
-    // "logs:0/50 ⚠ below 25 🔒 in use by TessaBot" with TessaBot not in the session at all.
-    // Broadcasting the roster rather than a "forget X" instruction is deliberate: state is re-sensed
-    // against what is true NOW (Invariant B), so it self-heals whatever the bots believed before —
-    // no message can be missed, because the next broadcast restates the whole truth.
+    // Station and building maps sent whole to every bot, including entries it originated (idempotent
+    // merges). Connected roster sent on every broadcast — ground truth on who is here (Invariant B).
     const payload = { connected_bots: [...botClients.keys()] };
     if (Object.keys(chairsForBot).length > 0) payload.bot_boardroom = chairsForBot;
     if (stationsPresent) payload.logistics_stations = mergedStations;
-    // Sent WHOLE and UNCONDITIONALLY — including when it is empty, which is the case the other keys here
-    // do not have and this one does. Every broadcast restates the truth, so a bot that missed one is
-    // corrected by the next rather than needing a delta it can ask for; a crew reads only its own rows out
-    // of it (request_ledger.outstanding). Omitting the key when the map is empty breaks exactly that claim
-    // at the one moment it matters most: mergeBroadcast writes only what it is given, so the LAST cancel —
-    // the one that empties the ledger — sends a payload with no requests key at all, every crew keeps the
-    // rows it already mirrored, and a withdrawn requirement is worked on forever by bots nobody can call
-    // off. The empty map is a FACT the foreman authored, not an absence of news (Invariant B: the mirror
-    // follows the authority, and `{}` is something the authority is saying).
+    // Sent whole and unconditionally, including when empty, so a withdrawn requirement does not stick on
+    // a bot's stale mirror (Invariant B).
     payload.standing_requests = standingRequests;
     if (buildingsPresent) payload.building_conference = mergedBuildings;
     if (Object.keys(payload).length > 0) {
@@ -406,12 +284,7 @@ function handleRegister(ws, msg) {
     }
   }
 
-  // THE SPECIES IS REQUIRED, NOT DEFAULTED, and the direction of the danger decides that. This value
-  // is what the in-game door routes on, and the only unsafe error is a homesteader that looks like a
-  // contractor — it would take a stranger's orders. An absent mode has no safe reading either: default
-  // it to homesteader and every contractor the foreman fetched becomes uncommandable with nothing said,
-  // default it to contractor and a mis-wired launch hands the world a bot built to ignore it. So an
-  // unregistered species is a bot that does not join (Law 13, same reasoning as bot_mandate's read).
+  // Species is required, not defaulted: an unregistered species is a bot that does not join (Law 13).
   const mode = msg.payload.mode;
   if (typeof mode !== 'string' || !mode.trim()) {
     warn(`Bot '${botId}' registered without a species — refusing. Every bot declares its mandate on register.`);
@@ -419,18 +292,13 @@ function handleRegister(ws, msg) {
     return;
   }
 
-  // A BOT THAT CAME BACK IS NOT A DEPARTED BOT. death_manager relaunches a body deliberately, and a
-  // reconnect that left its own departure standing would wake a run for a recovery that WORKED — a
-  // false alarm, which costs more than the alarm is worth (Law 25). The departure is the fact that a
-  // bot left and did not return; this line is what makes that true rather than approximately true.
+  // A reconnect clears its own departure and sent-home record (Law 25).
   departedBots.delete(botId);
+  sentHome.delete(botId);
   botClients.set(botId, {
     ws,
     mode: mode.trim().toLowerCase(),
-    // Not validated against the species here, and deliberately: bot_mandate refuses to BOOT an
-    // ownerless contractor or an owned homesteader, so a bad pairing cannot reach this line. Re-checking
-    // it would be a second enforcer of a fact already made impossible, and the two would have to be kept
-    // in step forever (Law 16).
+    // Owner/species pairing is not re-validated here; bot_mandate already guarantees it (Law 16).
     owner: typeof msg.payload.owner === 'string' && msg.payload.owner.trim() ? msg.payload.owner.trim() : null,
     boardroom_chair: msg.payload.boardroom_chair || null,
     connected_at: new Date().toISOString(),
@@ -495,23 +363,20 @@ function handleClaimRelease(ws, msg) {
   brain.handleClaimRelease(botId, key);
 }
 
-// Planning token transport (arbiter flavor b — see foreman_brain.js taxonomy).
-// The brain decides WHO gets the token; this callback is the one pathway every
-// grant (immediate, on-release promotion, TTL-expiry promotion) travels to reach
-// the winning bot (Law 16). The request handler itself never replies — a queued
-// bot simply waits for its 'planning_granted'.
-brain.onPlanningGrant((botId) => {
+// Planning token transport (Law 16): the brain decides who gets the token; this delivers the grant.
+brain.onPlanningGrant((botId, entry, resource) => {
   const client = botClients.get(botId);
-  if (!client) return;   // winner vanished mid-grant — its disconnect cleanup frees the token
-  sendToBot(client.ws, 'planning_granted', botId, {});
+  if (!client) return;   // winner vanished mid-grant — its disconnect cleanup closes the entry
+  sendToBot(client.ws, 'planning_granted', botId, { entry, ...resource });
+});
+// The other answer to a request: the body's place in the line and who holds the token.
+brain.onPlanningQueued((botId, place) => {
+  const client = botClients.get(botId);
+  if (!client) return;   // asker vanished — its disconnect cleanup takes it out of the line
+  sendToBot(client.ws, 'planning_queued', botId, place);
 });
 
-// The brain's own lines into the run record, beside this file's. Registered here rather than in the
-// brain because the brain must stay require-able cold (preflight loads it with no server); `persistCombined`
-// is passed unwrapped so the brain's `[FOREMAN_BRAIN]` tag survives into the trace and a lens can tell
-// the arbiter's decisions apart from the transport's. Without this the one component that decides which
-// bot may think wrote nothing any lens could read — see the header of foreman_brain.js SECTION 4 for the
-// run that cost.
+// Forwards the brain's own log lines into the same run record, tagged [FOREMAN_BRAIN].
 brain.onLog(persistCombined);
 
 function handlePlanningRequest(ws, msg) {
@@ -520,7 +385,27 @@ function handlePlanningRequest(ws, msg) {
     warn(`planning_request from unregistered bot '${botId}' — ignoring.`);
     return;
   }
-  brain.requestPlanningToken(botId);
+  brain.requestPlanningToken(botId, msg.payload && msg.payload.phase, msg.payload && msg.payload.requestId);
+}
+
+// ── ONE BODY LOST ENDS THE WHOLE RUN ─────────────────────────────────────────────────────────────
+// A body leaves a run one way: the foreman sent it home, and `sentHome` holds the record of that order.
+// The run continues only on that proof (Law 13). Every other departure ends the whole run here, because
+// the bodies are identical and the next one reaches the same place the same way.
+function bodyLeft(botId, how, said) {
+  if (sentHome.has(botId)) return;
+  require('../js_kernel/utils/timeout_crash').crashEverything(`bot:${botId}`, `a body left the run and the foreman had not sent it home (${how})`, said);
+}
+
+// A body that has stopped working but whose process still runs is out of the gate and out of the line
+// from this message on, by the same close a disconnect makes.
+function handleBodyStoodDown(ws, msg) {
+  const botId = msg.bot_id;
+  if (!botClients.has(botId)) return;
+  const reason = (msg.payload && msg.payload.reason) || 'no reason given';
+  warn(`Bot '${botId}' stood down: ${reason}.`);
+  brain.releaseForBot(botId, 'stood down');
+  bodyLeft(botId, 'it stood down', reason);
 }
 
 function handlePlanningRelease(ws, msg) {
@@ -529,68 +414,67 @@ function handlePlanningRelease(ws, msg) {
     warn(`planning_release from unregistered bot '${botId}' — ignoring.`);
     return;
   }
-  brain.releasePlanningToken(botId);
+  brain.releasePlanningToken(botId, msg.payload && msg.payload.entry);
 }
 
-// Print a bot's forwarded log line so both bots can be watched in one place. The line already
-// carries its own runtime tag + stage; we splice the bot id in right after the tag so the stream
-// reads uniformly:  [0m 35s] [AurenBot] [LOCOMOTION_DISPATCHER] 📊 …  (printed raw, not via log()).
-// ── THE LIVE FAULT TALLY (Architect 2026-09-16) ─────────────────────────────────────────────────────
-// *"Nothing should be using trace monitor while the bot is online, its post Mortem only. Run.js should
-// be talking directly to the program it needs… not asking trace monitor who checks the file which was
-// written by the program that it needs its answer from."*
-//
-// Until this date the only way for a supervisor to learn that the fleet had errored was to read the
-// trace file through a lens WHILE THE FLEET WAS STILL RUNNING — three hops (bot writes → file → lens
-// reads → parses its own prose) to recover a fact that passed through this very function, live, and was
-// thrown away. This is the first hop, and it is the only one that has a witness: every bot's error()
-// forwards here the instant it fires.
-//
-// IT IS A COUNT OF A FIELD, NOT A READING OF A LINE (Law 3 — the foreman stays passive). The watcher
-// states which channel it used and that word arrives as `level`; nothing here inspects the text, decides
-// what a fault is, or ranks one line above another. A line whose level is absent is counted as
-// `unlabelled` rather than guessed at, so an old bot build talking to a new foreman under-reports
-// visibly instead of being silently scored as clean (Law 25).
-//
-// `last_error` is the bot's OWN line, carried verbatim. The bot participated in the decision it is
-// reporting and may say why; this process did not and only relays it (the emitter-authority rule).
+// A body that found itself stuck, or in a state the design makes impossible, says so here; the whole
+// run ends on the foreman's one crash road with the body's report carried whole.
+function handleFleetCrash(ws, msg) {
+  const said = (msg.payload && msg.payload.report) || 'the body sent no report';
+  require('../js_kernel/utils/timeout_crash').crashEverything(`bot:${msg.bot_id}`, 'a body asked for the whole run to end', said);
+}
+
+// Prints a bot's forwarded log line, tagged with its bot id.
+// ── THE LIVE FAULT TALLY ─────────────────────────────────────────────────────
+// Per-bot count of forwarded log lines by level (Law 3). Missing level counts as `unlabelled` (Law 25).
+// `last_error` is the bot's own line, carried verbatim.
 const LOG_LEVELS = ['summary', 'warn', 'error', 'context', 'unlabelled'];
 const logTally = new Map();   // bot_id → { summary, warn, error, context, unlabelled, last_error }
 
-// ── A BOT THAT LEAVES IS REMEMBERED AS HAVING LEFT (Architect 2026-09-16) ───────────────────────────
-// *"if bots crash it should still end the run and wake you to investigate."*
-//
-// `botClients.delete(botId)` on close is correct and stays: a chair is a live bot's inventory and must
-// die with the connection, or the foreman hires a corpse and the camera warden films an empty chair.
-// But deleting the CLIENT deleted the only evidence the bot was ever here, so a crashed bot did not read
-// as a fault — it read as a smaller fleet. A supervisor polling the roster saw one bot where there had
-// been two and had nothing to compare against; the run soaked out its whole window beside a dead crew.
-//
-// AN ABSENCE IS ONLY A FAULT AGAINST A MEMORY OF PRESENCE. That memory is this map, and it is the whole
-// mechanism: the departure is a FACT the foreman witnessed (it held the socket that closed), not an
-// inference anybody downstream has to make by diffing two polls of their own.
-//
-// It rides in `fleet_state` as its own key rather than inside `bots`, because every existing reader of
-// that array treats a member as a bot it may act on — hire it, film it, send it a verb. A departed bot
-// appearing among them would be a ghost in all three (Law 8). One question, one answer, and the new fact
-// beside the old one instead of hidden inside it.
-const departedBots = new Map();   // bot_id → { gone_at, last_error }
+// ── A BOT THAT LEAVES IS REMEMBERED AS HAVING LEFT ───────────────────────────
+// Departure is a fact the foreman witnessed, kept beside the roster in fleet_state, not inside it (Law 8).
+const departedBots = new Map();   // bot_id → { gone_at, last_error, sent_home }
+
+// ── A BOT SENT HOME IS NOT A CRASH ────────────────────────────────────────────────────────
+// `stop`/`shutdown`/`wipe` deliveries are recorded here so a departure reads as ordered.
+const sentHome = new Map();       // bot_id → { verb, origin, asker }
 
 function _tallyFor(botId) {
   let t = logTally.get(botId);
   if (!t) {
-    t = { last_error: null };
+    t = { last_error: null, last_line_at: null, last_line: null };
     for (const k of LOG_LEVELS) t[k] = 0;
     logTally.set(botId, t);
   }
   return t;
 }
 
-// Handed to the fleet-state answer. A bot with no forwarded line yet reads as all-zero rather than
-// absent: it is registered, so silence from it is a measurement and not a gap.
+// A bot with no forwarded line yet reads as all-zero (registered, so silence is a measurement).
 function tallyOf(botId) {
   const t = logTally.get(botId) || _tallyFor(botId);
   return { ...t };
+}
+
+// ── THE LIVE WARNING FOLD ────────────────────────────────────────────────────
+// Every warning the fleet has raised this run, folded by unit and shape as it arrives, so a live fleet
+// answers "what is it warning about" from the door (Law 23). `sample` is the newest line of that shape,
+// the bot's own words.
+const warningFold = new Map();    // `${unit}|${shape}` → { unit, shape, count, bots:Set, first_at, last_at, sample }
+
+function _foldWarning(botId, line) {
+  const { unit, shape } = require('../js_kernel/utils/warning_shape').foldLine(line);
+  const key = `${unit}|${shape}`;
+  const now = new Date().toISOString();
+  const row = warningFold.get(key) || { unit, shape, count: 0, bots: new Set(), first_at: now, last_at: now, sample: line };
+  row.count++;
+  row.bots.add(botId);
+  row.last_at = now;
+  row.sample = line;
+  warningFold.set(key, row);
+}
+
+function warningsNow() {
+  return [...warningFold.values()].map(r => ({ ...r, bots: [...r.bots] }));
 }
 
 function handleLog(msg) {
@@ -600,65 +484,24 @@ function handleLog(msg) {
   const level = (msg.payload && msg.payload.level) || null;
   const t = _tallyFor(botId);
   t[LOG_LEVELS.includes(level) ? level : 'unlabelled']++;
+  // The newest line of any level and when it arrived: a body that has gone quiet shows here.
+  t.last_line_at = new Date().toISOString();
+  t.last_line = line.slice(0, 240);
   if (level === 'error') t.last_error = line;
+  if (level === 'warn') _foldWarning(botId, line);
   const idx = line.indexOf('] ');
   const tagged = idx >= 0
     ? `${line.slice(0, idx + 1)} [${botId}]${line.slice(idx + 1)}`
     : `[${botId}] ${line}`;
-  // PRINTED, NOT PERSISTED (Architect 2026-08-12). The foreman console is still the one place a human
-  // watches the whole fleet live, so the tagged line goes to stdout — but the bot already wrote this
-  // exact line to its own story file, and persisting it here stored every fleet event twice and made a
-  // second source of truth for the same event (Law 16 / Invariant D). readTrace now merges the per-bot
-  // files with this one by ISO stamp, so the merged view is built where it is read, not written twice.
+  // Printed only; the bot already wrote this line to its own story file (Law 16 / Invariant D).
   console.log(tagged);
 }
 
-// Relay one fleet verb to every registered bot. The foreman stays passive (Law 3): it
-// validates the verb and forwards it unchanged — each bot executes locally through the same
-// operator_commands pathway its own console uses (Law 16). Returns the number of bots reached.
-// `only` addresses a single bot when the operator named one. Still passive (Law 3): the foreman
-// makes no decision, it delivers to the address it was given. It exists because `move` walks a body
-// to an authored cell — broadcasting that to a three-bot fleet would send three bots to one voxel,
-// which is three occupants of one scope (Law 4). Verbs with no addressee broadcast exactly as before.
-// `origin` rides along on every command because the fleet now holds TWO SPECIES and the difference
-// between them is a question about TRANSPORT, not vocabulary: a homesteader must still take `exit`
-// from the operator's console and must never take anything from a human in the world. The foreman
-// stamps it because the foreman is the only party that KNOWS it — it can see which socket spoke —
-// whereas a bot receiving the message cannot verify a claim about where the message came from
-// (Law 23). Passive still (Law 3): stamping a fact it observed is not deciding anything.
-//
-// ── THE IN-GAME DOOR OPENS ONTO CONTRACTORS AND ONTO NOTHING ELSE ────────────────────────────────
-// A human speaking in the world addresses the bots fetched for them. That is not a permission check
-// bolted onto delivery — it is what the address book CONTAINS: an INGAME command is delivered to the
-// contractors, and a homesteader is never one of the addresses, the same way the foreman's ear is never
-// installed on one. Nothing is refused because nothing is aimed there.
-//
-// IT IS ROUTED HERE RATHER THAN GUARDED AT THE BOT, and that placement is the whole isolation. The
-// receiving bot cannot verify a claim about where a message came from (Law 23), so a check there would
-// be trusting the sender's word about the sender. The foreman is the one party that KNOWS, because it
-// observed which door the socket arrived at — so the fact is used at the only place it exists.
-//
-// ── AND ONTO ONE PERSON'S BOTS WITHIN THAT ──────────────────────────────────────────────────────
-// The world holds more than one human, so "the contractors" is not an address — each of them belongs
-// to somebody. `asker` is who spoke, and an in-game verb reaches the bots that are THEIRS.
-//
-// THE TERMINAL IS NOT AN EXCEPTION TO THIS RULE; IT IS OUTSIDE IT. Ownership is a fact about who may
-// command a bot FROM INSIDE THE WORLD, and the operator is not inside the world — he is the party that
-// built it, and the console reaches every bot of either species exactly as it always has. Writing that
-// as an override ("unless the asker is the Architect") would put the operator INTO the ownership model
-// as its most privileged member, and a model with a member who is exempt from it is two models. The
-// filter simply does not run on a terminal verb.
-//
-// WHY `asker` IS TRUSTED FROM THE DOOR WHEN A SPECIES CLAIM WOULD NOT BE. Each party states only what
-// it alone observed, and nothing states anything about itself: the bot declares its own owner at birth
-// (an environment fact it cannot rewrite), the foreman stamps the origin from which of its own
-// listeners accepted the socket, and the foreman reports which player spoke — read off the authenticated
-// chat packet's sender, the same wire-level fact that already keeps the console from impersonating a
-// player. Three observations, three observers, none of them vouching for itself (Law 23).
-//
-// THE SKIPPED COUNTS ARE RETURNED, NOT DROPPED (Law 6/25). "Reached nobody", "they are homesteaders"
-// and "that one is somebody else's" are three different facts, and a human told only the first goes
-// looking for a broken foreman.
+// Relays one fleet verb to every registered bot (Law 3). Returns the number of bots reached.
+// `only` addresses a single bot (Law 4). `origin` is stamped by the foreman, the one party that
+// observed which socket spoke (Law 23). In-game commands reach only the contractors owned by the
+// asker; the terminal is outside the ownership model. Skipped counts are returned, not dropped (Law
+// 6/25).
 function broadcastCommand(verb, args = {}, only = null, origin, asker = null) {
   let sent = 0;
   let skippedSpecies = 0;
@@ -669,38 +512,24 @@ function broadcastCommand(verb, args = {}, only = null, origin, asker = null) {
       if (client.mode !== BOT_MODES.CONTRACTOR) { skippedSpecies++; continue; }
       if (!asker || client.owner !== asker) { skippedOwner++; continue; }
     }
-    if (sendToBot(client.ws, 'command', id, { verb, args, origin })) sent++;
+    if (sendToBot(client.ws, 'command', id, { verb, args, origin })) {
+      sent++;
+      if (verb === 'stop' || verb === 'shutdown') sentHome.set(id, { verb, origin, asker });
+    }
   }
   return { sent, skippedSpecies, skippedOwner };
 }
 
-// The ONE operator-verb pathway (Law 16) — every transport lands here: the TTY console (readline
-// below), the headless 'operator_command' socket message (fleet_control), and — once the doorman
-// lands — a human speaking inside the world.
-//
-// `origin` is a REQUIRED argument rather than something inferred from `source`. `source` is a human-
-// readable label for the log ('console', 'socket:fleet_control') and labels drift; the isolation
-// between the two species cannot rest on a string somebody might reword. Callers state the origin
-// explicitly, and there is exactly one place per transport where that statement is made.
-//
-// IT DOES NOT DEFAULT, and the direction of the danger is why. The tempting default is TERMINAL,
-// because that is what every caller wanted on the day this was written — but TERMINAL is the
-// PRIVILEGED origin, the one a homesteader obeys. A doorman that forgot to stamp INGAME would have
-// its commands quietly promoted to console authority and delivered to exactly the species that must
-// never receive them. A default here would silently undo the isolation the rest of this design
-// spends three layers building, so an unstamped verb is a fault and is refused (Law 13).
+// The one operator-verb pathway (Law 16): console, socket, and the in-game door.
+// `origin` is a required argument, stated explicitly by each transport, and never defaults (Law 13).
 function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
-  // Every exit from here returns a verdict rather than falling off the end, because a caller on the
-  // in-game door has a human waiting and "nothing happened" has four different causes worth telling
-  // apart (Law 25). The log line stays for the operator's window; the return is for the far end.
+  // Every exit returns a verdict (Law 25).
   const nil = { sent: 0, skippedSpecies: 0, skippedOwner: 0 };
   if (!VALID_ORIGINS.has(origin)) {
     warn(`Refusing '${verb}' from ${source} — unstamped or unknown origin '${origin}'. Every operator verb must declare where it entered the fleet (${[...VALID_ORIGINS].join(' | ')}).`);
     return { ...nil, reason: 'bad_origin' };
   }
-  // AN IN-GAME VERB WITH NO ASKER IS REFUSED RATHER THAN BROADCAST. The unaddressed form means "all of
-  // MY bots", so an anonymous one would mean "all of everybody's" — the single most dangerous reading
-  // available here, and the one a missing field would silently produce (Law 13: absent is a fault).
+  // An in-game verb with no asker is refused (Law 13).
   if (origin === ORIGIN.INGAME && !asker) {
     warn(`Refusing '${verb}' from ${source} — it arrived from inside the world with nobody named as the asker.`);
     return { ...nil, reason: 'no_asker' };
@@ -709,61 +538,30 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
     warn(`Unknown ${source} verb '${verb}' — valid: ${[...OPERATOR_VERBS].join(' | ')}.`);
     return { ...nil, reason: 'unknown_verb' };
   }
-  // ── THE IN-GAME VOCABULARY IS SMALLER THAN THE OPERATOR'S, AND THE DIFFERENCE IS ENFORCED HERE ────
-  // Not in the foreman, and the placement is the whole point. The foreman is the only thing that speaks
-  // on the in-game door today, so a check inside it would be the sender promising to behave — and the
-  // two-listener design exists precisely because a guarantee resting on a sender's honesty is not one
-  // (Law 23). This refuses on the origin the foreman OBSERVED (which of its own servers accepted the
-  // socket), so no message from the world can carry a bench verb however the foreman is edited.
-  //
-  // WHAT IS EXCLUDED AND WHY, in one sentence each, because "the human's set is smaller" invites a
-  // successor to widen it back: `move`/`surveylayout`/`respawn`/`sentry` are bench instruments whose
-  // effects are invisible or unrecoverable from inside the world, and `flush` erases every owner's
-  // memory — which is the operator's authority, at the operator's scope of accountability, and not a
-  // player's. The player's scoped equivalent is `wipe`.
+  // ── THE IN-GAME VOCABULARY IS SMALLER THAN THE OPERATOR'S ────────────────────────────────────
+  // Enforced by the origin the foreman observed, not at the bot (Law 23). `move`/`surveylayout`/
+  // `respawn`/`sentry`/`flush` stay operator-only; the player's scoped equivalent of `flush` is `wipe`.
   if (origin === ORIGIN.INGAME && !INGAME_VERBS.has(verb)) {
     warn(`Refusing '${verb}' from ${asker} inside the world — it is an operator verb, not one of the `
       + `in-game vocabulary (${[...INGAME_VERBS].join(' | ')}). The terminal keeps it.`);
     return { ...nil, reason: 'not_ingame_verb' };
   }
-  // ── 'shutdown' ENDS THE WHOLE RUN, AND ONLY THE TERMINAL MAY SAY IT (Architect 2026-09-18) ──────────
-  // *"how does shutting down a server work after a soak or a problem?… I want foreman to handle that."*
-  // It is not delivered to any bot: it hands the foreman's own shutdown road the reason, and that road sends
-  // every bot `stop`, stops a world this process started, and ends the process. The in-game gate above
-  // already refuses it from inside the world — it is not in INGAME_VERBS.
+  // ── 'shutdown' ENDS THE WHOLE RUN, TERMINAL ONLY ──────────
+  // Not delivered to any bot: hands foremanWorld's shutdown road the reason.
   if (verb === 'shutdown') {
     const begun = foremanWorld.askShutdown(`the terminal's 'shutdown' (${source})`);
     return { ...nil, reason: begun ? 'shutting_down' : 'no_shutdown_road' };
   }
-  // ── 'wipe' IS SETTLED HERE, ABOVE THE no_bots GATE, AND IT NEEDS NO BODY AT ALL ──────────────────
-  //
-  // THE ASK (Architect 2026-09-05): *"a wipe needs to also stop the bots and make them exit… wiping can
-  // happen if there is or isnt bots because the corporate hq is the players on permanent file instead of
-  // anything requiring a live bot."*
-  //
-  // WHAT CHANGED UNDERNEATH THIS, and it is what makes the new shape correct rather than merely allowed.
-  // A wipe used to be DELIVERED: the owner's bots ran `wipe_system` against their own memory and the
-  // tombstones came back up on the next merge, so the verb needed a living body to mean anything and the
-  // gate below was right to refuse without one. Contractors are now stateless — their memory dies with
-  // them and never reaches a disk — so a bot's own tombstone is worth nothing the moment it stops, and
-  // the ONLY durable copy is the player's file, which this process owns. The authority and the memory
-  // are now in the same place, so the work belongs here.
-  //
-  // AND IT HAD TO MOVE HERE ANYWAY, because of the second half of his ask: a wipe now STOPS the bots. If
-  // the bots were still the ones striking their rows, stopping them in the same breath would race their
-  // own tombstones out of existence — the strike is written, the body dies before the delta is sent, and
-  // the wipe silently does nothing. Striking centrally removes the race instead of timing it (Law 16).
-  //
-  // TOMBSTONES, NOT DELETES, IN BOTH ROOMS — the reasoning is `wipe_system`'s and has not changed: the
-  // merge reads INCOMING keys, so a locally-absent key is no-news and any bot still holding the old row
-  // hands it straight back. A homesteader that adopted a peer's room is exactly that bot. An absence
-  // does not travel; a fact does.
-  //
-  // THE SCOPE IS THE SPEAKER (Law 27/28). In-game, the owner is the ASKER and nothing else — not the
-  // owners of whichever bots happen to be connected, which is what it used to read and which is
-  // meaningless when the answer is meant to be "none of them". A person's memory is theirs whether or
-  // not they currently hold a crew. The terminal keeps its old reading: the operator's scope is the
-  // fleet, so it strikes the owners of the bots it can see, and `flush` remains the fleet-wide verb.
+  // ── 'teleport' MOVES A PERSON, AND THE TERMINAL IS NOT ONE ───────────────────────────────────────
+  // The in-game path never reaches here — the desk answers it directly. The terminal refuses it.
+  if (verb === 'teleport') {
+    warn(`'teleport' from ${source} has nobody to move — it brings the ASKER to the alpha anchor, so it is said inside the world by the person who wants to go there, never from the terminal.`);
+    return { ...nil, reason: 'no_asker' };
+  }
+  // ── 'wipe' IS SETTLED HERE, ABOVE THE no_bots GATE, AND NEEDS NO BODY AT ALL ──────────────────
+  // Contractors are stateless; the player's file is the only durable HQ, owned by this process (Law 16).
+  // Struck centrally, in the same tombstone shape as station_registry. Scope is the speaker: in-game the
+  // owner is the asker; the terminal's scope is the fleet (Law 27/28).
   if (verb === 'wipe') {
     const owners = new Set();
     if (origin === ORIGIN.INGAME) owners.add(asker);
@@ -785,10 +583,7 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
       mergedBuildings[key] = { removed_at: now };
       struckBuildings++;
     }
-    // THE STATION TOMBSTONE KEEPS pos/type/owner AND THE BUILDING'S KEEPS NOTHING, and that asymmetry is
-    // `station_registry`'s, reproduced rather than invented: a building key already carries structure and
-    // owner so a reader can place the row from the key alone, while a station row is keyed by position
-    // and would be unattributable without them.
+    // Station tombstones keep pos/type/owner; building tombstones keep nothing (station_registry's shape).
     let struckStations = 0;
     for (const [stationId, entry] of Object.entries(mergedStations)) {
       if (!entry || !owners.has(entry.owner)) continue;
@@ -799,22 +594,22 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
 
     for (const o of owners) wipedOwners.add(o);
     savePlayerMemory();
-    ownerMemory.flushNow();
+    const saved = ownerMemory.flushNow();
     broadcastBoardroom();
 
-    // THE CREW GOES WITH THE MEMORY (his ask, and it is the honest lifecycle — Law 8). A bot standing in
-    // the world holding a base that no longer exists is a body mid-task against a plan that was just
-    // revoked; sending it away is cheaper and more truthful than teaching every fragment to notice. The
-    // person says `get` and receives a fresh pair, teleported to wherever they are now — which is the
-    // whole point of wiping, since the reason to wipe is that they have moved.
+    // ── THE CREW GOES WITH THE MEMORY (Law 8) ──
+    // Bots whose owner was wiped are stopped and sent home.
     let stopped = 0;
     for (const [botId, client] of botClients) {
       if (!client.owner || !owners.has(client.owner)) continue;
-      if (sendToBot(client.ws, 'command', botId, { verb: 'stop', args: {}, origin })) stopped++;
+      if (sendToBot(client.ws, 'command', botId, { verb: 'stop', args: {}, origin })) {
+        stopped++;
+        sentHome.set(botId, { verb: 'wipe', origin, asker: client.owner });
+      }
     }
 
-    log(`Wipe for ${[...owners].join(', ')}: ${struckBuildings} building room(s) and ${struckStations} station(s) `
-      + `tombstoned, written to the player file(s), ${stopped} bot(s) sent away. Every other owner untouched.`);
+    Promise.resolve(saved).then(() => log(`Wipe for ${[...owners].join(', ')}: ${struckBuildings} building room(s) and ${struckStations} station(s) `
+      + `tombstoned, player-file flush finished (any failed save is reported above), ${stopped} bot(s) sent away.`));
     return { ...nil, reason: 'wiped', struckBuildings, struckStations, stopped };
   }
 
@@ -823,27 +618,8 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
     return { ...nil, reason: 'no_bots' };
   }
 
-  // 'flush' means "fresh server" fleet-wide: the bots wipe their own corporate_headquarters,
-  // but this long-lived foreman also mirrors fleet HQ (merged stations + structures) and
-  // would otherwise re-broadcast the pre-flush home straight back into the freshly-blank bots —
-  // which now trips set_buildspot's Law-13 guard. Clear the mirror here so the fleet is truly
-  // fresh. Done before the broadcast so a bot's immediate post-reset (empty) update can't be
-  // out-raced by our own clear.
-  //
-  // FLUSH'S BLAST RADIUS EXCEEDS ANY ONE OWNER'S BOTS, AND THAT IS NOW CORRECT RATHER THAN TOLERATED.
-  //
-  // THE THIRD OPTION THIS COMMENT SAID DID NOT EXIST (2026-09-01). It used to read: an in-game flush
-  // clears the whole mirror, scoping it is impossible because a station is a world voxel rather than a
-  // person's property, *"there is no third option while the mirror is shared, so the honest move is to
-  // let the verb do what it does and say so where a human will read it."* It was right that the verb
-  // could not be scoped and wrong that admitting it was the only remaining move. The third option was to
-  // stop admitting it: `flush` is no longer in INGAME_VERBS, so the in-game arm this branch used to carry
-  // is unreachable and has been deleted rather than left as a warning for a case that cannot occur
-  // (Law 27 — the failing case stops existing inside the thing instead of being announced at its door).
-  //
-  // IT IS STILL THE RIGHT VERB FOR THE TERMINAL, and for the reason it was the wrong one for the world:
-  // authority is bounded by accountability, and at the console the whole fleet is one person's
-  // responsibility, so a fleet-wide erase is exactly their share. A player's scoped equivalent is `wipe`.
+  // 'flush' clears the mirrored fleet HQ (stations + structures + standing requests) so bots re-sync
+  // from empty. Fleet-wide and not scopable — not in INGAME_VERBS, terminal only.
   if (verb === 'flush') {
     mergedStations = {};
     mergedBuildings = {};
@@ -854,13 +630,7 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
   const only = typeof args.bot === 'string' && args.bot ? args.bot : null;
   const { sent, skippedSpecies, skippedOwner } = broadcastCommand(verb, args, only, origin, asker);
   const out = { sent, skippedSpecies, skippedOwner };
-  // Law 25: a verb that reached NOBODY is not a delivery. Say so rather than logging a 0 — and say
-  // WHICH nobody. "No such bot", "that species takes no orders from you" and "that one is someone
-  // else's" send a reader to three different places, and only the last is about another person.
-  //
-  // ORDERED MOST SPECIFIC FIRST. A bot skipped on OWNERSHIP was already a contractor, so reporting the
-  // species would be true of the fleet and false about the bot the human meant (Law 25 again — the
-  // reader would go and fetch a contractor they already have).
+  // A verb that reaches nobody is not a delivery; which nobody is reported (Law 25).
   if (sent === 0 && skippedOwner > 0) {
     warn(`'${verb}' from ${asker} reached nobody — ${skippedOwner} contractor(s) belong to someone else.`);
     return { ...out, reason: 'not_yours' };
@@ -882,15 +652,8 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
   return { ...out, reason: null };
 }
 
-// The headless transport. The origin is a fixed ARGUMENT here rather than a field read off the message,
-// and that is the whole reason there are two listeners: each one calls this with the origin ITS door
-// means, so no message can name its own authority (Law 23 — an inbound field is a claim). A sender able
-// to spell `origin: 'terminal'` on the in-game door would separate the two species by nothing more than
-// its own honesty.
-//
-// The result travels BACK on the same socket, because the far end has a human waiting for an answer.
-// Delivery is not outcome and this says only what it knows — how many bots the verb reached and why it
-// reached no more than that (Law 25). What those bots then DO with it is not observable from here.
+// Headless transport. `origin` is a fixed argument per door, never read off the message (Law 23). The
+// result travels back on the same socket (Law 25).
 function handleOperatorCommand(ws, msg, origin) {
   const payload = operatorResult(msg.payload || {}, `socket:${msg.bot_id}`, origin);
   if (ws.readyState === WebSocket.OPEN) {
@@ -898,51 +661,23 @@ function handleOperatorCommand(ws, msg, origin) {
   }
 }
 
-// The verdict half of the handler above, shared by the socket and by the desk living in this process.
+// Verdict half of the handler above, shared by the socket and the desk.
 function operatorResult(p, source, origin) {
   const verb = p.verb;
   const args = p.args || {};
-  // `asker` is read off the payload and is meaningful ONLY on the in-game origin, where the foreman is the
-  // party that observed which player spoke. On the terminal door there is no asker and none is read:
-  // the operator is not a participant in ownership (see broadcastCommand).
+  // `asker` is meaningful only on the in-game origin; the terminal door reads none (see broadcastCommand).
   const asker = typeof p.asker === 'string' && p.asker.trim() ? p.asker.trim() : null;
   const result = runOperatorVerb(typeof verb === 'string' ? verb.trim() : '', source, args, origin, asker)
     || { sent: 0, skippedSpecies: 0, skippedOwner: 0, reason: 'refused' };
   return { verb, origin, ...result };
 }
 
-// WHO IS OUT THERE, AND WHOSE — answered from the live registry rather than from the PID file.
-//
-// The foreman needs this for two different questions and both were being answered badly. `list` read
-// fleet_control's runtime file, which records processes it once launched and reports long-dead PIDs as
-// roster entries — a human was being shown the launcher's memory instead of the world. And the two-bot
-// cap needs a COUNT OF WHAT THIS PERSON CURRENTLY HAS, which is exactly the kind of fact that must be
-// re-sensed rather than tallied as bots are handed out: a foreman holding its own counter loses it on
-// restart and drifts every time a bot dies (Invariant B).
-//
-// It reports the whole fleet, not the asker's share, and that is not a leak: `list` is meant to show a
-// human what is standing in the world with them, which they can also see by looking. What ownership
-// governs is who may COMMAND a bot, and that is decided at delivery.
-// ── WHERE EACH BODY IS AND WHAT IT IS DOING, RELAYED FROM THE CHAIR IT ALREADY WRITES ────────────
-// Added for the desk's `where`. NOTHING NEW IS SENSED AND NOTHING IS COMPUTED (Law 3): every bot already
-// stamps `body_cell` into its own boardroom chair on an interval, and the dispatcher already stamps the
-// `magnet` — the task-identity marker — into the same chair when it claims a job. Both were reaching this
-// process on every hq_delta and stopping here.
-//
-// THE MAGNET IS THE JOB TOKEN AND IS FORWARDED, NOT SUMMARISED. Which of its fields a person is shown is
-// the desk's business, not the coordinator's; picking two here would make this a second opinion about
-// what a bot is doing, disagreeing with the trace the moment the magnet gains a field (Law 16).
-//
-// A NULL IS AN ANSWER. No magnet is a bot holding no job — genuinely idle — and no body_cell is a bot
-// that has not reported a position yet. Both are facts, and the desk says so in words rather than
-// printing a zero for either (Law 25 — the absence is not a failure, and inventing a figure to fill it is).
-//
-// IT CARRIES THE LIVE FAULT TALLY TOO, and that is why a supervisor no longer needs a lens (Architect
-// 2026-09-16). The counts are spread in beside the roster fields rather than answered by a second
-// question, because "how is the fleet" is one question and splitting it would give a caller two
-// answers taken at two different instants (Law 16). A bot that has died still appears here — the
-// registry holds connection rather than life — so its error count survives its body, which is exactly
-// what a run verdict needs.
+// Who is out there, and whose — answered from the live registry, never a PID file (Invariant B).
+// Reports the whole fleet; ownership governs delivery, not visibility.
+// ── WHERE EACH BODY IS AND WHAT IT IS DOING ────────────
+// Relayed from the chair each bot already writes: `body_cell` and the dispatcher's `magnet` (Law 3,
+// Law 16). Null is an answer — no magnet is idle, no body_cell is unreported (Law 25). Carries the live
+// fault tally beside the roster (Law 16).
 function handleFleetQuery(ws, msg) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(createEnvelope('fleet_state', 'foreman', fleetState())));
@@ -956,59 +691,36 @@ function fleetState() {
     owner: c.owner,
     body_cell: (c.boardroom_chair && c.boardroom_chair.body_cell) || null,
     magnet: (c.boardroom_chair && c.boardroom_chair.magnet) || null,
-    // The body's own answer about whether it has a body, written by job_board every sweep. `null` is
-    // "it has not said yet" and is a different answer from `false` — a bot that has never swept cannot
-    // be reported alive on this process's guess (Law 25).
+    // First route search / first walk (navigator.announceFirstMove); null before then.
+    first_move_at: (c.boardroom_chair && c.boardroom_chair.first_move_at) || null,
+    // Bot's own liveness answer, written by job_board; null means not yet reported (Law 25).
     dead: (c.boardroom_chair && typeof c.boardroom_chair.dead === 'boolean') ? c.boardroom_chair.dead : null,
+    // The body's own running clock of time on jobs and time walking for them (bot_minutes); null before its first job ends.
+    work_clock: (c.boardroom_chair && c.boardroom_chair.work_clock) || null,
+    // Which structures the body read as built on its last sweep (job_board); null before its first sweep.
+    built: (c.boardroom_chair && c.boardroom_chair.built) || null,
+    // The body's last count of finished cubes of the building it makes (downloaded_build); null before its first count.
+    cubes_finished: (c.boardroom_chair && c.boardroom_chair.cubes_finished) || null,
     ...tallyOf(id),
   }));
-  // Departed bots ride beside the roster, never inside it — see departedBots' header for why that
-  // separation is load-bearing for the foreman and the camera warden.
+  // Departed bots ride beside the roster, never inside it (Law 8).
   const departed = [...departedBots.entries()].map(([id, d]) => ({ id, ...d, ...tallyOf(id) }));
-  // THE SITES THAT ALREADY EXIST, READ-ONLY (2026-09-18). The desk sites every base before it spawns a body,
-  // so it must know whether one is already there — *"if theres already a partially constructed building then
-  // it again spawns bots nearby"*. Without this it surveys blind to the fleet's own memory and hands a new
-  // site that the crew's existing lock contradicts. Each row is the `set_buildspot` + `blueprint_paster`
-  // chairs of one live building, keyed `<structure>|<owner>`; wiped rows are left out.
-  //
-  // A READ, SO THE DOOR STAYS WHAT IT IS. The door refuses to be an HQ writer, because a writer here would let
-  // anyone who can open this socket plant a base; reading where bases already stand grants nothing, and it is
-  // the same "read everyone's" every body's own siting has always done (`find_buildingspot`).
+  // Sites that already exist, read-only, so the desk doesn't survey over an existing lock. Keyed
+  // `<structure>|<owner>`; wiped rows left out.
   const buildings = {};
   for (const [key, entry] of Object.entries(mergedBuildings)) {
     if (!entry || isBuildingTombstone(entry) || !entry.set_buildspot) continue;
     buildings[key] = { set_buildspot: entry.set_buildspot, blueprint_paster: entry.blueprint_paster || null };
   }
-  return { bots, departed, buildings, world: foremanWorld.status() };
+  return { bots, departed, buildings, warnings: warningsNow(), workspace: brain.workspaceState(), world: foremanWorld.status(), run: require('./foreman_plan').progressNow() };
 }
 
-// handleRequestCommand — a person's standing requirement, arriving from the desk.
-//
-// THE ASKER IS THE OWNER KEY, which is what makes this safe to accept from a socket: a request can only
-// ever be filed against the name of the person who spoke it, so one player cannot place or withdraw
-// work on another's crew. Refused outright when unnamed, for the same reason an unaddressed operator
-// verb is (Law 13 — an anonymous request would be a requirement belonging to nobody).
-//
-// THE RULES ARE NOT RESTATED HERE. Whether an item may be asked for, whether a repeat replaces or adds,
-// what a row looks like — all of it lives in request_ledger and is called, never copied, so the desk and
-// the crews cannot come to disagree about what was asked (Law 16).
-// crewProgress(asker) → { item: { ...measurement, measured_at, by } } for the bots this person owns, or
-// {} when none of them has reported yet.
-//
-// PURE RELAY, NO ARITHMETIC (Law 3). Every figure here was computed inside a body by the same lens its
-// own supply assessor stands down on; this picks the freshest report per item and forwards it untouched.
-// The desk cannot compute these — it holds no owner key, so it cannot tell which chests belong to whom —
-// and the foreman must not either: counting the merged station map here would be a second answer to
-// "how much have we got", disagreeing with the crews the moment a claim is held (Law 16, Law 25).
-//
-// FRESHEST WINS, PER ITEM, and it is chosen per item rather than per bot because a crew's members sync
-// at different moments and a whole-chair choice would discard a newer figure sitting beside an older one.
-// Two bots of one crew read the same shared chests, so they do not disagree about a count — only about
-// when they last looked.
-//
-// SILENCE IS REPORTED AS SILENCE. A row with no measurement is left absent rather than filled with a
-// zero: "nothing gathered yet" and "no bot has looked yet" are different facts, and only one of them is
-// news about the work (Law 25 — an invented figure is the failure, not the missing one).
+// handleRequestCommand — a person's standing requirement, from the desk.
+// Asker is the owner key; refused when unnamed (Law 13). Rules live in request_ledger, called never
+// copied (Law 16).
+
+// crewProgress(asker) → freshest measurement per item for the bots this person owns, or {} (Law 3, Law
+// 16). Silence is reported as silence, not zero (Law 25).
 function crewProgress(asker) {
   const out = {};
   for (const [botId, client] of botClients.entries()) {
@@ -1034,7 +746,7 @@ function handleRequestCommand(ws, msg) {
   }
 }
 
-// The verdict half of the handler above, shared by the socket and by the desk living in this process.
+// Verdict half of the handler above, shared by the socket and the desk.
 function requestResult({ action, item, quantity, asker }) {
   if (!asker) {
     warn('In-game door: a request naming no asker was refused.');
@@ -1064,11 +776,8 @@ function requestResult({ action, item, quantity, asker }) {
 }
 
 // ── THE IN-GAME DOOR ─────────────────────────────────────────────────────────────────────────────
-// Its own listener, and it accepts exactly ONE message type. A door that also spoke the fleet's
-// internal vocabulary would be a second registration path, a second claim arbiter and a second HQ
-// writer, reachable by anyone who can open a socket to it — the in-game surface would then be the
-// whole protocol rather than the operator verbs. Everything else arriving here is reported and dropped:
-// reported, because a silently ignored message is indistinguishable from a deaf door (Law 6).
+// Its own listener, accepting operator verbs and one roster question. Anything else is reported and
+// dropped (Law 6).
 function onIngameConnection(ws) {
   log('In-game door: a client connected.');
   ws.on('message', (raw) => {
@@ -1114,15 +823,26 @@ function onConnection(ws) {
       case 'planning_request':
         handlePlanningRequest(ws, msg);
         break;
+      case 'planning_cancel':
+        if (botClients.has(msg.bot_id)) brain.cancelWorkspaceRequest(msg.bot_id, msg.payload && msg.payload.requestId);
+        break;
       case 'planning_release':
         handlePlanningRelease(ws, msg);
+        break;
+      case 'body_stood_down':
+        handleBodyStoodDown(ws, msg);
+        break;
+      case 'fleet_crash':
+        handleFleetCrash(ws, msg);
         break;
       case 'log':
         handleLog(msg);
         break;
+      case 'item_book':
+        itemBook.record(msg.bot_id, msg.payload && msg.payload.entries);
+        break;
       case 'operator_command':
-        // This listener IS the terminal door — fleet_control speaking for the operator, and the
-        // operator's own console one function down. Stated here, once, per transport.
+        // This listener is the terminal door (fleet_control and the console).
         handleOperatorCommand(ws, msg, ORIGIN.TERMINAL);
         break;
       default:
@@ -1134,20 +854,16 @@ function onConnection(ws) {
     for (const [botId, client] of botClients) {
       if (client.ws === ws) {
         log(`Bot '${botId}' disconnected.`);
-        // Recorded BEFORE the delete, so the tally this bot accumulated travels with the departure —
-        // a crash usually says something on its way out, and that last line is the first thing anyone
-        // investigating will want. See departedBots' header.
-        departedBots.set(botId, { gone_at: new Date().toISOString(), last_error: tallyOf(botId).last_error });
+        // Recorded before the delete so the tally travels with the departure.
+        departedBots.set(botId, { gone_at: new Date().toISOString(), last_error: tallyOf(botId).last_error,
+          sent_home: sentHome.get(botId) || null });
         botClients.delete(botId);
         brain.releaseForBot(botId);
         broadcastBoardroom();
-        // The player's file must show the crew that is ACTUALLY here. A chair is a live bot's
-        // inventory, so it dies with the connection (Law 8) — the buildings and stations in the
-        // same file do not, and that asymmetry is the whole point of the store. Written here
-        // rather than left to the debounce because a shutdown can arrive first and freeze a
-        // departed bot's inventory into the file as if the bot were still standing there.
+        // The player's file must show the crew actually here; a chair dies with the connection (Law 8).
         savePlayerMemory();
-        ownerMemory.flushNow();   // not queued behind the debounce: measured at up to 40s of ghost otherwise
+        ownerMemory.flushNow();   // not queued behind the debounce
+        bodyLeft(botId, 'its connection to the foreman closed', departedBots.get(botId).last_error || 'the body reported no error before it left');
         break;
       }
     }
@@ -1163,16 +879,11 @@ function onConnection(ws) {
 // SECTION 5 — Server startup
 // ─────────────────────────────────────────────────────────────────────────────
 
-const wss = new WebSocket.Server({ port: PORT });
+// Both of the foreman's ports bind to this computer only: every bot it serves runs here.
+const wss = new WebSocket.Server({ port: PORT, host: '127.0.0.1' });
 wss.on('connection', onConnection);
 
-// A PORT ALREADY IN USE IS THE FIRST ERROR A NEW PERSON MEETS, and it reached them as an unhandled
-// 'error' event: a nine-line Node stack naming `websocket-server.js` and the word EADDRINUSE, which
-// says nothing about what they did or what to do. The commonest cause is the most innocent one —
-// running a launcher twice, or leaving yesterday's foreman alive — so it is a world-fact rather than a
-// coding violation, and it is refused in the world's terms with the two things that actually fix it
-// (Law 13: every failure states exactly what caused it; Law 25: a message that does not say what to do
-// costs a search). Anything else is re-thrown untouched rather than swallowed into this one diagnosis.
+// A port already in use is refused in world terms, with the fix named (Law 13, Law 25).
 const listenFailure = (which) => (err) => {
   if (err && err.code === 'EADDRINUSE') {
     console.error(`\n  The foreman cannot start: something is already using port ${err.port || PORT}`
@@ -1186,17 +897,12 @@ const listenFailure = (which) => (err) => {
 };
 wss.on('error', listenFailure('the fleet port'));
 
-// The second door. Bound to localhost EXPLICITLY, unlike the fleet port: this is the one surface that
-// carries a stranger's authority, and the machine it runs on is the only place it has any business
-// being reachable from. A door open to the network would let anything that can route to this host
-// command the contractors without ever joining the world the foreman listens in.
+// The in-game door binds to localhost only — the surface that carries a stranger's authority.
 const ingameDoor = new WebSocket.Server({ port: INGAME_DOOR_PORT, host: '127.0.0.1' });
 ingameDoor.on('connection', onIngameConnection);
 ingameDoor.on('error', listenFailure('the in-game door'));
 
-// Startup banner (bright magenta, bold) — deliberately a DIFFERENT colour from the bots' cyan banner
-// so the two window types are told apart at a glance. This is the one window that carries the whole
-// fleet's live log stream; the bot windows are near-silent by design.
+// Startup banner, magenta — distinct from the bots' cyan banner.
 (function hubBanner() {
   const M = '\x1b[95m\x1b[1m', R = '\x1b[0m';
   const bar = '═'.repeat(50);
@@ -1207,22 +913,17 @@ ingameDoor.on('error', listenFailure('the in-game door'));
 })();
 
 // ── THE MIRROR STARTS FULL, NOT EMPTY ───────────────────────────────────────────────────────────────
-// Before this line ran, `mergedBuildings` and `mergedStations` began every foreman life as `{}` and a
-// player's places existed only for as long as some bot that had built them kept reconnecting. This is the
-// line that makes a player's HQ outlive the bodies — and it must run BEFORE the first bot can register,
-// which is why it sits with the startup banner rather than inside an async warm-up.
+// Restores a player's HQ before the first bot can register.
 Object.assign(mergedBuildings, _restored.buildings);
 Object.assign(mergedStations,  _restored.stations);
 
-log(`Foreman WebSocket server listening on ws://localhost:${PORT}`);
+log(`Foreman WebSocket server listening on ws://127.0.0.1:${PORT}`);
 log(`In-game door listening on ws://127.0.0.1:${INGAME_DOOR_PORT} — verbs arriving here reach CONTRACTORS only.`);
 log(`Waiting for bot connections...`);
 log(`Operator console ready — type a verb + Enter to command every bot: start | stop | flush | shutdown.`);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 6 — Operator console (TTY transport into runOperatorVerb — Law 16:
-// the socket 'operator_command' is the other transport, same one pathway).
-// The foreman stays passive (Law 3): it only validates and forwards, never decides.
+// SECTION 6 — Operator console (TTY transport into runOperatorVerb, Law 16).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -1236,25 +937,40 @@ rl.on('line', (input) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 7 — The desk's entrance (the foreman lives in this process)
 // ─────────────────────────────────────────────────────────────────────────────
-// The foreman used to reach this file through the in-game socket, from a second process. Now that it is
-// the same process, it calls the same three answers directly. They are the functions the socket handlers
-// call, so the desk and a socket caller cannot come to hear different answers (Law 16). The origin is
-// fixed HERE as in-game, exactly as the in-game listener fixes it: the desk relays a player's words, and
-// a player's words never carry console authority, whatever road they took. The socket door stays open
-// for the readers that are still other processes (run.js, the camera warden).
+// Calls the same three answers the socket handlers call (Law 16). Origin fixed as in-game.
+// ── WHERE THE CREW LIVES, AS ONE CELL ────────────────────────────────────────
+// The alpha structure's buildspot (`architect_config.ALPHA_STRUCTURE`), read from lockSite's write.
+// Null when nothing is sited (Law 25).
+function alphaSpot() {
+  const { ALPHA_STRUCTURE } = require('../Thinking_fragments/architect_config');
+  const names = new Set(Object.values(ALPHA_STRUCTURE));
+  for (const [key, entry] of Object.entries(mergedBuildings)) {
+    if (!names.has(key.split(BUILDING_ROOM_SEPARATOR)[0])) continue;
+    if (isBuildingTombstone(entry)) continue;
+    const spot = entry.set_buildspot && entry.set_buildspot.transpose_origin;
+    if (spot && Number.isFinite(spot.x) && Number.isFinite(spot.y) && Number.isFinite(spot.z)) {
+      return { structure: key.split(BUILDING_ROOM_SEPARATOR)[0], x: spot.x, y: spot.y, z: spot.z };
+    }
+  }
+  return null;
+}
+
 const desk = Object.freeze({
   fleetState: () => fleetState(),
+  // The item book's file, written on demand; the run's end calls it once the bodies have left.
+  writeItemBook: () => itemBook.write(),
+  flushMemory: () => ownerMemory.flushNow(),
+  // The crew's home cell, for the one verb that takes a person to it (see alphaSpot).
+  alphaSpot: () => alphaSpot(),
   operator: (payload) => operatorResult(payload || {}, 'desk', ORIGIN.INGAME),
   request: (payload) => requestResult(payload || {}),
   // The one writer of a location (see lockSite). The desk calls it after its survey, before any spawn.
   lockSite: (rows, ownerKey) => lockSite(rows, ownerKey),
-  // THE FLEET STOPS WHEN THE RUN ENDS (Architect 2026-09-18: *"The body is needed, it’s not an optional
-  // process"*, and *"Who owns the process? Foreman does."*). Not a player's word, so it does not ride
-  // `operator`: this is the process ending its own run, and `stop` is the operator verb every bot already
-  // obeys from the terminal. It is a function of its own so no caller can pass an origin in.
+  // ── THE FLEET STOPS WHEN THE RUN ENDS ──
+  // `why` rides to the bodies so each records the real cause of its own stop.
   stopFleet: (why) => {
     warn(`STOPPING THE FLEET — ${why}`);
-    return runOperatorVerb('stop', 'foreman-body', {}, ORIGIN.TERMINAL);
+    return runOperatorVerb('stop', 'foreman-body', { why }, ORIGIN.TERMINAL);
   },
 });
 

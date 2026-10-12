@@ -3,21 +3,16 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/voxe
 // tool: voxel_reader_stress_bench — the ADVERSARIAL half of the reader evidence. Its job is to BREAK the
 // prototype, not to confirm it.
 //
-// Architect 2026-08-04: "gotta challenge before we use. what was tha nature of the test? does it
-// compensate for a dynamic voxel changing world? does this savings go away when the dynamic world
-// changes? like digging or creeper explosion. also, i want more data saying the test was a success. you
-// are self certifying right now. i need more data so i can decide if its good. not you."
-//
 // ── WHY THIS FILE EXISTS SEPARATELY FROM astar_reader_v2_bench ──────────────────────────────────────
-// That bench was built to measure a speedup and it gates on route identity; every phase in it is a
-// phase the prototype was expected to pass. A suite whose author expects it to pass is a suite that
-// certifies its author (Law 25 — the performer deciding what counts as enough for the asker). This file
-// is built the other way round: every phase below is an attempt to produce a WRONG answer out of the
-// prototype, and three of them succeed by design against a deliberately misused API so that the ones
-// that DON'T fire mean something. A green run here is evidence; a green run there was a claim.
+// astar_reader_v2_bench measures a speedup and gates on route identity; every phase in it is a phase the
+// prototype is expected to pass. A suite whose author expects it to pass is a suite that certifies its
+// author (Law 25 — the performer deciding what counts as enough for the asker). This file is built the
+// other way round: every phase below attempts to produce a WRONG answer out of the prototype, and three
+// of them succeed by design against a deliberately misused API, so that the ones that don't fire mean
+// something. A green run here is evidence; a green run from a suite built to pass is only a claim.
 //
-// It also writes every raw sample to a JSON file rather than only printing aggregates, because a mean is
-// the performer's summary of its own result. The file is the data; the console is the summary.
+// It writes every raw sample to a JSON file, not only aggregates: the file is the data, the console is
+// the summary.
 //
 // ── THE FIVE PHASES ─────────────────────────────────────────────────────────────────────────────────
 //   1 CHURN CORRECTNESS   every reader, against bot.blockAt, immediately after each of N real server
@@ -48,7 +43,7 @@ const DIST     = Number(arg('dist', 64));
 const REPEAT   = Number(arg('repeat', 6));
 const MAXNODES = Number(arg('nodes', 30000));
 const CHURN_N  = Number(arg('churn', 120));
-// Version READ from architect_config, never restated here — one authored answer (Law 16, 2026-09-17).
+// Version READ from architect_config, never restated here — one authored answer (Law 16).
 // A bench pinned to a different Minecraft than the body grades this fleet against a game it is not playing.
 const { SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
 const VERSION  = arg('version', SERVER_MINECRAFT_VERSION);
@@ -69,9 +64,8 @@ const check = (name, cond, detail) => {
     return cond;
 };
 
-// The comparison key: exactly the fields A* consults, and nothing else. Widening it would fail the
-// prototype for a difference the search cannot observe (light/biome are deliberately not per-position in
-// the shell); narrowing it would let a real disagreement through.
+// The comparison key: exactly the fields A* consults, and nothing else — light/biome are not per-position
+// in the shell and are out of scope for this key.
 const key = b => b === null ? 'NULL' : `${b.name}|${b.boundingBox}|${!!b.diggable}|${pathfinding.isFullHeightFloor(b)}`;
 
 async function main() {
@@ -112,10 +106,10 @@ async function main() {
 }
 
 // ── PHASE 1 ─────────────────────────────────────────────────────────────────────────────────────────
-// The direct answer to "does it compensate for a dynamic voxel changing world". Every reader is asked
-// about the cell IMMEDIATELY after the server rewrites it, with no invalidation call of any kind. The
-// last op is a 9x9x9 /fill — 729 blocks in one multi_block_change, which is creeper-scale and then some
-// (a creeper destroys ~30-50). Digging is the same packet path, so this covers it.
+// Whether each reader tracks a world that is actively being rewritten. Every reader is asked about the
+// cell IMMEDIATELY after the server rewrites it, with no invalidation call of any kind. The last op is a
+// 9x9x9 /fill — 729 blocks in one multi_block_change, creeper-scale and then some (a creeper destroys
+// ~30-50). Digging travels the same packet path, so this covers it too.
 async function phase1ChurnCorrectness(bot, link, readers) {
     log('phase', '1 — CHURN CORRECTNESS: do the readers track a world being actively rewritten?');
     const base = bot.entity.position.floored();
@@ -181,13 +175,11 @@ function phase2NegativeControls(bot, proto) {
 
     // (i) The borrowed shell's contract, violated on purpose: hold the block across another read.
     //
-    // THE FIRST VERSION OF THIS CONTROL DID NOT FIRE, and what it exposed was a wrong claim in the
-    // prototype's own header rather than a bad test. Shells are memoized PER STATE ID, so reading a
-    // different block leaves the held one untouched — the corruption needs a second read of the SAME
-    // state id. That makes the hazard worse, not milder: it is intermittent and data-dependent, so a
-    // caller that misuses borrowing survives every test where the two cells happen to differ and
-    // corrupts silently the moment they match. The control therefore hunts for two cells that share a
-    // state id, which is the case a careless caller will meet constantly (stone beside stone).
+    // Shells are memoized PER STATE ID, so reading a different block leaves a held one untouched — the
+    // corruption needs a second read of the SAME state id. The hazard is intermittent and data-dependent:
+    // a caller that misuses borrowing survives every read where the two cells happen to differ and
+    // corrupts silently the moment they match. The control hunts for two cells that share a state id,
+    // which a careless caller meets constantly (stone beside stone).
     let a2 = null, b2 = null;
     for (let dx = -6; dx <= 6 && !b2; dx++) for (let dz = -6; dz <= 6 && !b2; dz++) for (let dy = -3; dy <= 1 && !b2; dy++) {
         const p = new Vec3(base.x + dx, base.y + dy, base.z + dz);
@@ -225,9 +217,8 @@ function phase2NegativeControls(bot, proto) {
 
 // ── PHASE 3: THE HELD-HANDLE HAZARD ─────────────────────────────────────────────────────────────────
 // The column memo is the one thing the prototype keeps across reads, so this is the one place a stale
-// answer could come from. Not a stale BLOCK (the object is live) but a stale IDENTITY: if a column is
-// unloaded while a reader still holds it, the reader would answer from terrain the bot can no longer
-// see. Provoked by walking the bot far enough that the server unloads the columns behind it.
+// answer could come from — not a stale BLOCK (the object is live) but a stale IDENTITY: a column held
+// past its unload would answer about terrain outside the bot's current view (Law 23).
 async function phase3HeldHandle(bot, proto) {
     log('phase', '3 — HELD-HANDLE HAZARD: is the memo dropped when its column is unloaded?');
     const base = bot.entity.position.floored();
@@ -253,11 +244,10 @@ async function phase3HeldHandle(bot, proto) {
 
 // ── PHASES 4 and 5: TIMING, QUIET vs CHURNING ───────────────────────────────────────────────────────
 // Same trials, run twice: once against a quiet world and once while the server rewrites the SAME columns
-// the search reads. The churn is placed in the air well above the terrain, which is deliberate and is a
-// stated limitation: it produces real packets, real multi_block_change traffic and real section writes in
-// the columns under search, WITHOUT altering the ground the routes cross — so route identity remains a
-// valid gate. A change ON the path would legitimately change the route, and correctness under that case
-// is what phase 1 tests directly.
+// the search reads. The churn sits in the air well above the terrain: it produces real packets, real
+// multi_block_change traffic and real section writes in the columns under search, without altering the
+// ground the routes cross, so route identity stays a valid gate. Correctness under a change ON the path
+// is phase 1's question.
 async function phaseTrials(bot, shipped, proto, scoped, link, label) {
     log('phase', `${link ? '4' : '5'} — TIMING (${label}): 4 readers, one unmodified computeAStar, ${REPEAT} trials`);
     const feet = bot.entity.position.floored();
@@ -313,18 +303,16 @@ async function phaseTrials(bot, shipped, proto, scoped, link, label) {
             ms: Object.fromEntries(ARMS.map(a => [a.n, +out[a.n].ms.toFixed(1)])),
             reads: Object.fromEntries(ARMS.map(a => [a.n, out[a.n].reads])),
             memoSize: scoped.memoSize, pathLen: (out.A.res?.path || []).length,
-            // WHERE THE TIME ACTUALLY GOES. Once arm D showed that removing 97% of world reads changes
-            // nothing, the remaining cost has to be the search's own machinery — so the search's shape is
-            // the thing to record. nodesVisited/pathLen is the expansion overhead: how many cells were
-            // examined per cell of route actually returned.
+            // WHERE THE TIME GOES: the search's own machinery, recorded via its expansion shape.
+            // nodesVisited/pathLen is the expansion overhead — how many cells were examined per cell of
+            // route actually returned.
             nodesVisited: out.A.res?.nodesVisited ?? null,
             partial: out.A.res?.partial ?? null,
             readsPerNode: out.A.res?.nodesVisited ? +(out.A.reads / out.A.res.nodesVisited).toFixed(1) : null,
             nodesPerPathCell: out.A.res?.nodesVisited && (out.A.res?.path || []).length
                 ? +(out.A.res.nodesVisited / out.A.res.path.length).toFixed(1) : null,
             // The re-read factor: total reads the search issued divided by the distinct cells it ever
-            // asked about. This is the number that decides whether caching a per-cell answer can pay at
-            // all, so it is recorded per trial rather than argued once.
+            // asked about — the number that decides whether caching a per-cell answer can pay at all.
             distinctCells: scoped.memoSize,
             // Requests, not live reads. `stats.reads` only counts reads that reached the chunk store, so
             // with the memo on it equals the miss count and the ratio would be 1.0 by construction — a

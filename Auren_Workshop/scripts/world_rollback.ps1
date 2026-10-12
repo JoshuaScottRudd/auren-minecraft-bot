@@ -9,15 +9,13 @@
 
 .ACTIONS
   snapshot : Copy the current world folder into a timestamped (or named) snapshot directory.
-  restore  : Replace the current world folder with a chosen snapshot (backing up current first).
+  restore  : Replace the current world folder with a chosen snapshot. The world it replaces is deleted.
              Bot kernel state (corporate_headquarters*.json) is LEFT INTACT so restoring a
              completed-build snapshot keeps its build-center/stations. If the snapshot is from a
              DIFFERENT world, run the 'flush' verb yourself before starting -- flush is deliberate,
              never a restore side effect.
   list     : List available snapshots for a world.
   prune    : Keep only the newest N snapshots, deleting older ones.
-  trim     : Delete pre-restore safety copies beyond -KeepBackups (restore does this itself; this
-             verb is for cleaning up a backlog without performing a restore).
 
 .PARAMETERS
   -World         Name of the world folder. Default: whatever server.properties says is live —
@@ -27,8 +25,7 @@
   -Zip           Compress snapshot to .zip (speeds up storage; slower restore). Not required.
   -Keep          When pruning: how many latest snapshots to retain.
   -Force         Skip confirmation prompts for restore/prune.
-  -Action        One of snapshot|restore|list|prune|trim.
-  -KeepBackups   Pre-restore safety copies to retain (default 3). Applied on every restore.
+  -Action        One of snapshot|restore|list|prune.
   -PidFile       Optional path to a server PID file (if you modify your launch script to create one).
   -AutoStart     After restore, restart server using launch command (provide -LaunchScript or -LaunchCommand).
   -LaunchScript  Relative path to a .ps1 or .bat used to start the server (mutually exclusive with -LaunchCommand).
@@ -64,7 +61,7 @@
   This script can only kill the PID if provided; for safest operation, stop manually first.
 #>
 param(
-  [Parameter(Mandatory=$true)][ValidateSet('snapshot','restore','list','prune','trim')][string]$Action,
+  [Parameter(Mandatory=$true)][ValidateSet('snapshot','restore','list','prune')][string]$Action,
   # Empty = read `level-name` from server.properties. The old default was the literal 'Test world',
   # which silently became wrong the day the active level changed and would have pointed every verb at
   # a world nobody runs (Invariant B — re-sense the current state, never act on a remembered one;
@@ -79,9 +76,6 @@ param(
   [string]$SnapshotsDir = 'world_snapshots',
   [switch]$Zip,
   [int]$Keep = 0,
-  # How many pre-restore safety copies to retain. See Invoke-BackupRetention for why this defaults to
-  # a number instead of "all" — 302 of them reached 21 GB before anyone looked.
-  [int]$KeepBackups = 3,
   [switch]$Force,
   [string]$PidFile = 'server.pid',
   [switch]$AutoStart,
@@ -102,8 +96,8 @@ function Write-Err($msg){ Write-Host "[ERR ] $msg" -ForegroundColor Red }
 
 # -Root MAKES THIS THE ONE ROLLBACK IMPLEMENTATION FOR EVERY SERVER ON THE MACHINE (Law 16). A machine can
 # hold several Minecraft servers — the fleet's own dev world and any other world beside it — and each needs
-# snapshots, restores and the same pre-restore safety copy.
-# A second rollback per server would be a second set of retention rules, a second world-is-held guard and
+# snapshots and restores.
+# A second rollback per server would be a second world-is-held guard and
 # a second place for the destructive path to be wrong. Every path below resolves through $scriptRoot.
 #
 # IT SHIPS WITH THE BOT (moved out of MinecraftServer\ on 2026-09-11), because a run that restores a world
@@ -148,47 +142,10 @@ if(!(Test-Path $worldSnapRoot)){ New-Item -ItemType Directory -Path $worldSnapRo
 # developer door was dot-sourced above and brought strict mode in with it, which refuses .Count on a single
 # object. The first restore after that died "The property 'Count' cannot be found on this object" before
 # touching anything. @() alone is not enough: PowerShell unrolls an array a function returns, so a
-# one-item @() arrives as the item again. The unary comma returns the array itself. Get-PreRestoreBackups
-# below carries the same fix; it had only escaped because three backups existed.
+# one-item @() arrives as the item again. The unary comma returns the array itself.
 function Get-Snapshots(){
   if(!(Test-Path $worldSnapRoot)){ return ,@() }
   return ,@(Get-ChildItem -Path $worldSnapRoot -Directory | Sort-Object Name -Descending)
-}
-
-# ── The pre-restore safety copies ────────────────────────────────────────────────────────────────
-# THE BLOAT THIS EXISTS TO STOP, and why nobody saw it: `restore` copies the whole world to
-# $snapRoot\backup_before_restore_<ts> every single time, but `list` and `prune` both read
-# $worldSnapRoot — the per-world subfolder — so the ONE directory that grows without bound was the one
-# directory the tool's own verbs could not see. 302 of them accumulated between 2025-08-14 and
-# 2026-08-01 and reached 21 GB, against a live world of 19 MB. Nothing was broken; nothing reported it.
-#
-# Two fixes, and they are the same law twice: retention gives each backup a terminator so it does not
-# outlive the run that raised it (Law 8), and `list` now reports them so the growth is inspectable
-# rather than hidden (Invariant C / Law 6). Retention is the guarantee; the report is the catch.
-#
-# Deliberately NOT filed under $worldSnapRoot with the named snapshots: `restore` with no -Name takes
-# $snapshots[0], the newest by name, and a backup landing in that list would make an accidental
-# restore-of-a-backup the default. They stay separate and are pruned on their own clock.
-function Get-PreRestoreBackups(){
-  if(!(Test-Path $snapRoot)){ return ,@() }
-  return ,@(Get-ChildItem -Path $snapRoot -Directory -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -like 'backup_before_restore_*' } | Sort-Object Name -Descending)
-}
-
-function Invoke-BackupRetention([int]$Keep){
-  if($Keep -lt 0){ return }
-  $all = Get-PreRestoreBackups
-  if($all.Count -le $Keep){ Write-Info "Pre-restore backups: $($all.Count) (retention $Keep) — nothing to trim."; return }
-  $toDelete = @($all | Select-Object -Skip $Keep)
-  Write-Info "Pre-restore backups: $($all.Count); retention is $Keep — trimming $($toDelete.Count) oldest."
-  foreach($d in $toDelete){
-    try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction Stop }
-    catch {
-      # Environmental, not a coding fault: an explorer window or a scanner can hold a folder. The
-      # restore already succeeded and the next run trims again, so this warns and never aborts.
-      Write-Warn "Could not trim $($d.Name): $($_.Exception.Message)"
-    }
-  }
 }
 
 # Ensure the Minecraft server is stopped before destructive operations.
@@ -316,24 +273,6 @@ switch($Action){
         Write-Host "  - $label"
       }
     }
-    # Always reported, even when zero. This line is the whole reason the 21 GB could not have hidden:
-    # `list` used to answer only about the per-world folder, so the one tree that grows unbounded was
-    # invisible to the verb whose job is showing you what is on disk (Invariant C).
-    $backups = Get-PreRestoreBackups
-    $bytes = 0
-    foreach($b in $backups){
-      $bytes += (Get-ChildItem -LiteralPath $b.FullName -Recurse -File -ErrorAction SilentlyContinue |
-                 Measure-Object -Property Length -Sum).Sum
-    }
-    $gb = [math]::Round($bytes / 1GB, 2)
-    Write-Host "Pre-restore backups (all worlds): $($backups.Count), $gb GB — retention $KeepBackups per restore." -ForegroundColor Green
-    if($backups.Count -gt $KeepBackups){
-      Write-Warn "Above retention. The next restore trims automatically, or run: rollback.ps1 -Action trim"
-    }
-    break
-  }
-  'trim' {
-    Invoke-BackupRetention -Keep $KeepBackups
     break
   }
   'restore' {
@@ -351,13 +290,6 @@ switch($Action){
       $resp = Read-Host "Confirm restore of snapshot '$Name' to world '$World'? This overwrites current world (y/N)"
       if($resp -notin @('y','Y','yes','YES')){ Write-Info 'Restore cancelled.'; exit 0 }
     }
-    $backupDir = Join-Path $snapRoot ("backup_before_restore_" + (Get-Date -Format 'yyyyMMdd_HHmmss'))
-    Write-Info "Backing up current world to $backupDir"
-    Copy-Item -Path $worldPath -Destination $backupDir -Recurse -Force
-    # Trim AFTER the new copy exists, never before: the retention count includes the backup this
-    # restore just took, so the world being replaced is inside the window and can never be the one
-    # deleted to make room for itself.
-    Invoke-BackupRetention -Keep $KeepBackups
     Write-Info "Removing current world folder ( $worldPath )"
     # Waits for the dying JVM to release the folder, by attempting the removal itself — see the
     # function's note for why probing session.lock instead was a proxy that passed while the real

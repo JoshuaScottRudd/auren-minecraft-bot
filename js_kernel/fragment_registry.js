@@ -18,15 +18,11 @@ const buildingManager     = require('@action/building_manager.js');
 const miningManager       = require('@action/mining_manager.js');
 const farmManager         = require('@action/farm_manager.js');
 const eatManager          = require('@action/eat_manager.js');
-// Death recovery — a MANAGER because both its acts are verified by sensing rather than by trusting the
-// command that caused them (spawn → is there a body; teleport → did it actually move). It delegates to no
-// executor: each act is a single packet whose whole substance is the check around it.
+// Death recovery — a MANAGER: each act (spawn checked for a body, teleport checked for actual movement) is
+// verified by sensing its outcome. It delegates to no executor; each act is a single packet with its check
+// built in.
 const deathManager        = require('@action/death_manager.js');
 const groundSalvageExecutor = require('@action/ground_salvage_executor.js');
-// compost_executor is a LIBRARY: filling and emptying the compost bin is part of inventory swapping, so
-// both its verbs happen inside one dumpExcess visit, and it has no `receive` and no signal can be routed
-// to it. inventory_swapper requires it directly — same conversion land_prep and farm_executor got, and
-// the same reason it carries no entry below.
 
 // ── Executors ───────────────────────────────────────────────────────────────
 const explorationExecutor = require('@action/exploration_executor.js');
@@ -37,53 +33,48 @@ const preconstruction     = require('@action/preconstruction.js');
 const buildExecutor       = require('@action/build_executor.js');
 const deliveryExecutor    = require('@action/delivery_executor.js');
 const furnaceExecutor     = require('@action/furnace_executor.js');
-// find_buildingspot + set_buildspot are LIBRARIES now: their reactive `receive`s — the lazy per-blueprint
-// locate route — are retired under Law 16 (one pathway), so they are no longer signal-dispatch targets
-// and carry no registry entry. lock_all_buildspots requires them directly (locate/lock) as the ONE locator.
-// lock_all_buildspots IS A LIBRARY NOW TOO (2026-09-18): its `receive` served the body's own siting job,
-// which is deleted — the foreman sites the base and `start_injector` records the handed site by calling
-// `recordHandedSite` directly. No signal routes to it, so it carries no entry here.
+const compostExecutor     = require('@action/compost_executor.js');
+const chestHousekeepingExecutor = require('@action/chest_housekeeping_executor.js');
+// find_buildingspot, set_buildspot and lock_all_buildspots are LIBRARIES: lock_all_buildspots calls the
+// other two directly (locate/lock) as the one locator (Law 16), so none carries a `receive` and none has a
+// registry entry. The foreman sites the base; `start_injector` records the handed site by calling
+// `recordHandedSite` directly.
 const setWoodPreference   = require('@action/set_wood_preference.js');
 const idlePark            = require('@action/idle_park.js');
-// land_prep + farm_executor are LIBRARIES now: farm_manager owns the tend loop and calls their verbs
-// directly — land_prep.prepare() once, farm_executor.tendPlot() per plot (Law 15). Their signal `receive`s
-// are retired, so they are no longer signal-dispatch targets and carry no registry entry — the same
-// conversion find_buildingspot/set_buildspot got above.
+// land_prep and farm_executor are LIBRARIES: farm_manager owns the tend loop and calls their verbs
+// directly — land_prep.prepare() once, farm_executor.tendPlot() per plot (Law 15) — so neither has a
+// registry entry.
 const torchExecutor       = require('@action/torch_executor.js');
 const canopyClearExecutor = require('@action/canopy_clear_executor.js');
-// The producer supply_manager dispatches for a cobblestone shortfall — the stone sibling of
-// harvest_executor, dispatched by material rather than by a job type of its own.
+const clearGroundExecutor = require('@action/clear_ground_executor.js');
+// A downloaded building's site works — ONE verb (Law 0): work one anchor cube from beneath, removing every
+// wrong block and placing every right one. The ground is cleared by that same verb, so there is no scrape,
+// basement or seal fragment. The felling phase has no fragment of its own; it is the canopy executor above,
+// carrying the site's box.
+const buildColumnExecutor     = require('@action/build_column_executor.js');
+// A column's material is staged before the column is entered: withdraw, craft, then the executor above.
+const columnPreparation       = require('@action/column_preparation.js');
+// supply_manager dispatches this for a cobblestone shortfall — the stone sibling of harvest_executor,
+// keyed by material.
 const stoneProspectExecutor = require('@action/stone_prospect_executor.js');
 const eatExecutor         = require('@action/eat_executor.js');
 
 // ── Admin ───────────────────────────────────────────────────────────────────
-// start_injector is NOT registered: it has no `receive` and nothing routes to it. Its two callers —
-// master_core (on the `start` operator verb) and operator_commands — call `.inject()` directly, so it is
-// a LIBRARY in the same sense as compost_executor and land_prep above. It carried a registry entry from
-// 2026-06 until 2026-09-10 anyway, which made it a name the bus would accept and then drop on the floor
-// (Law 8, orphaned message) had anything ever routed to it.
+// start_injector is NOT registered: it has no `receive` and nothing routes to it. master_core (on the
+// `start` operator verb) and operator_commands call `.inject()` directly, so it is a LIBRARY like
+// land_prep above.
 //
-// NO SECOND ASSERT WAS ADDED FOR IT, and the reasoning is the point. A check for "every entry has a
-// receive" passes two of the Architect's three gates for a guard — it is necessary (this file carried a
-// real violation for three months) and it is deterministic (one `typeof` over the exported map). It
-// fails the third: the damage is bounded and self-announcing. The bus already warns
-// `No valid receiver found for '<name>'` and the trace names the target, so the failure costs one
-// look at a trace rather than a silent wrong answer. Compare the catch-shape gate, where the failure is
-// an error swallowed forever with nothing written anywhere. Delete the entry; do not build the machine.
+// No load-time assert checks for this here: the bus already warns `No valid receiver found for '<name>'`
+// and names the target in the trace, so an orphaned route (Law 8) surfaces on its own.
 const recursiveJudge       = require('@action/recursive_judge.js');
 // Live single-fragment isolation harness (manual). Registered so the bus can dispatch a
 // fragment-under-test's rerouted return signal (to:'fragment_tester') back to its receive.
 const fragmentTester       = require('@action/fragment_tester.js');
 
 // ── Sentry mode: the watch ──────────────────────────────────────────────────
-// Combat with the planning recursion removed — armed by the `sentry` operator verb instead of
-// `start`. Registered here like any other target: it rides the real bus so it can be grafted into
-// the recursion later by changing a route, not by rewriting it.
-// ONE fragment: a separate sentry_judge is redundant, since recursive_judge with `test: true` already
-// halts without replanning. A split scheduler/scan pair is also wrong, since waiting for aggro is one
-// verb — splitting it forces the two halves to hand back and forth to perform it, which is a chain
-// re-entering a fragment it had already visited, and the bus correctly refuses that. See await_aggro's
-// header for the hop count.
+// Combat with the planning recursion removed, armed by the `sentry` operator verb instead of `start`.
+// Registered like any other target so it rides the real bus. recursive_judge with `test: true` halts
+// without replanning, so sentry needs no fragment of its own beyond await_aggro below.
 const awaitAggro          = require('@action/await_aggro.js');
 
 // ── Locomotion sub-loop (Law 15) ────────────────────────────────────────────
@@ -113,11 +104,16 @@ module.exports = {
   preconstruction:       preconstruction,
   delivery_executor:   deliveryExecutor,
   furnace_executor:    furnaceExecutor,
+  compost_executor:    compostExecutor,
+  chest_housekeeping_executor: chestHousekeepingExecutor,
   build_executor:      buildExecutor,
   set_wood_preference: setWoodPreference,
   idle_park:        idlePark,
   torch_executor:   torchExecutor,
   canopy_clear_executor: canopyClearExecutor,
+  clear_ground_executor: clearGroundExecutor,
+  build_column_executor:     buildColumnExecutor,
+  column_preparation:        columnPreparation,
   stone_prospect_executor: stoneProspectExecutor,
   eat_executor:     eatExecutor,
 
@@ -136,15 +132,11 @@ module.exports = {
 
 // ── Load-time completeness assert (Law 13, Law 8) ────────────────────────────
 // Every name the dispatcher can route a job to must exist here, or the signal has a destination with no
-// receiver — an orphaned message (Law 8), and one that only surfaces when that job type first posts, deep
-// into a live run. Adding a job type is three edits (config rank, dispatcher map, this registry), and the
-// third is the easy one to forget: the wiring test loads every FILE but never asks whether a routable name
-// is reachable. This is that question, asked at load.
+// receiver — an orphaned message (Law 8) that only surfaces when that job type first posts, deep into a
+// live run.
 //
-// It DISCOVERS rather than carries a list (`tools/README.md`): it reads the dispatcher's live map, so a
-// job type added tomorrow is checked tomorrow with no edit here. That is why it earns a permanent home —
-// a hand-written list of job types would be stale the day after the next one is added, and would report
-// green the whole time. It rides `preflight`'s pass 1 for free, since that loads this file.
+// It reads the dispatcher's live map to discover the check, so a job type added later is checked with no
+// edit here. It rides `preflight`'s pass 1 for free, since that loads this file.
 {
   const { MANAGER_MAP } = require('@thinking/dispatcher');
   const missing = Object.entries(MANAGER_MAP)

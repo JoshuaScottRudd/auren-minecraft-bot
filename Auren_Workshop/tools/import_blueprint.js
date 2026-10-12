@@ -9,8 +9,8 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/impo
 // Two files, both in the folder the downloaded file sits in unless --out names another:
 //   downloaded_blueprints.json          every imported entry, keyed by name, each marked
 //                                       `origin: "downloaded"` and carrying its own bill_of_materials.
-//                                       Never building_blueprints.json: the two do not mix (Architect
-//                                       2026-09-16; the reasons are in js_kernel/blueprint_importer.js).
+//                                       Never building_blueprints.json: the two are separate stores, kept
+//                                       apart by js_kernel/blueprint_importer.js.
 //   <name>.bill_of_materials.md         the same bill written to be READ — totals, every item and how
 //                                       many, every block and the states it is placed in, what this
 //                                       server version cannot build.

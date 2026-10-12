@@ -1,33 +1,30 @@
 // fragment: torch_executor (action / base-lighting)
-// purpose: The engine of the lighting pathway (combat refurbish §1b) — the deliberate counterpart to
-//          the ambient auto-torch reflex. Where the reflex lights the ONE cell a walking bot steps
-//          toward, this executor is dispatched to walk the dark surface cells torch_integrity found in
-//          the headframe safe square and place a torch at each, closing the coverage gap the roaming
-//          reflex leaves in unstepped corners. One verb: light dark cells (Law 0).
+// purpose: The engine of the lighting pathway — the deliberate counterpart to the ambient auto-torch
+//          reflex. Where the reflex lights the one cell a walking bot steps toward, this executor is
+//          dispatched to walk the dark surface cells torch_integrity found in the headframe safe square
+//          and place a torch at each, closing the coverage gap the roaming reflex leaves in unstepped
+//          corners. One verb: light dark cells (Law 0).
 //
-// WHY re-scan instead of trusting the job: the dispatcher magnet copies a fixed field set, so the
-// dark-cell LIST never rode the job here (job_board deliberately passed only `where`). Good — a list
-// carried from post-time would be stale (Invariant B): peers and the reflex light cells between sweeps.
-// The executor re-senses the dark cells live at run time, exactly as farm_executor re-derives its
+// Re-scans instead of trusting the job: the dark-cell list never rides the job here, since a list
+// carried from post-time would be stale (Invariant B) — peers and the reflex light cells between
+// sweeps. The executor re-senses the dark cells live at run time, the way farm_executor re-derives its
 // till/plant/harvest work from the field's current state.
 //
-// WHY stand adjacent, never on the cell: a torch occupies the air cell (standPos) attached to the top
-// face of the floor below it. Standing IN standPos to place it means placing into the bot's own AABB
-// (placeBlock times out — the trap farm_executor documents). So for each dark cell we path to a
-// walkable NEIGHBOR and reach over, the identical geometry the reflex uses (stand on A, place on the
-// floor of adjacent B).
+// Stands adjacent, never on the cell: a torch occupies the air cell (standPos) attached to the top face
+// of the floor below it, and standing in standPos to place it means placing into the bot's own AABB. So
+// for each dark cell it paths to a walkable neighbor and reaches over, the same geometry the reflex uses
+// (stand on A, place on the floor of adjacent B).
 //
-// WHY suppress the reflex here: the ambient auto-torch reflex fires on forward-walk and competes for
-// the main hand. During a deliberate lighting pass the executor owns the hand; it disables the reflex
-// on entry and restores it through withCleanup (mirror of battle_stations suppressing it during combat),
-// so two torch-placers never race the hand. The restore runs on every exit, abandon and throw included.
+// Suppresses the ambient auto-torch reflex here, since it fires on forward-walk and competes for the
+// main hand: the executor disables it on entry and restores it through withCleanup on every exit,
+// abandon and throw included, so two torch-placers never race the hand.
 //
 // invariants:
 //  - Self-contained (Law 2): every cell re-senses floor/air/light fresh before placing; no cell assumes
 //    a sibling's outcome. A cell lit by a peer between scan and reach is re-read as lit and skipped.
 //  - No torches mid-loop is environmental (the torch stock ran dry — supply re-crafts): warn, stop the
 //    loop, report best-effort, never throw (Law 13). One unreachable cell is skipped, not fatal.
-//  - Terminates at recursive_judge with a readable that stays identical only when NOTHING changes pass
+//  - Terminates at recursive_judge with a readable that stays identical only when nothing changes pass
 //    to pass — so a base that cannot be lit (every cell unreachable) trips the judge's stuck-loop kill.
 
 'use strict';
@@ -36,10 +33,9 @@ const Vec3 = require('vec3');
 const { performPlace } = require('@utils/movement/place_authority');
 const watcher = require('@kernel/watcher');
 const locomotion = require('@locomotion/locomotion_dispatcher');
-// Entered through combatCheckpoint, never battleStations directly (Architect 2026-08-08: "remove it
-// from the callers"). One process-wide 500 ms clock, shared with the dig and drive primitives that now
-// carry the same gate, plus the engaging/escaping bypass so combat's own arms cannot re-enter it. The
-// whole reasoning is in its header; a call a primitive already paid for costs nothing here.
+// Entered through combatCheckpoint, never battleStations directly: one process-wide 500ms clock,
+// shared with the dig and drive primitives, plus the engaging/escaping bypass so combat's own arms
+// cannot re-enter it.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { isWalkableSurface, getClearance } = require('@utils/movement/terrain_predicates');
 const survival = require('@locomotion/survival_instincts');
@@ -49,13 +45,11 @@ const { routeToJudge } = require('@utils/signal_utils');
 const { guardExternal, guardExternalSync, withCleanup } = require('@utils/external_library_guard');
 
 const TAG = 'torch_executor';
-const STEP_WAIT_MS = 200;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const AIR_NAMES = new Set(['air', 'cave_air', 'void_air']);   // true air, not water/lava (both boundingBox 'empty')
 const isOpenAir = b => !!b && b.boundingBox === 'empty' && AIR_NAMES.has(b.name);
 
-// findStand: a walkable cardinal neighbor of standPos to place from — true-air body cell, air headroom,
-// solid walkable floor under it. Returns the stand coordinate or null (cell boxed in / no footing).
+// findStand: a walkable neighbor of standPos to place from, or null if the cell has no footing.
 function findStand(bot, standPos) {
   for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
     const n = new Vec3(standPos.x + dx, standPos.y, standPos.z + dz);
@@ -134,21 +128,20 @@ module.exports = {
         const stand = findStand(bot, standPos);
         if (!stand) { skipped++; watcher.warn(TAG, `light skip (${c.x},${c.y},${c.z}) — no adjacent footing`); continue; }
 
-        const nav = await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z, exact: true });
+        const nav = await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z, exact: true, leg: 'work' });
         if (!nav || nav.arrived === false) { skipped++; watcher.warn(TAG, `light skip (${c.x},${c.y},${c.z}) — stand unreachable`); continue; }
 
         const floorBlock = stillDark(bot, standPos, floorPos);
         if (!floorBlock) { skipped++; continue; }         // lit / occupied / changed since scan
 
-        // Out of torches is a DIFFERENT exit from a refused place — it ends the whole pass rather than
-        // skipping one cell — so it is still asked here, before the one place route is entered.
+        // Out of torches is a different exit from a refused place — it ends the whole pass, not just
+        // this cell — so it is asked here, before the one place route is entered.
         if (!bot.inventory.items().some(i => i.name === 'torch')) {
           missingTorch = true; watcher.warn(TAG, 'lighting stopped — out of torches mid-pass'); break;
         }
         // The one place route (Law 16) owns equip, the spawn-protection gate, the combat checkpoint, the
-        // aim and the click. A cell refused for spawn protection is counted a SKIP rather than a failure:
-        // it is not a fault to repair, it is ground this fleet may not light, and calling it a failed
-        // place would send a reader hunting a bug.
+        // aim and the click. A cell refused for spawn protection is counted a skip, not a failure: it is
+        // ground this fleet may not light, not a fault to repair.
         const torchPlace = await performPlace(bot, standPos, floorBlock, new Vec3(0, 1, 0), 'torch', TAG);
         if (!torchPlace.ok && torchPlace.reason === 'spawn_protected') { skipped++; continue; }
         // The result's ok flag is not this tally's verdict: a torch that placed and was then reverted and

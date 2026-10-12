@@ -1,31 +1,21 @@
 'use strict';
-// foreman_world — THE FOREMAN'S HOLD ON THE WORLD. It starts a local Minecraft server or reaches a remote
+// foreman_world — the foreman's hold on the world. It starts a local Minecraft server or reaches a remote
 // one, says in words why when it cannot, watches the server it started, and stops that server at the end.
 //
-// ── WHO OWNS THE PROCESS? THE FOREMAN (Architect 2026-09-18) ────────────────────────────────────────
-// *"Foreman starts first before the server. Then if it says in its config a local server then it will start
-// the server. If not and it's on a public one then you give it the address and it attempts to connect. If
-// any part of the process fails then the Foreman is a live process that can troubleshoot… how does shutting
-// down a server work after a soak or a problem?… I want foreman to handle that… Who owns the process?
-// Foreman does."*
-//
-// Before this file the world was started by one workshop script (`host_and_run` → `fleet_control
-// server-start`), checked by another (`run.js`), prepared by a third (`start_auren.prepareOwnServer`), and
-// stopped by a fourth (`fleet_control down`). A failure in any of them surfaced as the next one's confusing
-// error, because the process that could have read the server's own output had already exited. Now the one
-// process that lives for the whole run holds the server as its child and reads every line it prints.
+// The foreman owns the server process for the whole run, holding it as its own child and reading every
+// line it prints, so a failure anywhere is read by the one process still alive to explain it.
 //
 // WHAT `foreman_config.where` DECIDES:
-//   'local'   startLocal: write the settings the bots need, mint a one-time console password, launch Java,
+//   'local'   localSteps: write the settings the bots need, mint a one-time console password, launch Java,
 //             wait for the server's own "Done", open the console, set the gamerules. Stopped by stopServer.
-//   'remote'  reachRemote: connect to host:port and then the console, with a sentence for each way that
+//   'remote'  remoteSteps: connect to host:port and then the console, with a sentence for each way that
 //             fails. Never started, never stopped — that world belongs to somebody else.
 //
-// THE SAFETY KEPT FROM THE OLD RULING (2026-09-11: nothing here starts or stops a world it did not create).
-// A local start refuses when a server is already answering on the port, because that server is somebody
-// else's, and stopServer acts only on the child this process launched. A world is never killed: stop is the
-// server's own `stop` command, and a server that will not finish saving is reported, not ended, because a
-// killed JVM can tear the chunk it was writing.
+// Nothing here starts or stops a world it did not create. A local start refuses when a server is already
+// answering on the port, because that server is somebody else's, and stopServer acts only on the child
+// this process launched. A world is never killed: stop is the server's own `stop` command, and a server
+// that will not finish saving is reported, not ended, because a killed JVM can tear the chunk it was
+// writing.
 
 const fs = require('fs');
 const net = require('net');
@@ -39,14 +29,59 @@ const rcon = require('@utils/rcon_link');
 const { RECORDS_DIR } = require('@utils/record_homes');
 const consoleWindow = require('@utils/console_window');
 const { guardExternal } = require('@utils/external_library_guard');
+const { runSteps } = require('./foreman_steps');
+const plan = require('./foreman_plan');
+const processPriority = require('./utils/process_priority');
 
 const WHERE = ['local', 'remote'];
 const STARTUP_LIMIT_MS = 300000;      // a first boot generates the spawn area; five minutes is generous
 const CONSOLE_OPEN_LIMIT_MS = 60000;  // the console opens a moment after "Done"
-const SHUTDOWN_LIMIT_MS = 180000;     // measured: saving ~1000 chunks took 2m34s (fleet_control, 2026-09-10)
-const REACH_DELAYS_MS = [0, 5000, 15000];
+const SHUTDOWN_LIMIT_MS = 180000;     // a large save (~1000 chunks) can take over two minutes to finish
+const REACH_LIMIT_MS = 20000;          // a remote world is knocked on every 5 s for this long
 const TAIL_LINES = 80;
-const JAVA_ARGS = ['-Xmx4G', '-Xms4G', '-jar', 'server.jar', 'nogui'];   // 4 GB: fleet_control's 2026-09-10 soak
+// Java grows its heap with demand while leaving startup memory available to the desktop and bodies.
+const JAVA_ARGS = ['-Xmx4G', '-Xms512M', '-jar', 'server.jar', 'nogui'];
+const PULSE_MS = 60000;               // how often the server is asked how its ticks and entities stand
+const LAG_RE = /Can't keep up!.*Running (\d+)ms or (\d+) ticks behind/;
+
+// ── WHAT JAVA RECORDS ABOUT ITSELF, EVERY RUN ───────────────────────────────────────────────────────
+// A server that stalls says only "Can't keep up", after the fact. These two records say why, from inside Java:
+//   server_gc.log — every garbage collection and every safepoint, with its pause, so a stall that is memory
+//                   cleanup shows as a pause of that length at that second.
+//   server.jfr    — Java Flight Recorder, kept the whole run and written when the server stops: CPU per thread,
+//                   where the server thread was (method samples), garbage collection, disk reads and writes,
+//                   thread waits. Read with the JDK's own `jfr print --events <name> server.jfr`.
+// Both land in fleet_logs, so they belong to this run like every other record there. The GC log's path is
+// written relative to the server folder when it can be: `-Xlog` reads a colon as its own separator.
+function javaRecordArgs(serverDir) {
+  const gc = path.join(RECORDS_DIR, 'server_gc.log');
+  const rel = path.relative(serverDir, gc);
+  const gcPath = rel.includes(':') ? `"${gc}"` : rel;
+  return [
+    `-Xlog:gc*,safepoint:file=${gcPath}:time,uptime,level,tags`,
+    `-XX:StartFlightRecording=name=auren,settings=default,disk=true,dumponexit=true,filename=${path.join(RECORDS_DIR, 'server.jfr')}`,
+  ];
+}
+
+// ── THE SERVER'S PULSE, ASKED ONCE A MINUTE AND AFTER EVERY LAG ─────────────────────────────────────
+// `tick query` is the server's own account of its tick times (average and percentiles); the entity counts are
+// the load it is ticking. Each reading is one SERVER PULSE line in the record; a reading that cannot be taken
+// says so in the same line.
+let pulseTimer = null;
+async function samplePulse(log, why) {
+  const r = await guardExternal('foreman_world', 'server pulse', () => rcon.once([
+    'tick query', 'execute if entity @e', 'execute if entity @e[type=item]',
+  ]));
+  if (!r.ok) { log(`SERVER PULSE why=${why} unread=${r.reason}`); return; }
+  const flat = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+  const count = (t) => { const m = /count: (\d+)/i.exec(String(t || '')); return m ? m[1] : 'none'; };
+  log(`SERVER PULSE why=${why} entities=${count(r.value[1].body)} items=${count(r.value[2].body)} | ${flat(r.value[0].body).slice(0, 400)}`);
+}
+function startPulse(log) {
+  if (pulseTimer || !WORLD.ours) return;
+  pulseTimer = require('../js_kernel/utils/timeout_crash').every('foreman_world', 'sample the entity and item counts of the server', () => samplePulse(log, 'minute'), PULSE_MS);
+  pulseTimer.unref();
+}
 
 // What the world is doing right now. `ours` is the whole difference between a world this process may stop
 // and one it may not.
@@ -150,7 +185,7 @@ function openServerLog() {
 const SHOWN = /Done \(|Starting minecraft server|Preparing level|WARN|ERROR|Exception|Stopping|eula/i;
 const NOT_SHOWN = /RCON (Client|Listener)|restricted method|enable-native-access|Restricted methods|java\.lang\.System::load/i;
 
-// ── NO INVISIBLE PROCESSES (Architect 2026-09-18: *"no visible windows. no invisible processes allowed"*) ──
+// ── no invisible processes ──────────────────────────────────────────────────
 // The server is this process's child with its console piped here, so it has no window of its own. It gets
 // one: a follower on its console log, the same kind every fetched bot gets (`console_window.followFile`),
 // opened when the server is launched and closed when this process ends — the server is stopped by then, and
@@ -161,70 +196,186 @@ function closeServerWindow() {
 }
 process.on('exit', closeServerWindow);
 
-async function startLocal(log) {
-  const folder = findFolder();
-  if (folder.error) return failed(folder.error);
-  const dir = folder.dir;
-  WORLD.folder = dir;
+// ── local, as proved steps ──────────────────────────────────────────────────
+// Each step below is sensed, acted on and proved from the world (foreman_steps.runSteps); a step that
+// cannot be proved stops the start with its own sentence.
+function localSteps(log) {
+  const ctx = { dir: null, java: null, gamePort: null, prep: null, restored: null, launch: null };
+  return [
+    {
+      name: 'the server folder is found',
+      proof: async () => {
+        const folder = findFolder();
+        if (folder.error) return { ok: false, final: true, why: folder.error };
+        ctx.dir = folder.dir;
+        WORLD.folder = folder.dir;
+        return { ok: true, why: folder.dir };
+      },
+    },
+    {
+      name: 'the server can run here',
+      proof: async () => {
+        if (!fs.existsSync(path.join(ctx.dir, 'server.jar'))) {
+          return { ok: false, final: true, why: `There is no server.jar in ${ctx.dir}. Put the Minecraft server jar there, named server.jar.` };
+        }
+        if (!eulaAccepted(ctx.dir)) {
+          return { ok: false, final: true, why: `The server will not run until its licence is accepted, and that is your choice to make: open `
+            + `${path.join(ctx.dir, 'eula.txt')} and set eula=true (the licence: https://aka.ms/MinecraftEULA).` };
+        }
+        ctx.java = workstation.findJava();
+        if (!ctx.java.exe) {
+          return { ok: false, final: true, why: `No Java ${workstation.JAVA_FLOOR} or newer was found, and the server needs it. `
+            + `Tried: ${ctx.java.tried.join(', ')}. Install a Java ${workstation.JAVA_FLOOR}+ runtime (for example Eclipse Temurin).` };
+        }
+        return { ok: true, why: `server.jar, licence accepted, Java at ${ctx.java.exe}` };
+      },
+    },
+    {
+      name: "nothing else is on the server's port",
+      proof: async () => {
+        ctx.gamePort = settings.serverPort(ctx.dir);
+        if (await settings.serverAnswers(ctx.gamePort)) {
+          return { ok: false, final: true, why: `A server is already answering on port ${ctx.gamePort}, and this foreman did not start it, so it will `
+            + `not start a second one or stop that one. Stop it (a server left from an earlier start is the usual cause), `
+            + `or, to join it as it is, set where: 'remote' in foreman_config.js with its console password.` };
+        }
+        return { ok: true, why: `port ${ctx.gamePort} is free` };
+      },
+    },
+    {
+      // A ROLLBACK START PUTS THE WORLD BACK FIRST, while the server is down (foreman_plan.restoreFreshWorld).
+      name: 'the world is its clean copy',
+      when: () => plan.CONFIG.start === 'rollback',
+      act: async () => {
+        ctx.restored = plan.restoreFreshWorld(ctx.dir, settings.levelName(ctx.dir), log);
+        if (ctx.restored.error) return { give: ctx.restored.error };
+        return null;
+      },
+      // Proved by the world folder's level.dat being the clean copy's, byte for byte in size — read off the disk.
+      proof: async () => {
+        if (!ctx.restored.restored) return { ok: true, why: 'this server has no clean copy, so the world is used as it is' };
+        const fresh = plan.freshWorld(ctx.dir);
+        const a = path.join(ctx.dir, fresh.worldName, 'level.dat');
+        const b = path.join(ctx.dir, 'world_snapshots', fresh.worldName, fresh.snapshot, 'level.dat');
+        const same = fs.existsSync(a) && fs.existsSync(b) && fs.statSync(a).size === fs.statSync(b).size;
+        return same ? { ok: true, why: `'${fresh.worldName}' is '${fresh.snapshot}'` }
+          : { ok: false, final: true, why: `the world folder does not match its clean copy after the copy (${a})` };
+      },
+    },
+    {
+      // THE SETTINGS, WRITTEN AND SAID OUT LOUD (*"it should instead report loudly what it
+      // did and why"*). The server is down, so a fresh one-time console password is minted and read by this boot.
+      name: 'the server settings are written',
+      act: async () => {
+        ctx.prep = settings.prepare(ctx.dir, { serverUp: false });
+        if (ctx.prep.changes.length) {
+          log(`SERVER SETTINGS CHANGED in ${ctx.prep.file}:`);
+          for (const c of ctx.prep.changes) log(`   ${c.key}  — ${c.why}`);
+        }
+        if (ctx.prep.changes.some(c => c.key.startsWith('online-mode'))) {
+          log('   NOTE: in offline mode a server checks no accounts. Keep it private or turn on the whitelist.');
+        }
+        return null;
+      },
+      // Read back from the file: every required key holds its value and the console password is the one minted.
+      proof: async () => {
+        const props = rcon.parseServerProperties(fs.readFileSync(ctx.prep.file, 'utf8'));
+        const off = Object.entries(settings.REQUIRED_PROPS).filter(([k, v]) => props[k] !== v).map(([k, v]) => `${k}=${props[k]} (wanted ${v})`);
+        if (props['rcon.password'] !== ctx.prep.password) off.push('rcon.password is not the one just written');
+        return off.length ? { ok: false, final: true, why: `server.properties did not keep: ${off.join(', ')}` }
+          : { ok: true, why: `${Object.keys(settings.REQUIRED_PROPS).length} settings and a fresh console password` };
+      },
+    },
+    {
+      name: 'the server is running',
+      act: async () => { launchServer(ctx, log); return null; },
+      within: STARTUP_LIMIT_MS,
+      every: 1000,
+      proof: async () => {
+        if (ctx.launch.how === 'done') return { ok: true, why: `"Done" after ${Math.round((Date.now() - ctx.launch.at) / 1000)}s` };
+        if (ctx.launch.how === 'exit') return { ok: false, final: true, why: diagnose(ctx.dir, child.exitCode), lines: lastLines() };
+        return { ok: false, why: `the server started but did not finish loading in ${STARTUP_LIMIT_MS / 60000} minutes. It is `
+          + 'still running and the foreman will stop it; its last lines are below.', lines: lastLines() };
+      },
+    },
+    {
+      // THE CONSOLE OPENS A MOMENT AFTER "Done". Everything the foreman does next (placing a crew, the gamerules)
+      // goes through it, so the world is not up until the console answers.
+      name: 'the server console answers',
+      within: CONSOLE_OPEN_LIMIT_MS,
+      every: 1000,
+      proof: async () => {
+        const r = await rcon.probe();
+        return r.ok ? { ok: true, why: `port ${ctx.prep.rconPort}` }
+          : { ok: false, why: `the server is running, but its console never answered on port ${ctx.prep.rconPort}: ${r.reason}`, lines: lastLines() };
+      },
+    },
+    gamerulesStep(log),
+  ];
+}
 
-  if (!fs.existsSync(path.join(dir, 'server.jar'))) {
-    return failed(`There is no server.jar in ${dir}. Put the Minecraft server jar there, named server.jar.`);
-  }
-  if (!eulaAccepted(dir)) {
-    return failed(`The server will not run until its licence is accepted, and that is your choice to make: open `
-      + `${path.join(dir, 'eula.txt')} and set eula=true (the licence: https://aka.ms/MinecraftEULA).`);
-  }
-  const java = workstation.findJava();
-  if (!java.exe) {
-    return failed(`No Java ${workstation.JAVA_FLOOR} or newer was found, and the server needs it. `
-      + `Tried: ${java.tried.join(', ')}. Install a Java ${workstation.JAVA_FLOOR}+ runtime (for example Eclipse Temurin).`);
-  }
+// THE GAMERULES, EVERY START (fleet_control's reasoning, now in server_settings) — set, then read back, because a
+// rule the server accepted and did not apply must not be reported as set.
+function gamerulesStep(log) {
+  return {
+    name: 'the gamerules are set',
+    tries: 2,
+    retryAfter: 3000,
+    act: async () => {
+      for (const [rule, want] of Object.entries(settings.REQUIRED_GAMERULES)) {
+        await guardExternal('foreman_world', `gamerule ${rule}`, () => rcon.once([`gamerule ${rule} ${want}`]));
+      }
+      return null;
+    },
+    proof: async () => {
+      const off = [];
+      for (const [rule, want] of Object.entries(settings.REQUIRED_GAMERULES)) {
+        const r = await guardExternal('foreman_world', `read gamerule ${rule}`, () => rcon.once([`gamerule ${rule}`]));
+        const said = r.ok ? r.value[0].body : r.reason;
+        if (!r.ok || !String(said).includes(want)) off.push(`${rule} reads "${said}"`);
+      }
+      return off.length ? { ok: false, why: `not taken: ${off.join('; ')}` }
+        : { ok: true, why: Object.entries(settings.REQUIRED_GAMERULES).map(([k, v]) => `${k}=${v}`).join(', ') };
+    },
+  };
+}
 
-  const gamePort = settings.serverPort(dir);
-  if (await settings.serverAnswers(gamePort)) {
-    return failed(`A server is already answering on port ${gamePort}, and this foreman did not start it, so it will `
-      + `not start a second one or stop that one. Stop it (a server left from an earlier start is the usual cause), `
-      + `or, to join it as it is, set where: 'remote' in foreman_config.js with its console password.`);
-  }
-
-  // THE SETTINGS, WRITTEN AND SAID OUT LOUD (Architect 2026-09-14: *"it should instead report loudly what it
-  // did and why"*). The server is down, so a fresh one-time console password is minted and read by this boot.
-  const prep = settings.prepare(dir, { serverUp: false });
-  if (prep.changes.length) {
-    log(`SERVER SETTINGS CHANGED in ${prep.file}:`);
-    for (const c of prep.changes) log(`   ${c.key}  — ${c.why}`);
-  }
-  if (prep.changes.some(c => c.key.startsWith('online-mode'))) {
-    log('   NOTE: in offline mode a server checks no accounts. Keep it private or turn on the whitelist.');
-  }
-
-  // THE ENVIRONMENT IS HOW EVERY CHILD LEARNS THE WORLD — bots read foreman_config at their own load, and
-  // foreman_config reads the environment first. Set before any child exists.
-  process.env.AUREN_SERVER_DIR = dir;
+// Launch Java as this process's child, with its console piped to the record and a visible follower window. The
+// step's proof reads `ctx.launch.how`: 'starting' until the server prints "Done", 'exit' if Java ends first.
+function launchServer(ctx, log) {
+  process.env.AUREN_SERVER_DIR = ctx.dir;
   process.env.AUREN_SERVER_HOST = 'localhost';
-  process.env.AUREN_SERVER_PORT = String(gamePort);
-  process.env.AUREN_RCON_PASSWORD = prep.password;
-  process.env.AUREN_RCON_PORT = String(prep.rconPort);
+  process.env.AUREN_SERVER_PORT = String(ctx.gamePort);
+  process.env.AUREN_RCON_PASSWORD = ctx.prep.password;
+  process.env.AUREN_RCON_PORT = String(ctx.prep.rconPort);
   WORLD.host = 'localhost';
-  WORLD.port = gamePort;
+  WORLD.port = ctx.gamePort;
 
   const sink = openServerLog();
-  serverWindow = consoleWindow.followFile({ title: 'auren server', logFile: path.join(RECORDS_DIR, 'console_server.log') });
-  if (!serverWindow) log('WARNING could not open a window on the server console; it is in fleet_logs/console_server.log.');
-  log(`starting the Minecraft server in ${dir} (port ${gamePort}); its full console goes to fleet_logs/console_server.log`);
+  // Opened without waiting — the PowerShell behind a window held this process 5 s on a busy machine.
+  consoleWindow.followFileAsync({ title: 'auren server', logFile: path.join(RECORDS_DIR, 'console_server.log') }).then(w => {
+    serverWindow = w;
+    if (!w) log('WARNING could not open a window on the server console; it is in fleet_logs/console_server.log.');
+  });
+  log(`starting the Minecraft server in ${ctx.dir} (port ${ctx.gamePort}); its full console goes to fleet_logs/console_server.log`);
   WORLD.state = 'starting';
   WORLD.startedAt = new Date().toISOString();
-  child = spawn(java.exe, JAVA_ARGS, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  ctx.launch = { how: 'starting', at: Date.now() };
+  child = spawn(ctx.java.exe, [...javaRecordArgs(ctx.dir), ...JAVA_ARGS], { cwd: ctx.dir, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   WORLD.ours = true;
   WORLD.pid = child.pid;
+  child.once('spawn', () => processPriority.apply(child.pid, 'server', log));
 
-  let ready = null;
-  const readyOnce = new Promise(r => { ready = r; });
   const onLine = (line) => {
     tail.push(line);
     if (tail.length > TAIL_LINES) tail.shift();
     if (SHOWN.test(line) && !NOT_SHOWN.test(line)) log(`[server] ${line}`);
-    if (/\]: Done \(/.test(line)) ready('done');
+    if (/\]: Done \(/.test(line) && ctx.launch.how === 'starting') ctx.launch.how = 'done';
+    const lag = LAG_RE.exec(line);
+    if (lag) {
+      log(`SERVER LAG behind_ms=${lag[1]} ticks=${lag[2]} — server_gc.log and server.jfr hold what Java was doing`);
+      if (pulseTimer) samplePulse(log, 'lag');
+    }
   };
   for (const stream of [child.stdout, child.stderr]) {
     let buf = '';
@@ -237,59 +388,16 @@ async function startLocal(log) {
   }
   // A write to the console after the server has gone is not a fault worth a crash; the exit below says why.
   child.stdin.on('error', (e) => log(`server console input closed: ${e.message}`));
-  child.on('error', (e) => { tail.push(`[foreman] could not launch Java: ${e.message}`); ready('exit'); });
+  child.on('error', (e) => { tail.push(`[foreman] could not launch Java: ${e.message}`); ctx.launch.how = 'exit'; });
   child.on('exit', (code, signal) => {
     sink.end();
     const wasUp = WORLD.state === 'up';
-    ready('exit');
+    ctx.launch.how = 'exit';
     if (stopping) { WORLD.state = 'stopped'; return; }
     WORLD.state = 'failed';
-    WORLD.reason = diagnose(dir, signal || code);
+    WORLD.reason = diagnose(ctx.dir, signal || code);
     if (wasUp) for (const fn of unexpectedExitListeners) fn(WORLD.reason, lastLines());
   });
-
-  const limit = setTimeout(() => ready('timeout'), STARTUP_LIMIT_MS);
-  const how = await readyOnce;
-  clearTimeout(limit);
-  if (how === 'exit') return failed(diagnose(dir, child.exitCode), lastLines());
-  if (how === 'timeout') {
-    return failed(`The server started but did not finish loading in ${STARTUP_LIMIT_MS / 60000} minutes. It is `
-      + 'still running and the foreman will stop it; its last lines are below.', lastLines());
-  }
-
-  // THE CONSOLE OPENS A MOMENT AFTER "Done". Everything the foreman does next (placing a crew, the gamerules)
-  // goes through it, so the world is not up until the console answers.
-  const consoleUp = await waitForConsole();
-  if (!consoleUp.ok) {
-    return failed(`The server is running, but its console never answered on port ${prep.rconPort}: ${consoleUp.reason}`, lastLines());
-  }
-  await applyGamerules(log);
-  WORLD.state = 'up';
-  WORLD.upAt = new Date().toISOString();
-  log(`the world is up — localhost:${gamePort}, console on ${prep.rconPort}. This foreman started it and will stop it.`);
-  return { ok: true };
-}
-
-async function waitForConsole() {
-  const until = Date.now() + CONSOLE_OPEN_LIMIT_MS;
-  let last = { ok: false, reason: 'not asked yet' };
-  while (Date.now() < until) {
-    last = await rcon.probe();
-    if (last.ok) return last;
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  return last;
-}
-
-// ── THE GAMERULES, EVERY START (fleet_control's reasoning, now in server_settings) ──────────────────────
-// Read back after writing, because a rule the server accepted and did not apply must not be reported as set.
-async function applyGamerules(log) {
-  for (const [rule, want] of Object.entries(settings.REQUIRED_GAMERULES)) {
-    const r = await guardExternal('foreman_world', `gamerule ${rule}`, () =>
-      rcon.once([`gamerule ${rule}`, `gamerule ${rule} ${want}`, `gamerule ${rule}`]));
-    const after = r.ok ? r.value[2].body : r.reason;
-    log(r.ok && after.includes(want) ? `gamerule ${rule}=${want}` : `WARNING gamerule ${rule} would not take — "${after}"`);
-  }
 }
 
 // ── REMOTE ──────────────────────────────────────────────────────────────────────────────────────────
@@ -314,47 +422,71 @@ function knock(host, port) {
   });
 }
 
-async function reachRemote(log) {
+function remoteSteps(log) {
   const host = CONFIG.host;
   const port = CONFIG.port;
-  WORLD.host = host;
-  WORLD.port = port;
-  if (!host) return failed("foreman_config.js says where: 'remote' and gives no host. THE SPOT TO CHANGE: foreman_config.js -> host.");
-  if (!CONFIG.rconPassword) {
-    return failed(`foreman_config.js says where: 'remote' (${host}:${port}) and gives no console password. A crew is `
-      + 'placed through that world\'s console, so the owner of the world has to give you its password. '
-      + 'THE SPOT TO CHANGE: foreman_config.js -> rconPassword (and rconPort).');
-  }
-  WORLD.state = 'starting';
-  let knocked = null;
-  for (const wait of REACH_DELAYS_MS) {
-    if (wait) { log(`world not reached (${knocked.reason}); trying again in ${wait / 1000}s`); await new Promise(r => setTimeout(r, wait)); }
-    knocked = await knock(host, port);
-    if (knocked.ok) break;
-  }
-  if (!knocked.ok) return failed(`Could not reach the world at ${host}:${port}: ${knocked.reason}. THE SPOT TO CHANGE: foreman_config.js -> host, port.`);
-  const consoleUp = await rcon.probe({ creds: { port: CONFIG.rconPort, password: CONFIG.rconPassword } });
-  if (!consoleUp.ok) {
-    return failed(`The world at ${host}:${port} answers, but its console on port ${CONFIG.rconPort} refused the foreman: `
-      + `${consoleUp.reason}. THE SPOT TO CHANGE: foreman_config.js -> rconPort, rconPassword (they must match that server's rcon.port and rcon.password).`);
-  }
-  process.env.AUREN_SERVER_HOST = host;
-  process.env.AUREN_SERVER_PORT = String(port);
-  process.env.AUREN_RCON_PASSWORD = CONFIG.rconPassword;
-  process.env.AUREN_RCON_PORT = String(CONFIG.rconPort);
-  WORLD.state = 'up';
-  WORLD.upAt = new Date().toISOString();
-  log(`the world is up — ${host}:${port}, console on ${CONFIG.rconPort}. Somebody else runs it; this foreman will not stop it.`);
-  return { ok: true };
+  const creds = { port: CONFIG.rconPort, password: CONFIG.rconPassword };
+  return [
+    {
+      name: 'the address and console password are given',
+      proof: async () => {
+        if (!host) return { ok: false, final: true, why: "foreman_config.js says where: 'remote' and gives no host. THE SPOT TO CHANGE: foreman_config.js -> host." };
+        if (!CONFIG.rconPassword) {
+          return { ok: false, final: true, why: `foreman_config.js says where: 'remote' (${host}:${port}) and gives no console password. A crew is `
+            + 'placed through that world\'s console, so the owner of the world has to give you its password. '
+            + 'THE SPOT TO CHANGE: foreman_config.js -> rconPassword (and rconPort).' };
+        }
+        WORLD.host = host;
+        WORLD.port = port;
+        WORLD.state = 'starting';
+        return { ok: true, why: `${host}:${port}` };
+      },
+    },
+    {
+      name: `the world answers at ${host}:${port}`,
+      within: REACH_LIMIT_MS,
+      every: 5000,
+      proof: async () => {
+        const k = await knock(host, port);
+        return k.ok ? { ok: true } : { ok: false, why: `Could not reach the world at ${host}:${port}: ${k.reason}. THE SPOT TO CHANGE: foreman_config.js -> host, port.` };
+      },
+    },
+    {
+      name: "the world's console lets the foreman in",
+      within: 10000,
+      every: 2000,
+      proof: async () => {
+        const r = await rcon.probe({ creds });
+        return r.ok ? { ok: true, why: `port ${CONFIG.rconPort}` }
+          : { ok: false, why: `The world at ${host}:${port} answers, but its console on port ${CONFIG.rconPort} refused the foreman: `
+            + `${r.reason}. THE SPOT TO CHANGE: foreman_config.js -> rconPort, rconPassword (they must match that server's rcon.port and rcon.password).` };
+      },
+      act: async () => {
+        process.env.AUREN_SERVER_HOST = host;
+        process.env.AUREN_SERVER_PORT = String(port);
+        process.env.AUREN_RCON_PASSWORD = CONFIG.rconPassword;
+        process.env.AUREN_RCON_PORT = String(CONFIG.rconPort);
+        return null;
+      },
+    },
+  ];
 }
 
-// bringUp(log) → { ok } | { ok:false, reason, lines } — whichever the config names.
-async function bringUp(log) {
+// bringUp(log, { note, stopped }) → { ok } | { ok:false, reason, lines } — whichever the config names, as proved steps.
+async function bringUp(log, { note, stopped } = {}) {
   WORLD.where = CONFIG.where;
   if (!WHERE.includes(CONFIG.where)) {
     return failed(`foreman_config.js says where: '${CONFIG.where}', which is neither 'local' nor 'remote'. THE SPOT TO CHANGE: foreman_config.js -> where.`);
   }
-  return CONFIG.where === 'local' ? startLocal(log) : reachRemote(log);
+  log(`bringing up the ${CONFIG.where} world, one proved step at a time:`);
+  const r = await runSteps(CONFIG.where === 'local' ? localSteps(log) : remoteSteps(log), { log, note, stopped });
+  if (!r.ok) return failed(r.why, r.lines);
+  WORLD.state = 'up';
+  WORLD.upAt = new Date().toISOString();
+  log(CONFIG.where === 'local'
+    ? `the world is up — localhost:${WORLD.port}. This foreman started it and will stop it.`
+    : `the world is up — ${WORLD.host}:${WORLD.port}. Somebody else runs it; this foreman will not stop it.`);
+  return { ok: true };
 }
 
 // stopServer(log) → { stopped: boolean, reason } — the server's own `stop`, and a wait for Java to exit.
@@ -364,14 +496,15 @@ async function stopServer(log) {
     return { stopped: false, reason: WORLD.ours ? 'it had already exited' : 'this foreman did not start it' };
   }
   stopping = true;
+  if (pulseTimer) { require('../js_kernel/utils/timeout_crash').stop(pulseTimer); pulseTimer = null; }
   WORLD.state = 'stopping';
   log('stopping the Minecraft server — it saves the world first, which can take a couple of minutes');
   const exited = new Promise(r => child.once('exit', () => r(true)));
   child.stdin.write('stop\n');
   const started = Date.now();
-  const nag = setInterval(() => log(`still saving (${Math.round((Date.now() - started) / 1000)}s)`), 15000);
+  const nag = require('../js_kernel/utils/timeout_crash').every('foreman_world', 'say the world is still saving', () => log(`still saving (${Math.round((Date.now() - started) / 1000)}s)`), 15000);
   const done = await Promise.race([exited, new Promise(r => setTimeout(() => r(false), SHUTDOWN_LIMIT_MS))]);
-  clearInterval(nag);
+  require('../js_kernel/utils/timeout_crash').stop(nag);
   if (done) {
     WORLD.state = 'stopped';
     log(`the Minecraft server has stopped and the world is saved (${Math.round((Date.now() - started) / 1000)}s).`);
@@ -383,4 +516,27 @@ async function stopServer(log) {
   return { stopped: false, reason: why };
 }
 
-module.exports = { bringUp, stopServer, status, endpoint, onUnexpectedExit, lastLines, onShutdownAsked, askShutdown };
+// ── one line into the server's own console ───────────────────────────────────
+// A teleport is the server's to perform, not a bot's. The foreman's body is an ordinary player without
+// operator rights, so `bot.chat('/tp …')` is a sentence the server refuses. The console IS the operator,
+// and this process already holds that pipe: `stopServer` writes `stop` to it the same way.
+//
+// Acts only on a server this foreman started, the same rule `stopServer` above states. A `remote` world
+// belongs to somebody else; there is no stdin to reach, so the refusal is a return, never a throw — the
+// caller turns it into a sentence a person standing in that world can act on.
+//
+// The line is written whole and nothing is parsed back. A console command's reply arrives in the server's
+// log stream on its own schedule and is not addressed to the asker. What the person sees is the world
+// moving (Law 3 — the world is the report), and what they hear from the desk is that the ask was sent.
+function consoleCommand(line) {
+  if (typeof line !== 'string' || !line.trim()) {
+    throw new Error(`[foreman_world] CODING VIOLATION (Law 13): consoleCommand needs the console line to send, got ${JSON.stringify(line)}.`);
+  }
+  if (!WORLD.ours || !child || child.exitCode !== null || child.signalCode !== null) {
+    return { sent: false, reason: WORLD.ours ? 'the server has already exited' : 'this foreman did not start this world, so it has no console to speak into' };
+  }
+  child.stdin.write(`${line.trim()}\n`);
+  return { sent: true, reason: null };
+}
+
+module.exports = { bringUp, stopServer, startPulse, status, endpoint, onUnexpectedExit, lastLines, onShutdownAsked, askShutdown, consoleCommand };
