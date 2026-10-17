@@ -80,13 +80,14 @@ function arm(bot) {
 // HOLD_AFTER_MS old, otherwise on the next one. A body that acts while the server is frozen sends moves
 // and digs the server applies late or refuses, so each act that changes the world waits here first.
 const HOLD_AFTER_MS = 2000;
-// Said once per silence: every act that waits on the same silence waits for the same tick.
+// Said once per silence: every act that waits on the same silence waits for the same tick. An ordinary
+// line: a server pauses for a moment in normal running, and the warning is the watch's at warn_ms.
 let _holdSaid = false;
 function answering(bot) {
     if (silentMs() < HOLD_AFTER_MS) return Promise.resolve();
     if (!_holdSaid) {
         _holdSaid = true;
-        require('@kernel/watcher').warn(TAG, `HOLDING STILL — the server has been silent ${silentMs()} ms; the next act waits for its next tick`);
+        require('@kernel/watcher').summary(TAG, `HOLDING STILL — the server has been silent ${silentMs()} ms; the next act waits for its next tick`);
     }
     for (const c of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) bot.setControlState(c, false);
     return new Promise(resolve => bot._client.once('update_time', resolve));

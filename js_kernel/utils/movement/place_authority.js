@@ -162,6 +162,7 @@ async function _place(bot, pos, anchor, face, itemName, tag, opts) {
 const BODILESS = new Set(['item', 'experience_orb']);
 const CHARGE_POLL_MS = 50;   // one tick between reads of the cell while the swing recharges
 const HIT_LIMIT = 40;        // hits on one cell before the place is given back to its caller as refused
+const REACH_WAIT_MS = 4000;  // how long a creature in the cell but out of the arm's reach is waited on to wander
 
 // Does this entity's box overlap the unit cell at `pos`? The box is feet-centred on the entity's position.
 function overlapsCell(e, pos) {
@@ -198,10 +199,22 @@ function cellHolds(bot, pos) {
 async function clearCell(bot, pos, tag) {
   const combat = require('@utils/combat_utils');
   const { weaponProfile } = require('@utils/calculators/attack_cadence_calculator');
-  let hits = 0, name = null;
+  let hits = 0, name = null, outOfReachSince = null;
   for (let target = bodiesInCell(bot, pos)[0]; target; target = bodiesInCell(bot, pos)[0]) {
     name = target.name || 'entity';
     if (hits >= HIT_LIMIT) return { ok: false, reason: `${name} is still in the cell after ${hits} hit(s) | ${cellHolds(bot, pos)}` };
+    // A cell in placing reach can hold a creature past the arm's shorter reach. It is waited on to wander
+    // out or come closer; a swing at it would be refused.
+    const gap = combat.swingDistance(bot, target);
+    if (gap != null && gap > combat.BOT_STRIKE_REACH) {
+      outOfReachSince = outOfReachSince || Date.now();
+      if (Date.now() - outOfReachSince > REACH_WAIT_MS) {
+        return { ok: false, reason: `${name} stayed in the cell ${gap.toFixed(2)} blocks off, past the ${combat.BOT_STRIKE_REACH}-block arm, for ${REACH_WAIT_MS} ms | ${cellHolds(bot, pos)}` };
+      }
+      await sleep(CHARGE_POLL_MS);
+      continue;
+    }
+    outOfReachSince = null;
     const cooldownMs = weaponProfile(bot.heldItem ? bot.heldItem.name : null).cooldownMs;
     if (combat.chargeNow(cooldownMs) < 1) { await sleep(CHARGE_POLL_MS); continue; }
     await guardExternal(tag, `look at ${name}`, () => bot.lookAt(target.position.offset(0, (target.height || 1.8) / 2, 0)));
@@ -318,5 +331,6 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 module.exports = {
   performPlace,
+  clearCell,
   PLACE_SETTLE_MS,
 };

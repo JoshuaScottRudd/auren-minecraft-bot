@@ -35,13 +35,13 @@ const { routeToJudge } = require('@utils/signal_utils');
 const { guardExternal, withCleanup } = require('@utils/external_library_guard');
 
 // ── VEINS: THE ORE A STRIP SEGMENT UNCOVERS ──────────────────────────────────────────────────────────
-// mineVeins(bot, seg) — the ore in the tunnel's walls, floor and ceiling and the ore joined to it face to face,
+// mineVeins(bot, seg) — the ore in the tunnel's walls and ceiling and the ore joined to it face to face, never at
+// or below the floor,
 // out to VEIN_MAX blocks, one block at a time: dig one, walk to what fell, dig the next from where the body
 // now stands. A block is mined only when it is in reach of the feet, is not the block the body stands on,
 // touches no water or lava, carries no falling block on top, and a pickaxe the body holds can harvest it.
 // The spot the vein was started from is kept, and the body returns to it once, when the vein is done, by the
-// navigator's ordinary route. The walls it opens are part of the tunnel, so the segment's next settle
-// refills them (structural_fill) with the stone the body carries.
+// navigator's ordinary route. The walls it opens stay open: a branch keeps only its floor (mining_integrity).
 const ORE = /_ore$/;
 const VEIN_MAX = 16;
 async function mineVeins(bot, seg) {
@@ -54,6 +54,7 @@ async function mineVeins(bot, seg) {
   const open = new Map(seg.voxels.filter(v => v[3] !== 'air').map(v => [`${v[0]},${v[1]},${v[2]}`, new Vec3(v[0], v[1], v[2])]));
   const seen = new Set(open.keys());
   const home = bot.entity.position.floored();
+  const floorY = seg.world_position.y;
   const mined = {};
   let passed = {};
   const drops = { picked: 0, seen: 0, no_route: 0, long_walk: 0 };
@@ -68,11 +69,15 @@ async function mineVeins(bot, seg) {
       if (!b || !ORE.test(b.name)) { open.delete(k); continue; }
       let why = null;
       if (p.x === feet.x && p.z === feet.z && p.y < feet.y) why = 'underfoot';
+      // NO ORE IS TAKEN AT OR BELOW THE TUNNEL'S FLOOR: a cave can lie under it. A vein is chased along the
+      // walls and up, never down.
+      else if (p.y <= floorY) why = 'floor';
       else if (anchoredRepair.reachFromStand(bot, feet, p) > BLOCK_REACH) why = 'reach';
       else if (SIX.some(([dx, dy, dz]) => { const n = bot.blockAt(p.offset(dx, dy, dz)); return !!n && isFluid(n.name); })) why = 'fluid';
       else if ((() => { const up = bot.blockAt(p.offset(0, 1, 0)); return !!up && isGravityBlock(up.name); })()) why = 'gravity';
       else if (!bot.inventory.items().some(i => b.canHarvest(i.type))) why = 'tool';
-      if (why) { round[why] = (round[why] || 0) + 1; continue; }
+      // Named by ore, so a passed vein says which ore was left and why (a 'tool' pass names the pickaxe short).
+      if (why) { const key = `${why}:${b.name}`; round[key] = (round[key] || 0) + 1; continue; }
       pick = { k, p, b };
       break;
     }
@@ -392,6 +397,8 @@ module.exports = {
           stand: stands[i],
           steps: groups[i],
           label: `${seg.type} ${seg.id} anchor${i}`,
+          // A tunnel is dug the way a person digs one: the block in front, head then feet, then the next.
+          ...(seg.type === 'cell' ? { digOrder: 'nearest_column' } : {}),
         }, swapsFloor ? { ...ops, footingSidestep: true } : ops);
         digOk += r.dig_ok; digFail += r.dig_fail;
         placeOk += r.place_ok; placeFail += r.place_fail;

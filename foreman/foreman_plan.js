@@ -19,6 +19,7 @@ const PERMITTED = {
   crew: [BOT_MODES.CONTRACTOR, BOT_MODES.HOMESTEADER, BOT_MODES.BUILDER],
   clock: ['dawn', 'day', 'held'],
   record: ['off', 'cameras', 'film'],
+  go: ['now', 'held'],
   ends: ['soak', 'built'],
   landing: ['usual', 'random'],
   windowsPriority: ['normal', 'high'],
@@ -47,6 +48,15 @@ function check() {
   }
   const t = testModes.check(CONFIG.test);
   if (!t.ok) wrong.push(`test: ${t.why}`);
+  const testStart = testModes.startFor(CONFIG.test);
+  if (testStart && CONFIG.start !== testStart) {
+    wrong.push(`start: test '${CONFIG.test}' looks at the world the last run left, so it needs start '${testStart}' — `
+      + `'${CONFIG.start}' would put the world back to its clean copy and empty the fleet's memory first.`);
+  }
+  if (testModes.keepsSeat(CONFIG.test) && CONFIG.crew === BOT_MODES.CONTRACTOR) {
+    wrong.push(`crew: test '${CONFIG.test}' goes to the base a crew built, and a contractor's base belongs to whoever asked `
+      + `for it. Use '${BOT_MODES.BUILDER}' or '${BOT_MODES.HOMESTEADER}'.`);
+  }
   const wakes = Array.isArray(CONFIG.wake) ? CONFIG.wake : [];
   for (const w of wakes) if (!WAKES.includes(w)) wrong.push(`wake: '${w}' is not one of ${WAKES.map(v => `'${v}'`).join(' | ')}.`);
   if (!Array.isArray(CONFIG.wake)) wrong.push(`wake: must be a list, e.g. ['error', 'death'].`);
@@ -76,6 +86,17 @@ function raisesOwnCrew() { return CONFIG.crew !== BOT_MODES.CONTRACTOR; }
 function isTest() { return CONFIG.test !== 'off'; }
 function testName() { return CONFIG.test; }
 
+// A test that keeps the one camera window a person flies, with no bot window beside it.
+function seatOnly() { return isTest() && testModes.keepsSeat(CONFIG.test); }
+
+// The cameras this run really has. A test raises no bodies, so it has no camera on one; a seat-only test
+// has its seat whatever the page says, since the seat is what it is run for.
+function record() {
+  if (!isTest()) return CONFIG.record;
+  if (!seatOnly()) return 'off';
+  return CONFIG.record === 'off' ? 'cameras' : CONFIG.record;
+}
+
 // A continued run carries on from the last one: the base is the one in memory and every body starts where
 // the last run left it standing. The one place that knows what 'continue' means for the crew (Law 16).
 function continues() { return CONFIG.start === 'continue'; }
@@ -84,6 +105,8 @@ function build() { return CONFIG.crew === BOT_MODES.BUILDER ? CONFIG.builder.bui
 
 // Does the run end the moment the building stands? The one place that knows what 'built' means for the run (Law 16).
 function endsWhenBuilt() { return CONFIG.ends === 'built'; }
+// A held crew is raised and placed, and waits for the operator's `start` before any body works.
+function heldForGo() { return CONFIG.go === 'held'; }
 
 // Does the foreman roll where a crew it raises lands? The one place that knows what 'random' means for the run (Law 16).
 function landsAtRandom() { return CONFIG.landing === 'random'; }
@@ -101,12 +124,12 @@ function sentence() {
 }
 // The overlays, said after the sentence: the clock, the cameras, and whether the run is watched.
 function overlays() {
-  // A test has no cameras (no bodies to frame) and no watch (the watch reads a fleet). Both are stated as
-  // absent, so the header never implies one is running.
+  // A test has no bot cameras (no bodies to frame) and no watch (the watch reads a fleet). Both are stated
+  // as absent, so the header never implies one is running.
   const eye = CONFIG.observer ? `watched by ${CONFIG.observer}` : null;
-  if (isTest()) return [`clock ${CONFIG.clock}`, 'no cameras', 'not watched', testModes.describe(CONFIG.test), eye].filter(Boolean).join(' · ');
+  if (isTest()) return [`clock ${CONFIG.clock}`, seatOnly() ? 'a seat to fly, no bot cameras' : 'no cameras', 'not watched', testModes.describe(CONFIG.test), eye].filter(Boolean).join(' · ');
   return [`clock ${CONFIG.clock}`, CONFIG.record === 'off' ? 'no cameras' : CONFIG.record,
-    CONFIG.watch ? `watched (wakes on ${CONFIG.wake.join(', ')})` : 'not watched', eye].filter(Boolean).join(' · ');
+    CONFIG.watch ? `watched (wakes on ${CONFIG.wake.join(', ')})` : 'not watched', heldForGo() ? 'crew held for start' : null, eye].filter(Boolean).join(' · ');
 }
 
 // ── A ROLLBACK START EMPTIES THE FLEET'S MEMORY ──────────────────────────────────────────────────────
@@ -164,4 +187,4 @@ const progress = { sentence: null, crew: 'waiting', soakEndsAt: null, closing: n
 function note(fields) { Object.assign(progress, fields); }
 function progressNow() { return { ...progress, sentence: sentence() }; }
 
-module.exports = { CONFIG, check, sentence, overlays, raisesOwnCrew, isTest, testName, continues, build, endsWhenBuilt, landsAtRandom, emptyMemory, freshWorld, restoreFreshWorld, note, progressNow };
+module.exports = { CONFIG, check, sentence, overlays, raisesOwnCrew, isTest, testName, seatOnly, record, continues, build, endsWhenBuilt, heldForGo, landsAtRandom, emptyMemory, freshWorld, restoreFreshWorld, note, progressNow };

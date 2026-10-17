@@ -212,5 +212,8 @@ module.exports = {
     // measureStage is exported for the decision bench, which asks it directly. It is NOT a second entry
     // point for the fleet: the board calls orderSweep and nothing else (Law 16).
     measureStage,
+    // measureSiteRank is the site order the board walks inside a band; the mine orders its seats' askers by
+    // the same answer (assessors/mining.seatGroups), so a seat is given in the order its job is chosen in.
+    measureSiteRank,
     describeBand,
 };

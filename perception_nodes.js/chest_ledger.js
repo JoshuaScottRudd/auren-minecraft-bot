@@ -80,6 +80,7 @@ function _totals(list) {
 //   asked `logs`,    told `{logs: 7}`     → 7
 //   asked `logs`,    told `{oak_log: 3}`  → 3
 //   asked `oak_log`, told `{logs: 7}`     → 0   (how many of the 7 are oak is not knowable here)
+// That is the join for STOCK. A claim is joined by _claimToward, where the third row counts in full.
 // The join is biased so that it over-reports a CLAIM and under-reports AVAILABILITY. Under-counting a
 // claim lets a second body take material already spoken for, which is a collision; under-counting
 // availability sends a body off to gather material that was sitting there, which costs one trip.
@@ -108,14 +109,29 @@ function claim(stationId, take = []) {
     if (!chair.magnet) return false;
 
     const takes = _totals(Array.isArray(take) ? take : []);
-    if (Object.keys(takes).length === 0) return false;
+    // A line is filed for what the pool holds unclaimed by others, and no more: a claim on stock another
+    // body has spoken for would be honoured at the withdrawal door as if it were real.
+    const prior = chair.magnet.bank_claim;
+    chair.magnet.bank_claim = null;
+    hq.writeBoardroomChair(botId, chair);
+    for (const [item, n] of Object.entries(takes)) {
+        const free = unclaimedOf(_namesOf(item), botId);
+        if (free < n) {
+            watcher.summary(TAG, `${botId} asked to claim ${n} ${item} and ${free} is unclaimed — the claim is filed for ${free}.`);
+            if (free > 0) takes[item] = free; else delete takes[item];
+        }
+    }
+    if (Object.keys(takes).length === 0) {
+        if (prior) _publish();
+        return false;
+    }
     chair.magnet.bank_claim = { station: stationId, at: Date.now(), take: takes };
     hq.writeBoardroomChair(botId, chair);
     _publish();
 
     const parts = Object.entries(takes).map(([item, n]) => `${n} ${item}`);
     watcher.summary(TAG, `${botId} claimed ${parts.join(', ')} at ${stationId} — held until its magnet clears.`);
-    return true;
+    return { ...takes };   // what was filed, line by line; a caller compares it with what it asked
 }
 
 // release: drop this body's claim once the transfer is done or abandoned.
@@ -145,8 +161,7 @@ function drawn(item, amount) {
     const chair = hq.readBoardroomChair(botId, {});
     const held = chair && chair.magnet && chair.magnet.bank_claim;
     if (!held || !held.take || !(amount > 0)) return;
-    const members = Array.isArray(group_to_item[item]) ? group_to_item[item] : [];
-    const lines = Object.keys(held.take).filter(token => token === item || members.includes(token)
+    const lines = Object.keys(held.take).filter(token => token === item
         || (Array.isArray(group_to_item[token]) && group_to_item[token].includes(item)));
     lines.sort((a, b) => (a === item ? -1 : 0) - (b === item ? -1 : 0));
     let left = amount;
@@ -191,7 +206,7 @@ function availableAt(stationId, item, botId) {
     let n = _countToward(item, chestItemCounts(entry));
     for (const row of claimsAt(stationId)) {
         if (row.botId === who) continue;
-        n -= _countToward(item, row.take);
+        n -= _claimToward(item, row.take);
     }
     return Math.max(0, n);
 }
@@ -200,7 +215,7 @@ function availableAt(stationId, item, botId) {
 // what the fleet holds that is NOT free for the next job.
 function claimedAt(stationId, item) {
     let n = 0;
-    for (const row of claimsAt(stationId)) n += _countToward(item, row.take);
+    for (const row of claimsAt(stationId)) n += _claimToward(item, row.take);
     return n;
 }
 
@@ -219,8 +234,22 @@ function claimedByOthers(item, botId) {
     for (const id of poolStations()) {
         for (const row of claimsAt(id)) {
             if (row.botId === who) continue;
-            n += _countToward(item, row.take);
+            n += _claimToward(item, row.take);
         }
+    }
+    return n;
+}
+
+// _claimToward — how much of a claim's take speaks for `item`, matched the way unclaimedOf matches it
+// (Law 16: the planner and the withdrawal door ask one question one way). A claim on a group counts in
+// full against each of its members, and a claim on a member counts toward its group: a claim is
+// over-reported, never under-reported.
+function _claimToward(item, take) {
+    const asked = Array.isArray(group_to_item[item]) ? group_to_item[item] : [];
+    let n = 0;
+    for (const [token, count] of Object.entries(take || {})) {
+        const members = Array.isArray(group_to_item[token]) ? group_to_item[token] : [];
+        if (token === item || members.includes(item) || asked.includes(token)) n += count;
     }
     return n;
 }
@@ -306,23 +335,32 @@ function lessClaims(pool, exceptBot = null) {
 // withdrawal door (`inventory_swapper`) caps every take by this, so a claim binds a body that never read
 // it. Pool-wide, because a claim is filed at one station and spends from every chest. A claim on a group
 // counts in full against any of its members, the same bias as `_countToward`: a claim is over-reported.
+//
+// THIS BODY'S OWN CLAIM IS A FLOOR. What it claimed it may take, whatever others claimed after it: a claim
+// is filed only for stock that was unclaimed (see `claim`), so honouring the earlier one is what makes the
+// later one wait. Without the floor a later claim, over-reported by the group bias, starves the earlier.
 function unclaimedOf(names, botId) {
     const who = botId || _botId();
     const want = new Set(names);
     const stations = stationRegistry.getStations();
-    let stock = 0, claimed = 0;
+    let stock = 0, claimed = 0, own = 0;
     for (const id of poolStations()) {
         const counts = chestItemCounts(stations[id]);
         for (const name of want) stock += counts[name] || 0;
         for (const row of claimsAt(id)) {
-            if (row.botId === who) continue;
             for (const [token, n] of Object.entries(row.take || {})) {
                 const members = Array.isArray(group_to_item[token]) ? group_to_item[token] : [];
-                if (want.has(token) || members.some(m => want.has(m))) claimed += n;
+                if (!(want.has(token) || members.some(m => want.has(m)))) continue;
+                if (row.botId === who) own += n; else claimed += n;
             }
         }
     }
-    return Math.max(0, stock - claimed);
+    return Math.max(0, Math.min(own, stock), stock - claimed);
+}
+
+// The concrete names a claim line speaks for: the token, and a group's members.
+function _namesOf(token) {
+    return [...new Set([token, ...(Array.isArray(group_to_item[token]) ? group_to_item[token] : [])])];
 }
 
 // worthTheTrip: the one question the withdraw decision asks, answered in one place so every caller asks
@@ -346,6 +384,59 @@ function worthTheTrip(stationId, item, wanted, botId) {
     };
 }
 
+// ── THE DEPOSIT CLAIM: ROOM SPOKEN FOR BEFORE THE WALK ─────────────────────────────────────────────
+// The withdrawal claim above stops two bodies walking for the same stack. The deposit claim stops two
+// bodies walking to the same last free slots: a depositor files the slots it will fill at each station
+// before it walks, and every other depositor counts those slots as taken. Without it the lowest-numbered
+// station with room draws every depositor at once, and the later ones arrive to a full chest.
+//
+// It lives on the magnet for the reason the withdrawal claim does: clearMagnet ends it with the work,
+// and a body with no magnet files none (Law 8). Such a body still deposits; it simply goes to the next
+// chest when the one it chose has filled. `slots` are fresh slots: room inside a part stack is not
+// reserved, so two bodies topping one part stack both arrive, and the second spills into a free slot.
+//
+// rows: [{ station, item, amount, slots }]. Replaces the body's previous deposit claim.
+function claimRoom(rows) {
+    const botId = _botId();
+    const chair = hq.readBoardroomChair(botId, {});
+    if (!chair.magnet) return false;
+    const kept = (Array.isArray(rows) ? rows : []).filter(r => r && r.station && r.slots >= 0 && r.amount > 0);
+    chair.magnet.deposit_claim = kept.length ? { at: Date.now(), rows: kept } : null;
+    hq.writeBoardroomChair(botId, chair);
+    _publish();
+    if (kept.length) {
+        watcher.summary(TAG, `${botId} claimed room for ${kept.map(r => `${r.amount} ${r.item} (${r.slots} slot(s)) at ${r.station}`).join(', ')} — held until it deposits or its magnet clears.`);
+    }
+    return kept.length > 0;
+}
+
+// releaseRoom: drops this body's room at one station once its deposit window there has closed, or the
+// whole claim when `stationId` is null.
+function releaseRoom(stationId = null) {
+    const botId = _botId();
+    const chair = hq.readBoardroomChair(botId, {});
+    const held = chair && chair.magnet && chair.magnet.deposit_claim;
+    if (!held) return;
+    const rows = stationId ? held.rows.filter(r => r.station !== stationId) : [];
+    if (rows.length === held.rows.length) return;
+    chair.magnet.deposit_claim = rows.length ? { ...held, rows } : null;
+    hq.writeBoardroomChair(botId, chair);
+    _publish();
+}
+
+// reservedSlotsAt: fresh slots at this station spoken for by OTHER bodies' deposit claims.
+function reservedSlotsAt(stationId, botId) {
+    const who = botId || _botId();
+    let n = 0;
+    for (const [id, chair] of Object.entries(hq.getFullBoardroom({}))) {
+        if (id === who) continue;
+        const held = chair && chair.magnet && chair.magnet.deposit_claim;
+        if (!held || !Array.isArray(held.rows)) continue;
+        for (const r of held.rows) if (r.station === stationId) n += r.slots || 0;
+    }
+    return n;
+}
+
 // report: every live claim at a station as one line, for the trace and for a lens to read back.
 function report(stationId) {
     const rows = claimsAt(stationId);
@@ -357,8 +448,19 @@ function report(stationId) {
     return `${stationId}: ${rows.length} claim(s) — ${seats.join(' | ')}`;
 }
 
+// memberUnclaimed — what the pool holds of one concrete item past every other body's claim on it, with no
+// floor for this body's own claim. A withdrawal by a group's name (logs) holds each member it lands as to
+// this, so a take under the group never empties a member another body claimed by its own name.
+function memberUnclaimed(name, botId) {
+    const stations = stationRegistry.getStations();
+    let stock = 0;
+    for (const id of poolStations()) stock += chestItemCounts(stations[id])[name] || 0;
+    return Math.max(0, stock - claimedByOthers(name, botId));
+}
+
 module.exports = {
     claim, release, drawn, claimsAt, availableAt, claimedAt, availablePool, claimedPool, poolStations,
-    stationHolding, lessClaims, claimedByOthers, unclaimedOf,
+    stationHolding, lessClaims, claimedByOthers, unclaimedOf, memberUnclaimed,
+    claimRoom, releaseRoom, reservedSlotsAt,
     worthTheTrip, report,
 };

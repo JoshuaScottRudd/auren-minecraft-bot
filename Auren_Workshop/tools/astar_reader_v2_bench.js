@@ -2,11 +2,8 @@
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/astar_reader_v2_bench.js');
 // tool: astar_reader_v2_bench — the live A/B/C that decides whether voxel_reader_v2_prototype ships.
 //
-// SUPERSEDES astar_ab_bench.js, which compared raw blockAt against cartographer_prototype at the ADAPTER
-// level; the open question now lives at a different seam (computeAStar's own opts.voxelReader), needing
-// three arms to attribute the result. Keeping both benches would be two instruments answering one
-// question (Law 16); the old one stays only as the evidence behind the 2.35x already on record and is
-// imported by nothing.
+// Three reader implementations enter the same computeAStar seam, so the comparison attributes
+// route-search cost to the reader while keeping the search itself constant.
 //
 // ── THREE ARMS, ONE UNMODIFIED computeAStar ─────────────────────────────────────────────────────────
 //   A  baseline   raw bot.blockAt per read

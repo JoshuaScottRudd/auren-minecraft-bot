@@ -56,13 +56,18 @@ for (const row of STOCK_THRESHOLDS) {
 
 // Best owned tier, read off item NAMES — not countInInventory, which is group-aware and answers "how
 // many swords", not "which tier".
-// stoneOrBetter(family, inventory) → how many tools of the family at stone tier or above are held.
-function stoneOrBetter(family, inventory) {
+// tierOrBetter(family, inventory, tool) → how many tools of the family at `tool`'s tier or above are held.
+function tierOrBetter(family, inventory, tool) {
     let n = 0;
     for (const [name, count] of Object.entries(inventory || {})) {
-        if (count && name.endsWith(`_${family}`) && tierRank(name) >= tierRank('stone')) n += count;
+        if (count && name.endsWith(`_${family}`) && tierRank(name) >= tierRank(tool)) n += count;
     }
     return n;
+}
+
+// stoneOrBetter(family, inventory) → how many tools of the family at stone tier or above are held.
+function stoneOrBetter(family, inventory) {
+    return tierOrBetter(family, inventory, 'stone');
 }
 
 // ── WHICH TOOL A BODY GETS WHEN ITS POCKET IS SHORT ─────────────────────────────────────────────────
@@ -287,11 +292,19 @@ async function standingSiteTrees(bot, centre, box) {
     // "ask again next sweep" and never as "done" (Invariant B). An empty array is a real clear site.
     if (!scan.ok) return null;
     const built = require('@perception/blueprint_survey').getAllProtectedBlocks() || new Set();
-    const inSite = (scan.value || []).filter(p => !built.has(`${p.x},${p.y},${p.z}`) && inBox(box, centre, p));
+    // The downloaded building's own log cells are the building, counted by nobody as a tree (the plan
+    // registry answers for every body alike, before and after the latch).
+    const planned = require('@kernel/downloaded_plan_registry').buildWoodCells() || new Map();
+    const inSite = (scan.value || []).filter(p => !built.has(`${p.x},${p.y},${p.z}`)
+        && !planned.has(`${p.x},${p.y},${p.z}`) && inBox(box, centre, p));
     // `collapseToTrunkBases` is the feller's own target test, so a phase can never be sized off trees no
     // executor would accept (Law 16).
     const { collapseToTrunkBases, readerForBot } = require('@perception/trunk_bases');
-    return (await collapseToTrunkBases(readerForBot(bot), inSite.map(p => {
+    // The walk down a trunk to its base stops above a cell that is the building's: a wild log standing on
+    // a building log has its base on the wild one, which is a target the feller accepts.
+    const world = readerForBot(bot);
+    const reader = { blockAt: (x, y, z) => (built.has(`${x},${y},${z}`) || planned.has(`${x},${y},${z}`) ? null : world.blockAt(x, y, z)) };
+    return (await collapseToTrunkBases(reader, inSite.map(p => {
         const b = bot.blockAt(new Vec3(p.x, p.y, p.z));
         return { name: b?.name, position: { x: p.x, y: p.y, z: p.z } };
     }).filter(b => b.name))).map(b => b.position);
@@ -465,6 +478,7 @@ module.exports = {
     noteShelfShort,
     bestOwnedTierRank,
     stoneOrBetter,
+    tierOrBetter,
     tierRank,
     TIER_ORDER,
     currentBiome,

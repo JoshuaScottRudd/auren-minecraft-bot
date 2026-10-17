@@ -93,15 +93,27 @@ async function stepOutOfFootprint(bot, integrity) {
   const inside = bp.x >= fp.minX && bp.x <= fp.maxX && bp.z >= fp.minZ && bp.z <= fp.maxZ
               && bp.y >= fp.minY && bp.y <= fp.maxY + 1;
   if (!inside) return;
+  // A body in a blueprint's lane is not boxed in: the lane is the building's way out, and every walk
+  // from it leaves by the lane's exit (locomotion_dispatcher.goTo).
+  const survey = require('@perception/blueprint_survey');
+  if (survey.laneLegs(survey.getWorldLanes(), bp, null).length > 0) return;
 
   const MARGIN = 3;   // clear of the outermost voxels + placement reach
-  // Exit via the nearest cardinal edge — shortest walk out, least chance of clipping the build.
+  // Exit via the nearest cardinal edge whose stand belongs to no building — shortest walk out, least
+  // chance of clipping the build. A stand on another building's cell would be dug out to stand there and
+  // then repaired by that building's crew.
+  const spokenFor = survey.getAllFootprintCells() || new Set();
+  const free = c => [fp.minY, fp.minY + 1].every(y => !spokenFor.has(`${c.x},${y},${c.z}`));
   const target = [
     { d: bp.x - fp.minX, x: fp.minX - MARGIN, z: bp.z },
     { d: fp.maxX - bp.x, x: fp.maxX + MARGIN, z: bp.z },
     { d: bp.z - fp.minZ, x: bp.x, z: fp.minZ - MARGIN },
     { d: fp.maxZ - bp.z, x: bp.x, z: fp.maxZ + MARGIN },
-  ].sort((a, b) => a.d - b.d)[0];
+  ].sort((a, b) => a.d - b.d).find(free);
+  if (!target) {
+    watcher.warn(TAG, `Bot is inside the footprint @(${bp.x},${bp.y},${bp.z}) and every edge stand belongs to a building — crafting from current spot, craft_handler walks to the home table from here.`);
+    return;
+  }
 
   watcher.summary(TAG, `Bot is inside the footprint @(${bp.x},${bp.y},${bp.z}) — relocating to open ground @(${target.x},~,${target.z}) before crafting.`);
   // goTo places the feet at the named cell; fp.minY is the footprint's floor block, not a stance, so

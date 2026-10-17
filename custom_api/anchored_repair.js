@@ -6,7 +6,7 @@
 // (a "cheat place"). Valid on a vanilla server with no anti-cheat / no LOS.
 //
 // CONTRACT — repairAtAnchor(bot, job, ops):
-//   job = { stand:{x,y,z}, steps:[integrity steps], label:string }  // stand = the FEET cell
+//   job = { stand:{x,y,z}, steps:[integrity steps], label:string, digOrder?:'nearest_column' }  // stand = the FEET cell
 //     (anchor floor block Y + 1); steps are already grouped for THIS anchor by the caller.
 //   ops = {
 //     digOne(step) -> Promise<bool>            // executor's per-block dig
@@ -66,9 +66,14 @@ const ATTACH_DIRS = [
 
 // findAttachable — the nearest solid full-block neighbor of pos to place against (no raycast).
 // Interactable blocks (chests/doors) are a last-resort fallback (placing against them opens a UI).
-function findAttachable(bot, pos) {
+// blockName, when given, limits the faces to the ones that block stands on: a block that only sits
+// (a pressure plate, a carpet, a rail — support_plan.sitsOnly) is clicked onto the block below or not at
+// all, since the server refuses it on a side face.
+function findAttachable(bot, pos, blockName = null) {
   let interactableFallback = null;
+  const sitsOnly = !!blockName && require('@kernel/support_plan').sitsOnly(blockName);
   for (const { d, face } of ATTACH_DIRS) {
+    if (sitsOnly && d.y !== -1) continue;
     const neighborPos = pos.plus(d);
     const block = bot.blockAt(neighborPos);
     if (!block || isAir(block.name)) continue;
@@ -173,7 +178,7 @@ function evaluatePlacement(bot, step, stand) {
   const centerD = dist3({ x: pos.x + 0.5, y: pos.y + 0.5, z: pos.z + 0.5 }, eye);
   if (centerD < MIN_PLACEMENT_DIST) return { ok: false, reason: 'too_close', pos };
 
-  const attach = findAttachable(bot, pos);
+  const attach = findAttachable(bot, pos, step.type || null);
   if (!attach) return { ok: false, reason: 'no_attach_point', pos, neighbors: describeNeighborhood(bot, pos) };
 
   return { ok: true, pos, anchor: attach.anchor, face: attach.face, underFeet: false };
@@ -348,7 +353,13 @@ async function repairAtAnchor(bot, job, ops) {
   // ── Dig ALL (top-down). Cheat-dig: reach-distance gate only, no LOS. Reach is asserted from
   // the microCentered stand; an unreachable target is a coverage fault → Law 13 throw.
   await ensureAtAnchor();
-  const digSteps = steps.filter(s => s.action === 'dig' && !isFootingStep(s)).sort((a, b) => b.place.y - a.place.y);
+  // `digOrder: 'nearest_column'` (a tunnel advancing): the column nearest the stand first, head then feet, so
+  // the body opens the block in front of it before the one behind it. Otherwise top-down, row by row.
+  const flat = (p) => Math.abs(p.x - stand.x) + Math.abs(p.z - stand.z);
+  const byOrder = job.digOrder === 'nearest_column'
+    ? (a, b) => (flat(a.place) - flat(b.place)) || (b.place.y - a.place.y)
+    : (a, b) => b.place.y - a.place.y;
+  const digSteps = steps.filter(s => s.action === 'dig' && !isFootingStep(s)).sort(byOrder);
   for (const s of digSteps) {
     const pos = new Vec3(s.place.x, s.place.y, s.place.z);
     if (outOfReach(pos)) { deferred++; deferReasons.off_stand = (deferReasons.off_stand || 0) + 1; continue; }
@@ -539,8 +550,11 @@ async function settle({ rescan, work, label, tag }) {
     worked.add(sig);
     cycles++;
     const r = await work(steps, cycles);
-    for (const k of ['dig_ok', 'dig_fail', 'place_ok', 'place_fail', 'deferred', 'cheat_placed', 'skipped', 'pocket_short']) totals[k] += r[k] || 0;
-    for (const [m, c] of Object.entries(r.short_materials || {})) totals.short_materials[m] = (totals.short_materials[m] || 0) + c;
+    for (const k of ['dig_ok', 'dig_fail', 'place_ok', 'place_fail', 'deferred', 'cheat_placed', 'skipped']) totals[k] += r[k] || 0;
+    // A shortfall is a standing state, not a count of events: each cycle re-reads the same missing blocks,
+    // so the settle reports the last cycle's shortfall, never their sum.
+    totals.pocket_short = r.pocket_short || 0;
+    totals.short_materials = { ...(r.short_materials || {}) };
     const moved = (r.dig_ok || 0) + (r.place_ok || 0);
     steps = rescan();
     if (moved === 0 && steps.length > 0) { stop = 'no_moves'; break; }

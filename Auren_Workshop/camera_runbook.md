@@ -269,8 +269,10 @@ camera windows and a director standing. Matching is by **command line** (the ins
 `camera_rig.js` for the director), the same order-independent discriminator the titler uses. The titler is
 deliberately **not** killed: it exits on its own the pass after the last window goes.
 
-Its name is declared once, in `camera_configure.js` (`architect.camName`), and read from there by all three
-consumers — the launcher, the rig and the titler (Law 16).
+Its names are declared once, in `camera_configure.js` (`architect.camNames`), and read from there by every
+consumer — the launcher, the rig, the titler and the recorder (Law 16). Each name is one more window of the
+same kind: `Cam_Timelapse` (the wide fixed view of the build), `Cam_Mine` (the mine below it) and `Cam_Roam`
+(the roaming shot). A run that sites a base puts all of them 8 blocks above it, then leaves each to its pilot.
 
 ---
 

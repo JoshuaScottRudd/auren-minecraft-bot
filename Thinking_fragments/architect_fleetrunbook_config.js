@@ -154,7 +154,7 @@ module.exports = {
     // ─────────────────────────────────────────────────────────────────────────────────────────────
     // RECORD — filmed: one .mp4 per camera plus the composite, into footage/. Three bots — footage
     // is the point, and one camera comes with each bot the overlay raises. The operator's own eye
-    // (Cam_Architect) is answered once in camera_configure (Law 16).
+    // seats (architect.camNames) are answered once in camera_configure (Law 16).
     // ─────────────────────────────────────────────────────────────────────────────────────────────
     record: {
       description: 'A rollback run, filmed — a camera per bot and OBS writing every one of them.',

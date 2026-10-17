@@ -75,6 +75,10 @@ const SILENT_TERMINAL = !!_watcherBotId;
 // never spelled here, so every reader agrees on where it lives.
 // Relative require, not `@utils` — this module loads in processes that register no alias table.
 const recordHomes = require('./utils/record_homes');
+const recordClaims = require('./utils/record_claims');
+// How soon a write held back by a reader of the record asks again.
+const READER_HOLD_RETRY_MS = 100;
+const EXIT_READER_WAIT_MS = 2000;
 const WATCHER_FILE = recordHomes.traceFile(_watcherBotId);
 
 // The one encoder. Both the async and the sync flush go through it, so the file can never hold two
@@ -476,22 +480,34 @@ class Watcher {
       return;
     }
     this._writing = true;
-    this._lastWriteStart = Date.now();
     try {
+      // A fresh clone has no `fleet_logs/` at all — whoever writes first makes the directory.
+      if (!this._fileOpened) { this._fileOpened = true; recordHomes.ensureTraceDir(); }
+      // A READER HOLDS THE RECORD: the lines stay queued and the write asks again (record_claims).
+      if (!recordClaims.beginWrite(WATCHER_FILE)) {
+        this._writing = false;
+        this._scheduledTimeout = setTimeout(() => {
+          this._scheduledTimeout = null;
+          this._writeWatcherFile();
+        }, READER_HOLD_RETRY_MS);
+        if (this._scheduledTimeout.unref && this._writeCompleteWaiters.length === 0) this._scheduledTimeout.unref();
+        return;
+      }
+      this._lastWriteStart = Date.now();
       const upto = this.summaryLog.length;
       const chunk = encodeStoryLines(this.summaryLog.slice(this._writtenThrough));
       if (ENABLE_WATCHER_LOGS) { console.log(`Appending ${upto - this._writtenThrough} story line(s)`); }
-      // A fresh clone has no `fleet_logs/` at all — whoever writes first makes the directory.
-      if (!this._fileOpened) { this._fileOpened = true; recordHomes.ensureTraceDir(); }
       fs.appendFile(WATCHER_FILE, chunk, (err) => {
         // Advance only on success, so a failed append re-sends the same lines next cycle.
         if (err) _selfFault(`_writeWatcherFile(${path.basename(WATCHER_FILE)})`, err);
         else this._writtenThrough = upto;
+        recordClaims.endWrite(WATCHER_FILE);
         this._writing = false;
         this._afterWrite();
       });
     } catch (error) {
       _selfFault('_writeWatcherFile', error);
+      recordClaims.endWrite(WATCHER_FILE);
       this._writing = false;
     }
   }
@@ -534,7 +550,15 @@ class Watcher {
     try {
       if (!this._fileOpened) { this._fileOpened = true; recordHomes.ensureTraceDir(); }
       const chunk = encodeStoryLines(this.summaryLog.slice(this._writtenThrough));
+      // A process on its way out waits for a reader of the record as long as an exit can, then writes:
+      // the lines exist nowhere else.
+      let held = recordClaims.beginWrite(WATCHER_FILE);
+      for (let waited = 0; !held && waited < EXIT_READER_WAIT_MS; waited += READER_HOLD_RETRY_MS) {
+        recordClaims.sleepSync(READER_HOLD_RETRY_MS);
+        held = recordClaims.beginWrite(WATCHER_FILE);
+      }
       fs.appendFileSync(WATCHER_FILE, chunk);
+      recordClaims.endWrite(WATCHER_FILE);
       this._writtenThrough = upto;
     } catch (err) {
       _selfFault('flushNow', err);

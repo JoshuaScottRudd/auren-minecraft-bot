@@ -4,8 +4,7 @@
 # asks through `& (Get-AurenNode) ...\workstation.js java|server` - node is the one tool that has to be
 # found BEFORE any JS can run, which is the only reason this file exists in a second language.
 #
-# ---- THE RULE (Architect 2026-09-11) ----------------------------------------------------------------
-# "if run then check stranger way, if fail then architect way." Two legs, in this order:
+# Tool resolution uses the declared candidates in this order:
 #   1. node on PATH - what every stranger has, and the only thing their refusal ever names.
 #   2. the EXACT paths in ..\Architect_workstation\workstation.json, one level above the bot - his
 #      machines only. One named file is opened; nothing above the bot is searched or listed.
@@ -15,10 +14,7 @@
 # candidate is asked for its version and must meet `engines.node` in Auren_Bot\package.json - the bot's
 # own declaration, read rather than copied (Law 25 - exercise the capability, never infer it).
 #
-# THIS FILE IS PLAIN ASCII ON PURPOSE. Windows PowerShell 5.1 reads a script without a byte-order mark
-# as the ANSI code page, where the last byte of a UTF-8 long dash is a curly double quote - and inside a
-# double-quoted string that ends the string. Measured 2026-09-11: one dash in a message broke the parse
-# of the whole file, and every entry point that dot-sources it lost Get-AurenNode.
+# ASCII source keeps this shared resolver readable by Windows PowerShell 5.1's default decoder.
 
 function Get-AurenNodeFloor {
     $botRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # scripts -> Auren_Workshop -> Auren_Bot
@@ -50,7 +46,7 @@ function Get-AurenNode {
         $tried += 'node on PATH (none)'
     }
 
-    # 2. The Architect's way - exact paths only.
+    # 2. The workstation's declared paths.
     $manifest = Join-Path $aboveBot 'Architect_workstation\workstation.json'
     if (Test-Path -LiteralPath $manifest) {
         foreach ($rel in (Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json).node) {

@@ -96,6 +96,11 @@ function scanSegment(bot, segment, excluded) {
     }
 
     if (SOLID_FILL_TOKENS.has(expType)) { // wall: any solid non-gravity block is acceptable
+      // A BRANCH KEEPS ONLY ITS FLOOR. A cell's walls and ceiling are not repaired: a cave or a vein that opens
+      // them is left open, and nobody comes back to close it. The floor (the anchor's own height) is what the
+      // feet walk on, so a hole in it is still filled. The staircase is the fleet's one way in and out and
+      // keeps every wall.
+      if (segment.type === 'cell' && y !== segment.world_position.y) { correct++; continue; }
       if (isAir(actName)) {
         missing++; // hole in the wall (e.g. the shaft grazed a cave): wall it off
         placeSteps.push({ id: segment.id, action: 'place', place: { x, y, z }, type: expType, reason: 'wall_breach' });

@@ -88,9 +88,9 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 - **the tank crew** — combat as three seats with one writer per board section: `commander` (the fleet's only monster scanner), `gunner` (facing and swinging), `driver` (the lower body), `crew_board` (where they agree about the world). `custom_api/`
 - **battle_stations** — the emergency hook every executor and the navigator move loop `await` at loop boundaries. `custom_api/battle_stations.js`
 - **fuse_meter** — the creeper fuse counter. `custom_api/combat_counters/fuse_meter.js`
-- **the sub-loop APIs (Law 15)** — a caller says "I want this and it isn't here" and may be abandoned mid-loop: `tree_feller`, `seed_picker`, `drop_collector`, `anchored_repair`, `inventory_swapper`, `craft_handler`, `exploration_api`
+- **the sub-loop APIs (Law 15)** — a caller says "I want this and it isn't here" and may be abandoned mid-loop: `tree_feller`, `sapling_planter`, `seed_picker`, `drop_collector`, `anchored_repair`, `inventory_swapper`, `craft_handler`, `exploration_api`
 - **anchored_repair** — the one stationary anchor-build routine, shared by `build_executor` and `mining_executor`. `custom_api/anchored_repair.js`
-- **chest_lock_utils** — the one wait-for-release primitive for peer-locked chests. A locked chest stays fully readable; only the write waits. `js_kernel/utils/chest_lock_utils.js`
+- **chest spots and claims** — storage takes no lock and no queue: any number of bodies act in one chest at once. A withdrawal is capped by the item claim and a deposit by the room it claimed before walking (`chest_ledger.claim`, `chest_ledger.claimRoom`); the spot (`station_registry.claimSpot`) only says a peer may be moving the chest. Chests are numbered (`station_registry.chestNumbers`): deposits fill from the lowest, withdrawals draw from the highest. Every crossing of a window is one shift-click, every split happens in the pocket (`custom_api/inventory_swapper.js` SECTION 3).
 - **the calculators** — pure arithmetic with no world access: archer, attack cadence, build material, food, inventory, jump, smelt, stack split. `js_kernel/utils/calculators/`
 
 ## E. State and memory

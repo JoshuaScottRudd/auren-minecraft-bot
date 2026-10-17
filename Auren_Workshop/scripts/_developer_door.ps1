@@ -12,7 +12,7 @@
 # `node developer_mode.js on` and by nothing else. This file is a second READER of that one fact, in the
 # one other language this project runs in, and it sits beside `_node.ps1` for exactly the same reason
 # that file exists. PowerShell cannot ask a Node module a question without first solving the problem
-# `_node.ps1` was written to solve, and a door that needed a toolchain resolved before it could refuse
+# `_node.ps1` solves, and a door that needs a toolchain resolved before it can refuse
 # would be a door with a lobby (Law 16 - one owner of the ANSWER, which is the marker, not the reader).
 #
 # ---- WHAT IT COVERS AND WHAT IT DELIBERATELY DOES NOT (Law 29) -----------------------------------

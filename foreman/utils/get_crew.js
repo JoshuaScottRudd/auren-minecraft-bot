@@ -89,7 +89,7 @@ function existingSite(buildings, ownerKey) {
 // Gates the asker's ground, sites the base into the fleet's memory, launches the crew one body at a time
 // (Law 16). `at` is the foreman's own position when raising its own crew; `build` is builder.build or null;
 // `resume` is a continued run, whose crew goes back to the base in memory with nobody placed.
-async function getCrew(from, species, { reply, correct, trouble, at = null, build = null, siteOnly = false, resume = false }) {
+async function getCrew(from, species, { reply, correct, trouble, at = null, build = null, siteOnly = false, resume = false, held = false }) {
   const bot = getBot();
   const wantsContractors = species === 'contractor';
   const size = crewSizeFor(species);   // the one crew-size answer shared with startup proof and cameras
@@ -218,7 +218,7 @@ async function getCrew(from, species, { reply, correct, trouble, at = null, buil
   // The foreman's own startup sites and raises as two steps; this call stops here with the base in memory.
   if (siteOnly) return;
 
-  return launchCrew({ from, species, crew, mine, needed, size, wantsContractors, isOurs, placeAt, reply, trouble });
+  return launchCrew({ from, species, crew, mine, needed, size, wantsContractors, isOurs, placeAt, reply, trouble, held });
 }
 
 // groundBesideAsker(bot, from, crew, at, trouble) → { feet, reader, placeAt }, or null once it has refused.
@@ -309,7 +309,7 @@ async function groundBesideAsker(bot, from, crew, at, trouble) {
 
 // launchCrew — brings the named bodies up one lane at a time and says what actually arrived. `placeAt` is
 // the cell every body is put on, "x y z", or '' for a crew that starts where each body stands.
-async function launchCrew({ from, species, crew, mine, needed, size, wantsContractors, isOurs, placeAt, reply, trouble }) {
+async function launchCrew({ from, species, crew, mine, needed, size, wantsContractors, isOurs, placeAt, reply, trouble, held = false }) {
   // Said while they wait, not after — the two species look identical until a homesteader doesn't answer
   // (Law 25).
   const forWhom = wantsContractors ? 'for you' : 'for the homestead — they won\'t answer you';
@@ -328,7 +328,7 @@ async function launchCrew({ from, species, crew, mine, needed, size, wantsContra
   let reach = null;                       // the last fleet error, when the registry could not be read
   const queue = crew.slice();
   const bringOne = async (target) => {
-    const r = await startBot(target, species, wantsContractors ? from : '', placeAt);
+    const r = await startBot(target, species, wantsContractors ? from : '', placeAt, held);
     said.push(firstMeaningfulLine(r.out) || `${target}: the launcher exited ${r.code}`);
 
     // Polled, not slept-then-checked, so a fast registration is brought over fast.
@@ -350,8 +350,8 @@ async function launchCrew({ from, species, crew, mine, needed, size, wantsContra
     standing.push(target);
 
     // Off the spot before this lane launches again (FIRST_MOVE_CEILING_MS); nothing waits on a body with
-    // no successor.
-    if (!queue.length) return;
+    // no successor, nor on a held body, which stands still until the operator's `start`.
+    if (!queue.length || held) return;
     const t0 = Date.now();
     let moved = false;
     for (;;) {
@@ -388,7 +388,7 @@ async function launchCrew({ from, species, crew, mine, needed, size, wantsContra
     // "Here" is proved, not reported: each body places itself and refuses to work unconfirmed, so working
     // means standing here (Law 27).
     const whose = wantsContractors ? 'yours' : 'the homestead\'s';
-    reply(`${standing.join(' and ')} are ${whose}, here, and working.`);
+    reply(`${standing.join(' and ')} are ${whose}, here, and ${held ? 'waiting for start' : 'working'}.`);
     return;
   }
   // What they have and what to do, no machine detail — that belongs in the log and record, not open chat

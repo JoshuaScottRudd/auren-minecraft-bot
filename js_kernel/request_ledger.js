@@ -137,7 +137,7 @@ function cancel(item, ownerKey) {
 
 // outstanding() → this crew's rows, oldest first. Contents are NOT read here and no row carries a
 // "have" figure: how much is on hand is a fact about the world, read at the moment it is reported
-// (Invariant B). A stored progress number would be the stale answer this whole design removed.
+// (Invariant B). Progress is sensed when reported so the verdict reflects current holdings.
 function outstanding(ownerKey) { return rowsFor(_all(), _ownerKey(ownerKey)); }
 
 // status(haveOf) → [{ item, asked, have, met }], measured NOW against a caller-supplied count.

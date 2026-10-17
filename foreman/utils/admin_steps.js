@@ -1,10 +1,8 @@
 'use strict';
 // foreman/utils/admin_steps.js — THE RUN'S ADMIN, AS STEPS THE FOREMAN PROVES LIKE ANY OTHER.
 //
-// *"run.js is to be removed … foreman should do all the critical stuff like checking no
-// windows are open, start the cameras, watch for errors and wakes. so fold everything into foreman. its all now
-// foremans job."* These were the workshop run script's opening moves; each is now a step in the shape
-// `foreman_steps.runSteps` walks (act, then proof read from the world), so the foreman paces them with the rest.
+// The foreman owns terminal checks, clock setup and cameras as proved startup steps.
+// Each step acts and reads its result before the next step proceeds.
 //
 //   terminalsStep()        no terminal from an earlier run is open — checked, never closed
 //   clockStep(clock)       the world's time and daylight cycle are what the run asked for
@@ -15,11 +13,12 @@
 // requires the workshop (preflight's dependency pass). `record_overlay.js raise` and `stop` are run as children,
 // awaited without blocking this process's loop, exactly as a person would run them.
 
+const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const consoleWindow = require('@utils/console_window');
 const { CLOCKS } = require('@utils/server_settings');
-const { guardExternal } = require('@utils/external_library_guard');
+const { guardExternal, guardExternalSync } = require('@utils/external_library_guard');
 
 const PROCESS_STARTED_AT = Date.now() - Math.round(process.uptime() * 1000);
 // A window opened this close before the foreman's own start is this run's (the launcher opens a window on the
@@ -83,18 +82,35 @@ function run(args) {
 }
 const tail = (out) => out.trim().split('\n').slice(-4).join(' | ');
 
+// The camera rig publishes who it armed here once every client stands in the world; `free` names the seats
+// a person flies.
+const RIG_READY = path.join(__dirname, '..', '..', 'js_kernel', 'camera_rig_ready.json');
+
 // The config says 'cameras' / 'film'; the overlay's own words are 'watch' / 'record'. Translated here, once.
-function camerasStep({ record, count, fill }) {
+// `eye` asks for the seat a person flies whatever camera_configure says; `onSeats` is handed the seats the
+// rig armed, so the foreman can put the person flying one where the run is.
+function camerasStep({ record, count, fill, eye, onSeats }) {
   let result = null;
   return {
     name: record === 'off' ? 'the cameras are up' : `the cameras are up (${record})`,
     when: () => record !== 'off',
     act: async () => {
       result = await run(['raise', `--overlay=${record === 'film' ? 'record' : 'watch'}`, `--count=${count}`,
-        ...(fill ? [] : ['--fill=off'])]);
+        ...(fill ? [] : ['--fill=off']), ...(eye ? ['--architect'] : [])]);
       return result.code === 0 ? null : { give: `the camera overlay did not come up: ${tail(result.out)}` };
     },
-    proof: async () => ({ ok: result && result.code === 0, why: 'cameras are watching the fleet' }),
+    proof: async () => {
+      if (!result || result.code !== 0) return { ok: false, why: 'the camera overlay did not come up' };
+      const read = guardExternalSync('foreman', 'read who the camera rig armed', () => JSON.parse(fs.readFileSync(RIG_READY, 'utf8')));
+      const seats = read.ok && Array.isArray(read.value.free) ? read.value.free : [];
+      if (eye && !seats.length) {
+        return { ok: false, why: `the run asked for a seat to fly and the rig armed none (${read.ok ? 'its ready record names no free seat' : read.reason})` };
+      }
+      // A seat the rig put at its own fixed spot is left there, never placed at the base.
+      const fixed = read.ok && Array.isArray(read.value.fixed) ? read.value.fixed : [];
+      if (onSeats) onSeats(seats.filter(s => !fixed.includes(s)));
+      return { ok: true, why: seats.length ? `cameras are up, and ${seats.join(', ')} is a seat to fly` : 'cameras are watching the fleet' };
+    },
   };
 }
 

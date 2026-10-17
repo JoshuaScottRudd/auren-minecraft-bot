@@ -247,7 +247,7 @@ async function runBuilderLayout(bot, dryRun, unlocked, surveyFrom, build) {
       const r = pit.refused;
       report.push(`${pitKey}: ✗ NOT FOUND within ${WASTE_PIT_SITING.min_gap}-${WASTE_PIT_SITING.search_to} blocks of ${yardKey} over ${pit.candidates} position(s) — `
         + `refused: ${r.not_land} not land, ${r.trunk} on a tree trunk, ${r.too_uneven} more than ${WASTE_PIT_SITING.scrape_max} over or ${WASTE_PIT_SITING.fill_max} under a floor within ±${WASTE_PIT_SITING.rise} of y${yardFloor}.`);
-      return finish(dryRun, report, [], [`${pitKey}: NOT FOUND beside ${yardKey} — no level, dry 3x3 spot ${WASTE_PIT_SITING.min_gap}+ blocks from its footprint and outside ${castleKey}'s ring.`], false);
+      return finish(dryRun, report, [], [`${pitKey}: NOT FOUND beside ${yardKey} — no level, dry spot for its pad ${WASTE_PIT_SITING.min_gap}+ blocks from its footprint and outside ${castleKey}'s ring.`], false);
     }
     report.push(`${pitKey}: FOUND at (${pit.center.x},${pit.center.y},${pit.center.z}), ${pit.gap} blocks from ${yardKey}'s footprint, `
       + `pad y${pit.floor} (yard floor y${yardFloor}), ${pit.scrape} block(s) to cut and ${pit.fill} to fill.`);
@@ -325,14 +325,25 @@ async function siteShaft(bot, g, avoid) {
     }
   }
   cands.sort((a, b) => a.gaps[0].gap - b.gaps[0].gap || a.gaps[1].gap - b.gaps[1].gap);
+  // The nearest mouth whose descent is solid ground the whole way. With none inside the walk limit, the
+  // fluid-safe descent that meets the least cave is taken and said (SHAFT ALERT).
   let tried = 0;
+  let leastCave = null;
   for (const c of cands) {
     if (tried >= SHAFT_WALK_LIMIT) break;
     await pace();
     tried++;
     const st = evaluateStaircaseFrom(bot, c.top, c.top.y);
-    if (st.ok) return { found: true, ...c, staircase: st, tried, candidates: cands.length };
-    refused[st.reason] = (refused[st.reason] || 0) + 1;
+    if (!st.ok) { refused[st.reason] = (refused[st.reason] || 0) + 1; continue; }
+    if (st.caveAir <= STAIRCASE_SAFETY.CAVE_AIR_MAX) return { found: true, ...c, staircase: st, tried, candidates: cands.length };
+    refused.cave = (refused.cave || 0) + 1;
+    if (!leastCave || st.caveAir < leastCave.staircase.caveAir) leastCave = { ...c, staircase: st };
+  }
+  if (leastCave) {
+    watcher.warn(TAG, `SHAFT ALERT: no descent within ${tried} mouth(s) is solid the whole way — the one sited at `
+      + `(${leastCave.top.x},${leastCave.top.y},${leastCave.top.z}) meets ${leastCave.staircase.caveAir} cell(s) of cave air, the fewest found `
+      + `(${refused.cave} mouth(s) refused for cave).`);
+    return { found: true, ...leastCave, tried, candidates: cands.length };
   }
   return { found: false, refused, tried, candidates: cands.length };
 }

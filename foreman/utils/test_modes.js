@@ -7,9 +7,9 @@
 // and never authored). Raising bodies after it proves nothing about the siting.
 //
 // NOT A SECOND PATHWAY (Law 16): `foremanSteps` is the same list, walked by the same runner, against the
-// same server. A test run differs by subtraction only — the crew step, the soak step and the cameras (a
+// same server. A test run differs by subtraction only — the crew step, the soak step and the bot cameras (a
 // window onto bodies that will not exist) do not apply to it. Everything before that point, a test run
-// proves identically.
+// proves identically. A test whose row says `seat` keeps the one window a person flies.
 //
 // THE REPORT IS READ OFF THE FLEET, NEVER OFF A RECORD. The fleet is still up when a test finishes, so
 // `door.query()` — the fleet's live door — is asked directly, and the base it returns is the base the crew
@@ -75,15 +75,48 @@ function scanReport(site, species) {
   return { ok: unknown.length === 0 && !!seat, lines };
 }
 
+// ── inspect ────────────────────────────────────────────────────────────────────────────────────────
+// What it is for: a person looking over what a finished run built. The world comes up as that run left it,
+// the base is read back from the fleet's memory, the seat a person flies is raised and put at the base's
+// alpha structure (a builder's laydown yard, a homesteader's headframe), and the run then stays open with
+// no body raised until it is stopped.
+function inspectReport(site) {
+  const lines = site.map((r) => {
+    const o = r.candidate.transpose_origin;
+    return `  ${r.roomKey} — ${r.blueprint} at (${o.x},${o.y},${o.z})`;
+  });
+  const alpha = Object.values(ALPHA_STRUCTURE);
+  const seat = site.find(r => alpha.includes(r.roomKey));
+  if (!seat) lines.push(`  WRONG: no alpha structure (${alpha.join(' / ')}) is in the site, so there is nowhere to put the person looking.`);
+  return { ok: !!seat, lines };
+}
+
+// A row may also carry:
+//   start  the one `start` the test makes sense on; any other is refused before anything is touched
+//   seat   true: the test keeps the one camera window a person flies, and no bot window
+//   open   true: the test stays up until stopped once its steps are proved, in place of shutting down
 const TESTS = {
   scan: {
     what: 'the world comes up, the body finds a spot, and the base is sited — the wheat field and the headframe',
     upTo: 'the base is sited and in memory',
     report: scanReport,
   },
+  inspect: {
+    what: 'the world comes up as the last run left it, a seat to fly is put at the base, and it stays open until stopped',
+    upTo: 'the camera is at the build',
+    start: 'continue',
+    seat: true,
+    open: true,
+    report: inspectReport,
+  },
 };
 
 const NAMES = Object.keys(TESTS);
+
+// What a named test asks of the run around it; each answers "nothing" for 'off' and for an unknown name.
+const startFor = (name) => (TESTS[name] && TESTS[name].start) || null;
+const keepsSeat = (name) => !!(TESTS[name] && TESTS[name].seat);
+const staysOpen = (name) => !!(TESTS[name] && TESTS[name].open);
 
 // check(name) → { ok, why } — whether this is a test the foreman knows. Called by foreman_plan's whole-config
 // check so a misspelt test is refused in the same breath as every other config fault.
@@ -119,4 +152,4 @@ function verdict(name, { site, species }) {
 
 const describe = (name) => (name === 'off' ? null : `test ${name}: ${TESTS[name].what}`);
 
-module.exports = { TESTS, NAMES, check, stepsFor, verdict, describe };
+module.exports = { TESTS, NAMES, check, stepsFor, verdict, describe, startFor, keepsSeat, staysOpen };

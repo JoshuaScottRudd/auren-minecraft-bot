@@ -62,13 +62,10 @@
 #>
 param(
   [Parameter(Mandatory=$true)][ValidateSet('snapshot','restore','list','prune')][string]$Action,
-  # Empty = read `level-name` from server.properties. The old default was the literal 'Test world',
-  # which silently became wrong the day the active level changed and would have pointed every verb at
-  # a world nobody runs (Invariant B — re-sense the current state, never act on a remembered one;
-  # Law 6 — server.properties is the one place that knows which world is live).
+  # Empty selects the live level-name from server.properties, the owner of the active world (Law 6).
   [string]$World = '',
   # Which SERVER directory to act on — the folder holding server.properties and the world folders.
-  # REQUIRED: this script ships inside the bot now, so its own folder is never a server, and a default
+  # REQUIRED: this script's folder is the workshop, so a default
   # would be a guess at which world to overwrite (Law 13 — never default a field whose wrong value
   # destroys something).
   [Parameter(Mandatory=$true)][string]$Root,
@@ -100,9 +97,7 @@ function Write-Err($msg){ Write-Host "[ERR ] $msg" -ForegroundColor Red }
 # A second rollback per server would be a second world-is-held guard and
 # a second place for the destructive path to be wrong. Every path below resolves through $scriptRoot.
 #
-# IT SHIPS WITH THE BOT (moved out of MinecraftServer\ on 2026-09-11), because a run that restores a world
-# calls it and a download has no MinecraftServer\ to find it in. That is why -Root has no default: this
-# script's own folder is the workshop, not a server.
+# Root names the server explicitly because the script's own folder belongs to the workshop.
 if (-not (Test-Path -LiteralPath (Join-Path $Root 'server.properties'))) {
   Write-Err "-Root '$Root' holds no server.properties, so it is not a server folder. Pass the folder that holds server.properties and the world folders (for example the fleet's MinecraftServer folder)."
   exit 1
@@ -137,50 +132,14 @@ $snapRoot = Join-Path -Path $scriptRoot -ChildPath $SnapshotsDir
 $worldSnapRoot = Join-Path $snapRoot ($World -replace '[\\/:*?"<>|]','_')
 if(!(Test-Path $worldSnapRoot)){ New-Item -ItemType Directory -Path $worldSnapRoot | Out-Null }
 
-# ALWAYS A LIST, and the leading comma is what makes it one (fixed 2026-09-11). A world with exactly ONE
-# snapshot came back as a bare folder object, and every caller asks .Count: fine for years, until the
-# developer door was dot-sourced above and brought strict mode in with it, which refuses .Count on a single
-# object. The first restore after that died "The property 'Count' cannot be found on this object" before
-# touching anything. @() alone is not enough: PowerShell unrolls an array a function returns, so a
-# one-item @() arrives as the item again. The unary comma returns the array itself.
+# The unary comma preserves an array return for zero, one or many snapshots, so callers can use Count.
 function Get-Snapshots(){
   if(!(Test-Path $worldSnapRoot)){ return ,@() }
   return ,@(Get-ChildItem -Path $worldSnapRoot -Directory | Sort-Object Name -Descending)
 }
 
-# Ensure the Minecraft server is stopped before destructive operations.
-# If a PID file is present (default server.pid in this folder), try to stop that process.
-# Wait until the world folder is genuinely free, not merely until the stop command RETURNED.
-#
-# WHY: stopping the server is asynchronous. `fleet down` sends the rcon stop, deletes server.pid and
-# returns, but the JVM is still flushing region files for seconds afterwards -- and with no pid file
-# left, Stop-ServerProcess has nothing to wait on and reports success immediately. The restore then
-# raced the dying server and died on it twice on 2026-07-21:
-#   Remove-Item : Cannot remove item ...\sub_agent_01: being used by another process
-# and the fleet never came up. A fixed Start-Sleep would be a guess; this measures the actual handle.
-#
-# THE TEST IS THE DELETION ITSELF, and the first version of this got that wrong. It probed
-# `session.lock` for an exclusive open, reasoning that this is the handle Minecraft holds all run.
-# That handle does clear -- and the delete still failed, because the blocker is a handle on the
-# DIRECTORY (and on subdirectories: the first occurrence named `...\sub_agent_01\stats`), which no
-# amount of testing one file inside it can see. Measured 2026-07-21: the probe passed silently and the
-# very next line died "Cannot remove item ...\sub_agent_01: being used by another process."
-# So this asks the operating system the only question whose answer cannot be a proxy -- can this
-# folder be removed RIGHT NOW -- by attempting it. Any lesser probe is an inference about a handle we
-# cannot enumerate.
-#
-# WHY IT NEEDS TO WAIT AT ALL: stopping the server is asynchronous. `fleet down` sends the rcon stop,
-# deletes server.pid and returns, but the JVM keeps flushing region files for seconds after -- and with
-# no pid file left, Stop-ServerProcess has nothing to wait on and reports success immediately. A record
-# test tears the fleet down and restores in the same breath, so it hits the JVM mid-exit EVERY time;
-# the two runs that got away with it were ones where minutes had passed.
-#
-# Retrying a delete is not the catch-and-retry Law 13 forbids: that bars retrying when the outcome is
-# uncertain or deterministic-zero-progress. Here the outcome is neither -- a process is exiting, so the
-# blocker is transient by construction and each attempt has strictly better odds than the last. A fixed
-# Start-Sleep would be the guess.
-# Default stopped (Law 13): on timeout this returns false and the caller REFUSES the restore rather
-# than proceeding into a half-deleted world, which is the one outcome worse than not restoring at all.
+# Deletion tests whether the exiting server has released the world and its subdirectory handles.
+# The bounded wait returns false on timeout, keeping restoration stopped until deletion succeeds (Law 13).
 function Remove-WorldFolderWhenFree {
   param([string]$Path, [int]$TimeoutSeconds = 60)
   if(!(Test-Path $Path)){ return $true }
@@ -292,8 +251,7 @@ switch($Action){
     }
     Write-Info "Removing current world folder ( $worldPath )"
     # Waits for the dying JVM to release the folder, by attempting the removal itself — see the
-    # function's note for why probing session.lock instead was a proxy that passed while the real
-    # handle (on the directory) was still held.
+    # function's deletion result for evidence that directory handles are released.
     if(-not (Remove-WorldFolderWhenFree -Path $worldPath -TimeoutSeconds 60)){
       Write-Err "Refusing to restore: world '$World' is still held by a running process. Stop the fleet and retry."
       exit 1
@@ -309,15 +267,8 @@ switch($Action){
     }
     Write-Info "Restore complete. World replaced with snapshot '$Name'"
 
-    # HQ kernel state is LEFT INTACT on restore (Architect, 2026-07-03). The whole point of
-    # snapshotting a completed build is to skip the ~12-minute rebuild -- but that only works if the
-    # matching corporate_headquarters (build-center, staircase site, tracked chests) survives with the
-    # world. Auto-deleting it here wiped that state, so bots cold-started with no build site and
-    # mining_manager looped to death ("staircase site not locked") until the judge killed it.
-    # A flush is now a DELIBERATE act, never a restore side effect: run the 'flush' verb yourself
-    # (or delete Auren_Bot/js_kernel/corporate_headquarters*.json) only when you actually want a cold
-    # start against a fresh/mismatched world. Forgetting to flush a stale HQ is recoverable; a restore
-    # silently erasing the HQ you meant to keep is not.
+    # Restoration preserves HQ so matching world snapshots retain their build sites and stations.
+    # The explicit flush verb owns resetting HQ for a different world.
     Write-Info "HQ kernel state left intact (build-center/stations preserved). If this snapshot is from a DIFFERENT world, run the 'flush' verb before starting so bots don't act on stale coordinates."
 
     if($AutoStart){

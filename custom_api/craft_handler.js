@@ -418,16 +418,11 @@ async function tryScanNearbyStation(bot, stationType) {
 // (1-4) — back into main inventory. mineflayer's bot.craft can desync and leave output on the cursor or
 // in a grid slot, where bot.inventory.count() cannot see it and the server ejects it on disconnect.
 // Cursor clears first, since putAway needs a free cursor. Idempotent and near-free when already clean.
+// The sweep is utils/trash's (Law 16): it reads the server's own copy of the pocket before each click.
 async function clearCraftingResidue(bot) {
   const win = bot.inventory;                      // player window: slot 0 = result, 1-4 = 2x2 grid
   if (!win || !Array.isArray(win.slots)) return;
-  if (win.selectedItem) {
-    const empty = typeof win.firstEmptyInventorySlot === 'function' ? win.firstEmptyInventorySlot() : null;
-    if (empty != null) await guardExternal(TAG, 'clickWindow to clear the crafting cursor', () => bot.clickWindow(empty, 0, 0));
-  }
-  for (const s of [0, 1, 2, 3, 4]) {
-    if (win.slots[s]) await guardExternal(TAG, `putAway crafting slot ${s}`, () => bot.putAway(s));
-  }
+  await require('@utils/trash').sweepCraftArea(bot);
 }
 
 // The true count of an item broken out by where it sits: bot.inventory.count() sees only main+hotbar,

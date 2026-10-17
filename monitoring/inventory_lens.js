@@ -31,6 +31,10 @@ const QUEUE_RE = /chest (\S+) released after (\d+)s in queue/;
 const PICTURE_RE = /Contents matched the picture in (\d+)ms\./;
 // The walk to the chest's stance, the travel share of the chest line's wait clock.
 const WALK_RE = /Walked ([\d.]+)s of the wait\./;
+// The chest timer (inventory_swapper._executeTransfer), one per window since storage dropped its lock and
+// queue: walk, open (click to window), picture (window to matching the record), work (to the close), and how
+// many peers were using the same chest when the window opened and closed.
+const CHEST_TIMER_RE = /chest timer (deposit|retrieve) (\S+(?: #\d+)?) (\S+): walk=([\d.]+) open=([\d.]+) picture=([\d.]+) work=([\d.]+) total=([\d.]+) peers_at_open=(\d+) peers_at_close=(\d+) contended=([01]) items=(\d+)/;
 const COMPOST_WAIT_RE =/compost_executor: fed (\d+) item\(s\)(.*?) after ([\d.]+)s waiting to get in\./;
 
 // ── THE MATERIAL ACCOUNT ─────────────────────────────────────────────────────
@@ -58,6 +62,7 @@ const TINY_RE = /NOT walking to the barrel: (\w+): only (\d+) unclaimed and I ne
 // multiplies the known constant by the window count.
 const FIXED_TOLL_SEC = 0.43;
 
+const BARREL_SLOTS = 27;          // a barrel's slot count; a snapshot with this many stacks is a full barrel
 const SMALL_TRANSFER = 2;        // at or below this the fixed ~430ms window overhead dominates entirely
 
 function _parseStacks(text) {
@@ -95,13 +100,15 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
     let fellings = 0;
     let maxRel = 0;
     const composter = { waitSec: 0, visits: 0, gaveUp: 0 };
+    const timers = [];            // one row per chest timer line
 
     const C = (id) => {
         let c = chests.get(id);
         if (!c) {
             c = { stacks: [], at: null, deposits: 0, retrieves: 0, itemsIn: 0, itemsOut: 0,
                   waitSec: 0, queueSec: 0, queues: 0, flowIn: {}, flowOut: {}, lastTotals: {},
-                  fragPeak: 0, fragPeakAt: null, fragPeakText: '' };
+                  fragPeak: 0, fragPeakAt: null, fragPeakText: '',
+                  slotsPeak: 0, slotsPeakAt: null, fullSince: null, fullSec: 0, fullTimes: 0 };
             chests.set(id, c);
         }
         return c;
@@ -138,6 +145,13 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
             const extra = Object.values(byName).reduce((n, k) => n + (k - 1), 0);
             if (extra > c.fragPeak) { c.fragPeak = extra; c.fragPeakAt = l.relSec; c.fragPeakText = stackText; }
 
+            // Fill is read the same way: the most slots any snapshot showed, and the time between a
+            // snapshot showing every slot taken and the next one showing a free slot.
+            if (stacks.length > c.slotsPeak) { c.slotsPeak = stacks.length; c.slotsPeakAt = l.relSec; }
+            if (stacks.length >= BARREL_SLOTS) {
+                if (c.fullSince === null) { c.fullSince = l.relSec; c.fullTimes++; }
+            } else if (c.fullSince !== null) { c.fullSec += l.relSec - c.fullSince; c.fullSince = null; }
+
             c.stacks = stacks;      // newest snapshot wins outright for STANDING contents — no merging
             c.at = l.relSec;
             c.waitSec += +waitStr;
@@ -148,6 +162,9 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
             manifest.push({ t: l.relSec, bot: l.bot, dir, count, kinds, moved: movedText, chestId,
                             openSec: +openStr, msPerItem: +msPerItem, waitSec: +waitStr,
                             pictureMs: pic ? +pic[1] : null, walkSec: walk ? +walk[1] : null });
+        } else if ((m = l.raw.match(CHEST_TIMER_RE))) {
+            timers.push({ dir: m[1], chest: m[3], walk: +m[4], open: +m[5], picture: +m[6], work: +m[7], total: +m[8],
+                          peersOpen: +m[9], peersClose: +m[10], contended: m[11] === '1', items: +m[12] });
         } else if ((m = l.raw.match(QUEUE_RE))) {
             const c = C(m[1]); c.queues++; c.queueSec += +m[2];
         } else if ((m = l.raw.match(COMPOST_WAIT_RE))) {
@@ -374,6 +391,33 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
     out.kv('total_wait_sec', (chestWait + composter.waitSec).toFixed(1));
     out.kv('total_wait_bot_min', botMin(chestWait + composter.waitSec));
 
+    // ── CHEST TIMERS: THE NO-QUEUE VISIT, PHASE BY PHASE ────────────────────────────────────────────────
+    // Read beside queue_time: `chest_wait_bot_min` above is the standing time before a body could act,
+    // whatever the system; this splits it. `queue_bot_min` is 0 by construction under the no-queue system and
+    // is printed so the comparison with a queued run reads off one field. A run from before the timer line
+    // existed prints windows 0 here.
+    const sum = (k, rows = timers) => rows.reduce((n, t) => n + t[k], 0);
+    out.section('chest_timers');
+    out.kv('windows', timers.length);
+    out.kv('windows_contended', timers.filter(t => t.contended).length);
+    out.kv('peers_at_open_max', timers.reduce((n, t) => Math.max(n, t.peersOpen), 0));
+    out.kv('walk_bot_min', botMin(sum('walk')));
+    out.kv('open_bot_min', botMin(sum('open')));
+    out.kv('picture_bot_min', botMin(sum('picture')));
+    out.kv('queue_bot_min', botMin(0));
+    out.kv('standing_before_work_bot_min', botMin(sum('open') + sum('picture')));
+    out.kv('work_bot_min', botMin(sum('work')));
+    out.kv('visit_bot_min', botMin(sum('total')));
+    out.kv('items', sum('items'));
+    if (timers.length) {
+        const rows = ['deposit', 'retrieve'].map(d => {
+            const r = timers.filter(t => t.dir === d);
+            const mean = (k) => r.length ? (sum(k, r) / r.length).toFixed(2) : '0.00';
+            return [d, r.length, r.filter(t => t.contended).length, mean('walk'), mean('open'), mean('picture'), mean('work'), mean('total')];
+        });
+        out.table(['direction', 'windows', 'contended', 'walk_s_mean', 'open_s_mean', 'picture_s_mean', 'work_s_mean', 'total_s_mean'], rows);
+    }
+
     // Double handling: the same item deposited into and withdrawn from the SAME chest — the round trip
     // the material did not need to make, since it was already inside storage when withdrawn.
     let doubleTotal = 0;
@@ -397,6 +441,22 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
             fragRows.push([_prettyId(id), c.fragPeak, relativeTime(c.fragPeakAt), c.fragPeakText]);
         }
     }
+    const fillRows = [];
+    let everFull = 0, fullAtEnd = 0;
+    for (const [id, c] of [...chests].filter(([, c]) => c.at !== null).sort((a, b) => b[1].slotsPeak - a[1].slotsPeak)) {
+        const openFull = c.fullSince !== null ? maxRel - c.fullSince : 0;
+        if (c.fullTimes) everFull++;
+        if (c.fullSince !== null) fullAtEnd++;
+        fillRows.push([_prettyId(id), c.slotsPeak, relativeTime(c.slotsPeakAt), c.fullTimes,
+                       Math.round((c.fullSec + openFull) / 6) / 10, c.stacks.length]);
+    }
+    out.section('chest_fill');
+    out.kv('barrel_slots', BARREL_SLOTS);
+    out.kv('chests_read', fillRows.length);
+    out.kv('chests_ever_full', everFull);
+    out.kv('chests_full_at_end', fullAtEnd);
+    out.table(['chest', 'slots_peak', 'peak_at', 'times_full', 'full_min', 'slots_at_end'], fillRows);
+
     out.section('cost_fragmentation');
     out.kv('redundant_slots_peak', fragWaste);
     out.kv('chests_fragmented', fragChests);
@@ -414,4 +474,4 @@ function runInventory({ seg = [], traceName = '?', bot: botFilter = null, verbos
     out.kv('ms_per_item_bulk', avg(bulk));
 }
 
-module.exports = { runInventory };
+module.exports = { runInventory, TX_RE, parseStacks: _parseStacks };

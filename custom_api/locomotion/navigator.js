@@ -522,9 +522,11 @@ async function jumpOutStep(bot, feetTarget) {
     () => { bot.setControlState('jump', false); });
 }
 
-async function bridgeLevelStep(bot, dir) {
+// targetFeet is the planned stand cell; the floored feet drift a cell along an axis on a diagonal edge, and
+// feet plus dir then names a cell off the route.
+async function bridgeLevelStep(bot, dir, targetFeet = null) {
   const feet = bot.entity.position.floored();
-  const overFeet = new Vec3(feet.x + dir.x, feet.y, feet.z + dir.z);
+  const overFeet = targetFeet || new Vec3(feet.x + dir.x, feet.y, feet.z + dir.z);
   const overFloor = bot.blockAt(overFeet.offset(0, -1, 0));
   if (!overFloor || overFloor.name === 'air' || overFloor.boundingBox === 'empty') {
     const r = await tryBridgeStep(bot, dir.x, dir.z);
@@ -1126,15 +1128,19 @@ async function runNavigation(payload) {
   // the walked route — considering one fires on nearly every base-adjacent plan.
   const cuts = astarPath.filter(s => s.protectedVoxel);
   if (cuts.length) {
+    const goalAt = `(${selectedTarget.position.x},${selectedTarget.position.y},${selectedTarget.position.z})`;
     const where = cuts.slice(0, 6).map(s => `${s.edgeType}@(${s.pos.x},${s.pos.y + 1},${s.pos.z})`).join(' ');
     watcher.warn('navigator',
       `CUTTING THE BUILD — this route breaks ${cuts.length} PROTECTED voxel(s) and the bot is walking it. ` +
       `${where}${cuts.length > 6 ? ` +${cuts.length - 6} more` : ''}. ` +
-      `A* charges ${PROTECTED_VOXEL_DETOUR_BUDGET} per protected voxel and returns the cheapest route, so this is a PROOF that no ` +
-      `detour under ${PROTECTED_VOXEL_DETOUR_BUDGET} extra steps reaches (${selectedTarget.position.x},${selectedTarget.position.y},${selectedTarget.position.z}) — the goal is enclosed by the build, ` +
-      `not merely awkward to reach. Two fixes and they are opposite: if the goal SHOULD be reachable, the ` +
-      `blueprint is missing a way in; if it should not, the caller is targeting an interior cell instead of ` +
-      `an anchor. Raising the budget only buys a wider search for the same cut.`);
+      (isPartial
+        ? `This route came from a search cut off at its deadline (PARTIAL), so it proves nothing about a detour to ${goalAt}: ` +
+          `a full search may find one.`
+        : `A* charges ${PROTECTED_VOXEL_DETOUR_BUDGET} per protected voxel and returns the cheapest route, so this is a PROOF that no ` +
+          `detour under ${PROTECTED_VOXEL_DETOUR_BUDGET} extra steps reaches ${goalAt} — the goal is enclosed by the build, ` +
+          `not merely awkward to reach. Two fixes and they are opposite: if the goal SHOULD be reachable, the ` +
+          `blueprint is missing a way in; if it should not, the caller is targeting an interior cell instead of ` +
+          `an anchor. Raising the budget only buys a wider search for the same cut.`));
   }
 
   // Same shape as the cut above: a dig on this route will open lava into the hole it makes (a dig
@@ -1338,6 +1344,8 @@ async function runNavigation(payload) {
     // above unconditionally, since every predicate upstream already treats a phantom leaf as air. A
     // blueprint's leaf is not touched — leaf_authority.isPhantom refuses it (Law 25).
     await leafAuthority.clearStance(bot, step.pos.offset(0, 1, 0));
+    // A rising edge jumps from the cell it stands in, so the two cells over the head there are cleared too.
+    if (step.pos.y + 1 > curFeet.y) await leafAuthority.punch(bot, [curFeet.offset(0, 2, 0), curFeet.offset(0, 3, 0)]);
 
     const runCells = [];
     let runEndsAt = stepIdx;
@@ -1388,7 +1396,7 @@ async function runNavigation(payload) {
     }
 
     if (!runHandled) switch (step.edgeType) {
-      case 'walk':        ok = await bridgeLevelStep(bot, dir); break;
+      case 'walk':        ok = await bridgeLevelStep(bot, dir, step.pos.offset(0, 1, 0)); break;
       case 'jump_out':    ok = await jumpOutStep(bot, step.pos.offset(0, 1, 0)); break;
       case 'climb_up':    ok = await stairUpStep(bot, dir, step.edgeType); break;
       case 'climb_down':  ok = await stairDownStep(bot, dir, step.edgeType); break;
@@ -1414,7 +1422,7 @@ async function runNavigation(payload) {
         break;
       }
       case 'dig_through': ok = await digThroughStep(bot, dir); break;
-      case 'bridge':      ok = await bridgeLevelStep(bot, dir); break;
+      case 'bridge':      ok = await bridgeLevelStep(bot, dir, step.pos.offset(0, 1, 0)); break;
       case 'dig_down':    ok = await digDownStep(bot); break;
       case 'pillar':      ok = await pillarUpStep(bot); break;
       // A dug stair line arrives here one step at a time (pathfinding_utils unrolls it); each step is
@@ -1482,9 +1490,11 @@ async function runNavigation(payload) {
 
     // ── Footing recovery: the step target was never the problem — the body's footing was — so this
     // does not blacklist the destination and does not count as a replan attempt. Two passes,
-    // cheapest first: pass 1 (microcentre + walk) recovers a body hovering off the side of something;
+    // cheapest first: pass 1 (walk onto the solid neighbour) recovers a body hovering off the side of something;
     // pass 2 clears an open-top container's rim, which pass 1 cannot reach. ─────────────────────────
     {
+      // An airborne body has air under it by definition; its footing is read where it lands.
+      if (!bot.entity.onGround) await waitUntilSettled(bot);
       const hovFeet = bot.entity.position.floored();
       const stuckWhy = badFooting(bot);
       if (stuckWhy) {
@@ -1493,7 +1503,8 @@ async function runNavigation(payload) {
         for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
           const adjFloor = bot.blockAt(new Vec3(hovFeet.x + dx, hovFeet.y - 1, hovFeet.z + dz));
           if (adjFloor && adjFloor.boundingBox !== 'empty' && adjFloor.name !== 'air') {
-            await microCenter(bot);
+            // No centring first: a body standing on a neighbour's edge is held by that neighbour, and
+            // centring it over its own floored cell walks it off into the air it hovers above.
             bot.setControlState('forward', false);
             const target = new Vec3(hovFeet.x + dx + 0.5, hovFeet.y, hovFeet.z + dz + 0.5);
             // Only the aim is a boundary; a refused aim means this neighbour cannot be tried, so the
@@ -1550,7 +1561,9 @@ async function runNavigation(payload) {
     replans++;
     if (replans <= MAX_REPLANS) {
       const failFeet = bot.entity.position.floored();
-      watcher.warn('navigator', `Step failed: ${step.edgeType} to (${step.pos.x},${step.pos.y + 1},${step.pos.z}) — bot at (${failFeet.x},${failFeet.y},${failFeet.z}), charged ${movePenalties.get(finedKey)} on ${step.edgeType} into that cell (other ways in stay unpriced) and re-planning (${replans}/${MAX_REPLANS}).`);
+      // A failed step is the walk's ordinary correction: the move is priced up and the route planned again.
+      // The step's own ledger line (step_fail) carries what stopped it.
+      watcher.summary('navigator', `Step failed: ${step.edgeType} to (${step.pos.x},${step.pos.y + 1},${step.pos.z}) — bot at (${failFeet.x},${failFeet.y},${failFeet.z}), charged ${movePenalties.get(finedKey)} on ${step.edgeType} into that cell (other ways in stay unpriced) and re-planning (${replans}/${MAX_REPLANS}).`);
       const replanFloor = new Vec3(curFeet.x, curFeet.y - 1, curFeet.z);
       const tFailReplan = Date.now();
       const replanResult = await computeAStar(bot, replanFloor, goal, { movePenalties, sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: !goal.walk_only });

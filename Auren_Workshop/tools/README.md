@@ -180,6 +180,12 @@ Evidence, ten scored candidates and the method: `Documentation/guard_admission_1
 | **3 — unbound identifiers + dead-zone reads** | two ReferenceErrors a loader cannot see, because the line never runs at load time: a name read where **nothing** binds it, and a `let`/`const` read before its own initializer completes — where **too much** binds it | **live** (built 2026-08-14; found a dead cell claim on its first run) |
 | **4 — catch shape** | a `try` written anywhere except `external_library_guard.js` | **live** (gate since 2026-08-15, when the census reached zero) |
 
+The comment gate discovers shipped JavaScript and PowerShell source and applies the same storytelling
+patterns to parsed comments. Windows uses its built-in PowerShell parser; other systems require
+PowerShell 7 (`pwsh`) for this developer check. Strings and here-strings remain data. A match names its
+file, line and pattern for review; a clean scan reports pattern coverage. New narrative wording and
+false positives refine this one pattern list through the normal edit and preflight cycle.
+
 ### The session and record machinery lives at the repo root now — `Sessions/`
 
 **Moved out of this folder 2026-09-01** (Architect: *"lets move all the session logging systems outside of

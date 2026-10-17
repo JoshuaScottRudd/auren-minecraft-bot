@@ -139,7 +139,7 @@ module.exports = {
     // (harvest_executor / canopy_clear_executor conceding a futile pass) are one-shot concessions, not
     // a heartbeat, and each one is worth a line.
     if (!payload || payload.log_idle_line !== false) {
-      watcher.summary(TAG, `idle — ${_standing(payload)}; parked, re-checking the board every ${idleScheduler.RECHECK_MS / 1000}s.`);
+      watcher.summary(TAG, `idle — ${_standing(payload)}; parked, re-checking the board every ${idleScheduler.BOARD_RESCAN_MS / 1000}s.`);
     }
   }),
 };

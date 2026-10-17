@@ -36,7 +36,7 @@ const inventorySwapper = require('@api/inventory_swapper');
 const { craftBatch } = require('@api/craft_handler');
 const { remainingRawInSpecies, isRawMaterial, isChainOwned } = require('@utils/calculators/build_material_calculator');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
-const { buildPoolChests, chestItemCounts, getBotInventory, sleep } = require('@utils/fragment_utils');
+const { buildPoolChests, chestItemCounts, getBotInventory, sleep, group_to_item } = require('@utils/fragment_utils');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
 
 const TAG = 'column_preparation';
@@ -88,7 +88,9 @@ module.exports = {
     // The same question the assessor asked before it posted this cube (Law 16).
     const { cubeMaterials, trashOf, endsColumn } = require('@thinking/assessors/downloaded_build');
     const need = await cubeMaterials(bot, frame, column, anchor, await endsColumn(bot, frame, column, { anchor, seal: false }));
-    const chests = buildPoolChests(structure);
+    // The chests are read fresh at every use: a peer's update replaces a station's entry, so a list kept from
+    // the start of the trip would go on reading a chest as it was.
+    const chestsNow = () => buildPoolChests(structure);
     const lens = require('@kernel/inventory_lens');
     const trash = require('@utils/trash');
 
@@ -121,7 +123,7 @@ module.exports = {
 
     // What the build's chests hold of one item that no other body has claimed (chest_ledger).
     const freeInChests = item => Math.max(0,
-      chests.reduce((n, { station }) => n + countInInventory(item, chestItemCounts(station)), 0) - ledger.claimedByOthers(item));
+      chestsNow().reduce((n, { station }) => n + countInInventory(item, chestItemCounts(station)), 0) - ledger.claimedByOthers(item));
 
     // ── STEP 1: what the pool already holds FINISHED is taken first ───────────────────────────────────
     let pocket = buildPocket();
@@ -176,6 +178,29 @@ module.exports = {
     // The cube's withdrawals first, then the trash the pocket will still lack once they are in it, planned in
     // the order utils/trash draws it and out of what the withdrawals leave. A line the chests cannot hand over
     // ends the trip here, with nothing taken and nothing made.
+    // The pocket as it will stand with the withdrawals in it. A withdrawal asked by a group's name
+    // (furnace_material) lands as the members the chests hold, and the pocket is priced by those names.
+    const stockedWith = () => {
+      const view = { ...pocket };
+      for (const [item, n] of Object.entries(toWithdraw)) {
+        const members = group_to_item[item];
+        if (!Array.isArray(members) || members.includes(item)) { view[item] = (view[item] || 0) + n; continue; }
+        let left = n;
+        for (const member of members) {
+          const got = Math.min(left, freeInChests(member));
+          if (got > 0) { view[member] = (view[member] || 0) + got; left -= got; }
+        }
+        if (left > 0) view[members[0]] = (view[members[0]] || 0) + left;
+      }
+      return view;
+    };
+    // The withdrawals are read item by item; the bill is priced whole (billShort). What the whole bill still
+    // finds short of the cube's own blocks is added to the withdrawals, so the two answers are one (Law 16).
+    for (let pass = 0; pass < 3; pass++) {
+      const cubeShort = trash.shortWith(need, 0, stockedWith(), frame.wood);
+      if (!Object.keys(cubeShort).length) break;
+      for (const [raw, n] of Object.entries(cubeShort)) toWithdraw[raw] = (toWithdraw[raw] || 0) + n;
+    }
     const lines = Object.entries(toWithdraw).filter(([item, want]) => freeInChests(item) < want)
       .map(([item, want]) => `${item} ${freeInChests(item)}/${want}`);
     if (lines.length) {
@@ -183,8 +208,7 @@ module.exports = {
       return refused(`the chests hold too little unclaimed: ${lines.join(', ')}; nothing taken`);
     }
     const lackOf = short => Object.entries(short).reduce((n, [raw, k]) => n + k * (/_log$/.test(raw) ? trash.PLANKS_PER_LOG : 1), 0);
-    const stocked = { ...pocket };
-    for (const [item, n] of Object.entries(toWithdraw)) stocked[item] = (stocked[item] || 0) + n;
+    const stocked = stockedWith();
     // The plan is complete when the board's own question (billShort) finds nothing short in the pocket as it
     // will stand with the withdrawals and the planned trash in it (Law 16).
     const trashTake = {};
@@ -212,30 +236,43 @@ module.exports = {
     for (const [item, n] of Object.entries(trashTake)) bill[item] = (bill[item] || 0) + n;
     const billLines = Object.entries(bill).sort((a, b) => b[1] - a[1]);
     if (billLines.length) {
-      const at = ledger.stationHolding(billLines[0][0]) || (chests[0] && chests[0].id);
-      ledger.claim(at, billLines.map(([item, amount]) => ({ item, amount })));
+      const at = ledger.stationHolding(billLines[0][0]) || (chestsNow()[0] && chestsNow()[0].id);
+      // The ledger files a line for what is unclaimed at this moment, which can be less than the bill read a
+      // moment earlier; a trip that could not claim its whole bill takes nothing.
+      const filed = ledger.claim(at, billLines.map(([item, amount]) => ({ item, amount }))) || {};
+      const unfiled = billLines.filter(([item, amount]) => (filed[item] || 0) < amount).map(([item, amount]) => `${item} ${filed[item] || 0}/${amount}`);
+      if (unfiled.length) return refused(`the claim filed less than the bill: ${unfiled.join(', ')}; nothing taken`);
     }
     link.releaseClaim(billKey);
-
-    // From the first withdrawal on, the pocket may hold made goods of a cube that is not built yet.
-    require('@api/waste_pit').cubeTripUnbuilt();
+    // The trip's draw on the chests, in the tokens it is withdrawn under (the throughput lens reads this).
+    watcher.summary(TAG, `CUBE_BILL column=${index} cube=${anchor.index} bill=${JSON.stringify(bill)}`);
 
     const short = [];
-    for (const [item, want] of Object.entries(toWithdraw)) {
-      const sources = [];
-      let available = 0;
-      for (const { id, station } of chests) {
+    const sourcesOf = (item, tried) => {
+      const out = [];
+      for (const { id, station } of chestsNow()) {
         const n = countInInventory(item, chestItemCounts(station));
-        if (n > 0) { sources.push({ id, n }); available += n; }
+        if (n > 0 && !tried.has(id)) out.push({ id, n });
       }
+      return out.sort((a, b) => b.n - a.n);
+    };
+    for (const [item, want] of Object.entries(toWithdraw)) {
+      const tried = new Set();
+      let sources = sourcesOf(item, tried);
+      const available = sources.reduce((n, s) => n + s.n, 0);
       if (available < want) { short.push(`${item} ${available}/${want}`); continue; }
-      sources.sort((a, b) => b.n - a.n);
       let remaining = want;
-      for (const { id, n } of sources) {
-        if (remaining <= 0) break;
-        const result = await inventorySwapper.retrieveItems(bot, item, Math.min(n, remaining), id);
-        if (!result) return;   // abandoned to the judge (Law 15) — this line is dead
-        remaining -= (result.transferred || 0);
+      // A chest that handed over less is read again with the rest: the stock a peer moved is looked for in
+      // every other chest the fresh pictures show holding it, once.
+      for (let pass = 0; pass < 2 && remaining > 0; pass++) {
+        if (pass) sources = sourcesOf(item, tried);
+        for (const { id, n } of sources) {
+          if (remaining <= 0) break;
+          tried.add(id);
+          const result = await inventorySwapper.retrieveItems(bot, item, Math.min(n, remaining), id);
+          if (!result) return;   // abandoned to the judge (Law 15) — this line is dead
+          remaining -= (result.transferred || 0);
+        }
       }
       // The chests held it and the window moved less: the cause is the pocket, and the count of free slots says so.
       if (remaining > 0) short.push(`${item} ${want - remaining}/${want} (chests held ${available}, ${freeSlots()} free slot(s) in the pocket)`);
@@ -247,7 +284,7 @@ module.exports = {
     }
     // The cube's material is in the pocket; the claim that stays is the trash, drawn after the crafts (STEP 6).
     const trashLines = Object.entries(trashTake).sort((a, b) => b[1] - a[1]);
-    if (trashLines.length) ledger.claim(ledger.stationHolding(trashLines[0][0]) || (chests[0] && chests[0].id), trashLines.map(([item, amount]) => ({ item, amount })));
+    if (trashLines.length) ledger.claim(ledger.stationHolding(trashLines[0][0]) || (chestsNow()[0] && chestsNow()[0].id), trashLines.map(([item, amount]) => ({ item, amount })));
     else ledger.release(null, 'cube material withdrawn');
 
     // ── STEP 4: craft the finished blocks, whole order or none of it ─────────────────────────────────
@@ -318,12 +355,8 @@ module.exports = {
     // pay it first — and what is lacking is drawn in the order utils/trash states: spare wood, the building's
     // wood, dirt only where the chests hold no wood for it. STEP 3 found it in the chests and it has been claimed
     // since; a count short here is said as a warning, and the made goods are banked.
-    const trashCarried = () => {
-      const view = buildPocket();
-      for (const [item, count] of Object.entries(need)) if (view[item]) view[item] = Math.max(0, view[item] - count);
-      const held = trash.heldBlocks(view, frame.wood);
-      return held.spare + held.own + held.dirt;
-    };
+    const tripTrash = () => trash.inPocket(buildPocket(), need, frame.wood);
+    const trashCarried = () => tripTrash().worth;
     for (const [item, each] of trash.takeOrder(frame.wood)) {
       const lack = trashNeed - trashCarried();
       if (lack <= 0) break;
@@ -337,6 +370,16 @@ module.exports = {
     if (carried < trashNeed) {
       watcher.warn(TAG, `TRASH_DRAINED_DURING_CRAFT column=${index} cube=${anchor.index} carried=${carried} needed=${trashNeed} claimed=${JSON.stringify(trashTake)} crafted=${orders.length}. The made goods are banked for the next trip.`);
       return notStaged(`trash ${carried}/${trashNeed} after the craft`);
+    }
+
+    // ── STEP 7: THE TRASH IS MADE INTO PLANKS HERE, AT THE YARD ─────────────────────────────────────────
+    // The trip stands planks and dirt it already holds and crafts nothing once it has left (utils/trash). The
+    // logs past the cube's own are split until the pocket can stand the whole trash count.
+    const planks = await trash.makePlanks(bot, frame.wood, need, trashNeed, TAG);
+    watcher.summary(TAG, `TRASH_PLANKS column=${index} cube=${anchor.index} ready=${planks.ready} needed=${trashNeed} made=${planks.made} logs_left=${tripTrash().logs} free_slots=${freeSlots()}`);
+    if (planks.reason) {
+      watcher.warn(TAG, `TRASH_PLANKS_NOT_MADE column=${index} cube=${anchor.index} ready=${planks.ready} needed=${trashNeed}: ${planks.reason}. The made goods are banked for the next trip.`);
+      return notStaged(`trash planks ${planks.ready}/${trashNeed}: ${planks.reason}`);
     }
 
     ledger.release(null, 'cube trip staged');

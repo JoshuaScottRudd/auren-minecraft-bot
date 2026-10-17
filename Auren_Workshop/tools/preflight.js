@@ -607,6 +607,7 @@ const PRIVATE_REQUIRE = new RegExp(
   String.raw`require\s*\(\s*['"\`][^'"\`]*(?:` + PRIVATE_DOMAINS.join('|') + String.raw`)[\\/]`, 'g');
 
 const shipped = [];
+const shippedPowerShell = [];
 (function sweepShipped(rel) {
   const dir = path.join(BOT_DIR, rel);
   if (!fs.existsSync(dir)) return;
@@ -615,6 +616,7 @@ const shipped = [];
     const childRel = rel ? path.join(rel, ent.name) : ent.name;
     if (ent.isDirectory()) { sweepShipped(childRel); continue; }
     if (ent.name.endsWith('.js')) shipped.push(childRel);
+    if (ent.name.endsWith('.ps1')) shippedPowerShell.push(childRel);
   }
 })('');
 
@@ -694,7 +696,56 @@ const STORY_TRIGGERS = [
   { kind: 'history',  re: /\b(?:used to be|originally|formerly|was (?:deleted|removed|replaced|retired)|turned out|we (?:tried|found|saw)|(?:he|she|they) (?:said|ruled|asked)|his (?:ruling|call|words))\b/i },
   { kind: 'records',  re: /\b(?:bugsquashing|scratchpad)\b|§\s?\d/i },
   { kind: 'argument', re: /\b(?:deliberately not|do not reintroduce|the wrong turn|for two reasons)\b/i },
+  { kind: 'history',  re: /\b(?:was hardcoded|was indistinguishable|supersedes\s+\S+\.(?:js|ps1)|now lives at a different|these were the workshop|only added noise|(?:replacement for|analogue of) the old|the old trace lacked|is the old API|all-or-nothing removed|since the .+ became|this whole design removed|before this existed|(?:it |\S+ )?was written (?:for|to)|until that day|the rejected alternative was|the first version of this|the two runs that got away|the filter was|the old default was|auto-deleting it here|was proposed as the fix|that one was already fixed)\b/i },
 ];
+// PowerShell's own parser distinguishes comments from strings, here-strings and nested expressions.
+// One batched read keeps every discovered script behind the same pattern gate as JavaScript.
+function readPowerShellComments() {
+  if (!shippedPowerShell.length) return [];
+  const parser = String.raw`
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$ProgressPreference = 'SilentlyContinue'
+$sources = ConvertFrom-Json ([Console]::In.ReadToEnd())
+$rows = New-Object System.Collections.Generic.List[object]
+function Read-CommentTokens($tokens, $relative) {
+  foreach ($token in $tokens) {
+    if ($token.Kind -eq 'Comment') {
+      $rows.Add(@{ rel = $relative; line = $token.Extent.StartLineNumber; value = $token.Text })
+    }
+    if ($token.PSObject.Properties['NestedTokens']) { Read-CommentTokens $token.NestedTokens $relative }
+  }
+}
+foreach ($source in $sources) {
+  $tokens = $null
+  $errors = $null
+  $null = [System.Management.Automation.Language.Parser]::ParseInput($source.text, [ref]$tokens, [ref]$errors)
+  if ($errors.Count) {
+    foreach ($failure in $errors) { [Console]::Error.WriteLine($source.rel + ':' + $failure.Extent.StartLineNumber + ': ' + $failure.Message) }
+    exit 1
+  }
+  Read-CommentTokens $tokens $source.rel
+}
+ConvertTo-Json -InputObject @($rows.ToArray()) -Compress -Depth 4
+`;
+  const command = process.platform === 'win32'
+    ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'pwsh';
+  const result = spawnSync(command, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(parser, 'utf16le').toString('base64')], {
+    input: JSON.stringify(shippedPowerShell.map(rel => ({ rel, text: fs.readFileSync(path.join(BOT_DIR, rel), 'utf8').replace(/^\uFEFF/, '') }))),
+    encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true, timeout: 30000,
+  });
+  if (result.error) {
+    console.error('PowerShell comments were not checked: ' + result.error.message);
+    console.error('Run preflight with Windows PowerShell or PowerShell 7 (pwsh) available to parse the shipped scripts.');
+    process.exit(1);
+  }
+  if (result.status !== 0) {
+    console.error('PowerShell source could not be parsed: ' + result.stderr.trim());
+    console.error('Fix the named script before rerunning preflight.');
+    process.exit(1);
+  }
+  return JSON.parse(result.stdout.replace(/^\uFEFF/, '').trim());
+}
 if (espree) {
   const told = [];
   for (const rel of shipped) {
@@ -707,16 +758,21 @@ if (espree) {
       });
     }
   }
+  for (const comment of readPowerShellComments()) {
+    comment.value.split('\n').forEach((text, i) => {
+      const hit = STORY_TRIGGERS.find(t => t.re.test(text));
+      if (hit) told.push({ rel: comment.rel, line: comment.line + i, kind: hit.kind, text: text.trim().slice(0, 110) });
+    });
+  }
   if (told.length) {
-    console.error(`\nSTORYTELLING COMMENT — ${told.length} comment line(s) in the shipped tree tell the code's story (Law 14).`);
+    console.error(`\nSTORYTELLING PATTERN — ${told.length} comment line(s) in the shipped tree match the current history patterns (Law 14).`);
     console.error('  A comment states what the code beneath it is FOR, in the present tense. Dates, people, run');
     console.error('  numbers, what used to be, and record pointers go in the commit message and the records.');
     console.error('  Rewrite each line as purpose, or delete it:');
-    for (const t of told.slice(0, 40)) console.error(`      ${t.rel}:${t.line}   [${t.kind}]  ${t.text}`);
-    if (told.length > 40) console.error(`      … and ${told.length - 40} more line(s)`);
+    for (const t of told) console.error(`      ${t.rel}:${t.line}   [${t.kind}]  ${t.text}`);
     process.exit(1);
   } else {
-    console.log(`Comment style OK — no comment in ${shipped.length} shipped file(s) tells the code's story.`);
+    console.log(`Comment patterns OK — no storytelling pattern matched comments in ${shipped.length} JavaScript and ${shippedPowerShell.length} PowerShell files. Narrative wording beyond these patterns needs review.`);
   }
 }
 
@@ -922,13 +978,13 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
 }
 
 // ── PASS: THE FLEET NEVER REACHES FOR A LENS (STANDING) ────────────────────────
-// A lens reconstructs a run that is over; live code asking one reads a description of its own past
+// A lens reads a run's record; live code asking one reads a description of its own past
 // behaviour out of a file that the next start empties whole (Law 16 — the owning module is one call
 // away). "Live" is a property of WHEN code runs, which a static scan cannot see, so this pass proves
 // the structural half: everything under Auren_Bot/ that is not monitoring/ or Auren_Workshop/ exists
 // only to be a running bot, so any require or spawn of a lens from there is wrong in every execution
 // (Law 13). The workshop is not scanned here — a bench legitimately drives a fleet and reports on it,
-// and that is governed by WHEN instead, at monitoring/post_mortem_gate.js (Law 29).
+// and its reads are taken under the record's claim (js_kernel/utils/record_claims).
 {
   const lensOffenders = [];
   // The permitted readers, named positively: the lenses themselves, and the workshop, whose live reads

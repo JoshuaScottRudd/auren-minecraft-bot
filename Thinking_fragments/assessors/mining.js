@@ -127,8 +127,12 @@ function seatGroups(askers) {
     return [...byPlace.values()]
         .filter(g => g.stone > 0 || g.ore > 0)
         .map(g => ({ ...g, seats: Math.max(Math.ceil(g.stone / cellYield()), g.ore) }))
-        .sort((a, b) => CATEGORY_INDEX[a.band] - CATEGORY_INDEX[b.band]);
+        // BOARD ORDER IS BAND, THEN SITE (job_ranking.selectBand): the open cells go to the yard's ask before the
+        // castle's, as every other yard job does. By band alone the castle, counted first, took them all.
+        .sort((a, b) => (CATEGORY_INDEX[a.band] - CATEGORY_INDEX[b.band])
+            || (siteRank(a) - siteRank(b)));
 }
+const siteRank = (g) => require('@thinking/job_ranking').measureSiteRank({ structure: g.structure });
 
 // ── SECTION 1 — Mining (evaluates FIRST, Law 18; no deps on other assessments) ──
 async function assess({ excluded } = {}) {

@@ -62,7 +62,7 @@ function overheadClear(bot, x, z, groundY, buildingH, maxScrape = 0) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STAIRCASE-SAFETY OVERLAY — the diagonal-descent replacement for the old vertical shaft scan.
+// STAIRCASE-SAFETY OVERLAY — proves the diagonal descent is hazard-free through its required depth.
 // ─────────────────────────────────────────────────────────────────────────────
 const STAIRCASE_SAFETY = {
   // ONE depth knob (Law 16). The descent must be hazard-free all the way to this Y; a site whose
@@ -84,7 +84,12 @@ const STAIRCASE_SAFETY = {
   REQUIRED_DEPTH_Y: 14,
   PRISM_MARGIN:     1,   // shell of blocks around the staircase envelope checked for fluids —
                         // a fluid one block outside the carved volume still floods in
+  // A cave is air this many blocks or more under the ground the descent starts from. A standalone shaft is
+  // sited only where the whole descent meets at most CAVE_AIR_MAX such cells (lock_all_buildspots.siteShaft).
+  CAVE_BELOW_SURFACE: 4,
+  CAVE_AIR_MAX:       0,
 };
+const CAVE_AIR = new Set(['air', 'cave_air', 'void_air']);
 // Stop scanning once this many surface-spot + safe-staircase overlaps have been found. Keeps the
 // scan from checking far more candidates than needed while still guaranteeing a non-empty result if
 // a few exist nearby.
@@ -123,12 +128,15 @@ function getBiomeName(bot, x, y, z) {
 // that actually DRAINS a fluid into the descent (followGravityColumn → CONDUIT) is rejected, and that
 // is a lava/water hazard, not a "falling block" one.
 //
-// WHY margin: a fluid one block outside the carved staircase still floods in once the wall voxel is
-// dug or breaks, so the shell must be clear too — the diagonal analogue of the old column's 9×9
-// safety footprint, but hugging the actual prism instead of a vertical box.
-function checkCopyHazards(bot, segment) {
+// The prism margin checks fluids outside the staircase that can enter when a wall is dug or breaks.
+//
+// It also counts the open air the copy passes through or beside, `caveAir`: every air cell of the envelope
+// and its shell lying CAVE_BELOW_SURFACE or more under `surfY`. Air that deep is a cave, and a descent dug
+// through one has no floor or wall there.
+function checkCopyHazards(bot, segment, surfY = Infinity) {
   const m = STAIRCASE_SAFETY.PRISM_MARGIN;
   const fluidChecked = new Set();
+  let caveAir = 0;
 
   for (const v of segment.voxels) {
     const [wx, wy, wz] = v;
@@ -143,6 +151,7 @@ function checkCopyHazards(bot, segment) {
           const block = bot.blockAt(new Vec3(x, y, z));
           if (!block) return { safe: false, failureReason: 'unknown_block' };
           if (SHAFT_FLUID_HAZARDS.has(block.name)) return { safe: false, failureReason: block.name };
+          if (y <= surfY - STAIRCASE_SAFETY.CAVE_BELOW_SURFACE && CAVE_AIR.has(block.name)) caveAir++;
         }
       }
     }
@@ -160,7 +169,7 @@ function checkCopyHazards(bot, segment) {
     }
   }
 
-  return { safe: true, failureReason: null };
+  return { safe: true, failureReason: null, caveAir };
 }
 
 // evaluateStaircasePrism — project the diagonal staircase from a CANDIDATE transpose origin and hazard-
@@ -201,10 +210,12 @@ function evaluateStaircaseFrom(bot, headAWorld, surfY) {
   let lowestSafeY  = surfY;
   let safeCopies    = 0;
   let haltReason    = 'reached_target';
+  let caveAir       = 0;
 
   for (const seg of proj.segments) { // proj.segments are already shallow → deep
-    const hz = checkCopyHazards(bot, seg);
+    const hz = checkCopyHazards(bot, seg, surfY);
     if (!hz.safe) { haltReason = hz.failureReason; break; }
+    caveAir += hz.caveAir;
     lowestSafeY = seg.world_position.y + proj.minVoxY; // this copy's deepest voxel Y
     safeCopies++;
   }
@@ -220,7 +231,7 @@ function evaluateStaircaseFrom(bot, headAWorld, surfY) {
     ok: true,
     startX: headAWorld.x, startZ: headAWorld.z,
     surfaceY: surfY, lowestSafeY, depthReached: surfY - lowestSafeY, safeCopies,
-    haltReason,
+    haltReason, caveAir,
     prism: staircaseReach(proj),
   };
 }

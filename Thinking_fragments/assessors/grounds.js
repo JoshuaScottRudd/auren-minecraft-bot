@@ -1,4 +1,4 @@
-// assessors/grounds — keeps a downloaded building's grounds clear. See assessor_registry.
+// assessors/grounds — clears a downloaded building's grounds once the building stands. See assessor_registry.
 //
 // ── THE GROUNDS ARE A RING, AND THE FOOTPRINT IS NOT IN IT ────────────────────────────────────────────
 // The ring is the building's own box grown by GROUNDS_MARGIN on every side, with the footprint cut out:
@@ -115,6 +115,10 @@ async function assess() {
     const planRegistry = require('@kernel/downloaded_plan_registry');
     const plan = row && planRegistry.isLoaded() ? planRegistry.getPlan() : null;
     if (!plan) return { jobs };
+    // THE GROUNDS ARE TIDIED ONCE THE BUILDING STANDS: until this body's own count reads every cube
+    // finished, the ring is not read and nothing is posted over it.
+    const count = build.finishedCount();
+    if (!count || count.done < count.of) return { jobs };
 
     const centre = row.transpose_origin;
     const { box, hole } = groundsOf(plan);

@@ -12,7 +12,8 @@ const path = require('path');
 const { relativeTime } = require('./report_formatting');
 
 // The merged fleet stream, exported as a DEFAULT for callers to fall back to (Law 25).
-const DEFAULT_TRACE_FILE = require(require('./lens_paths').bot('js_kernel/utils/record_homes')).traceFile('fleet');
+const recordClaims = require('./record_read');
+const DEFAULT_TRACE_FILE =require(require('./lens_paths').bot('js_kernel/utils/record_homes')).traceFile('fleet');
 
 // ── Line parsing ─────────────────────────────────────────────────────────────
 // Two line shapes share one trace family:
@@ -66,7 +67,8 @@ function parseLine(raw, idx, fileBot, atMs = null) {
 // Story files are JSONL, appended and never rewritten, so a crash can only tear the LAST line. A torn
 // final line is dropped and announced (Law 25); a bad line elsewhere is a THROW, not a skip (Law 13).
 function parseStoryFile(file) {
-  const text = fs.readFileSync(file, 'utf8');
+  // Read under the record's claim: no append is in flight and none starts until the read is done.
+  const text = recordClaims.readUnderClaim(file, () => fs.readFileSync(file, 'utf8'));
   const rows = text.split('\n');
   if (rows.length && rows[rows.length - 1] === '') rows.pop();   // the trailing newline every append ends with
   const story = [];

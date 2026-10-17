@@ -39,7 +39,7 @@ function plan() {
   const { chestKeeps, madeGoodOrdered, stands } = require('@api/waste_pit');
   // Trash is taken out of a chest only for a pit that stands: before that it would be banked straight back.
   const pitStands = stands(global.bot);
-  const madeSeen = new Map();   // made good → how many the chests read so far are keeping
+  const madeSeen = new Map();   // made-to-order thing → how many the chests read so far are keeping
   const itemsByName = require('minecraft-data')(SERVER_MINECRAFT_VERSION).itemsByName;
   const stackOf = name => (itemsByName[name] && itemsByName[name].stackSize) || 64;
   const trash = new Set(WASTE_PIT.items.filter(item => item !== 'wooden_pickaxe'));
@@ -63,7 +63,7 @@ function plan() {
         if (pitStands) takes.push({ chest: chest.id, pos: chest.pos, item, count: row.count, stacks: row.stacks, why: 'trash', stray: false });
       } else if (!chestKeeps(item)) {
         if (!pitStands) continue;
-        // A made good stays in the chests up to what the building still asks for; the count past it is taken.
+        // A made-to-order thing stays in the chests up to what the building still asks for; the count past it is taken.
         const kept = Math.min(row.count, Math.max(0, madeGoodOrdered(item) - (madeSeen.get(item) || 0)));
         madeSeen.set(item, (madeSeen.get(item) || 0) + kept);
         const over = row.count - kept;

@@ -69,36 +69,15 @@ Assert-DeveloperMode 'Auren_Workshop/scripts/start_cameras.ps1'
 
 # ---- -Bots and -Add: raising a camera for a bot that did not exist when the run started -------
 #
-# WHY THIS SCRIPT NEEDED A SECOND SHAPE. It was written for a crew whose size is known before the
-# world starts: -Count N, N windows, one director, done. A CONTRACTOR run is the opposite - the world
-# comes up with zero bots and a person in the game says "foreman get", so which bots exist, and how
-# many, is not knowable until somebody asks. A camera per bot then has to be raisable mid-run.
-#
-# -Bots NAMES THE SET instead of counting into the roster, because the foreman hands out whatever
-# names are free rather than the first N in seniority order. -Count is untouched and still means what
-# it meant.
-#
-# -Add MAKES THE CALL CONVERGENT rather than additive, and that is deliberate: the caller passes the
-# WHOLE set it wants standing and this launches only the clients that are not already running, then
-# restarts the director and the titler over the full set. That is the same property `camera_obs up`
-# has and it is the reason both are safe to call repeatedly - a converging call is its own repair
-# path, while an additive one has to be told exactly what changed and is wrong the moment a client
-# died in between (Invariant B - re-sense the set, never track it).
-#
-# THE DIRECTOR AND THE TITLER ARE RESTARTED, NOT EXTENDED, AND THAT IS THE HONEST TRADE. Both take
-# their roster as a launch argument and neither re-reads it, so a late camera is invisible to a
-# director that is already running: it would never be armed to spectator and never cut to. Restarting
-# them costs a gap of a few seconds in camera MOVEMENT and costs the recording nothing at all - OBS
-# holds the windows, not the director, so every file keeps writing across the restart. The rejected
-# alternative was teaching the rig to poll a roster file: a live re-read inside a 1,600-line director
-# that is mid-cut is a much larger change with a much worse failure mode than a restart whose cost is
-# visible and bounded.
+# -Bots selects named cameras for crews hired during a run; -Count selects a seniority-ordered prefix.
+# -Add converges on the requested set and restarts the director and titler with that complete roster.
+# OBS holds the client windows, so its recordings continue across the director restart.
 
-# ---- The Architect's eye: the seat nothing directs, and only when asked for -------------------
+# ---- The free camera: the seat nothing directs, and only when asked for ----------------------
 # One more instance, built and launched exactly like a bot camera and titled the same way, that is
 # NOT passed to the director. It reaches the rig only through --freecams, which arms it (spectator +
 # night vision) and then sends it nothing for the rest of the run. The exclusion is what makes it the
-# Architect's, so it is expressed as an absence from --bots rather than as a rule inside the rig that
+# operator's, so it is expressed as an absence from --bots rather than as a rule inside the rig that
 # a later edit could weaken.
 #
 # OFF BY DEFAULT, because it is the one seat in the crew that produces nothing unless a human flies it
@@ -111,19 +90,13 @@ Assert-DeveloperMode 'Auren_Workshop/scripts/start_cameras.ps1'
 # nothing, and a capture bound to a client that never launched reports a clean start over a black file.
 # Nothing throws either way. Callers that raise both (record_overlay) pass the same value to both.
 #
-# ---- -Down: the missing half of Law 8 ---------------------------------------------------------
-# This script raises three things no other teardown knows about - the camera clients, a director, and a
-# titler - and `fleet_control down` reaps none of them, so before this existed every filmed run left
-# camera windows and a director standing. Whatever a run raises, that run reaps.
+# ---- -Down: this script owns its camera clients, director and titler lifecycle (Law 8) --------
 # Matching is by COMMAND LINE, the same discriminator the titler already uses: a camera's java process
 # carries its instance name and the director's processes carry camera_rig.js. Process order and window
 # titles are not identity here (the titler's header has the long form of why).
 
-# NOTHING HERE LOOKS ABOVE THE BOT (2026-09-14). Prism and the server folder are both the workstation
-# resolver's answers, asked once node is resolved below: a download keeps Prism inside the bot at
-# Auren_Workshop\camera\clients\PrismLauncher, and the Architect's machines name their own folder in their
-# workstation file. Until that day this script computed three hops up and put 1.1 GB in `tools\` beside
-# the bot — somebody else's disk on a stranger's machine.
+# The workshop anchors local paths; the workstation resolver owns Prism and server locations.
+# A standalone download keeps its portable launcher inside the bot's camera clients folder.
 $scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $workshopDir  = Split-Path -Parent $scriptDir
 $botRoot      = Split-Path -Parent $workshopDir
@@ -133,7 +106,7 @@ $fleetControl = Join-Path $workshopDir 'fleet_control.js'
 # ---- -Down: reap what this script raises, and nothing else -----------------------------------
 # Runs before the roster is even read: a teardown that needed node, a roster and a server would be
 # unavailable in exactly the situation it is most wanted (a half-dead run). Every camera instance
-# lives under ...\instances\Cam_<name>\, so one pattern covers the bot cameras and the Architect's
+# lives under ...\instances\Cam_<name>\, so one pattern covers the bot cameras and the operator's
 # eye without either being enumerated here.
 # The titler is not killed and must not be: it watches for the windows and exits on its own the pass
 # after the last one goes (its Law 8 clause). Killing it would race that and prove nothing.
@@ -148,16 +121,20 @@ if ($Down) {
         Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
         $killed++
     }
-    # THE SLASH IS THE WHOLE BUG THIS SHAPE PREVENTS. The filter was a single WQL LIKE on
-    # '%instances\Cam_%' and matched NOTHING, because Prism writes the instance path into the java
-    # command line with FORWARD slashes (-Djava.library.path=.../instances/Cam_AurenBot/natives) even on
-    # Windows. Measured 2026-08-16: a teardown reported "2 process(es) stopped" - the director only - and
-    # left four game windows running while claiming the crew was down (Law 25: the count is what made it
-    # a lie rather than a miss). So the coarse set comes from WQL and the identity test is a regex that
-    # accepts either separator; no path string in this file may assume a slash direction again.
+    # The camera identity accepts either path separator because Prism's Java command lines can use
+    # forward slashes on Windows; WQL supplies the coarse Java-process set.
     foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name LIKE 'java%'" -ErrorAction SilentlyContinue |
                         Where-Object { $_.CommandLine -match 'instances[\\/]Cam' })) {
         Write-Host "  stopping camera client pid $($proc.ProcessId)"
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        $killed++
+    }
+    # The launcher that started each camera stays open after its client is gone (its own console window
+    # for the instance). Only a Prism this script raised is matched: one whose command line launched a
+    # Cam_ instance, never a Prism the person opened by hand.
+    foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name LIKE 'prismlauncher%'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -match '--launch\s+"?Cam_' })) {
+        Write-Host "  stopping camera launcher pid $($proc.ProcessId)"
         Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
         $killed++
     }
@@ -203,12 +180,12 @@ if ($Count -gt $Roster.Count) { $Count = $Roster.Count }
 
 # The bot cameras, and then the seat nobody directs. $BotCams is what the director is told about;
 # $CamList is every window that gets built, launched and titled. Keeping them as two lists is the whole
-# mechanism of the Architect's eye - the director simply never learns the extra name.
+# mechanism of the free camera - the director simply never learns the extra name.
 #
 # WHEN THE EYE IS OFF the two lists are identical, and every consumer below reads $CamList - so the off
 # state removes the window, its title, its options patch and its --freecams entry in one place rather
 # than in five branches (Law 16).
-# -Bots names the set outright; -Count keeps its old meaning (the first N in seniority order). A name
+# -Bots names the set outright; -Count selects the first N in seniority order. A name
 # that is not on the roster is REFUSED rather than skipped: it would silently produce a crew one camera
 # short of the one that was asked for, and the shortfall is only discovered in the footage (Law 25).
 # AN EMPTY -Bots IS A REAL ANSWER when the parameter was actually passed, and -Count 0 already means
@@ -232,9 +209,9 @@ $BotCams = @($BotNames | ForEach-Object { "Cam_$_" })
 # JS string literal. `enable` travels the same way, so -Architect is an override of a declared default
 # rather than the only way to ask for the seat.
 $cfgPath = ($workshopDir -replace '\\', '/') + '/camera/camera_configure.js'
-$ArchitectCam = (& $node -p "require('$cfgPath').architect.camName").Trim()
-if (-not $ArchitectCam) {
-    Write-Host 'Could not read architect.camName from camera/camera_configure.js.'; exit 1
+$ArchitectCams = @(((& $node -p "require('$cfgPath').architect.camNames.join(',')") -as [string]).Trim() -split ',' | Where-Object { $_ })
+if (-not $ArchitectCams.Count) {
+    Write-Host 'Could not read architect.camNames from camera/camera_configure.js.'; exit 1
 }
 $ArchitectOn = $Architect.IsPresent -or ((& $node -p "!!require('$cfgPath').architect.enable").Trim() -eq 'true')
 
@@ -243,7 +220,7 @@ $ArchitectOn = $Architect.IsPresent -or ((& $node -p "!!require('$cfgPath').arch
 # full reasoning is in that file's HOST SEAT section). Three consumers read them - this launcher
 # builds and titles the window, camera_obs binds its capture and routes the microphone into its file,
 # and the DIRECTOR deliberately never hears of it at all. That last one is the whole difference
-# between this seat and the Architect's eye: the eye is passed on --freecams, which arms it to
+# between this seat and the free camera: the eye is passed on --freecams, which arms it to
 # spectator; a presenter must be able to mine, build, die and hire a crew, so it is passed on NEITHER
 # list and nothing in the rig can address it.
 $HostCam    = (& $node -p "require('$cfgPath').host.camName").Trim()
@@ -254,7 +231,7 @@ if (-not $HostCam -or -not $HostPlayer) {
 $HostOn = $HostSeat.IsPresent -or ((& $node -p "!!require('$cfgPath').host.enable").Trim() -eq 'true')
 
 $CamList = @($BotCams)
-if ($ArchitectOn) { $CamList += $ArchitectCam }
+if ($ArchitectOn) { $CamList += $ArchitectCams }
 if ($HostOn)      { $CamList += $HostCam }
 
 # The player name each window joins under. Every camera wears its own cam name - they are invented
@@ -357,11 +334,8 @@ if ($McVersion -eq '') {
         if ($verLine) { $McVersion = $verLine.Matches[0].Groups[1].Value }
     }
     if ($McVersion -eq '') {
-        # THE EXAMPLE IS READ, NOT RESTATED (Law 16, 2026-09-17). This line used to print a literal
-        # `1.21.5`, which is a second answer to a question architect_config already answers - and the day
-        # the fleet moved to 26.1 it became a hint that hands the reader the WRONG version to type at the
-        # exact moment they have no other source for it. The detection above is still the real answer;
-        # this only fires when the server log could not be read.
+        # The configured version supplies the example when the server log cannot answer, so the
+        # refusal points at the same version declaration the fleet uses (Law 16).
         $cfgVer = & $node -e "process.stdout.write(require('$($botRoot -replace '\\','/')/Thinking_fragments/architect_config.js').SERVER_MINECRAFT_VERSION)" 2>$null
         if ([string]::IsNullOrWhiteSpace($cfgVer)) { $cfgVer = '<the version your server runs>' }
         Write-Host 'Could not detect the server version from its log - pass it explicitly:'
@@ -422,44 +396,15 @@ foreach ($cam in $CamList) {
         [IO.File]::WriteAllText($cfgFile, $cfg, $utf8NoBom)
     }
 
-    # ---- Window size: PINNED to the delivery format, re-asserted every run ---------------------
-    # WHY. The capture resolution IS the window's client size — OBS Window Capture grabs exactly that.
-    # Left unpinned it was whatever the window happened to be: measured 958x1000 on one run and
-    # 2560x1370 on the next. That is two defects at once. (1) Delivery: neither is 16:9, so every take
-    # needs cropping or pillarboxing for YouTube. (2) Framing: hold.frameExitDeg is specified in DEGREES
-    # off the frozen aim, but how many degrees the frame spans horizontally depends on the window's
-    # ASPECT — so the SAME setting meant "86% of the way to the edge" in the near-square window and
-    # ~57% in the wide one. A framing constant cannot mean two things.
-    # 1920x1080 is the YouTube target and the CLIENT area, so the window is slightly larger with its
-    # border — it fits the 2560x1440 display, which is where the cameras are meant to be stacked
-    # anyway (WGC keeps an occluded window rendering, so they need not be tiled across monitors).
-    # RE-ASSERTED every run, never create-only: instance.cfg above is written only when absent, so a
-    # create-only pin would leave every EXISTING camera unpinned while looking applied — the exact
-    # failure mode the inactivityFpsLimit fix below was written to avoid.
+    # Pin the client area to the 1920x1080 delivery format so capture size and angular framing
+    # agree across cameras. Reassert the geometry for existing instances on every launch.
     Set-InstanceCfgLine $cfgFile 'OverrideWindow'     'true'
     Set-InstanceCfgLine $cfgFile 'LaunchMaximized'    'false'
     Set-InstanceCfgLine $cfgFile 'MinecraftWinWidth'  '1920'
     Set-InstanceCfgLine $cfgFile 'MinecraftWinHeight' '1080'
 
-    # ---- JavaPath: RE-ANCHORED to this repo whenever it has gone stale -------------------------
-    # WHY THIS KEY NEEDS AN OWNER. Prism writes an ABSOLUTE JavaPath when it first auto-detects its
-    # bundled runtime, and then nothing ever rewrites it. Move the repo and every camera keeps
-    # pointing at the old location: the 2026-08-02 move to C:\Auren left all three instances aimed at
-    # the previous tree, and no amount of re-running this script repaired it, because this script did
-    # not own the key (Invariant D — state with no owner rots unattended).
-    #
-    # RE-ANCHOR, NEVER CHOOSE. Which runtime to use (java-runtime-delta vs gamma vs ...) is Prism's
-    # decision and stays Prism's (Law 26 — never author what the machine decides). This preserves
-    # whatever folder Prism picked and only re-roots it under THIS machine's $prismDir.
-    #
-    # THE WRONG TURN, NAMED: the first version of this gated on `-not (Test-Path $javaVal)` — "only
-    # repair a path that no longer resolves" — and it was a no-op on the exact machine it was written
-    # for. An abandoned tree does not reliably stop answering. Measured 2026-08-02: the previous
-    # location still returned True for javaw.exe (a cloud-backed folder leaves ONLINE-ONLY PLACEHOLDER
-    # reparse points behind, and an existence check succeeds on every one of them), so the stale path
-    # looked healthy and the guard never fired. Existence is not evidence of the right file.
-    # So the test is WHERE it points, never whether it opens — the only question with a stable answer.
-    # Anything outside this repo's launcher is stale by definition, resolvable or not.
+    # Preserve Prism's selected runtime while reanchoring JavaPath under this machine's launcher.
+    # Path ownership determines staleness even when the previous location still resolves (Law 26).
     $javaLine = Get-Content $cfgFile | Where-Object { $_ -match '^JavaPath=' } | Select-Object -First 1
     if ($javaLine) {
         $javaVal   = $javaLine -replace '^JavaPath=', ''
@@ -553,27 +498,8 @@ foreach ($cam in $CamList) {
         Set-OptionLine $optFile 'tutorialStep'           'none'
     }
 
-    # ---- The unfocused-framerate keys: RE-ASSERTED EVERY RUN, not written once -----------------
-    # These are set unconditionally (not inside the "if not exists" above) because they are the fix
-    # for a bug that EXISTING instances already have. A create-only write would leave every camera
-    # built before this change stuttering forever, and the fix would look applied while doing
-    # nothing for the instances that actually needed it.
-    #
-    # THE BUG (diagnosed 2026-07-20). Minecraft 1.21.2+ ships InactivityFpsLimiter: with no keyboard
-    # or mouse input for 60s it drops the client to 30 FPS, and to 10 FPS after 10 minutes. An
-    # UNFOCUSED window receives no input by definition, so every camera window except the one being
-    # clicked is treated as AFK and throttled. This is NOT the same mechanism as pauseOnLostFocus
-    # (which only governs the pause menu) — that one was already fixed here, and fixing it is what
-    # made this second, quieter throttle the remaining cause.
-    #
-    # WHY IT MATTERS MORE THAN IT SOUNDS: OBS records what the window RENDERS. A throttled window
-    # yields 30- or 10-FPS footage no matter what OBS's output is set to, so this is a footage-
-    # quality defect, not a comfort one — and it already applied at two cameras.
-    #
-    # inactivityFpsLimit:minimized keeps the limiter ONLY for genuinely iconified windows, which a
-    # camera never is (never minimize one — that trips the real limiter and OBS captures nothing).
-    # THE WRONG TURN, NAMED: the Sodium Extra mod was proposed as the fix and does not carry this
-    # option at all — it has no focus-aware setting and never has. No mod is needed; this is vanilla.
+    # Reassert minimized-only throttling and background simulation on every camera launch.
+    # These vanilla options keep unfocused windows rendering at the capture rate while they stay open.
     Set-OptionLine $optFile 'inactivityFpsLimit' 'minimized'
     Set-OptionLine $optFile 'pauseOnLostFocus'   'false'
     # ---- fullscreen OFF: the window size pinned in instance.cfg only holds if the game is WINDOWED --
@@ -592,8 +518,6 @@ foreach ($cam in $CamList) {
     # ---- maxFps 60: the delivery framerate, and the reason the GPU has headroom at all --------------
     # Every frame above the recording framerate is rendered and then thrown away before it reaches a
     # file, and the waste MULTIPLIES BY WINDOW COUNT - which is the direction this system scales.
-    # Measured 2026-08-16 with this pinned at 260 ("Unlimited" to Minecraft): four windows held the GPU
-    # at 98% for five straight minutes, flat, with no spikes - saturation by request, not by load.
     # 60 matches the OBS canvas, so nothing that survives to disk is lost.
     # NOT THE SAME KNOB AS VSYNC, which stays off: vsync blocks on the display's refresh through DWM and
     # N windows doing that serialise and cap each other. This is the game's own internal limiter and
@@ -630,27 +554,17 @@ foreach ($cam in $CamList) {
     # which are wanted, and it cannot be automated anyway (it is a keystroke, so it would break the
     # unattended record chain).
     #
-    # THE ARCHITECT'S EYE IS NOT A LENS, IT IS A SEAT, and hidden chat took away the only input channel a
-    # human flying it has. There is no other way to reach the world from inside that window: teleport to a
-    # bot that has wandered out of sight, set the time, summon something, switch to creative. The cost is
-    # a chat line in the corner of ONE window that is not a directed shot in the first place, and the
-    # camera_rig grants that seat operator so the commands it can now type actually run.
-    # 0 = shown, and shown is required: "commands only" (1) hides the RESPONSE, so a refused teleport
-    # would look identical to one that worked.
+    # The free camera exposes chat commands and their replies so its operator can act and verify results.
     #
     # THE HOST SEAT IS THE STRONGEST CASE OF THE THREE, and it is not about diagnostics. Chat is the
     # only channel to the foreman: the desk reads the WIRE and accepts `player_chat` alone, so "foreman
     # get" has to be typed by somebody holding a player slot. Hidden chat on this seat would leave the
     # presenter unable to hire the crew the episode is about, and the desk's replies - which are the
     # thing the audience is watching him read - would not be on the tape either.
-    Set-OptionLine $optFile 'chatVisibility' $(if ($cam -eq $ArchitectCam -or $cam -eq $HostCam) { '0' } else { '2' })
+    Set-OptionLine $optFile 'chatVisibility' $(if ($ArchitectCams -contains $cam -or $cam -eq $HostCam) { '0' } else { '2' })
 
-    # renderDistance is the GAME'S to decide, not this script's. It was pinned to 12 here, which is a
-    # number this file has no basis for: the right distance depends on the machine and on how many
-    # windows are up, and Minecraft already picks from what it finds. Deleted rather than set to any
-    # value, because writing a number is still deciding it - and deleted every run rather than only on
-    # create, so instances an earlier revision pinned are released too instead of staying at 12 while
-    # the code reads as if the game owned it.
+    # renderDistance belongs to the game, which selects it from the machine's available resources.
+    # Removing the launcher override on every run leaves that decision with the game.
     if (Remove-OptionLine $optFile 'renderDistance') { Write-Host "  $cam : renderDistance released to the game's own default" }
 
     # Resource packs: copy every one from the main game and enable them (vanilla base first).
@@ -752,7 +666,7 @@ for ($i = 0; $i -lt $toLaunch.Count; $i++) {
 }
 
 # The director — reuses $node (located up-front for the roster read; guaranteed set by the early exit).
-# --bots carries ONLY the roster cameras; the Architect's eye travels on --freecams, which is armed and
+# --bots carries ONLY the roster cameras; the free camera travels on --freecams, which is armed and
 # never commanded. Two lists, so the exclusion cannot be undone by an edit inside the rig.
 #
 # ON -Add THE DIRECTOR IS REPLACED, NOT ADDED TO. It takes its roster once, at launch, and never
@@ -771,7 +685,7 @@ if ($Add) {
     }
 }
 $rigArgs = "--bots=$($BotNames -join ',') --launchlogs='$launchLogDir'"
-if ($ArchitectOn) { $rigArgs += " --freecams=$ArchitectCam" }
+if ($ArchitectOn) { $rigArgs += " --freecams=$($ArchitectCams -join ',')" }
 # --presentplayers, never --bots and never --freecams. The rig's ONLY act for this name is the read
 # that asks whether the client has finished joining, which is the one fact nothing else in the stack
 # can answer and which the overlay gates OBS on. See the PRESENT-ONLY block in camera_rig.js.
@@ -794,7 +708,7 @@ Start-Process powershell -ArgumentList '-NoExit', '-Command', "& '$node' '$rig' 
 # wrong one on a restart. This background daemon renames each window to its cam name (stable across
 # restarts, derived from bot identity) so ONE OBS instance can lock a Window Capture source per
 # camera and reattach correctly. It exits when the cameras do (Law 8). See camera_window_titler.ps1.
-# The Architect's eye is in this list: it is a window OBS must be able to address by title like any
+# The free camera is in this list: it is a window OBS must be able to address by title like any
 # other, and being undirected changes nothing about how a capture finds it.
 $camNames = $CamList -join ','
 $titler   = Join-Path $scriptDir 'camera_window_titler.ps1'
@@ -812,7 +726,7 @@ Write-Host "Starting window titler (unique OBS-addressable titles): $camNames"
 Start-Process powershell -WindowStyle Minimized -ArgumentList '-NoProfile', '-File', $titler, '-Cams', $camNames
 
 Write-Host ''
-$eyeNote = if ($ArchitectOn) { " (incl. $ArchitectCam - yours to fly)" } else { ' (no Architect eye - add -Architect for a seat you fly)' }
+$eyeNote = if ($ArchitectOn) { " (incl. $($ArchitectCams -join ', ') - yours to fly)" } else { ' (no Architect eye - add -Architect for a seat you fly)' }
 $hostNote = if ($HostOn) { " (incl. $HostCam - yours to PLAY, joined as $HostPlayer)" } else { '' }
 Write-Host "Camera crew up: $($CamList.Count) window(s)$eyeNote$hostNote + 1 director + titler."
 Write-Host 'In each camera window: press F1 once for a clean view.'

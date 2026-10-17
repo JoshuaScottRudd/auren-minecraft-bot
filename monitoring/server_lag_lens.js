@@ -27,10 +27,17 @@ const HOLD_RE = /HOLDING STILL/;
 // The foreman's own readings of the machine's disk (foreman/machine_pulse.js).
 const DISK_SLOW_RE = /DISK SLOW write_ms=(\d+)/;
 const WRITERS_RE = /DISK WRITERS why=(\w+) over_s=(\d+) total_mb=([\d.]+) mb_per_s=([\d.]+) probe_worst_ms=(\d+) free_memory_mb=(\d+) top_mb=(\S+)/;
+// The foreman's reading of the whole machine at each lag (machine_pulse.atLag), and each Windows event of the lag's stretch.
+const AT_LAG_RE = /MACHINE AT LAG behind_ms=(\d+) cpu_top_pct=(\S+) io_top_mb_per_s=(\S+) available_mb=(\S+) pages_per_s=(\S+) commit_pct=(\S+) disk_write_ms=(\S+) disk_queue=(\S+) disk_busy_pct=(\S+) events=(\d+)/;
+const AT_LAG_EVENT_RE = /MACHINE AT LAG EVENT at=(\S+) log=(\S+) source=(\S+) id=(\d+) text=(.*)$/;
+// The machine each second of the minute before a lag was written out (machine_pulse.writeSeconds).
+const AT_LAG_SECOND_RE = /MACHINE AT LAG SECOND at=(\S+) disk_write_ms=(\S+) disk_queue=(\S+) disk_busy_pct=(\S+) defender_cpu_pct=(\S+) server_write_ops=(\S+) server_cpu_pct=(\S+)/;
 const EVENTS = 'jdk.FileWrite,jdk.FileForce,jdk.FileRead,jdk.JavaMonitorEnter,jdk.GarbageCollection';
 // Seconds read before the stated start of a lag: the console line is printed after the server caught
-// its breath, so the work that caused it began a little earlier than `behind_ms` alone reaches.
-const LEAD_SEC = 2;
+// its breath, so the work that caused it began earlier than `behind_ms` alone reaches. The server prints
+// the line only once its catching-up has fallen behind past its threshold, which has come up to 14 s after
+// the stall that caused it ended.
+const LEAD_SEC = 15;
 const ROWS = 12;
 
 const UNIT_MS = { ns: 1e-6, us: 1e-3, 'µs': 1e-3, ms: 1, s: 1000, m: 60000 };
@@ -57,12 +64,15 @@ function flightEvents(jfrFile) {
   let ev = null;
   for (const line of r.stdout.split(/\r?\n/)) {
     const head = /^(\S+) \{$/.exec(line);
-    if (head) { ev = { name: head[1].replace(/^jdk\./, ''), at: null, ms: 0, thread: null, file: null, frames: [] }; continue; }
+    if (head) { ev = { name: head[1].replace(/^jdk\./, ''), at: null, ms: 0, pauseMs: null, thread: null, file: null, frames: [] }; continue; }
     if (!ev) continue;
-    if (line === '}') { rows.push(ev); ev = null; continue; }
+    // A collection's `duration` includes the work G1 does beside the running program; only its pauses stop the
+    // server, so a collection is counted by `sumOfPauses`.
+    if (line === '}') { if (ev.pauseMs !== null) ev.ms = ev.pauseMs; rows.push(ev); ev = null; continue; }
     let m;
     if ((m = /^\s+startTime = (\d\d):(\d\d):(\d\d)\.(\d+)/.exec(line))) ev.at = secOfDay(m[1], m[2], m[3]) + (+`0.${m[4]}`);
-    else if ((m = /^\s+(?:duration|sumOfPauses) = (.+)$/.exec(line))) ev.ms = Math.max(ev.ms, ms(m[1]));
+    else if ((m = /^\s+sumOfPauses = (.+)$/.exec(line))) ev.pauseMs = ms(m[1]);
+    else if ((m = /^\s+duration = (.+)$/.exec(line))) ev.ms = Math.max(ev.ms, ms(m[1]));
     else if ((m = /^\s+eventThread = "([^"]+)"/.exec(line))) ev.thread = m[1];
     else if ((m = /^\s+path = "([^"]+)"/.exec(line))) ev.file = m[1];
     else if ((m = /^\s+([\w.$<>]+)\(.*\)\s+line:/.exec(line))) ev.frames.push(m[1].split('.').slice(-2).join('.'));
@@ -122,10 +132,19 @@ function runLag({ seg = [], traceName = '?', verbose = false } = {}) {
   // the most between readings.
   const slow = [];
   const readings = [];
+  const atLag = [];
+  const atLagEvents = [];
+  const atLagSeconds = new Map();
   const desk = require('./foreman_lens').readForemanTrace();
   const deskStart = desk.length ? desk[0].atMs : null;
   for (const l of desk) {
-    let m = DISK_SLOW_RE.exec(l.raw);
+    let m = AT_LAG_SECOND_RE.exec(l.raw);
+    if (m) { atLagSeconds.set(m[1], m.slice(1).map((v, i) => (i === 0 || v === 'unread') ? v : +v)); continue; }
+    m = AT_LAG_EVENT_RE.exec(l.raw);
+    if (m) { atLagEvents.push([m[1], m[2], m[3], +m[4], m[5]]); continue; }
+    m = AT_LAG_RE.exec(l.raw);
+    if (m) { atLag.push([(deskStart && l.atMs) ? +((l.atMs - deskStart) / 60000).toFixed(1) : null, +m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], +m[10]]); continue; }
+    m = DISK_SLOW_RE.exec(l.raw);
     if (m) { slow.push(+m[1]); continue; }
     m = WRITERS_RE.exec(l.raw);
     if (m) readings.push({ wallSec: (deskStart && l.atMs) ? (l.atMs - deskStart) / 1000 : null, why: m[1], sec: +m[2], mb: +m[3], rate: +m[4], probe: +m[5], free: +m[6], top: m[7] });
@@ -147,12 +166,27 @@ function runLag({ seg = [], traceName = '?', verbose = false } = {}) {
       programs.set(g.key, g);
     }
   }
-  out.table(['program', 'readings_in_top', 'total_mb', 'worst_reading_mb'],
+  // Every write a program made, files, pipes and network together (machine_pulse's header), not the disk alone.
+  out.table(['program', 'readings_in_top', 'all_writes_total_mb', 'all_writes_worst_reading_mb'],
     [...programs.values()].sort((a, b) => b.ms - a.ms).slice(0, ROWS).map(g => [g.key, g.n, +g.ms.toFixed(1), +g.max.toFixed(1)]));
   out.section('disk_heaviest_readings');
   out.table(['run_min', 'why', 'over_s', 'mb_per_s', 'probe_worst_ms', 'free_memory_mb', 'top_mb'],
     [...readings].sort((a, b) => (b.probe - a.probe) || (b.rate - a.rate)).slice(0, 8)
       .map(r => [r.wallSec === null ? null : +(r.wallSec / 60).toFixed(1), r.why, r.sec, r.rate, r.probe, r.free, r.top]));
+
+  // THE MACHINE AT EACH LAG: what was taking the processor and the disk, memory, and the disk's own latency.
+  out.section('machine_at_lag');
+  out.table(['run_min', 'behind_ms', 'cpu_top_pct', 'io_top_mb_per_s', 'available_mb', 'pages_per_s', 'commit_pct', 'disk_write_ms', 'disk_queue', 'disk_busy_pct', 'events'], atLag);
+  // Each second before a lag: the disk's own latency against the antivirus's processor and the server's writes.
+  out.section('machine_seconds_before_lag');
+  out.table(['at', 'disk_write_ms', 'disk_queue', 'disk_busy_pct', 'defender_cpu_pct', 'server_write_ops', 'server_cpu_pct'],
+    [...atLagSeconds.values()].sort((a, b) => (a[0] < b[0] ? -1 : 1)));
+  // Every Windows event of a lag's stretch, once each however many lags it fell inside.
+  const eventSeen = new Set();
+  out.section('windows_events_at_lag');
+  out.table(['at', 'log', 'source', 'id', 'text'],
+    atLagEvents.filter(e => { const k = e.join('|'); if (eventSeen.has(k)) return false; eventSeen.add(k); return true; })
+      .sort((a, b) => (a[0] < b[0] ? -1 : 1)).slice(0, verbose ? Infinity : ROWS * 3));
 
   const jfrFile = lensPaths.bot('fleet_logs', 'server.jfr');
   const flight = fs.existsSync(jfrFile) ? flightEvents(jfrFile) : { unread: 'no_server_jfr' };

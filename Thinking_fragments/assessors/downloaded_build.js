@@ -44,12 +44,12 @@ const { isAir } = require('@utils/movement/terrain_predicates');
 const inventoryLens = require('@kernel/inventory_lens');
 const watcher = require('@kernel/watcher');
 const { itemsFor } = require('@kernel/blueprint_importer');
-const { remainingRawInSpecies, familyBalance, familyRoot } = require('@utils/calculators/build_material_calculator');
+const { remainingRawInSpecies, familyBalance, familyRoot, isChainOwned, isGatherable } = require('@utils/calculators/build_material_calculator');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
-const { getBotInventory, homeChest, isUnderground } = require('@utils/fragment_utils');
+const { getBotInventory, homeChest, isUnderground, group_to_item } = require('@utils/fragment_utils');
 
 const { JOB_TYPE, BOT_MODES } = require('@thinking/architect_config');
-const { TAG, deliverScope, supplyJob, planTreeBox, siteTreePhaseDone, siteTreesJob } = require('@thinking/assessors/shared');
+const { TAG, deliverScope, supplyJob, planTreeBox, siteTreePhaseDone, siteTreesJob, furnaceInput } = require('@thinking/assessors/shared');
 
 const trash = require('@utils/trash');
 // How many paid-for cubes are posted as jobs each sweep, and how many bodies' trash the window's order carries.
@@ -188,10 +188,12 @@ async function workable(bot, frame, anchor) {
 // as a failure. It is read again on every sweep and at the start of every trip, so it goes in on the first trip
 // after the cube that owns its support has placed it.
 //
-// A support counts when it is: ground outside the box showing a full block; another cube's cell already holding
-// what the plan asks; or a full block of this same cube, which this trip places. A support in a stand column
-// never counts: the climb digs that column open on every trip and puts it back only when the whole column is
-// done, so whatever stands there during a trip is the body's own filler, and a block hung on it falls with it.
+// A support counts when it is: a cell no plan owns (outside the box) — ground standing there, or, where it is gone,
+// trash the trip stands there and leaves standing (build_column_executor.escalate, utils/trash.keptInHand); another
+// cube's cell already holding what the plan asks; or a full block of this same cube, which this trip places. A
+// support in a stand column never counts: the climb digs that column open on every trip and puts it back only when
+// the whole column is done, so whatever stands there during a trip is the body's own filler, and a block hung on it
+// falls with it.
 async function waitsOnSupport(bot, frame, anchor, t) {
     if (!t.v) return false;
     const { hangs, supportCells } = require('@kernel/support_plan');
@@ -207,12 +209,7 @@ async function waitsOnSupport(bot, frame, anchor, t) {
         const key = c.join(',');
         if (shaft.has(key)) continue;
         const o = cube.get(key);
-        if (!o) {
-            const p = frame.worldOf(c[0], c[1], c[2]);
-            const at = bot.blockAt(new Vec3(p.x, p.y, p.z));
-            if (!at || !at.name || (!isAir(at.name) && at.boundingBox === 'block')) return false;
-            continue;
-        }
+        if (!o) return false;   // outside the box: ground, or trash that stays where the ground is gone
         if (!o.t.v || !full(frame.blockOf(o.t.v[3], o.t.v[1]))) continue;
         if (o.index === anchor.index || cellState(bot, frame, o.t) !== 'wrong') return false;
     }
@@ -263,11 +260,13 @@ async function waitsOf(bot, frame, anchor, statusOf) {
         return !at || !at.name || isAir(at.name);
     };
     const on = {};
+    const named = [];   // each waiting cell as `x,y,z:block` (blueprint cell), so the line says which block waits
     let cells = 0;
     for (const t of targetsOf(anchor)) {
         if (!t.v || cellState(bot, frame, t) === 'ok') continue;
         if (!itemsFor(frame.blockOf(t.v[3], t.v[1]), frame.stateOf(t.v[4]), mc).length) continue;
         cells++;
+        named.push(`${t.b.join(',')}:${frame.blockOf(t.v[3], t.v[1])}`);
         const reasons = new Set();
         let planNeighbours = 0, own = false;
         for (const [dx, dy, dz] of SIX) {
@@ -288,7 +287,7 @@ async function waitsOf(bot, frame, anchor, statusOf) {
         if (!reasons.size) reasons.add(own ? 'own_cell' : planNeighbours ? 'click' : 'no_neighbour');
         for (const r of reasons) on[r] = (on[r] || 0) + 1;
     }
-    return { cells, on };
+    return { cells, on, named };
 }
 let _waitsAt = 0, _waitsTotal = null;
 const _waitsSaid = new Map();   // cube → the line last said for it
@@ -323,7 +322,7 @@ async function noteWaitsOn(bot, frame, waiting, offered, finished) {
         }
         const top = Object.entries(byKind).filter(([k]) => k !== 'own_cell').sort((a, b) => b[1] - a[1])[0];
         if (top) primary[top[0]] = (primary[top[0]] || 0) + 1;
-        const said = `CUBE_WAITS cube=${index} layer=${anchor.layer} column=${anchor.column} cells=${w.cells} on=${Object.entries(w.on).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${r}=${n}`).join(',') || 'none'}`;
+        const said = `CUBE_WAITS cube=${index} layer=${anchor.layer} column=${anchor.column} cells=${w.cells} on=${Object.entries(w.on).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${r}=${n}`).join(',') || 'none'} at=${w.named.slice(0, 6).join('|') || 'none'}`;
         if (_waitsSaid.get(index) !== said) { _waitsSaid.set(index, said); watcher.summary(TAG, said); }
     }
     for (const index of [..._waitsSaid.keys()]) {
@@ -345,15 +344,25 @@ function rememberedFinished(structure) {
     return _finished;
 }
 
+// THE BASEMENT IS BUILT ONCE AND NEVER REPAIRED. A cube wholly below the ground floor is the basement: the
+// ground under the structure, cut through by the bodies' own ways in and about. Once finished it is never
+// re-read and never forgotten, so a passage opened through it later sends nobody back to fill it.
+function inBasement(index) {
+    const anchor = planRegistry.anchors()[index];
+    return anchor.cube_min[1] + CUBE <= planRegistry.getPlan().ground.ground_floor_layer;
+}
+
 // forgetFinished — this body has just read the cube at its column and it does not stand as the plan asks.
-// → true when the cube was remembered as finished.
+// → true when the cube was remembered as finished (never a basement cube: inBasement).
 function forgetFinished(structure, index) {
+    if (inBasement(index)) return false;
     return rememberedFinished(structure).delete(index);
 }
 
-// reverify — re-read the oldest few remembered cubes; any that has gone wrong is forgotten.
+// reverify — re-read the oldest few remembered cubes above the basement; any that has gone wrong is forgotten.
 function reverify(bot, frame, finished) {
-    const oldest = [...finished.entries()].sort((a, b) => a[1] - b[1]).slice(0, REVERIFIED_PER_SWEEP);
+    const oldest = [...finished.entries()].filter(([index]) => !inBasement(index))
+        .sort((a, b) => a[1] - b[1]).slice(0, REVERIFIED_PER_SWEEP);
     for (const [index] of oldest) {
         const anchor = planRegistry.anchors()[index];
         if (allCorrect(bot, frame, targetsOf(anchor))) finished.set(index, Date.now());
@@ -418,6 +427,16 @@ const FINISHED_COUNT_EVERY_MS = 30000;
 let _finishedSaid = null;
 let _finishedCountedAt = 0;
 let _finishedCount = null;
+
+// THE HIGHEST LAYER RELEASED: the highest layer any of whose cubes this body has seen posted, never lowered,
+// with the building's top layer beside it; null before the first cube is posted. The foreman announces each
+// new one off the chair (job_board).
+let _releasedLayer = null;
+function releasedLayer() {
+    if (_releasedLayer === null) return null;
+    const top = Math.max(...planRegistry.anchors().map(a => a.layer));
+    return { layer: _releasedLayer, of: top };
+}
 // The body's last count of finished cubes, { done, of, at }, for the foreman to read off the chair; null before the first count.
 function finishedCount() { return _finishedCount; }
 async function noteFinished(bot, frame, finished) {
@@ -523,36 +542,44 @@ function entryFoot(frame, column) {
 // stand, at the under-level. Every body comes down to this cell and walks under the box from it, so the fleet
 // digs one staircase to one door, outside the blueprint.
 function entryMouth(frame) {
-    const [sx, sz] = planRegistry.columns()[0].stand;
-    const { w, l } = planRegistry.dimensions();
-    const faces = [
-        { d: sx, b: [-1, sz] }, { d: w - 1 - sx, b: [w, sz] },
-        { d: sz, b: [sx, -1] }, { d: l - 1 - sz, b: [sx, l] },
-    ].sort((a, b) => a.d - b.d);
-    return frame.worldOf(faces[0].b[0], -ENTRY_FEET_BELOW, faces[0].b[1]);
+    return frame.worldOf(...planRegistry.mouthCell());
 }
 
 // cubeMaterials — every block of the BUILDING one trip still has to be handed: the item for every owned cell of
 // the cube that does not already stand as the plan asks, plus — on the trip that ends the column — the stand
 // column's own blocks for the descent. The trip's trash is priced beside it by trashOf.
 async function cubeMaterials(bot, frame, column, anchor, withDescent, withWaiters = withDescent) {
-    await pace();
+    return materialsOf(bot, frame, await tripCells(bot, frame, column, anchor, withDescent, withWaiters));
+}
+
+// materialsOf — { item: count } for a list of trip cells ({ v }). The one fold from plan voxels to pocket items:
+// the board's price, the preparation's withdrawals and the trip's own count of what it still owes all read it.
+function materialsOf(bot, frame, cells) {
     const mc = require('minecraft-data')(bot.version);
     const need = {};
-    const add = (v) => {
+    for (const { v } of cells) {
         const block = frame.blockOf(v[3], v[1]);
         for (const [item, n] of itemsFor(block, frame.stateOf(v[4]), mc)) {
             if (item.includes(' ')) continue;     // a block with no item — the plan's own report names it
             need[item] = (need[item] || 0) + n;
         }
-    };
+    }
+    return need;
+}
+
+// tripCells — the plan cells one trip is handed blocks for, as [{ b, v, whatever }]. `whatever` marks a shaft
+// cell the climb digs through: its block is owed on the descent whatever stands in it now.
+async function tripCells(bot, frame, column, anchor, withDescent, withWaiters = withDescent) {
+    await pace();
+    const cells = [];
+    const add = (v, b, whatever = false) => cells.push({ v, b, whatever });
     // A block that hangs and whose support does not stand yet is not ordered: the trip leaves it out.
     const ordered = [];
     for (const t of targetsOf(anchor)) {
         await pace();
         if (t.v && cellState(bot, frame, t) !== 'ok' && !await waitsOnSupport(bot, frame, anchor, t)) ordered.push(t);
     }
-    for (const t of ordered) add(t.v);
+    for (const t of ordered) add(t.v, t.b);
     // THE SUPPORTS THIS CUBE MAY PLACE EARLY (support_plan, build_column_executor.escalate): for each of its
     // blocks whose support is not sure to stand first, the first helper's block where it is another cube's own
     // block. A helper that is trash is in the trip's trash (trashOf).
@@ -562,7 +589,7 @@ async function cubeMaterials(bot, frame, column, anchor, withDescent, withWaiter
             const list = helpers.get(t.b.join(','));
             if (!list) continue;
             const h = list[0];
-            if (h.kind === 'pull' && cellState(bot, frame, { b: h.at, v: h.v }) !== 'ok') add(h.v);
+            if (h.kind === 'pull' && cellState(bot, frame, { b: h.at, v: h.v }) !== 'ok') add(h.v, h.at);
         }
     }
     // THE CLIMB CLEARS THE SHAFT. The body pillars up through every shaft cell from under the box to one above
@@ -571,7 +598,7 @@ async function cubeMaterials(bot, frame, column, anchor, withDescent, withWaiter
     // above it are counted by their state.
     if (withDescent) {
         for (const t of shaftTargets(column)) {
-            if (t.v && (t.b[1] <= anchor.stand[1] + 1 || cellState(bot, frame, t) !== 'ok')) add(t.v);
+            if (t.v && (t.b[1] <= anchor.stand[1] + 1 || cellState(bot, frame, t) !== 'ok')) add(t.v, t.b, t.b[1] <= anchor.stand[1] + 1);
         }
     }
     // THE BLOCKS THE DESCENT SETS AGAINST THE SHAFT: every open cell of a cube of this column that waits on the
@@ -581,11 +608,11 @@ async function cubeMaterials(bot, frame, column, anchor, withDescent, withWaiter
         for (const i of column.anchors) {
             if (!await sealable(bot, frame, column, i)) continue;
             for (const t of targetsOf(planRegistry.anchors()[i])) {
-                if (t.v && cellState(bot, frame, t) !== 'ok' && !held.has(t)) add(t.v);
+                if (t.v && cellState(bot, frame, t) !== 'ok' && !held.has(t)) add(t.v, t.b);
             }
         }
     }
-    return need;
+    return cells;
 }
 
 // trashOf — the trash blocks ONE trip to this cube is sent with (utils/trash), sized so the trip cannot run
@@ -613,6 +640,7 @@ function stillOrdered(item) {
 const BUILD_NEED_EVERY_MS = 30000;
 let _buildNeed = null;
 let _buildNeedAt = 0;
+let _cubeNeed = null;   // the same reading per cube: index → { layer, need }
 async function buildNeed(bot, frame, finished) {
     if (_buildNeed && Date.now() - _buildNeedAt < BUILD_NEED_EVERY_MS) return _buildNeed;
     const anchors = planRegistry.anchors();
@@ -629,6 +657,7 @@ async function buildNeed(bot, frame, finished) {
             if (targetsOf(anchors[i]).some(unseen)) { _buildNeedAt = Date.now(); _buildNeed = _buildNeed || {}; return _buildNeed; }
         }
     }
+    const byCube = new Map();
     for (const column of planRegistry.columns()) {
         // A stand column with a cell still open is climbed again, and the climb clears it: all of it is owed.
         const shaftOpen = shaftTargets(column).some(t => cellState(bot, frame, t) !== 'ok');
@@ -639,8 +668,10 @@ async function buildNeed(bot, frame, finished) {
             const anchor = anchors[index];
             const one = await cubeMaterials(bot, frame, column, anchor, withShaft, false);
             for (const [item, n] of Object.entries(one)) if (n > 0) need[item] = (need[item] || 0) + n;
+            byCube.set(index, { layer: anchor.layer, need: one });
         }
     }
+    _cubeNeed = byCube;
     _buildNeed = need;
     _buildNeedAt = Date.now();
     return need;
@@ -700,10 +731,77 @@ function noteLayerShort(layer, posted, offered) {
     watcher.summary(TAG, `OPEN_LAYER_SHORT layer=${layer} posted=${posted} cubes_short_of=${said}`);
 }
 
-async function assess() {
+// ── SMELTING GOES LAYER BY LAYER ────────────────────────────────────────────────────────────────────
+// The crew gathers for the whole building; the furnaces smelt for it a layer at a time. The layers are counted
+// lowest first, each on top of the ones below it, and a layer is stocked when the pool covers it and every layer
+// below. The furnaces work on the lowest layer that is not stocked (`target`, everything through it), and the
+// stocked layers below keep what they hold (`reserve`): a smelt never takes the input a stocked layer is counted
+// on. Both are raw, as remainingRawInSpecies names them (a smelted block is its own leaf). A cube a peer holds
+// took its material with it and is left out. null while the building posts no order.
+let _smeltPlan = null;
+let _smeltPlanSaid = null;
+function smeltPlan() { return _smeltPlan; }
+// STONE IS SMELTED FOR THE WHOLE BUILDING once the home stands and the pool holds more than TOOL_STONE of
+// cobblestone. TOOL_STONE is never smelted (`floor`, read by assessors/furnace._keeper): tools and furnaces are
+// made from it first. Every other smelt stays a layer at a time.
+const TOOL_STONE = 64;
+const fromCobblestone = (item) => { for (let i = item, n = 0; i && n < 4; i = furnaceInput(i), n++) if (i === 'cobblestone') return item !== 'cobblestone'; return false; };
+function smeltPlanOf(offered, held, pool, wood, homeStands = true) {
+    if (!_cubeNeed) return null;
+    const heldIndex = new Set(offered.filter(held).map(o => o.anchor.index));
+    const byLayer = new Map();
+    for (const [index, { layer, need }] of _cubeNeed) {
+        if (heldIndex.has(index)) continue;
+        const sum = byLayer.get(layer) || {};
+        for (const [item, n] of Object.entries(need)) sum[item] = (sum[item] || 0) + n;
+        byLayer.set(layer, sum);
+    }
+    let stocked = {}, through = {}, layer = null, stockedLayer = null;
+    for (const l of [...byLayer.keys()].sort((a, b) => a - b)) {
+        through = { ...stocked };
+        for (const [item, n] of Object.entries(byLayer.get(l))) through[item] = (through[item] || 0) + n;
+        layer = l;
+        if (Object.keys(remainingRawInSpecies(through, pool, wood)).length) break;
+        stocked = through;
+        stockedLayer = l;
+    }
+    const plan = {
+        layer, stocked_through: stockedLayer,
+        target: remainingRawInSpecies(through, {}, wood),
+        reserve: remainingRawInSpecies(stocked, {}, wood),
+        floor: { cobblestone: TOOL_STONE },
+    };
+    const wholeStone = homeStands && countInInventory('cobblestone', pool) > TOOL_STONE;
+    if (wholeStone) {
+        const whole = {};
+        for (const sum of byLayer.values()) for (const [item, n] of Object.entries(sum)) whole[item] = (whole[item] || 0) + n;
+        for (const [item, n] of Object.entries(remainingRawInSpecies(whole, {}, wood))) {
+            if (fromCobblestone(item)) plan.target[item] = Math.max(plan.target[item] || 0, n);
+        }
+    }
+    const said = `SMELT_LAYER layer=${layer} stocked_through=${stockedLayer ?? 'none'} stone=${wholeStone ? 'whole_building' : 'layer'} `
+        + `target=${Object.entries(plan.target).map(([k, n]) => `${k}:${n}`).join(',') || 'none'}`;
+    if (said !== _smeltPlanSaid) { _smeltPlanSaid = said; watcher.summary(TAG, said); }
+    return plan;
+}
+
+// ── THE HOME STANDS BEFORE THE FIRST CUBE, AND GATHERING NEVER WAITS FOR IT ─────────────────────────────
+// The crew's home (the laydown yard) is built before the building: no cube is posted while the home is not
+// built. The building's trees and its whole-building order are posted all the same, so a body the yard has
+// no seat for gathers for the building instead of standing. The yard still comes first: its site outranks the
+// building's in every band (job_ranking.selectBand). Said when it changes.
+let _homeFirstSaid = null;
+function noteHomeFirst(home, waiting) {
+    if (waiting === _homeFirstSaid) return;
+    _homeFirstSaid = waiting;
+    watcher.summary(TAG, `HOME_FIRST home=${home} cubes_wait=${waiting}`);
+}
+
+async function assess({ built = {} } = {}) {
     const jobs = [];
     const bot = global.bot;
     const name = buildName();
+    _smeltPlan = null;
     if (!name || !bot || !bot.blockAt || !bot.findBlocks) return { jobs };
 
     const row = sitedRow(name);
@@ -716,6 +814,10 @@ async function assess() {
     // than loading it itself: a sweep is not the stopped state, and a snapshot taken from inside one
     // would be taken by whichever bot swept first (Law 26 — build while off, drive while on).
     if (!plan) return { jobs };
+
+    const home = require('@kernel/bot_mandate').homeBlueprint();
+    const homeWaits = built[home] !== true;
+    noteHomeFirst(home, homeWaits);
 
     const frame = planRegistry.siteFrame(row);
     const centre = row.transpose_origin;
@@ -768,15 +870,15 @@ async function assess() {
 
     // ── LOWEST LAYER FIRST ──────────────────────────────────────────────────────────────────────────
     // The open layer is the lowest one holding a cube a trip can still move a block of, and its cubes are
-    // posted first. The layer above is posted once every posted cube below it is held by a body, so a layer
-    // down to its last cubes does not leave the rest of the crew without a build job.
+    // posted first, once the pool holds the material of the whole layer. The layer above is priced once every
+    // posted cube below it is held by a body, and is posted on the same condition.
     const openLayer = offered[0].anchor.layer;
 
     // THE ORDER IS THE WHOLE BUILDING: the material of every cube that does not stand yet, whatever its layer.
     // The crew gathers for all of it while the open layer is built; the board's fill levels spread the bodies
-    // across the kinds. Cubes are posted in build order, the first PRICED_PER_SWEEP the pool covers.
-    // TRASH IS PRICED WITH THE CUBE (trashOf, utils/trash): a cube is paid when the pool covers its blocks and
-    // its trip's trash together, so a body is never posted to a cube it cannot be stocked for. The trash order
+    // across the kinds. A paid layer's cubes are posted in build order, the first PRICED_PER_SWEEP of them.
+    // TRASH IS PRICED WITH THE LAYER (trashOf, utils/trash): a layer is paid when the pool covers its blocks and
+    // its trips' trash together, so a body is never posted to a cube it cannot be stocked for. The trash order
     // is what the bodies building at once carry, never a sum over every cube: each trip takes its trash back out.
     const windowNeed = { ...await buildNeed(bot, frame, finished) };
     // Holdings are sensed after the long world scan, immediately before pricing the offers (Invariant B).
@@ -790,49 +892,62 @@ async function assess() {
     const selfId = process.env.BOT_ID || 'default';
     const heldByPeer = new Set(Object.entries(hq.getFullBoardroom({}))
         .filter(([botId]) => botId !== selfId).map(([, chair]) => chair?.magnet?.job_id).filter(Boolean));
-    // THE NEXT LAYER OPENS WHEN THE ONE BELOW HAS NO BUILD JOB LEFT TO TAKE: `unclaimed` counts the cubes posted
-    // on the layer being priced that no peer holds, and a higher layer is priced only while that count is zero.
-    let pricedLayer = openLayer;
+    // A LAYER IS BUILT WHEN THE POOL HOLDS THE WHOLE OF IT, AND THE NEXT OPENS WHEN EVERY CUBE OF IT IS CLAIMED.
+    // The layers are taken lowest first. A layer's cubes are posted together, lowest column first, once the pool
+    // covers every cube of it no peer holds; a layer the pool does not cover posts nothing and no layer above it
+    // is priced. `unclaimed` counts the cubes posted on a layer that no peer holds, and the layer above is priced
+    // only while that count is zero. A body with no cube to take gathers for the whole building.
+    const bodies = Object.keys(hq.getFullBoardroom({})).length;
+    const held = o => heldByPeer.has(`site_column_${structure}_${o.column.column}`);
     let unclaimed = 0;
-    for (const o of offered) {
-        if (o.anchor.layer !== pricedLayer) {
-            if (unclaimed > 0) { o.layerClosed = true; continue; }
-            pricedLayer = o.anchor.layer;
-        }
-        const need = await cubeMaterials(bot, frame, o.column, o.anchor, await endsColumn(bot, frame, o.column, o));
-        const cubeTrash = trashOf(bot, frame, o.anchor);
-        maxTrash = Math.max(maxTrash, cubeTrash);
-        if (postedCubes >= PRICED_PER_SWEEP) continue;
+    let layerShort = false;
+    for (const layer of [...new Set(offered.map(o => o.anchor.layer))]) {
+        const cubes = offered.filter(o => o.anchor.layer === layer);
+        if (unclaimed > 0 || layerShort) { for (const o of cubes) o.layerClosed = true; continue; }
         // SPECIES-TRUE: only the site's own logs and planks count toward this building (see
         // remainingRawInSpecies), so the order names `<wood>_log` and the gate and the prep agree on it.
-        // ONE POOL PAYS FOR THE CUBES TOGETHER: a cube is paid when the pool covers it on top of every cube paid
-        // before it this sweep. A cube a peer holds took its material out of the pool with that body, so it
-        // is posted without being counted again.
-        if (!heldByPeer.has(`site_column_${structure}_${o.column.column}`)) {
-            const together = { ...paidNeed };
+        // ONE POOL PAYS FOR THE LAYER TOGETHER, on top of every layer paid before it this sweep. A cube a peer
+        // holds took its material out of the pool with that body, so it is not counted again. The layer's trash
+        // is what the bodies building it at once carry: each trip takes its trash back out.
+        const together = { ...paidNeed };
+        let layerTrash = 0, open = 0;
+        for (const o of cubes) {
+            const need = await cubeMaterials(bot, frame, o.column, o.anchor, await endsColumn(bot, frame, o.column, o));
+            const cubeTrash = trashOf(bot, frame, o.anchor);
+            maxTrash = Math.max(maxTrash, cubeTrash);
+            if (held(o)) continue;
             for (const [item, n] of Object.entries(need)) together[item] = (together[item] || 0) + n;
-            const short = Object.keys(trash.shortWith(together, paidTrash + cubeTrash, pool, frame.wood));
-            if (short.length) {
+            layerTrash = Math.max(layerTrash, cubeTrash);
+            open++;
+        }
+        const tripsTrash = layerTrash * Math.min(open, bodies);
+        const short = Object.keys(trash.shortWith(together, paidTrash + tripsTrash, pool, frame.wood));
+        layerShort = short.length > 0;
+        for (const o of cubes) {
+            // A CUBE A PEER HOLDS IS THAT PEER'S: it counts as posted for the layer and the waits, it was not priced
+            // against this body's pool, and it is no job on this body's board.
+            if (held(o)) { o.posted = true; postedCubes++; continue; }
+            if (layerShort) {
                 if (short.some(raw => IRON_RAW.test(raw))) ironHeld.push(o.anchor.index);
                 o.short = short;
                 continue;
             }
-            paidNeed = together;
-            paidTrash += cubeTrash;
+            if (postedCubes >= PRICED_PER_SWEEP) continue;
+            o.posted = true;
+            postedCubes++;
+            unclaimed++;
+            // Paid but not posted while the home stands unbuilt: the order above it is priced as if it were.
+            if (!homeWaits) jobs.push({
+                id: `site_column_${structure}_${o.column.column}`, type: 'column', what: 'build_column',
+                where: entryFoot(frame, o.column), structure,
+                column: o.column.column, anchor_index: o.anchor.index, build_order: o.order,
+                job_type: JOB_TYPE.site_column, scope: 'shared', claimed_by: null,
+            });
         }
-        o.posted = true;
-        postedCubes++;
-        // A CUBE A PEER HOLDS IS THAT PEER'S: it counts as posted for the layer and the waits, it was not priced
-        // against this body's pool, and it is no job on this body's board.
-        if (heldByPeer.has(`site_column_${structure}_${o.column.column}`)) continue;
-        unclaimed++;
-        jobs.push({
-            id: `site_column_${structure}_${o.column.column}`, type: 'column', what: 'build_column',
-            where: entryFoot(frame, o.column), structure,
-            column: o.column.column, anchor_index: o.anchor.index, build_order: o.order,
-            job_type: JOB_TYPE.site_column, scope: 'shared', claimed_by: null,
-        });
+        if (!layerShort) { paidNeed = together; paidTrash += tripsTrash; }
     }
+    _smeltPlan = smeltPlanOf(offered, held, pool, frame.wood, !homeWaits);
+    for (const o of offered) if (o.posted && o.anchor.layer > (_releasedLayer ?? -Infinity)) _releasedLayer = o.anchor.layer;
 
     noteOpenLayer(openLayer, postedCubes, offered.filter(o => o.layerClosed).length);
     noteLayerShort(openLayer, postedCubes, offered);
@@ -856,6 +971,19 @@ async function assess() {
         for (const [raw, count] of Object.entries(windowShort)) {
             if (isUnderground(raw)) pullNeeded[raw] = count;
             else surfaceNeeded[raw] = count;
+        }
+        // A SMELTED ITEM ORDERS ITS SURFACE INPUT WITH THE REST OF THE BUILDING. The smelted item is its own leaf
+        // (requirementTree), and its gather is the smelter's (job_exclusions: "the smelter delivers this"), so the
+        // gather the world can answer is its input: glass orders sand, charcoal orders the building's logs, for
+        // the whole building at once like every other raw, net of the input the chests already hold. An
+        // underground input (cobblestone, raw ore) stays the mine's, asked by the furnace's pull; an input that
+        // is itself smelted (smooth_stone ← stone) is already in this order.
+        for (const [raw, gap] of Object.entries({ ...surfaceNeeded })) {
+            const input = isChainOwned(raw) ? furnaceInput(raw) : null;
+            if (!input || isChainOwned(input) || !isGatherable(input) || isUnderground(input)) continue;
+            const token = group_to_item.logs.includes(input) || input === 'logs' ? `${frame.wood}_log` : input;
+            const short = gap - countInInventory(input, deliverable);
+            if (short > 0) surfaceNeeded[token] = (surfaceNeeded[token] || 0) + short;
         }
         const poolChest = homeChest();
         const posted = [];
@@ -932,4 +1060,4 @@ async function assess() {
 // cubeMaterials, targetsOf, shaftTargets and endsColumn are exported for column_preparation and the executor,
 // which must ask the SAME questions this gate asked before it posted the cube (Law 16) — two copies of "what
 // does this cube own" or "what does this trip need" could disagree.
-module.exports = { name: 'downloaded_build', assess, buildName, sitedRow, castleBalance, finishedCount,familyLevel,cubeMaterials, trashOf, stillOrdered, targetsOf, shaftTargets, endsColumn, entryFoot, entryMouth, waitsOnSupport, sealable, forgetFinished };
+module.exports = { name: 'downloaded_build', assess, smeltPlan, buildName, sitedRow, castleBalance, finishedCount, releasedLayer, familyLevel,cubeMaterials, tripCells, materialsOf, trashOf, stillOrdered, targetsOf, shaftTargets, endsColumn, entryFoot, entryMouth, waitsOnSupport, sealable, forgetFinished };

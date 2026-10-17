@@ -24,13 +24,14 @@ const fetched = [];
 // `species` is 'contractor' or 'homesteader'; owner is '' for a homesteader (`bot_mandate` requires it).
 // `BOT_AUTOSTART` starts a homesteader at fetch (a contractor is already born started); `BOT_START_NEAR`
 // places both species beside the asker, confirmed by the body itself before planning (`start_injector`'s
-// gate, Law 16). Each body's console drains to a file under `record_homes` (Law 16), tailed by a window.
-function startBot(botId, species, owner, placeBeside) {
+// gate, Law 16). `held` withholds `BOT_AUTOSTART`: the body places itself and waits for the operator's
+// `start` (foreman_config `go`). Each body's console drains to a file under `record_homes` (Law 16), tailed by a window.
+function startBot(botId, species, owner, placeBeside, held = false) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(BOT_DIR, 'start_bot.js')], {
       cwd: BOT_DIR,
       // The mandate stamped as environment, the path `start_bot.js` documents for a non-human caller.
-      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: '1', BOT_START_NEAR: placeBeside },
+      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: held ? '0' : '1', BOT_START_NEAR: placeBeside },
       stdio: ['ignore', 'pipe', 'pipe'], // Piped, not shown: the follower window opened below is the only console.
       // Detached so the child survives a force-killed foreman long enough for `foreman_link`'s close
       // handler to report it lost. Not `child.unref()`: `stopAll` still ends every body by pid (Law 8).

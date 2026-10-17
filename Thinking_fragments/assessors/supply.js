@@ -12,7 +12,7 @@ const {
     JOB_CATEGORY_OF,   // names the asker band in a supply job's `parts` breakdown (Law 16)
 } = require('@thinking/architect_config');
 
-const { deliverScope, supplyJob, furnaceInput, resolveCraftTier, kitTier, noteShelfShort, bestOwnedTierRank, tierRank, stoneOrBetter } = require('@thinking/assessors/shared');
+const { deliverScope, supplyJob, furnaceInput, resolveCraftTier, kitTier, noteShelfShort, bestOwnedTierRank, tierRank, stoneOrBetter, tierOrBetter } = require('@thinking/assessors/shared');
 // ── SECTION 3 — Supply (evaluates THIRD, Law 18) ── one loop over STOCK_THRESHOLDS (Law 16): stock below
 // `deficit_below` posts one refill job; holder decides destination, item nature decides source.
 
@@ -33,10 +33,20 @@ function _hasBotRowFor(item) {
     return rows.some(s => s.holder === 'bot' && s.kind === 'tool' && s.item === family);
 }
 
+// ── A STONE TOOL COMES BEFORE A SMELT ───────────────────────────────────────────────────────────────
+// What a stone tool would cost this body, for every tool row of its kit it holds nothing stone-or-better for and
+// whose tiers allow stone. A body names a stone tool only once it can see the cobblestone for it (kitTier), so a
+// furnace that smelted every cobblestone in the chests would leave every body on wood; assessors/furnace leaves
+// this much of a smelt's input in the chests. Read each sweep and published by job_board.
+let _stoneToolBill = {};
+function stoneToolBill() { return _stoneToolBill; }
+
 function assess({ inventory, buildClaim }) {
     const jobs       = [];
     const pullNeeded = {};
     const allStations = stationRegistry.getStations();
+    const stoneTools = {};
+    _stoneToolBill = stoneTools;
 
     // Contractor and homesteader rows share this one loop, row shape and job set (requested_work).
     for (const stock of require('@thinking/requested_work').activeStockRows()) {
@@ -118,12 +128,24 @@ function assess({ inventory, buildClaim }) {
 
         // Tool family: refill the deficit at the highest tier the bot can make.
         if (stock.kind === 'tool') {
+            if (stoneOrBetter(stock.item, inventory) === 0 && (!Array.isArray(stock.tiers) || stock.tiers.includes('stone'))) {
+                const { requirementTree } = require('@utils/calculators/build_material_calculator');
+                for (const [item, n] of Object.entries(requirementTree(`stone_${stock.item}`, 1, {}))) stoneTools[item] = (stoneTools[item] || 0) + n;
+            }
             const familyHave = countInInventory(stock.item, inventory);
             const tierItem = kitTier(stock, inventory);
             // Two shortfalls: familyHave (group-aware count) and tier (can the bot MAKE better than it holds,
             // judged by the row's own craft tier); either posts a job. The tool it gets is kitTier's: a shelf
             // stone tool first, a crafted stone one second, the row's own tier third.
-            const upgrade = bestOwnedTierRank(stock.item, inventory)
+            // A WOODEN TOOL IS SWAPPED FOR STONE AS SOON AS STONE CAN BE HAD: a body holding any wooden one of a
+            // tiered row whose kit tier is better gets one better tool a pass, and the dump throws out the wooden
+            // one it replaces (inventory_swapper keeps a family best tier first), until none is left. The swap
+            // stops once the kit's number of tools is held at the kit tier: the wooden one stays in the pocket
+            // until the next dump, and counting it again posted another tool every pass.
+            const swapWooden = Array.isArray(stock.tiers) && countInInventory(`wooden_${stock.item}`, inventory) > 0
+                && !!tierItem && tierRank(tierItem) > tierRank(`wooden_${stock.item}`)
+                && tierOrBetter(stock.item, inventory, tierItem) < stock.deficit_below;
+            const upgrade = swapWooden || bestOwnedTierRank(stock.item, inventory)
                 < tierRank(resolveCraftTier(stock.item, inventory, stock.min_tier, stock.max_tier));
             if (familyHave >= stock.deficit_below && !upgrade) continue;
             if (stock.stone_level && stoneOrBetter(stock.item, inventory) >= stock.stone_level) continue;
@@ -145,7 +167,7 @@ function assess({ inventory, buildClaim }) {
                 id: `supply_tool_${stock.item}`, stock, what: tierItem, need: deficit,
                 // Spare rung is passive unless the row names its spare_mode, so a spare can't gather ahead of
                 // a build; bootstrap uses the row's own mode.
-                mode_override: bootstrap ? null : (stock.spare_mode || 'passive'),
+                mode_override: (bootstrap || swapWooden) ? null : (stock.spare_mode || 'passive'),
                 where: null,
                 job_type: toolJobType,   // job_type: override honored here too (Law 16 — one mechanism, everywhere)
                 claimed_by: null,
@@ -188,4 +210,4 @@ function assess({ inventory, buildClaim }) {
     return { jobs, pullNeeded };
 }
 
-module.exports = { name: 'supply', assess };
+module.exports = { name: 'supply', assess, stoneToolBill };

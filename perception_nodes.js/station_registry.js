@@ -4,7 +4,9 @@
 //
 // registerStation requires an open window matching the expected block type before writing; on failure
 // nothing is written, and a block without a verified ID must not occupy a station slot (Law 16). A chest
-// carries no role and no number: storage is one pool, measured across every registered chest.
+// carries no role: storage is one pool, measured across every registered chest. Each storage station has
+// a NUMBER (chestNumbers) that orders the pool: deposits fill from the lowest and withdrawals draw from
+// the highest, so material consolidates toward the low end.
 //
 // Called by: build_executor (registerStation, after placing), job_board (getStations, for the census),
 // craft_handler (findStation), inventory_swapper (getStations, snapshotStation, for dumpExcess).
@@ -18,7 +20,7 @@ const { Vec3 } = require('vec3');
 const TAG = 'station_registry';
 
 // STORAGE_TYPES: the one definition of which stations hold the pool (Law 16); isStorage the one
-// question. A barrel is treated identically to a chest — same window, registration, lock, and pool.
+// question. A barrel is treated identically to a chest — same window, registration, spot, and pool.
 const STORAGE_TYPES = new Set(['chest', 'trapped_chest', 'barrel']);
 function isStorage(entry) { return !!entry && STORAGE_TYPES.has(entry.type); }
 
@@ -87,10 +89,77 @@ function _getBotId() {
     return process.env.BOT_ID || 'default';
 }
 
-// ── Magnet-locked chests ──────────────────────────────────────────────────────────────────────────────
-// A chest a bot is using is reserved to that bot's magnet. Locked is a mark, not a veil: peers still see
-// it, but must wait for release before acting on it (inventory_swapper queues at it). The lock lives
-// inside the magnet, so clearMagnet() releases every lock in one write (Law 8, Law 13).
+// ── THE NUMBER OF A STORAGE STATION ───────────────────────────────────────────────────────────────────
+// Derived from the station's place, never stored: blueprint, then x, then z, then y. A stored number would
+// be a second fact two bodies could write differently in the same instant; a derived one is the same
+// answer on every body from the same map (Law 16). A chest added later takes its place in the order and
+// the numbers after it shift by one, so no caller keeps a number across a re-read.
+function chestNumbers() {
+    const rows = findChests();
+    rows.sort((a, b) => String(a.blueprint || '').localeCompare(String(b.blueprint || ''))
+        || (a.pos.x - b.pos.x) || (a.pos.z - b.pos.z) || (a.pos.y - b.pos.y));
+    const numbers = new Map();
+    rows.forEach((r, i) => numbers.set(r.id, i + 1));
+    return numbers;
+}
+
+// ── THE SPOT: WHICH CHEST A BODY IS USING, SAID BEFORE IT WALKS ───────────────────────────────────────
+// Storage takes no lock. Minecraft lets any number of bodies hold one container's window and act in it at
+// once (BarrelBlock.useWithoutItem has no occupancy check; ContainerOpenersCounter only counts), and the
+// claims keep them apart: a withdrawal takes only stock no other body has claimed (chest_ledger.claim),
+// and a deposit fills only room it claimed (chest_ledger.claimRoom). The spot is not a lock and nothing
+// waits on it. It tells a body opening a window whether a peer may be moving the chest under it, which
+// decides whether the window must match the chest's last picture. It rides the chair, outside the magnet,
+// because a body deposits with or without a job, and a spot older than SPOT_STALE_MS is not counted, so
+// a body killed mid-window leaves nothing that matters.
+// A RELEASED SPOT KEEPS ITS TIMES. Whether a peer used a chest DURING a window is a question about an
+// interval, and two samples of who is there now (at the open and at the close) miss a peer whose whole
+// visit falls between them. So the release stamps `released_at` instead of erasing the
+// spot, and spotsDuring asks whether any peer's [at, released_at] overlapped the window.
+const SPOT_STALE_MS = 5 * 60 * 1000;
+function claimSpot(stationId, orderType) {
+    const botId = _getBotId();
+    const chair = hq.readBoardroomChair(botId, {}) || {};
+    chair.chest_spot = { id: stationId, dir: orderType, at: Date.now(), released_at: null };
+    hq.writeBoardroomChair(botId, chair);
+}
+function releaseSpot(stationId) {
+    const botId = _getBotId();
+    const chair = hq.readBoardroomChair(botId, {}) || {};
+    if (!chair.chest_spot || chair.chest_spot.id !== stationId || chair.chest_spot.released_at) return;
+    chair.chest_spot = { ...chair.chest_spot, released_at: Date.now() };
+    hq.writeBoardroomChair(botId, chair);
+}
+function _peerSpots(stationId, viewerBotId) {
+    const viewer = viewerBotId || _getBotId();
+    const out = [];
+    for (const [botId, chair] of Object.entries(hq.getFullBoardroom({}))) {
+        const spot = chair && chair.chest_spot;
+        if (botId === viewer || !spot || spot.id !== stationId) continue;
+        out.push({ botId, ...spot });
+    }
+    return out;
+}
+// The peers whose spot is this station now, as [{ botId, dir }].
+function spotHolders(stationId, viewerBotId) {
+    const now = Date.now();
+    return _peerSpots(stationId, viewerBotId)
+        .filter(s => !s.released_at && now - s.at <= SPOT_STALE_MS)
+        .map(s => ({ botId: s.botId, dir: s.dir }));
+}
+// The peers whose spot on this station overlapped [from, to] at any moment, as [{ botId, dir }].
+function spotsDuring(stationId, from, to, viewerBotId) {
+    const now = Date.now();
+    return _peerSpots(stationId, viewerBotId)
+        .filter(s => s.at <= to && (s.released_at ? s.released_at >= from : now - s.at <= SPOT_STALE_MS))
+        .map(s => ({ botId: s.botId, dir: s.dir }));
+}
+
+// ── Magnet-locked stations ────────────────────────────────────────────────────────────────────────────
+// A station a body uses whole (a composter) is reserved to that bot's magnet. Locked is a mark, not a
+// veil: peers still see it, but must wait for release before acting on it. Storage takes no lock (the
+// spot above). The lock lives inside the magnet, so clearMagnet() releases every lock in one write
+// (Law 8, Law 13).
 
 // Map of station ID → holding bot, for locks held by bots OTHER than the viewer.
 function _getLocksByStation(viewerBotId) {
@@ -427,4 +496,4 @@ function logContents() {
     }
 }
 
-module.exports = { posId, stationKey, openProofWindow, registerStation, snapshotStation, removeStation, getStations, getStationTypes, stationUsable, usableStationTypes, findStation, stationAt, findChests, isStorage, STORAGE_TYPES, lockChest, unlockChest, getLockHolder, acquireChestLock, setSmeltState, getSmeltState, clearSmeltState, verifyAgainstWorld, logContents };
+module.exports = { posId, stationKey, openProofWindow, registerStation, snapshotStation, removeStation, getStations, getStationTypes, stationUsable, usableStationTypes, findStation, stationAt, findChests, chestNumbers, claimSpot, releaseSpot, spotHolders, spotsDuring, isStorage, STORAGE_TYPES, lockChest, unlockChest, getLockHolder, acquireChestLock, setSmeltState, getSmeltState, clearSmeltState, verifyAgainstWorld, logContents };

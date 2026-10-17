@@ -32,6 +32,8 @@ const out = require('./data_out');
 // One line per cube trip: what stood wrong on arrival, as found>wanted counts (build_column_executor.workCube).
 const CUBE_FOUND_RE = /CUBE_FOUND cube=(\d+) layer=(\d+) wrong=(\S+)/;
 const CUBES_FINISHED_RE = /CUBES_FINISHED done=(\d+) of=(\d+) by_layer=(\S+)/;
+// The layer the castle posted cubes on, said by each body when it changes (assessors/downloaded_build noteOpenLayer).
+const OPEN_LAYER_RE = /OPEN_LAYER layer=(\d+) posted=(\d+)/;
 const CUBES_WAITING_ON_RE = /CUBES_WAITING_ON cubes=(\d+) cells=(\d+) cells_by=(\S+) cubes_by=(\S+)/;
 const CUBE_WAITS_RE = /CUBE_WAITS cube=(\d+) layer=(\d+) column=(\d+) cells=(\d+) on=(\S+)/;
 const CUBE_RE = COLUMN_TRIP_RE;
@@ -249,7 +251,8 @@ function reduceAccounting({ seg = [], bot: botFilter = null } = {}) {
 
   // ── THE FOUR SITE READINGS ──────────────────────────────────────────────────────────────────────
   const cubes = { waitsTotal: new Map(), waitsByBot: new Map(), trips: 0, dug: 0, placed: 0, failed: 0, shaftPlaced: 0, climbStopped: 0, zeroYield: 0,
-    cubeSet: new Set(), columnSet: new Set(), finished: null, byCube: new Map(), found: new Map(), foundTrips: 0, foundNone: 0, visits: [] };
+    cubeSet: new Set(), columnSet: new Set(), finished: null, byCube: new Map(), found: new Map(), foundTrips: 0, foundNone: 0, visits: [],
+    openLayers: new Map() };          // layer → first fleet second any body said it was the open layer
   const settles = new Map();         // "kind stop" → { kind, stop, count, cycles, dug, placed, left }
   const segments = new Set();
   const shaft  = { built: null, total: null, centre: null, topY: null, deepY: null };
@@ -302,6 +305,11 @@ function reduceAccounting({ seg = [], bot: botFilter = null } = {}) {
     }
 
     if ((m = CUBE_FOUND_RE.exec(raw)) && fresh(m[0])) cubes.visits.push({ sec: l.wallSec ?? 0, cube: m[1], wrong: m[3] });
+
+    if ((m = OPEN_LAYER_RE.exec(raw)) && l.wallSec != null) {
+      const at = cubes.openLayers.get(Number(m[1]));
+      if (at === undefined || l.wallSec < at) cubes.openLayers.set(Number(m[1]), l.wallSec);
+    }
 
     // Every body counts the finished cubes it can see; a body away from the site sees fewer. The fullest
     // count is the building's.
@@ -673,6 +681,29 @@ function runAccounting({ seg = [], traceName = '?', bot: botFilter = null, verbo
   out.section('anchor_cubes_finished_by_layer');
   if (r.cubes.finished) out.table(['layer', 'finished', 'holding_blocks'], r.cubes.finished.layers);
 
+  // THE LAYERS IN TIME: when each layer's cube trips began and ended, and how many of its trips were made while a
+  // lower layer still had a trip to come (`trips_before_lower_done`). A building raised layer by layer reads as
+  // first and last minutes climbing together with that column near zero. `open_at_min` is the first minute any
+  // body named the layer open.
+  out.section('anchor_cube_trips_by_layer');
+  const byLayer = new Map();
+  for (const c of r.cubes.byCube.values()) {
+    const row = byLayer.get(c.layer) || { cubes: 0, secs: [] };
+    row.cubes++;
+    for (const t of c.trips) if (t.sec != null) row.secs.push(t.sec);
+    byLayer.set(c.layer, row);
+  }
+  const layers = [...byLayer.keys()].sort((a, b) => a - b);
+  const lastOf = new Map(layers.map(L => [L, Math.max(...byLayer.get(L).secs, -Infinity)]));
+  const minute = s => (Number.isFinite(s) ? +(s / 60).toFixed(1) : null);
+  out.table(['layer', 'cubes', 'trips', 'open_at_min', 'first_trip_min', 'median_trip_min', 'last_trip_min', 'trips_before_lower_done'],
+    layers.map(L => {
+      const secs = byLayer.get(L).secs.sort((a, b) => a - b);
+      const lowerDone = Math.max(-Infinity, ...layers.filter(x => x < L).map(x => lastOf.get(x)));
+      return [L, byLayer.get(L).cubes, secs.length, minute(r.cubes.openLayers.get(L)), minute(secs[0]),
+        minute(secs[Math.floor(secs.length / 2)]), minute(secs[secs.length - 1]), secs.filter(s => s < lowerDone).length];
+    }));
+
   // What the waiting cubes wait on at the end of the run, as the body that saw the most of them stated it.
   out.section('anchor_cubes_waiting_on');
   const seer = [...r.cubes.waitsTotal.entries()].sort((x, y) => y[1].cubes - x[1].cubes)[0];
@@ -815,6 +846,15 @@ function runAccounting({ seg = [], traceName = '?', bot: botFilter = null, verbo
   const pitFailRe = /WASTE PIT (not reached|unusable)/;
   const reflexRe = /GRAVITY REFLEX at /, reflexNoRe = /GRAVITY REFLEX refused/, reflexDownRe = /GRAVITY REFLEX descent stopped/;
   const reflexClimbRe = /GRAVITY REFLEX at .* pillared (\d+), came back down (\d+)/;
+  // THE PIT'S TIME: the walk there (each `purpose=waste_pit` leg's `held`), and the stand at the pit, from the body's
+  // arrival on that walk to its `WASTE PIT tossed` line. A stand is paired only with an arrival under PIT_PAIR_MS
+  // before it, so a toss whose walk line is missing is not given a stand.
+  const pitWalkRe = /walk verb=\w+ category=(\S+) purpose=waste_pit leg=\w+ held=([\d.]+)s outcome=arrived/;
+  const stampRe = /^\[(\d{4}-\d\d-\d\dT[\d:.]+Z)\]/;
+  const PIT_PAIR_MS = 120000;
+  const arrivedAt = new Map();   // bot → ms of its last arrival at the pit
+  const stands = [], walkByJob = {}, sizes = [];
+  let pitWalkSec = 0;
   const tossed = {}, seenPit = new Set();
   let tossEvents = 0, tossItems = 0, pitFails = 0, reflexes = 0, reflexRefused = 0, reflexClimbs = 0, climbed = 0, cameDown = 0, descentStopped = 0;
   for (const l of seg) {
@@ -823,8 +863,20 @@ function runAccounting({ seg = [], traceName = '?', bot: botFilter = null, verbo
     const k = `${l.bot}|${l.wallSec}|${raw}`;
     if (seenPit.has(k)) continue;
     seenPit.add(k);
+    const st = stampRe.exec(raw);
+    const atMs = st ? Date.parse(st[1]) : (l.wallSec != null ? l.wallSec * 1000 : null);
     let m;
+    if ((m = pitWalkRe.exec(raw))) {
+      pitWalkSec += +m[2];
+      walkByJob[m[1]] = (walkByJob[m[1]] || 0) + +m[2];
+      if (atMs !== null) arrivedAt.set(l.bot, atMs);
+      continue;
+    }
     if ((m = tossRe.exec(raw))) {
+      const from = arrivedAt.get(l.bot);
+      if (atMs !== null && from !== undefined && atMs >= from && atMs - from < PIT_PAIR_MS) stands.push((atMs - from) / 1000);
+      arrivedAt.delete(l.bot);
+      sizes.push(+m[1]);
       tossEvents++; tossItems += +m[1];
       for (const pair of m[2].split(/,\s*/)) { const mm = /^(\w+)x(\d+)$/.exec(pair.trim()); if (mm) tossed[mm[1]] = (tossed[mm[1]] || 0) + +mm[2]; }
     } else if (pitFailRe.test(raw)) pitFails++;
@@ -843,6 +895,17 @@ function runAccounting({ seg = [], traceName = '?', bot: botFilter = null, verbo
   out.kv('pit_items_tossed', tossItems);
   out.kv('pit_items_by_kind', Object.entries(tossed).map(([k, n]) => `${k}=${n}`).join(' ') || 'none');
   out.kv('pit_visits_failed', pitFails);
+  const sorted = [...stands].sort((a, b) => a - b);
+  const at = q => (sorted.length ? +sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))].toFixed(1) : null);
+  out.kv('pit_walk_bot_min', +(pitWalkSec / 60).toFixed(1));
+  out.kv('pit_walk_sec_per_visit', tossEvents ? +(pitWalkSec / tossEvents).toFixed(1) : null);
+  out.kv('pit_stands_paired', stands.length);
+  out.kv('pit_stand_bot_min', +(stands.reduce((s, v) => s + v, 0) / 60).toFixed(1));
+  out.kv('pit_stand_sec_median', at(0.5));
+  out.kv('pit_stand_sec_p90', at(0.9));
+  out.kv('pit_stand_sec_max', sorted.length ? +sorted[sorted.length - 1].toFixed(1) : null);
+  out.kv('pit_visits_by_items', `1-4=${sizes.filter(n => n <= 4).length} 5-16=${sizes.filter(n => n > 4 && n <= 16).length} 17-64=${sizes.filter(n => n > 16 && n <= 64).length} 65+=${sizes.filter(n => n > 64).length}`);
+  out.kv('pit_walk_bot_min_by_job', Object.entries(walkByJob).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([j, s]) => `${j}=${(s / 60).toFixed(1)}`).join(' ') || 'none');
   out.kv('pit_stacks_followed', pit.stacks);
   out.kv('pit_items_in_pit', pit.inPit);
   out.kv('pit_items_outside_pit', pit.outside);

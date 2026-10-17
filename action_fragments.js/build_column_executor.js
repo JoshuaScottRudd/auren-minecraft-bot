@@ -57,6 +57,26 @@ const { claimFirst, releaseTarget } = require('@utils/target_claims');
 
 const TAG = 'build_column_executor';
 
+// A CLIMB THAT FAILS ON THE SAME CUBE, TRIP AFTER TRIP, IS AN ERROR. Each failed climb spends the next of
+// the foreman's once-only 'climb_stall:' keys for that cube, so the key a body is granted is the crew's count
+// of failed climbs on it, whichever bodies made them. A built cube ends its count, since its keys are never
+// asked for again. The body granted the STALL_LIMIT-th key raises the error. A body with no foreman is the
+// whole crew, and its own count is the count.
+const STALL_LIMIT = 5;
+const _stallsHere = new Map();   // cube key → highest count this body was granted or saw spent
+async function countClimbStall(structure, column, cube) {
+  const base = `climb_stall:${structure}:${column}:${cube}`;
+  const link = require('@kernel/foreman_link');
+  for (let n = (_stallsHere.get(base) || 0) + 1; n <= STALL_LIMIT; n++) {
+    _stallsHere.set(base, n);
+    const grant = await link.requestClaim(`${base}:${n}`);
+    if (!grant.granted) continue;
+    link.releaseClaim(`${base}:${n}`);   // out of this body's chair; the foreman keeps it spent
+    return n;
+  }
+  return null;   // the limit was already reached and reported
+}
+
 // A pillar step that does not rise is retried inside `pillarStep`; this bounds the whole ascent, so a
 // column that cannot be climbed reports instead of looping.
 const MAX_RISE_STEPS = 64;
@@ -119,19 +139,29 @@ function correctAlready(bot, frame, pos, v) {
 // A trip carries its cube's blocks and its trash in one pocket, and where the cube is built of the wood the
 // trash is made of they are the same items. `_owed` answers, off the world, what the trip's own cells still
 // ask for — { item: count } — and every trash block this file takes is taken past it (utils/trash.inHand).
+// The cells are the ones the yard stocked the pocket for (downloaded_build.tripCells) and the fold to items is
+// the one the yard priced them with (materialsOf), so the trip and the yard count one pocket one way (Law 16).
 let _owed = () => ({});
 function tripOwes(bot, frame, cells) {
+  const { materialsOf } = require('@thinking/assessors/downloaded_build');
+  // A cell of the trip turns correct when this body places into it, which changes the pocket: the answer is
+  // read off the world again whenever the pocket has changed and is the last one read until then.
+  let pocketWas = null;
+  let answer = {};
   _owed = () => {
-    const owed = {};
-    for (const t of cells) {
-      if (!t.v || correctAlready(bot, frame, frame.worldOf(t.b[0], t.b[1], t.b[2]), t.v)) continue;
-      const item = itemFor(bot, frame.blockOf(t.v[3], t.v[1]), frame.stateOf(t.v[4]));
-      if (item) owed[item] = (owed[item] || 0) + 1;
+    const pocketNow = bot.inventory.items().map(i => `${i.slot}:${i.type}:${i.count}`).join('|');
+    if (pocketNow !== pocketWas) {
+      pocketWas = pocketNow;
+      answer = materialsOf(bot, frame, cells.filter(c => c.whatever || !correctAlready(bot, frame, frame.worldOf(c.b[0], c.b[1], c.b[2]), c.v)));
     }
-    return owed;
+    return answer;
   };
 }
-const trashInHand = (bot, wood) => trash.inHand(bot, TAG, wood, _owed());
+const trashInHand = (bot, wood) => trash.inHand(bot, wood, _owed());
+const keptInHand = (bot, wood) => trash.keptInHand(bot, wood, _owed());
+// The trip's trash as utils/trash counts it, past what the trip still owes: `ready` is what can be stood now.
+const pocketOf = (bot) => { const counts = {}; for (const it of bot.inventory.items()) counts[it.name] = (counts[it.name] || 0) + it.count; return counts; };
+const tripTrash = (bot, wood) => trash.inPocket(pocketOf(bot), _owed(), wood);
 
 async function riseTo(bot, standX, standZ, feetY, wood) {
   for (let step = 0; step < MAX_RISE_STEPS; step++) {
@@ -147,13 +177,10 @@ async function riseTo(bot, standX, standZ, feetY, wood) {
     }
     const block = await trashInHand(bot, wood);
     if (!block) {
-      // A pocket that still holds trash wood past what the trip owes was stocked right and its split did not
-      // land: the climb stops here (environmental, Law 13) and the trip ends unbuilt.
-      const pocket = {};
-      for (const it of bot.inventory.items()) pocket[it.name] = (pocket[it.name] || 0) + it.count;
-      for (const [item, n] of Object.entries(_owed())) if (pocket[item]) pocket[item] = Math.max(0, pocket[item] - n);
-      const left = trash.heldBlocks(pocket, wood);
-      if (left.spare + left.own > 0) return { ok: false, y: feet.y, reason: `no log would split into a trash plank (${left.spare + left.own} plank(s) of wood still held)` };
+      // A pocket that still holds trash logs past what the trip owes left the yard before its planks were made:
+      // the climb stops here and the trip ends unbuilt, to be stocked again.
+      const left = tripTrash(bot, wood);
+      if (left.logs > 0) return { ok: false, y: feet.y, reason: `the trip's trash is still ${left.logs} log(s); its planks are made at the yard` };
       throw new Error(`[${TAG}] CODING VIOLATION (Law 13): no trash block in the pocket for the climb at y${feet.y} toward y${feetY} in the shaft at (${standX},${standZ}). `
         + `The cube's price carries the climb (downloaded_build.trashOf) and column_preparation gates the trip on it; a body that reaches its shaft short was priced or stocked wrong.`);
     }
@@ -211,6 +238,8 @@ async function workCube(bot, frame, anchor, stand, targets) {
     digOne: async (s) => {
       const at = new Vec3(s.place.x, s.place.y, s.place.z);
       const block = bot.blockAt(at);
+      // A cell already empty (gravel fell away, a peer dug it) is what the dig was for.
+      if (block && block.boundingBox === 'empty' && (block.name === 'air' || block.name === 'cave_air')) return true;
       return performDig(bot, at, block, TAG);
     },
     placeOne: async (s, ev) => {
@@ -263,7 +292,9 @@ async function workCube(bot, frame, anchor, stand, targets) {
 // This is the one answer to "how does this block get its face" (Law 16); support_plan's plan-time list is
 // what the cube's price reads to carry a neighbour's block.
 // What trash is and which block is spent first is utils/trash's. A block that falls off when its support
-// goes (support_plan.hangs) is never stood on trash: it is placed when its real support stands.
+// goes (support_plan.hangs) is never stood on trash that comes back out: it is placed when its real support
+// stands, and where that support is a cell no plan owns (outside the box) and nothing stands there, trash is
+// stood there and STAYS — cobblestone when the pocket holds one, the trash block otherwise (utils/trash.keptInHand).
 // THE TRIP'S TRASH IS IN THE CUBE'S PRICE, sized for every empty cell of the cube (downloaded_build.trashOf),
 // so a path the pocket cannot pay for is a trip priced or stocked wrong, and stops the run (Law 13).
 // Returns { placed, left } — left counts blocks still not standing, each said by name.
@@ -323,27 +354,19 @@ async function escalate(bot, frame, anchor, stand, places, targets) {
     return item ? { v, block, item } : null;
   };
   // A neighbour's block is spent only out of what the pocket holds past this cube's own open blocks.
-  const spare = (item) => {
-    const have = bot.inventory.items().filter(i => i.name === item).reduce((n, i) => n + i.count, 0);
-    const owed = open.filter(st => !standing(st) && itemFor(bot, st.type, st.state) === item).length;
-    return have - owed;
-  };
+  const spare = (item) => tripTrash(bot, frame.wood).past[item] || 0;
   const neighbourPlaced = {};                             // block → neighbours' own blocks this trip stood early
   // What the pocket can stand as trash right now (utils/trash), less the planks and logs this cube's own open
   // blocks are still to be placed from.
-  const trashWorth = counts => { const h = trash.heldBlocks(counts, frame.wood); return h.spare + h.own + h.dirt; };
-  const trashHeld = () => {
-    const counts = {};
-    for (const i of bot.inventory.items()) counts[i.name] = (counts[i.name] || 0) + i.count;
-    const owed = open.reduce((n, st) => n + (standing(st) ? 0 : trashWorth({ [itemFor(bot, st.type, st.state)]: 1 })), 0);
-    return trashWorth(counts) - owed;
-  };
+  const trashHeld = () => tripTrash(bot, frame.wood).ready;
   const trashItem = () => trashInHand(bot, frame.wood);
   // THE PLAN'S OWN BLOCK BEFORE TRASH: a cell that is one of this cube's open blocks takes that block when a
   // face already serves it, and trash only when it does not.
   const ownerOf = cell => open.find(st => st.place.x === cell.x && st.place.y === cell.y && st.place.z === cell.z);
   // standCell — one path cell filled: 'stood', 'standing' (something is there already), or why it was not.
-  const standCell = async (cell) => {
+  // `keep` stands the support of a block that hangs, which stays (utils/trash.keptInHand): never dug back out.
+  let kept = 0;                                           // supports stood to stay
+  const standCell = async (cell, keep = false) => {
     const here = bot.blockAt(cell);
     if (!here || !isAir(here.name)) return 'standing';
     const owner = ownerOf(cell);
@@ -356,10 +379,11 @@ async function escalate(bot, frame, anchor, stand, places, targets) {
       watcher.summary(TAG, `NEIGHBOUR_BLOCK cube=${anchor.index} ${theirs.block} at (${cell.x},${cell.y},${cell.z}) ok=${!!put.ok}${put.ok ? '' : ` reason=${put.reason}`}`);
       if (put.ok) { neighbourPlaced[theirs.block] = (neighbourPlaced[theirs.block] || 0) + 1; trashSpared++; return 'stood'; }
     }
-    const item = await trashItem();
+    const item = keep ? keptInHand(bot, frame.wood) : await trashItem();
     if (!item) return 'no_trash';
     const put = await performPlace(bot, cell, face.anchor, face.face, item, TAG, {});
     if (!put.ok) return 'refused';
+    if (keep) { kept++; return 'stood'; }
     temps.push(cell);
     trashPlaced[item] = (trashPlaced[item] || 0) + 1;
     trashPeak = Math.max(trashPeak, temps.length);
@@ -498,12 +522,28 @@ async function escalate(bot, frame, anchor, stand, places, targets) {
     if (theirs && correctAlready(bot, frame, cell, theirs.v)) continue;
     if (!(await performDig(bot, cell, here, TAG))) stuck++;
   }
-  // A block that hangs goes in last, on whatever of the plan now stands beside it.
-  for (const st of open) if (!standing(st) && hangs(st.block, st.state) && clickable(st)) await placeFinal(st);
+  // A block that hangs goes in last, on whatever of the plan now stands beside it. Where nothing does and its
+  // support is a cell no plan owns (outside the building's box), trash is stood there and stays (standCell keep).
+  const { supportCells } = require('@kernel/support_plan');
+  const ownedByPlan = c => c[0] >= 0 && c[1] >= 0 && c[2] >= 0 && c[0] < dims.w && c[1] < dims.h && c[2] < dims.l;
+  for (const st of open) {
+    if (standing(st) || !hangs(st.block, st.state)) continue;
+    if (!clickable(st) && st.b) {
+      for (const c of supportCells(st.b, st.block, st.state) || []) {
+        if (ownedByPlan(c)) continue;
+        const cell = new Vec3(origin.x + c[0], origin.y + c[1], origin.z + c[2]);
+        if (!reachable(cell)) continue;
+        const how = await standCell(cell, true);
+        watcher.summary(TAG, `KEPT_SUPPORT cube=${anchor.index} for=${st.block}@(${st.place.x},${st.place.y},${st.place.z}) at=(${cell.x},${cell.y},${cell.z}) how=${how}`);
+        if (clickable(st)) break;
+      }
+    }
+    if (clickable(st)) await placeFinal(st);
+  }
 
   const left = open.filter(st => !standing(st));
   watcher.summary(TAG, `CUBE_ESCALATED cube=${anchor.index} unplaced_after_pass=${start} left=${left.length} paths=${pathsWalked} paths_cut=${pathsCut} cells_refused=${refused.size} trash_stood=${temps.length} trash_stuck=${stuck} `
-    + `trash_placed=${Object.values(trashPlaced).reduce((n, c) => n + c, 0)} trash_peak=${trashPeak} trash_spared=${trashSpared} trash_left_in_pocket=${trashHeld()} `
+    + `trash_placed=${Object.values(trashPlaced).reduce((n, c) => n + c, 0)} trash_kept=${kept} trash_peak=${trashPeak} trash_spared=${trashSpared} trash_left_in_pocket=${trashHeld()} `
     + `trash_items=${Object.entries(trashPlaced).map(([item, n]) => `${item}:${n}`).join(',') || 'none'} `
     + `trash_beside=${temps.filter(cell => beside.has(keyOf(cell))).length} neighbour_blocks=${Object.entries(neighbourPlaced).map(([block, n]) => `${block}:${n}`).join(',') || 'none'}`);
   // One line per cube: the blocks left out, grouped by block and by why, with the first cell of each group.
@@ -623,9 +663,9 @@ async function restoreShaft(bot, frame, shaft, standX, standZ, waiters = []) {
     const item = itemFor(bot, block, state);
     if (!item) continue;                                // free half of a two-cell piece
     const temp = await shaftSupport(bot, at, block, state, frame.wood);
-    let attach = findAttachable(bot, at);
+    let attach = findAttachable(bot, at, block);
     const prop = attach ? [] : await shaftProp(bot, at, frame.wood);
-    if (!attach) attach = findAttachable(bot, at);
+    if (!attach) attach = findAttachable(bot, at, block);
     if (!attach) {
       failed++;
       const around = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0], [0, 1, 0]].map(([dx, dy, dz]) => bot.blockAt(at.offset(dx, dy, dz))?.name || 'unseen').join(',');
@@ -694,7 +734,7 @@ module.exports = {
     if (!column || !anchor || anchor.column !== index) {
       throw new Error(`[${TAG}] CODING VIOLATION: the board posted column ${index}, cube ${magnet.anchor_index} of "${structure}", which the plan does not have as one cube of that column.`);
     }
-    const { targetsOf, shaftTargets, entryFoot, entryMouth, sealable, forgetFinished } = require('@thinking/assessors/downloaded_build');
+    const { targetsOf, shaftTargets, entryFoot, entryMouth, sealable, forgetFinished, tripCells, endsColumn } = require('@thinking/assessors/downloaded_build');
     const foot = entryFoot(frame, column);
     const standX = foot.x, standZ = foot.z;
 
@@ -738,7 +778,8 @@ module.exports = {
     const sealed = new Set();
     for (const i of column.anchors) if (await sealable(bot, frame, column, i)) sealed.add(i);
     const stoodBefore = shaftTargets(column).filter(t => t.v && correctAlready(bot, frame, frame.worldOf(t.b[0], t.b[1], t.b[2]), t.v));
-    tripOwes(bot, frame, [...targetsOf(anchor), ...shaftTargets(column)]);
+    // The same question column_preparation stocked this pocket on, asked of the world as the trip finds it.
+    tripOwes(bot, frame, await tripCells(bot, frame, column, anchor, await endsColumn(bot, frame, column, { anchor, seal: false })));
     const rise = await riseTo(bot, standX, standZ, standWorld.y, frame.wood);
     let work = { dug: 0, placed: 0, failed: 0 };
     let shaftDone = { placed: 0, failed: 0 };
@@ -747,6 +788,12 @@ module.exports = {
       // A shaft that cannot be climbed is reported where it stopped. The body still comes back down its own
       // filler below, so the next trip starts from the entry cell like every other.
       watcher.warn(TAG, `Column ${index} stopped at y${rise.y} on the way to cube ${anchor.index} (${rise.reason}).`);
+      const stalls = await countClimbStall(structure, index, anchor.index);
+      if (stalls === STALL_LIMIT) {
+        watcher.error(TAG, `CLIMB STALLED ${STALL_LIMIT} TIMES IN A ROW — column ${index} of "${structure}" cannot reach cube ${anchor.index}: `
+          + `the last climb stopped at y${rise.y} (${rise.reason}) at (${standX},${rise.y},${standZ}). The crew has failed this climb `
+          + `${STALL_LIMIT} times without building the cube, so the build cannot finish on its own.`);
+      }
     } else {
       work = await workCube(bot, frame, anchor, { x: standX, y: standWorld.y, z: standZ }, targetsOf(anchor));
       // EVERY OTHER CUBE OF THE COLUMN IS READ FROM HERE, AND ONE THAT DOES NOT STAND IS THIS BODY'S TO FORGET.
@@ -788,7 +835,25 @@ module.exports = {
         waiters.push(...open.filter(t => t.v));
         return true;
       });
-      if (columnDone) shaftDone = await restoreShaft(bot, frame, shaftTargets(column), standX, standZ, waiters);
+      // THE DESCENT WORKS EVERY SHAFT CELL FROM TWO UNDER IT, SO IT STARTS UNDER THE HIGHEST ONE THAT IS OPEN.
+      // A trip to a low cube stands far below a shaft cell that fell out higher up; the body climbs to it
+      // first where its pocket holds the filler for the steps, and says so where it does not.
+      if (columnDone) {
+        const openShaft = shaftTargets(column).map(t => ({ t, pos: frame.worldOf(t.b[0], t.b[1], t.b[2]) }))
+          .filter(c => c.t.v && !correctAlready(bot, frame, c.pos, c.t.v));
+        const under = openShaft.length ? Math.max(...openShaft.map(c => c.pos.y)) - 2 : null;
+        const feetY = bot.entity.position.floored().y;
+        if (under !== null && under > feetY) {
+          const filler = tripTrash(bot, frame.wood).ready;
+          if (filler >= under - feetY) {
+            const up = await riseTo(bot, standX, standZ, under, frame.wood);
+            watcher.summary(TAG, `SHAFT_REACH column=${index} from_y=${feetY} to_y=${under} ok=${up.ok}${up.ok ? '' : ` reason=${up.reason}`}`);
+          } else {
+            watcher.summary(TAG, `SHAFT_REACH column=${index} from_y=${feetY} to_y=${under} ok=false reason=filler ${filler} of ${under - feetY}`);
+          }
+        }
+        shaftDone = await restoreShaft(bot, frame, shaftTargets(column), standX, standZ, waiters);
+      }
       // A TRIP THAT MOVED NO BLOCK LEAVES THE SHAFT AS IT FOUND IT. The climb dug every shaft cell it passed;
       // the ones that stood as the plan asks before it are set back on the way down, from the blocks the dig
       // put in the pocket.
@@ -828,8 +893,7 @@ module.exports = {
     capsule.readable = readable;
     payload.readable = readable;
 
-    // A built cube's leftover made goods go to the pit; an unbuilt one's are banked for its next trip.
-    if (capsule.success) require('@api/waste_pit').cubeTripBuilt();
+    // The trip's leftover made goods are banked for the next trip, up to what the building still asks for (waste_pit).
     const drop = await require('@api/inventory_swapper').dropOffHaul(bot);
     if (drop?.abandoned) return;
     routeToJudge(TAG, { ...payload, readable });

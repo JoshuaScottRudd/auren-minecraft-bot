@@ -55,6 +55,11 @@ if (CAMS.length !== BOTS.length) {
 
 // Free cameras: spectator + night vision only, never cut/teleported/gimbal-bound. Human-flown.
 const FREE_CAMS = opt('freecams', '').split(',').map(s => s.trim()).filter(Boolean);
+// Seats a person flies that start from a declared spot rather than the base (camera_configure).
+const FIXED_SPOTS = (CFG.architect && CFG.architect.fixed) || {};
+// Game rules turned off while cameras are up: command echoes in chat, admin commands in the log, and the
+// locator bar on the HUD.
+const CAMERA_GAMERULES_OFF = ['send_command_feedback', 'log_admin_commands', 'locator_bar'];
 
 // Present-only clients (e.g. the host seat): confirmed standing via `data get entity`, never armed or
 // directed. Carries in-world player names, unlike the window names in the other two lists.
@@ -444,7 +449,8 @@ async function main() {
   let scoutAnchor = null;
   let scoutSettleUntil = 0;
   // One scout client answers both framing (where to stand) and witness (what happened) — Law 16.
-  if (CFG.scout.enable && (FRAMING || WITNESS)) {
+  // Framing with no bot camera has no shot to place, so a crew of human-flown seats raises no scout.
+  if (CFG.scout.enable && ((FRAMING && BOTS.length > 0) || WITNESS)) {
     scout = createScout({
       host: SERVER_ENDPOINT.host, port: SERVER_ENDPOINT.port, version: SERVER_MINECRAFT_VERSION, username: CFG.scout.username,
       scanSliceMs: CFG.scout.scanSliceMs,
@@ -571,8 +577,14 @@ async function main() {
       });
       rcon = session;
       announcedDown = false;
-      await rcon.command('gamerule sendCommandFeedback false');
-      await rcon.command('gamerule logAdminCommands false');
+      // World rules for filming, by their 26.1 names (snake_case). `locator_bar` is the HUD strip of
+      // coloured player dots along the bottom of every client's screen, which is in every frame a camera
+      // films while it is on. Each reply is read back: a rule the server does not know answers with an
+      // error rather than a change, and that is reported rather than assumed set (Law 23).
+      for (const rule of CAMERA_GAMERULES_OFF) {
+        const said = (await rcon.command(`gamerule ${rule} false`)) || '';
+        if (!/now set to/i.test(said)) narrate('warn', 'camera_rig', `gamerule ${rule} was not set: the server said "${said.trim()}".`);
+      }
       narrate('summary', 'camera_rig',
         `rcon up · ${BOTS.map((b, i) => `${b}→${CAMS[i]}`).join(' · ')} · absorb=${CFG.frame.absorbRadius} min_hold=${CFG.timing.minHoldMs / 1000}s field≈${CFG.frame.field.azSteps * CFG.frame.field.elevs.length} rays/seek margin=${CFG.frame.field.margin}>airbox=${CFG.frame.field.airBox} spoil-cone=${CFG.frame.cone.gridH}×${CFG.frame.cone.gridV}`);
     } catch (e) {
@@ -998,6 +1010,12 @@ async function main() {
       await rcon.command(`gamemode spectator ${name}`);
       await rcon.command(`effect give ${name} minecraft:night_vision infinite 0 true`);
       await rcon.command(`op ${name}`);
+      // A seat with a declared spot is put there once, here, and nothing moves it after.
+      const spot = FIXED_SPOTS[name];
+      if (spot) {
+        await rcon.command(`tp ${name} ${spot.pos.join(' ')} ${spot.rotation.join(' ')}`);
+        narrate('summary', 'camera_rig', `${name} put at its fixed spot (${spot.pos.map(v => v.toFixed(2)).join(',')}) facing ${spot.rotation.map(v => v.toFixed(1)).join('/')}.`);
+      }
       freeCamArmed.add(name);
       narrate('summary', 'camera_rig',
         `${name} online — spectator + night vision + OPERATOR, and NOT directed: this rig sends it ` +
@@ -1074,7 +1092,10 @@ async function main() {
     if (!expected.length) return;
     const armed = new Set([...freeCamArmed, ...presentConfirmed, ...rigs.filter(r => r.ready).map(r => r.cam)]);
     if (!expected.every(name => armed.has(name))) return;
-    fs.writeFileSync(READY_FILE, JSON.stringify({ ready: true, cams: expected, at: new Date().toISOString() }, null, 2));
+    // `free` names the seats a person flies, so a reader placing that person need not know the seat's name;
+    // `fixed` names the ones this rig already put at their own spot, which no reader places at the base.
+    fs.writeFileSync(READY_FILE, JSON.stringify({ ready: true, cams: expected, free: FREE_CAMS,
+      fixed: FREE_CAMS.filter(n => FIXED_SPOTS[n]), at: new Date().toISOString() }, null, 2));
     crewReadyPublished = true;
     narrate('summary', 'camera_rig',
       `crew ready — ${expected.length} client(s) confirmed standing in the world (${expected.join(', ')}). ` +

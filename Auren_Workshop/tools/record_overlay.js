@@ -94,6 +94,8 @@ const OVERLAY_FLAGS = ['architect', 'host'];
 
 // The operator's eye — a spectator seat, off unless asked for.
 function architectEye() { return seatSwitch('architect', c => c.architect); }
+// How many windows the eye is: one per name camera_configure declares.
+function eyeSeatCount() { return require(paths.workshop('camera', 'camera_configure.js')).architect.camNames.length; }
 
 // THE HOST SEAT — the client a human PLAYS, the only file in a take that carries a microphone.
 function hostSeat() { return seatSwitch('host', c => c.host); }
@@ -326,7 +328,7 @@ function raise({ overlay, count, fill, test, conductorPid, host: hostOpt }) {
 
   // Gates on the RIG'S published fact (Law 16), counting only the seats actually launched (Law 25).
   // The repair, if it stalls, is the same launch plus `-Add`.
-  const crew = waitForCrew(count + (eye ? 1 : 0) + (host ? 1 : 0),
+  const crew = waitForCrew(count + (eye ? eyeSeatCount() : 0) + (host ? 1 : 0),
     () => runScript('start_cameras.ps1', [...camArgs, '-Add'], 'camera crew — relaunching what died on its first start'));
   if (!crew.ok) return { ok: false, why: crew.why };
 

@@ -121,4 +121,10 @@ function computeSupports(plan, isFull) {
     return { helpers, counts, stranded };
 }
 
-module.exports = { computeSupports, normalsOf, hangs, supportCells };
+// sitsOnly(name) — a block with no facing family that is placed on the block below and nowhere else (a
+// pressure plate, a carpet, a rail): the one question a caller holding only a block's name may ask.
+function sitsOnly(name) {
+    return !familyOf(name) && SITS.test(name);
+}
+
+module.exports = { computeSupports, normalsOf, hangs, supportCells, sitsOnly };

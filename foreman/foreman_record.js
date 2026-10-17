@@ -95,6 +95,14 @@ function said(who, text) {
   crewLog.flush();
 }
 
+// A line the foreman said to the whole world about the run: a structure finished or a layer released.
+// Addressed to no person, so `who` is `all`. `kind` and its own fields carry the event for a reader that
+// cuts on it (a timelapse switches cameras here); `text` is the sentence as it was said.
+function announced(kind, fields, text) {
+  crewLog.event(TAG, 'announced', { who: 'all', kind, ...fields, text: encodeText(text) });
+  crewLog.flush();
+}
+
 // ── there is no `ignored_origin` event ───────────────────────────────────────────────────────────
 // The channel subscribes to the player chat packet only, never the console's, so a console line never
 // reaches the desk — there is nothing to refuse and nothing to record. A verb that can never fire would
@@ -111,6 +119,6 @@ function note(message) {
 
 module.exports = {
   TAG,
-  heard, read_as, refused, relayed, fleet_said, said, note,
+  heard, read_as, refused, relayed, fleet_said, said, announced, note,
   encodeText, decodeText,
 };

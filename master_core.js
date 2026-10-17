@@ -239,6 +239,15 @@ bot.once('spawn', () => {
           + ' Nothing was surveyed and nothing was locked; the trace carries the detail.');
       }
     });
+  } else if (botMandate.startNearPlayer()) {
+    // A HELD BODY STANDS WHERE IT WILL WORK. Raised placed but unstarted (foreman_config `go: 'held'`), it
+    // goes to its place now and waits for its `start` (the foreman's release), which passes start_injector's placement
+    // gate again from here (Law 16: one placement act).
+    require('@kernel/world_ready').awaitWorld(bot)
+      .then(() => require('@kernel/body_recovery').arriveAtPlace(bot, botMandate.startNearPlayer()))
+      .then((p) => console.log(p && p.arrived ? '⏸️ Placed and held — waiting for the release.'
+        : `⏸️ Held, not placed yet (${(p && p.error) || 'no answer'}) — start places it.`))
+      .catch(e => console.log(`⏸️ Held, not placed yet (${e.message}) — start places it.`));
   }
 
   const rl = readline.createInterface({

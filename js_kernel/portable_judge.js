@@ -114,10 +114,8 @@ const forgivingRetries = {};
 // Returns undefined on normal (no detection).
 async function checkpoint(executor, readable, mode = 'strict') {
   if (!executors[executor]) {
-    // Start watching silently. The "now watching"/"done" bookends carried no
-    // diagnostic value on the happy path and only added noise to every executor
-    // loop (Law 5: log a step only if it carries genuine diagnostic value). The
-    // escalation path below still logs via warn()/error() — that is the signal.
+    // Watching starts silently; the escalation path owns the warning or error when progress stops
+    // (Law 5: persist events with diagnostic value).
     executors[executor] = { history: [], mode };
   }
 

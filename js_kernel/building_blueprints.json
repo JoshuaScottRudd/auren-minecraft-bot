@@ -6161,7 +6161,7 @@
       "name": "laydown_yard",
       "pledge_approved": true,
       "pledge_approved_note": "EVERY BODY MAY PLACE AT ONCE, ONE CELL AT A TIME (Architect 2026-09-21: *'we will make blueprints explicitly labeled pledge approved. A pledge here isnt 9 blocks either its 1. If a bot can place one block then it does it. But it can claim as many as it can make. So the pledge of 1 is a minimum not a maximum... as long as the single block on the bottom is placed, the one above it can be placed.'*). The label is a CLAIM ABOUT THIS PLAN, checked at load by blueprint_registry.validatePledgeApproved: exactly one anchor, so there is no cube above a cube for a body to pillar into; and every placed voxel rests on the plan's own floor or on another placed voxel, so the per-cell support rule can always release the next block. Both are properties of the FILE, which is why they are refused on the developer's machine rather than discovered as a stalled crew.",
-      "description": "The builder crew's staging area for a downloaded building: 10 barrels with 10 furnaces on top of them, a composter at the east end of each line (where the eleventh and twelfth pairs stood) for the crew's leaf litter and saplings, and one crafting table, on open ground. Two parallel lines six long, the lines 2 blocks apart, with the crafting table in the gap column at the west end (Architect 2026-09-20).",
+      "description": "The builder crew's staging area for a downloaded building: 13 barrels, 14 furnaces and one crafting table, on open ground. Two parallel lines seven long, the lines 2 blocks apart: the south line is seven barrels with a furnace on each, the north line is the crafting table at its west end and six barrels, with a furnace on each of the seven (Architect 2026-10-13: the composters are gone because the crew's leaf litter and saplings go to the waste pit).",
       "dimensions": {
         "w": 7,
         "h": 3,
@@ -6179,7 +6179,7 @@
         "y": 0,
         "z": 0
       },
-      "schema_note": "HALVED FROM 24 CONTAINERS TO 12, AND THE REASON REPLACES THE ORIGINAL ONE (Architect 2026-09-20: *\"cut the blueprint in half. We shouldnt need 24 chests and furnaces because were designing with throughput in mind. That material is going to be used as gathered. So it shouldnt fill up chests.\"*). The 2026-09-19 design sized this yard against a QUEUE — 24 separate containers so 20 bodies would not stand in one line — and that premise no longer holds: the bot band stopped banking at all (inventory_swapper.dropOffHaul), which took barrel traffic from 33.3 openings a minute to 3.1 and the container duty cycle from 90% to 3.6% in one run. Containers are no longer the constraint, so the yard is sized for what it actually holds rather than for a queue that stopped forming. WHY BARRELS AND NOT CHESTS is unchanged: a chest will not open with a solid block on top of it and a furnace is one, while a barrel opens whatever sits above it — so barrel-under-furnace is the stacking that keeps every container usable. THE FLOOR IS NATURAL GROUND (`natural_block`): the yard sits on the ground it is sited on. EACH FURNACE SITS ON ITS OWN BARREL, which is the furnace-and-container fitting furnace_executor requires. THE AISLE IS AIR TWO HIGH so a bot walks the middle and reaches both lines from it. THE CRAFTING TABLE IS PART OF THE BUILDING NOW, not wherever the first body to need one happened to stand: craft_handler.placeStation used to site a table at nearestPlaceableCell(bot), so the fleet's shared fixtures landed together only by luck (2026-09-19). It is placed in the gap column so it obstructs neither aisle lane.",
+      "schema_note": "HALVED FROM 24 CONTAINERS TO 12, AND THE REASON REPLACES THE ORIGINAL ONE (Architect 2026-09-20: *\"cut the blueprint in half. We shouldnt need 24 chests and furnaces because were designing with throughput in mind. That material is going to be used as gathered. So it shouldnt fill up chests.\"*). The 2026-09-19 design sized this yard against a QUEUE — 24 separate containers so 20 bodies would not stand in one line — and that premise no longer holds: the bot band stopped banking at all (inventory_swapper.dropOffHaul), which took barrel traffic from 33.3 openings a minute to 3.1 and the container duty cycle from 90% to 3.6% in one run. Containers are no longer the constraint, so the yard is sized for what it actually holds rather than for a queue that stopped forming. WHY BARRELS AND NOT CHESTS is unchanged: a chest will not open with a solid block on top of it and a furnace is one, while a barrel opens whatever sits above it — so barrel-under-furnace is the stacking that keeps every container usable. THE FLOOR IS NATURAL GROUND (`natural_block`): the yard sits on the ground it is sited on. EACH FURNACE SITS ON A BARREL, except the one on the crafting table; furnace_executor's fitting is a furnace with a chest registered in the fleet, which the yard's barrels are. THE COMPOSTERS BECAME BARREL-AND-FURNACE PAIRS, THE TABLE CARRIES A FURNACE AND THE CORNER OPPOSITE IT A PAIR (Architect 2026-10-13: *\"compost is pointless now that we have a waste pit. exchange the 2 compost bins for another layer of furnace and barrel... put another furnace ontop of the crafting table and another barrel and furnace opposit side so each size should have 7 furances, one side has 7 barrels, the other has 6 and a crafting table\"*): 13 barrels and 14 furnaces in the footprint the 12 containers had. THE AISLE IS AIR TWO HIGH so a bot walks the middle and reaches both lines from it. THE CRAFTING TABLE IS PART OF THE BUILDING NOW, not wherever the first body to need one happened to stand: craft_handler.placeStation used to site a table at nearestPlaceableCell(bot), so the fleet's shared fixtures landed together only by luck (2026-09-19). It is placed in the gap column so it obstructs neither aisle lane. EVERY BARREL AND FURNACE FACES THE AISLE (Architect 2026-10-15: *\"make the furnaces face inward and the barrels laydown so its uniform. all chests and furnaces should face inward on laydown yard\"*): the south line (z -2) faces south and the north line (z 1) faces north, so each fixture opens toward the bot standing in the aisle, and a barrel lies on its side like the furnace on it.",
       "anchor_order_note": "ONE ANCHOR at (3,0,-1) — the floor voxel of the middle aisle — so a body STANDS at (3,1,-1), the aisle cell itself. THE +1 IS THE POINT AND IT COST A RUN: an anchor names the block a body's feet rest ON (locomotion.goToStand adds the +1, and every other blueprint in this file files its anchor on a solid voxel — planks, structural_fill, stand_ground). This anchor was authored at (3,1,-1), the aisle cell, which is authored `air` in this very voxel list — so goToStand demanded feet at (3,2,-1) with nothing under them, the navigator tried to pillar into the cell the body was already standing in, and gave up. On 2026-09-20 that was 37 of the run's 38 navigation failures and every one of the twenty bodies: the barrels were built and then unreachable, and the yard stalled at 31/53 because the builder could not reach its own stand either. Every block of the section — including the crafting table in the gap column at (0,1,-2) — is within 4.18 of the stand at (3,1,-1), inside the 4.5 reach; lowering the anchor a block IMPROVED the worst case, which was 4.77 and already over.",
       "default_facing": "north",
       "attach_points": [
@@ -6242,7 +6242,7 @@
           }
         ]
       },
-      "lane_note": "THE AISLE IS A ONE-WAY LANE, EAST TO WEST. A body bound for the anchor stand walks to ENTRY first (the east mouth, between the composters), then to the stand; a body leaving walks to EXIT first (the west mouth, in the gap column beside the crafting table), then on to wherever it is going. Both attach points follow the anchor convention: the floor block the feet rest ON. `interior` is the feet cells of the aisle between the two mouths; a route whose goal lies outside it may not enter it. `closed` is the two fixture lines, barrel level and furnace level, the whole length of each line: no route stands in a fixture's cell or on top of a barrel, built or not yet built. EXIT is the west mouth because the waste pit lies one block west of it, so a body leaving with trash is already at the rim.",
+      "lane_note": "THE AISLE IS A ONE-WAY LANE, EAST TO WEST. A body bound for the anchor stand walks to ENTRY first (the east mouth, between the two lines' last barrels), then to the stand; a body leaving walks to EXIT first (the west mouth, in the gap column beside the crafting table), then on to wherever it is going. Both attach points follow the anchor convention: the floor block the feet rest ON. `interior` is the feet cells of the aisle between the two mouths; a route whose goal lies outside it may not enter it. `closed` is the two fixture lines, barrel level and furnace level, the whole length of each line: no route stands in a fixture's cell or on top of a barrel, built or not yet built. EXIT is the west mouth because the waste pit lies one block west of it, so a body leaving with trash is already at the rim.",
       "anchors": [
         {
           "position": [
@@ -6423,145 +6423,217 @@
               1,
               1,
               -2,
-              "barrel"
+              "barrel",
+              {
+                "facing": "south"
+              }
             ],
             [
               1,
               1,
               1,
-              "barrel"
+              "barrel",
+              {
+                "facing": "north"
+              }
             ],
             [
               2,
               1,
               -2,
-              "barrel"
+              "barrel",
+              {
+                "facing": "south"
+              }
             ],
             [
               2,
               1,
               1,
-              "barrel"
+              "barrel",
+              {
+                "facing": "north"
+              }
             ],
             [
               3,
               1,
               -2,
-              "barrel"
+              "barrel",
+              {
+                "facing": "south"
+              }
             ],
             [
               3,
               1,
               1,
-              "barrel"
+              "barrel",
+              {
+                "facing": "north"
+              }
             ],
             [
               4,
               1,
               -2,
-              "barrel"
+              "barrel",
+              {
+                "facing": "south"
+              }
             ],
             [
               4,
               1,
               1,
-              "barrel"
+              "barrel",
+              {
+                "facing": "north"
+              }
             ],
             [
               5,
               1,
               -2,
-              "barrel"
+              "barrel",
+              {
+                "facing": "south"
+              }
             ],
             [
               5,
               1,
               1,
-              "barrel"
+              "barrel",
+              {
+                "facing": "north"
+              }
             ],
             [
               6,
               1,
               -2,
-              "composter"
+              "barrel",
+              {
+                "facing": "south"
+              }
             ],
             [
               6,
               1,
               1,
-              "composter"
+              "barrel",
+              {
+                "facing": "north"
+              }
             ],
             [
               1,
               2,
               -2,
-              "furnace"
+              "furnace",
+              {
+                "facing": "south"
+              }
             ],
             [
               2,
               2,
               -2,
-              "furnace"
+              "furnace",
+              {
+                "facing": "south"
+              }
             ],
             [
               3,
               2,
               -2,
-              "furnace"
+              "furnace",
+              {
+                "facing": "south"
+              }
             ],
             [
               4,
               2,
               -2,
-              "furnace"
+              "furnace",
+              {
+                "facing": "south"
+              }
             ],
             [
               5,
               2,
               -2,
-              "furnace"
+              "furnace",
+              {
+                "facing": "south"
+              }
             ],
             [
               6,
               2,
               -2,
-              "air"
+              "furnace",
+              {
+                "facing": "south"
+              }
             ],
             [
               1,
               2,
               1,
-              "furnace"
+              "furnace",
+              {
+                "facing": "north"
+              }
             ],
             [
               2,
               2,
               1,
-              "furnace"
+              "furnace",
+              {
+                "facing": "north"
+              }
             ],
             [
               3,
               2,
               1,
-              "furnace"
+              "furnace",
+              {
+                "facing": "north"
+              }
             ],
             [
               4,
               2,
               1,
-              "furnace"
+              "furnace",
+              {
+                "facing": "north"
+              }
             ],
             [
               5,
               2,
               1,
-              "furnace"
+              "furnace",
+              {
+                "facing": "north"
+              }
             ],
             [
               6,
               2,
               1,
-              "air"
+              "furnace",
+              {
+                "facing": "north"
+              }
             ],
             [
               0,
@@ -6573,19 +6645,28 @@
               0,
               2,
               -2,
-              "air"
+              "furnace",
+              {
+                "facing": "south"
+              }
             ],
             [
               0,
               1,
               1,
-              "air"
+              "barrel",
+              {
+                "facing": "north"
+              }
             ],
             [
               0,
               2,
               1,
-              "air"
+              "furnace",
+              {
+                "facing": "north"
+              }
             ],
             [
               0,
@@ -6762,9 +6843,9 @@
     },
     "waste_pit": {
       "name": "waste_pit",
-      "description": "The builder crew's waste pit: a 3x3 pad of natural ground with one hole in its centre, three deep, where a pocket's trash is thrown to despawn (custom_api/waste_pit). The eight cells round the hole are one level floor, open two high. A thrower stands on one of the four pad cells that share a side with the hole. Sited by the foreman beside the laydown yard (Architect 2026-10-11).",
+      "description": "The builder crew's waste pit: a trench two blocks long and three deep in a 4x3 pad of natural ground, where a pocket's trash is thrown to despawn (custom_api/waste_pit). The ten cells round the trench are one level floor, open two high. A thrower stands on the pad cell at either end of the trench, in line with it, and throws along it at the block under the far end's stand. Sited by the foreman beside the laydown yard.",
       "dimensions": {
-        "w": 3,
+        "w": 4,
         "h": 5,
         "l": 3,
         "yMin": -2,
@@ -6780,12 +6861,141 @@
         "y": 0,
         "z": 0
       },
-      "anchor_order_note": "ONE ANCHOR at (1,0,0), the pad cell east of the hole: an anchor names the block the feet rest ON, so the body stands at (1,1,0) and reaches every voxel of the pad and the hole's floor from there. The transpose origin (0,0,0) is the hole itself, at the pad's floor level.",
+      "anchor_order_note": "TWO ANCHORS, one at each end of the trench: (1,0,0) east and (-2,0,0) west. An anchor names the block the feet rest ON, so a body stands at (1,1,0) or (-2,1,0) and reaches its own half: the hole column beside it down to its floor, and the pad cells of its two columns. The transpose origin (0,0,0) is the east hole cell, at the pad's floor level; the west hole cell is (-1,0,0).",
       "default_facing": "north",
       "anchors": [
         {
           "position": [
             1,
+            0,
+            0
+          ],
+          "voxels": [
+            [
+              0,
+              0,
+              -1,
+              "natural_block"
+            ],
+            [
+              0,
+              0,
+              1,
+              "natural_block"
+            ],
+            [
+              1,
+              0,
+              -1,
+              "natural_block"
+            ],
+            [
+              1,
+              0,
+              0,
+              "natural_block"
+            ],
+            [
+              1,
+              0,
+              1,
+              "natural_block"
+            ],
+            [
+              0,
+              1,
+              -1,
+              "air"
+            ],
+            [
+              0,
+              1,
+              0,
+              "air"
+            ],
+            [
+              0,
+              1,
+              1,
+              "air"
+            ],
+            [
+              1,
+              1,
+              -1,
+              "air"
+            ],
+            [
+              1,
+              1,
+              0,
+              "air"
+            ],
+            [
+              1,
+              1,
+              1,
+              "air"
+            ],
+            [
+              0,
+              2,
+              -1,
+              "air"
+            ],
+            [
+              0,
+              2,
+              0,
+              "air"
+            ],
+            [
+              0,
+              2,
+              1,
+              "air"
+            ],
+            [
+              1,
+              2,
+              -1,
+              "air"
+            ],
+            [
+              1,
+              2,
+              0,
+              "air"
+            ],
+            [
+              1,
+              2,
+              1,
+              "air"
+            ],
+            [
+              0,
+              0,
+              0,
+              "air"
+            ],
+            [
+              0,
+              -1,
+              0,
+              "air"
+            ],
+            [
+              0,
+              -2,
+              0,
+              "air"
+            ]
+          ]
+        },
+        {
+          "position": [
+            -2,
             0,
             0
           ],
@@ -6799,41 +7009,23 @@
             [
               -1,
               0,
-              0,
-              "natural_block"
-            ],
-            [
-              -1,
-              0,
               1,
               "natural_block"
             ],
             [
-              0,
+              -2,
               0,
               -1,
               "natural_block"
             ],
             [
-              0,
-              0,
-              1,
-              "natural_block"
-            ],
-            [
-              1,
-              0,
-              -1,
-              "natural_block"
-            ],
-            [
-              1,
+              -2,
               0,
               0,
               "natural_block"
             ],
             [
-              1,
+              -2,
               0,
               1,
               "natural_block"
@@ -6857,37 +7049,19 @@
               "air"
             ],
             [
-              0,
+              -2,
               1,
               -1,
               "air"
             ],
             [
-              0,
+              -2,
               1,
               0,
               "air"
             ],
             [
-              0,
-              1,
-              1,
-              "air"
-            ],
-            [
-              1,
-              1,
-              -1,
-              "air"
-            ],
-            [
-              1,
-              1,
-              0,
-              "air"
-            ],
-            [
-              1,
+              -2,
               1,
               1,
               "air"
@@ -6911,55 +7085,37 @@
               "air"
             ],
             [
-              0,
+              -2,
               2,
               -1,
               "air"
             ],
             [
-              0,
+              -2,
               2,
               0,
               "air"
             ],
             [
-              0,
+              -2,
               2,
               1,
               "air"
             ],
             [
-              1,
-              2,
               -1,
-              "air"
-            ],
-            [
-              1,
-              2,
-              0,
-              "air"
-            ],
-            [
-              1,
-              2,
-              1,
-              "air"
-            ],
-            [
-              0,
               0,
               0,
               "air"
             ],
             [
-              0,
+              -1,
               -1,
               0,
               "air"
             ],
             [
-              0,
+              -1,
               -2,
               0,
               "air"

@@ -123,6 +123,14 @@ function replyOpenChat(bot, to, text) {
   }
 }
 
+// An announcement is addressed to everyone in the world, so it carries no name; it shares the reply queue,
+// so a burst of them is paced like any other lines.
+function announceOpenChat(bot, text) {
+  for (const chunk of wrapLine(text, MAX_CHAT_LINE)) {
+    enqueue(() => { if (!departed.has(bot)) bot.chat(chunk); });
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // WHISPER — declared, not built
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -150,8 +158,8 @@ const replyWhisper = listenWhisper;
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 const CHANNELS = {
-  [FOREMAN_CHANNELS.OPEN_CHAT]: { listen: listenOpenChat, reply: replyOpenChat },
-  [FOREMAN_CHANNELS.WHISPER]:   { listen: listenWhisper,  reply: replyWhisper  },
+  [FOREMAN_CHANNELS.OPEN_CHAT]: { listen: listenOpenChat, reply: replyOpenChat, announce: announceOpenChat },
+  [FOREMAN_CHANNELS.WHISPER]:   { listen: listenWhisper,  reply: replyWhisper,  announce: listenWhisper },
 };
 
 function active() {

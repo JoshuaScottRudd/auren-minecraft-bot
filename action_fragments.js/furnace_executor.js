@@ -87,13 +87,15 @@ async function awaitWindowItem(furnace, name, timeoutMs = 1000) {
 }
 
 // ── THE FLEET'S FUEL IS BANKED: COAL, THEN CHARCOAL, THEN SPARE WOOD ──
-// Planks burn only when the chests hold neither coal nor charcoal, and then they are split from the logs of a
-// species the building is not made of. Returns { pref, log?, count } for what the chests hold, or null.
-function bankedFuel() {
+// The first of them that burns the whole `batch` is the fuel; when none does, the first the chests hold any
+// of. Planks are split from the logs of a species the building is not made of. Asked with no batch it is
+// the first fuel the chests hold. Returns { pref, log?, count } for what the chests hold, or null.
+function bankedFuel(batch = 0) {
   const lens = require('@kernel/inventory_lens');
+  const held = [];
   for (const pref of ['coal', 'charcoal']) {
     const count = lens.inChests(pref);
-    if (count > 0) return { pref, count };
+    if (count > 0) held.push({ pref, count, smelts: count * FUEL_SMELT_YIELD[pref] });
   }
   const plans = require('@kernel/downloaded_plan_registry');
   const wood = plans.isLoaded() ? plans.siteWood() : null;
@@ -103,9 +105,10 @@ function bankedFuel() {
       .map(name => ({ name, count: lens.inChests(name) }))
       .filter(l => l.count > 0)
       .sort((a, b) => b.count - a.count);
-    if (spare.length) return { pref: 'planks', log: spare[0].name, count: spare[0].count };
+    if (spare.length) held.push({ pref: 'planks', log: spare[0].name, count: spare[0].count, smelts: spare[0].count * PLANKS_PER_LOG * FUEL_SMELT_YIELD.planks });
   }
-  return null;
+  const fuel = held.find(f => f.smelts >= batch) || held[0];
+  return fuel ? { pref: fuel.pref, count: fuel.count, ...(fuel.log ? { log: fuel.log } : {}) } : null;
 }
 
 const PLANKS_PER_LOG = 4;
@@ -115,7 +118,7 @@ const yieldOf = pref => FUEL_SMELT_YIELD[pref] || (/_planks$/.test(pref) ? FUEL_
 // Puts one batch's fuel in the pocket from the chests. Returns the fuel token to burn, null when the chests
 // hold none (the pocket's own fuel is used), or undefined when a step already went to the judge (Law 15).
 async function fetchFuel(bot, batch, payload) {
-  const banked = bankedFuel();
+  const banked = bankedFuel(batch);
   if (!banked) return null;
   if (!banked.log) {
     const short = Math.ceil(batch / FUEL_SMELT_YIELD[banked.pref]) - bot.inventory.items().filter(i => i.name === banked.pref).reduce((n, i) => n + i.count, 0);
@@ -221,9 +224,9 @@ module.exports = {
       });
     }
 
-    // ── FETCH THE INPUT FIRST ── before the walk, so the trip runs chest→furnace. Only when holding
-    // none, never a top-up: retrieveItems abandons on a partial hold, so a short batch is left as a
-    // legal outcome (qty is re-bounded by the held count below).
+    // ── FETCH THE INPUT FIRST ── before the walk, so the trip runs chest→furnace. The pocket is topped up
+    // to the batch from what the chests hold unclaimed, so a body carrying a few of the input still loads
+    // the whole batch; a short batch stays a legal outcome (qty is re-bounded by the held count below).
     // THE FUEL COMES BEFORE THE INPUT, so a log fetched to burn is planks before a log fetched to cook arrives.
     let fetchedFuel = null;
     // A load empties the furnace's three slots into the pocket, so the pocket goes to it with room for them.
@@ -239,11 +242,19 @@ module.exports = {
       fetchedFuel = await fetchFuel(bot, job.batch_quantity || 1, payload);
       if (fetchedFuel === undefined) return;
     }
-    if (action === 'load' && job.input && !_largestHeld(bot, smeltInputs(job.order))) {
-      const got = await retrieveItems(bot, job.input, job.batch_quantity || 1, undefined, { only: smeltInputs(job.order) });
-      // undefined means retrieveItems already routed a fresh signal to the judge (Law 15); returning
-      // without routing again holds Law 4's one-signal invariant.
-      if (got === undefined) return;
+    if (action === 'load' && job.input) {
+      const names = smeltInputs(job.order);
+      const heldInput = _largestHeld(bot, names);
+      const short = (job.batch_quantity || 1) - (heldInput ? heldInput.count : 0);
+      // The stack already in the pocket is the one loaded, so only that kind tops it up.
+      const only = heldInput ? [heldInput.name] : names;
+      const take = Math.min(short, require('@perception/chest_ledger').unclaimedOf(only));
+      if (take > 0 || !heldInput) {
+        const got = await retrieveItems(bot, heldInput ? heldInput.name : job.input, Math.max(1, take), undefined, { only });
+        // undefined means retrieveItems already routed a fresh signal to the judge (Law 15); returning
+        // without routing again holds Law 4's one-signal invariant.
+        if (got === undefined) return;
+      }
     }
 
     const pos = new Vec3(where.x, where.y, where.z);

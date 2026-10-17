@@ -11,8 +11,10 @@ const { log, alarm } = require('./say');
 const { getCrew, existingSite } = require('./get_crew');
 const adminSteps = require('./admin_steps');
 const runWatch = require('./run_watch');
+const runAnnouncer = require('./run_announcer');
 const { crewSizeFor } = require('../foreman_vocabulary');
 const { guardExternal } = require('@utils/external_library_guard');
+const { CLOCKS } = require('@utils/server_settings');
 const siteGeometry = require('@utils/site_geometry');
 const { makeExecutionPacer } = require('@utils/execution_yield');   // Startup shares the runtime's computation budget.
 const { spawnProtectionBox } = require('@perception/spawn_protection');
@@ -46,6 +48,11 @@ const SPAWN_LATCH_WAIT_MS = 30000;
 // start, asset load, resource pack and login. A CEILING and never a requirement: the step's `onTimeout`
 // proves anyway and says the camera was not there.
 const OBSERVER_WAIT_MS = 120000;
+// A held crew's release: each body is given ceiling HELD_RELEASE_CEILING_MS to make its first move before the
+// next is started, and the whole crew HELD_GO_WAIT_MS after the last release to show it moved.
+const HELD_RELEASE_CEILING_MS = 45000;
+const HELD_RELEASE_GAP_MS = 3000;          // the least time between two releases, however fast the first moved
+const HELD_GO_WAIT_MS = 120000;
 const CREW_RAISE_TRIES = 3;
 const CREW_RAISE_RETRY_MS = 15000;
 const GROUND_ARRIVED_SHARE = 0.95;   // a view disc this full is ground enough to survey; the edge of a map never fills
@@ -153,13 +160,19 @@ function foremanSteps({ getBot, BODY, connectBody, door, desk, startSoak, shutdo
     // `camerasStep` carries its own `when` (`record !== 'off'`). Test-awareness is folded into the
     // `record` value passed in here, so one condition governs whether cameras raise (Law 16). The count
     // is `cameras` on the config page: 'crew' means one window per body, a number means that many seats.
+    // A seat-only test has the window a person flies and no bot window, whatever the page counts.
     adminSteps.camerasStep({
-      record: plan.isTest() ? 'off' : plan.CONFIG.record,
-      count: plan.CONFIG.cameras === 'crew' ? crewSizeFor(species)
-        : plan.CONFIG.cameras === 'none' ? 0
-          : plan.CONFIG.cameras,
+      record: plan.record(),
+      count: plan.seatOnly() ? 0
+        : plan.CONFIG.cameras === 'crew' ? crewSizeFor(species)
+          : plan.CONFIG.cameras === 'none' ? 0
+            : plan.CONFIG.cameras,
       // A run that names its bot seats has stated the whole answer, so a later body is not given one.
-      fill: plan.CONFIG.cameras === 'crew',
+      fill: !plan.seatOnly() && plan.CONFIG.cameras === 'crew',
+      // cameras 'none' is a run a person watches: the one window is the seat they fly.
+      eye: plan.seatOnly() || plan.CONFIG.cameras === 'none',
+      // The person flying a seat this run raised is placed at the build like a named observer.
+      onSeats: (seats) => observer.seatsRaised(seats),
     }),
     {
       name: 'the world spawn is known',
@@ -361,10 +374,11 @@ function foremanSteps({ getBot, BODY, connectBody, door, desk, startSoak, shutdo
       // Holds the crew back while the camera's client reaches the world; bounded, and never fails the run
       // — a run nobody is watching is still a run (observer.js: absent is not a failure, ever).
       //
-      // Off unless named, so a downloaded bot never waits for a camera that does not exist: `when` reads
-      // `foreman_config.observer`, which is '' by default.
+      // Off unless there is somebody to place, so a downloaded bot never waits for a camera that does not
+      // exist: `when` reads `foreman_config.observer`, '' by default, and after it a seat the cameras step
+      // raised for a person to fly.
       name: 'the camera is at the build',
-      when: () => self() && !!observer.name(),
+      when: () => self() && observer.names().length > 0,
       act: async () => {
         const state = await door.query();
         const held = state.ok ? existingSite(state.buildings, ownerKey) : null;
@@ -376,18 +390,18 @@ function foremanSteps({ getBot, BODY, connectBody, door, desk, startSoak, shutdo
       proof: async () => {
         const r = await observer.atSite();
         if (r.ok) return { ok: true, why: r.why };
-        return { ok: false, why: `${observer.name()} is not placed yet — ${r.why}` };
+        return { ok: false, why: `${observer.names().join(', ')} not all placed yet — ${r.why}` };
       },
       // A ceiling, not a requirement: `onTimeout` makes this step unfailable, taking this verdict instead
       // of the last refusal, so a camera that never logs in costs only the wait, and the crew goes up.
-      onTimeout: () => ({ ok: true, why: `${observer.name()} never arrived within ${OBSERVER_WAIT_MS / 1000}s — raising the crew anyway; joining later still puts it on the build.` }),
+      onTimeout: () => ({ ok: true, why: `${observer.names().join(', ')} did not all arrive within ${OBSERVER_WAIT_MS / 1000}s — raising the crew anyway; joining later still puts it on the build.` }),
     },
     {
       name: 'the crew is working',
       when: self,
       act: async () => {
         lastTrouble = null;
-        await getCrew(FOREMAN_NAME, species, { ...asItself, at: at.cell, build: plan.build(), resume: plan.continues() });
+        await getCrew(FOREMAN_NAME, species, { ...asItself, at: at.cell, build: plan.build(), resume: plan.continues(), held: plan.heldForGo() });
         return null;
       },
       within: 10000,
@@ -400,14 +414,53 @@ function foremanSteps({ getBot, BODY, connectBody, door, desk, startSoak, shutdo
       },
     },
     {
+      // ── A HELD CREW IS RELEASED ONCE EVERY BODY STANDS ─────────────────────
+      // The whole crew is raised and placed before any of it works, so the cameras are set up while bodies
+      // arrive. The step before proved every body standing; here the clock goes back to the run's start
+      // (the hold spent some of the morning) and the bodies are released one at a time, each after the
+      // one before it has made its first move — the operator's staggered start, given by the foreman.
+      // Proved from each body's own first route search, so the soak counts from the go.
+      name: 'the crew has its go',
+      when: () => self() && plan.heldForGo(),
+      act: async () => {
+        const want = CLOCKS[plan.CONFIG.clock];
+        if (want && !plan.continues()) await guardExternal('foreman', 'set the clock for the go', () => require('@utils/rcon_link').once([`time set ${want.time}`]));
+        for (const b of await crewStanding()) {
+          desk.startBody(b.id);
+          const t0 = Date.now();
+          for (;;) {
+            const now = await crewStanding();
+            if (now.some(x => x.id === b.id && x.first_move_at) || Date.now() - t0 >= HELD_RELEASE_CEILING_MS) break;
+            await new Promise(r => setTimeout(r, 500));
+          }
+          const spent = Date.now() - t0;
+          if (spent < HELD_RELEASE_GAP_MS) await new Promise(r => setTimeout(r, HELD_RELEASE_GAP_MS - spent));
+          log(`  released ${b.id} — moving after ${(spent / 1000).toFixed(1)}s`);
+        }
+        return null;
+      },
+      within: HELD_GO_WAIT_MS,
+      every: 3000,
+      proof: async () => {
+        const crew = await crewStanding();
+        const going = crew.filter(b => b.first_move_at);
+        return crew.length && going.length === crew.length ? { ok: true, why: `${going.length} bots started, one at a time` }
+          : { ok: false, why: `${going.length} of ${crew.length} bots started` };
+      },
+    },
+    {
       name: 'the soak is running',
       act: async () => {
         startSoak();
+        runAnnouncer.start({
+          fleetState: () => desk.fleetState(),
+          say: (text) => require('../foreman_channel').active().announce(getBot(), text),
+        });
         runWatch.start({
           fleetState: () => desk.fleetState(), wake: plan.CONFIG.wake, watch: plan.CONFIG.watch,
           onWake: (why) => { alarm(['THE WATCH WOKE — THE RUN IS ENDING', why]); shutdown(`the watch woke: ${why}`, 2); },
           build: plan.endsWhenBuilt() ? plan.build() : null,
-          onBuilt: (who) => shutdown(`${plan.build()} stands as its plan asks (read by ${who})`, 0),
+          onBuilt: (who) => { runAnnouncer.now(); shutdown(`${plan.build()} stands as its plan asks (read by ${who})`, 0); },
         });
         return null;
       },

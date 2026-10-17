@@ -47,6 +47,13 @@ run_lock.json
 # Which terminals the fleet has open (console_window's ledger) — the same kind of fact, for the same reason.
 console_windows.json
 console_windows.json.*.tmp
+# Which cameras are up right now (the overlay's session and stop request, the rig's ready record, the
+# sampler's and the warden's own pid records) — the same kind of fact. Each is deleted when the cameras come down.
+js_kernel/record_overlay_session.json
+js_kernel/record_overlay_stop.json
+js_kernel/camera_rig_ready.json
+js_kernel/machine_load_sampler.json
+js_kernel/camera_warden.json
 
 # ── The camera crew's game launcher ─────────────────────────────────────────────────────────────────
 # `start_cameras.ps1` downloads Prism Launcher here when a machine has none, and the camera clients' game

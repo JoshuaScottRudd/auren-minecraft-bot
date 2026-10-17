@@ -42,13 +42,16 @@ const requestedWork = require('@thinking/requested_work');
 // them is the allowance for every tool no family row names.
 const { group_to_item: _families } = require('@utils/fragment_utils');
 function inventoryWhitelist() {
-    return requestedWork.activeStockRows()
+    const rows = requestedWork.activeStockRows()
         .filter(s => s.holder === 'bot')
         // Family allowances consume their own tools before the general tool allowance.
         .sort((a, b) => Number(a.item === 'tools') - Number(b.item === 'tools'))
         .map(s => (s.kind === 'tool'
             ? { item: s.item, dump_threshold: s.dump_threshold, keep_order: [..._families[s.item]].reverse() }
             : { item: s.item, dump_threshold: s.dump_threshold }));
+    // A crew that replants keeps its primary sapling; the row stands first, so the `saplings` group row
+    // answers only for the others.
+    return [...require('@api/sapling_planter').pocketRow(), ...rows];
 }
 
 // ── Inventory helper ──
@@ -128,6 +131,7 @@ async function _sweep() {
     // Which structures this body read as built on its last sweep, for the foreman to read off the chair.
     boardroom.built = _builtLastSweep || {};
     boardroom.cubes_finished = require('./assessors/downloaded_build').finishedCount();
+    boardroom.layer_released = require('./assessors/downloaded_build').releasedLayer();
     hq.writeBoardroomChair(botId, boardroom);
 
 
@@ -166,7 +170,7 @@ async function _sweep() {
         await pace();
         inventory = _readInventory();
         const startedAt = Date.now();
-        const result = await assessor.assess({ inventory, buildClaim, excluded });
+        const result = await assessor.assess({ inventory, buildClaim, excluded, built });
         took.push({ name: assessor.name, ms: Date.now() - startedAt });
         results.set(assessor, result);
         // Two assessors reporting one structure differently is a wiring fault, not a tie to break.
@@ -257,25 +261,40 @@ async function _sweep() {
     // An order whose asker already took the fleet's stock off its figure says so (`net_of_pool`), and its
     // tokens are published a second time as owed in full: a producer that netted stock again would make
     // less than the asker is waiting on.
+    // The downloaded building's share of both figures is published beside them, so the furnace can smelt for it
+    // a layer at a time (downloaded_build.smeltPlan) in place of the whole building. What a stone tool would cost
+    // this body while it holds none is published as well: a smelt leaves that input in the chests (assessors/furnace).
     const wanted = {};
     const wantedNet = {};
+    const wantedCastle = {};
+    const wantedCastleNet = {};
+    const add = (into, tree) => { for (const [item, n] of Object.entries(tree)) into[item] = (into[item] || 0) + n; };
+    const castleResult = results.get(registry.EVALUATE_ORDER.find(a => a.name === 'downloaded_build')) || {};
+    const castleJobs = new Set(castleResult.jobs || []);
     for (const job of [...allJobs, ...held.map(h => h.job)]) {
         if (job.type !== 'supply' || !(job.need > 0) || !job.what) continue;
-        for (const [item, count] of Object.entries(requirementTree(job.what, job.need, {}))) {
-            wanted[item] = (wanted[item] || 0) + count;
-            if (job.net_of_pool) wantedNet[item] = (wantedNet[item] || 0) + count;
+        const tree = requirementTree(job.what, job.need, {});
+        add(wanted, tree);
+        if (job.net_of_pool) add(wantedNet, tree);
+        if (castleJobs.has(job)) {
+            add(wantedCastle, tree);
+            if (job.net_of_pool) add(wantedCastleNet, tree);
         }
     }
     // The mining pull is demand too: a building waiting on iron ingots asks the mine for the ore AND the
     // furnace for the smelt, so raw iron banked from a trip is cooked for the building that is waiting on it.
     for (const [item, count] of Object.entries(mergedPull)) {
         if (!(count > 0)) continue;
-        for (const [part, n] of Object.entries(requirementTree(item, count, {}))) {
-            wanted[part] = (wanted[part] || 0) + n;
-        }
+        add(wanted, requirementTree(item, count, {}));
+    }
+    for (const [item, count] of Object.entries(castleResult.pullNeeded || {})) {
+        if (count > 0) add(wantedCastle, requirementTree(item, count, {}));
     }
     boardroom.materials_wanted = wanted;
     boardroom.materials_wanted_net = wantedNet;
+    boardroom.materials_wanted_castle = wantedCastle;
+    boardroom.materials_wanted_castle_net = wantedCastleNet;
+    boardroom.materials_wanted_tools = require('@thinking/assessors/supply').stoneToolBill();
     boardroom.materials_wanted_at = now;
     hq.writeBoardroomChair(botId, boardroom);
     foremanLink.sendUpdate();
@@ -338,13 +357,13 @@ async function _sweep() {
         watcher.summary(TAG, 'No jobs posted — system idle.');
     }
 
-    // Storage thresholds: a peer-locked chest counts like any other (wait-to-act lives in
-    // inventory_swapper) and carries a 🔒 tag. One pool, one figure, no address — a `storage` row is a
+    // Storage thresholds: a chest a peer is using counts like any other (storage takes no lock) and the
+    // count of chests in use is printed beside the figure. One pool, one figure, no address — a `storage` row is a
     // request against the whole chest system, so what prints is the count of chests summed over.
     const summaryParts = [];
     const allStations = stationRegistry.getStations();
     const chestEntries = Object.values(allStations).filter(stationRegistry.isStorage);
-    const lockedChests = chestEntries.filter(e => e.locked_by).length;
+    const lockedChests = stationRegistry.findChests().filter(c => stationRegistry.spotHolders(c.id).length).length;
     for (const stock of requestedWork.activeStockRows()) {
         if (stock.deficit_below == null || stock.holder !== 'storage') continue;
         // Fleet-wide, the same figure the gate judged (Law 25).
@@ -368,7 +387,9 @@ async function _sweep() {
     // Station census (every chest/furnace's contents) — the registry reports its own state.
     stationRegistry.logContents();
 
-    await hq.flushNow();
+    // The sweep's memory is written now and the planning token is not held for the disk: the token is the
+    // fleet's one turn, and a write's outcome is the headquarters' own to report (Invariant D).
+    void hq.flushNow();
     return allJobs;
 }
 

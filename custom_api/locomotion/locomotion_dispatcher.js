@@ -417,7 +417,8 @@ async function descendColumn({ x, z, toFeetY }) {
     await digDownStep(bot);
     const after = bot.entity.position.floored();
     if (after.y >= before.y) { // dug counts observed drops, not swings
-      watcher.warn('locomotion_dispatcher',
+      // A refused step down is the descent's own gate answering; the caller is handed the reason.
+      watcher.summary('locomotion_dispatcher',
         `⛏ descendColumn stalled at y=${after.y} (wanted ${toFeetY}) after ${dug} observed drop(s) — ${digDownStall() || 'the step gave no reason'}.`);
       return { arrived: false, y: after.y, dug, reason: `step_refused (${digDownStall() || 'no reason given'})` };
     }

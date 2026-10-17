@@ -41,6 +41,8 @@ function passable(bot, x, y, z) {
 // shaveable — the rule in the header, asked of one block.
 function shaveable(bot, x, y, z) {
   if (!passable(bot, x, y + 1, z) || !passable(bot, x, y + 2, z)) return false;
+  // The block a sapling stands on is kept: digging it breaks the sapling.
+  if (/_sapling$/.test(bot.blockAt(new Vec3(x, y + 1, z))?.name || '')) return false;
   if (!isWalkableSurface(bot.blockAt(new Vec3(x, y - 1, z)))) return false;
   for (const [dx, dz] of EIGHT) {
     if (!passable(bot, x + dx, y + 1, z + dz)) return false;
@@ -134,7 +136,15 @@ function open(bot, { keepout, blocks }) {
 
   async function reach(target) {
     const stand = standBeside(bot, target);
-    const res = await require('@locomotion/locomotion_dispatcher').goTo({ ...stand, leg: 'work' });
+    const locomotion = require('@locomotion/locomotion_dispatcher');
+    const { bobbing } = require('@utils/movement/dig_authority');
+    let res = await locomotion.goTo({ ...stand, leg: 'work' });
+    // A WALK THAT ENDS AFLOAT HAS NOT REACHED THE GROUND: no dig is made afloat, so the body is walked onto the
+    // stand itself, and a stand it cannot get its feet on is one this errand did not reach.
+    if (res && res.arrived && bobbing(bot)) {
+      res = await locomotion.goToStand(new Vec3(stand.x, stand.y - 1, stand.z), { purpose: 'ground_stand' });
+      if (res && res.arrived && bobbing(bot)) return { ok: false, reason: 'afloat_at_stand' };
+    }
     return { ok: !!(res && res.arrived), reason: 'path_failed' };
   }
 

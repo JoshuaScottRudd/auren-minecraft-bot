@@ -44,11 +44,12 @@ const FLAGS = [
   { flag: 'ends', env: 'AUREN_ENDS', help: "'soak' (the run lasts the soak) or 'built' (a builder run ends when the building stands)" },
   { flag: 'crew', env: 'AUREN_CREW', help: "'homesteader', 'builder' or 'contractor'" },
   { flag: 'landing', env: 'AUREN_LANDING', help: "'usual' (the nearest good ground to world spawn) or 'random' (rolled new each run, far from the usual spot)" },
-  { flag: 'test', env: 'AUREN_TEST', help: "exercise the foreman and stop before any bot is raised: 'scan'" },
+  { flag: 'test', env: 'AUREN_TEST', help: "exercise the foreman and stop before any bot is raised: 'scan' or 'inspect'" },
   { flag: 'observer', env: 'AUREN_OBSERVER', help: "a person watching: the name you log in under. The foreman puts it in spectator at the site" },
   { flag: 'build', env: 'AUREN_BUILD', help: "for a builder crew: what it builds" },
   { flag: 'builder-count', env: 'AUREN_BUILDER_COUNT', help: 'how many builders the run raises, bounded by the available roster' },
   { flag: 'clock', env: 'AUREN_CLOCK', help: "'dawn', 'day' (pinned at midday) or 'held' (the world's own time)" },
+  { flag: 'go', env: 'AUREN_GO', help: "'now' (bots work as they arrive) or 'held' (every bot is raised and placed first, then all are released)" },
   { flag: 'record', env: 'AUREN_RECORD', help: "'off', 'cameras' (a camera window per bot) or 'film' (cameras + a recorder)" },
   { flag: 'machine-hour', env: 'AUREN_MACHINE_HOUR', help: "the hour a day the computer has to itself: '00:00-01:00', or 'off'" },
   { flag: 'watch', env: 'AUREN_WATCH', help: "'true' ends the run the moment something in --wake happens, 'false' runs it out" },
@@ -77,9 +78,17 @@ function usage() {
 
   It brings the world up, joins it, finds a standing spot, sites the base, says what it found
   and shuts everything down. Nothing else about the run changes: it is the ordinary startup
-  with its last two steps left off. The tests there are: scan.
+  with its last two steps left off. The tests there are: scan, inspect.
 
-    --test scan             the same thing said as an option, if you prefer options
+  To LOOK OVER what the last run built — one word:
+
+    node start_auren.js inspect
+
+  It brings the world up as the last run left it, raises no bot, opens the one camera
+  window you fly, puts it at the base (a builder's laydown yard), pins midday, and stays
+  up until you stop it. Nothing is put back or emptied.
+
+    --test scan|inspect     the same thing said as an option, if you prefer options
     --where local|remote    which world  (default: ${WORLD.where}, from foreman_config.js)
     --start rollback|continue   a clean start, or carry on  (default: ${WORLD.start})
     --soak <minutes>        how long it runs once the crew is working  (default: ${WORLD.soak}; 0 = until stopped)
@@ -156,10 +165,21 @@ if (argv[0] === 'test') {
   argv.splice(0, 3);
 }
 
+// `inspect [crew]`: shorthand for --test inspect on a continue start with midday pinned, so an untimed
+// look never walks into a night. The crew is the page's unless one is said; a later flag still wins.
+if (argv[0] === 'inspect') {
+  const crew = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
+  given.test = 'inspect';
+  given.start = 'continue';
+  given.clock = 'day';
+  if (crew) given.crew = crew;
+  argv.splice(0, crew ? 2 : 1);
+}
+
 for (let i = 0; i < argv.length; i++) {
   const raw = argv[i];
   if (raw === '--help' || raw === '-h') { usage(); process.exit(0); }
-  if (!raw.startsWith('--')) die(`'${raw}' is not an option. Options start with --, and only 'test <what> <crew>' may come first. Try --help.`);
+  if (!raw.startsWith('--')) die(`'${raw}' is not an option. Options start with --, and only 'test <what> <crew>' or 'inspect' may come first. Try --help.`);
   const eq = raw.indexOf('=');
   const name = (eq === -1 ? raw.slice(2) : raw.slice(2, eq)).toLowerCase();
   if (!FLAGS.some(f => f.flag === name)) die(`'--${name}' is not an option. Try --help for the list.`);
@@ -175,7 +195,7 @@ for (let i = 0; i < argv.length; i++) {
 const FLAG_ENV = {
   where: 'AUREN_SERVER_WHERE', start: 'AUREN_START', soak: 'AUREN_SOAK', ends: 'AUREN_ENDS', crew: 'AUREN_CREW', build: 'AUREN_BUILD', landing: 'AUREN_LANDING',
   test: 'AUREN_TEST', observer: 'AUREN_OBSERVER', 'builder-count': 'AUREN_BUILDER_COUNT',
-  clock: 'AUREN_CLOCK', record: 'AUREN_RECORD', 'machine-hour': 'AUREN_MACHINE_HOUR', watch: 'AUREN_WATCH', wake: 'AUREN_WAKE',
+  clock: 'AUREN_CLOCK', go: 'AUREN_GO', record: 'AUREN_RECORD', 'machine-hour': 'AUREN_MACHINE_HOUR', watch: 'AUREN_WATCH', wake: 'AUREN_WAKE',
   'server-folder': 'AUREN_SERVER_DIR', host: 'AUREN_SERVER_HOST', port: 'AUREN_SERVER_PORT',
   'rcon-password': 'AUREN_RCON_PASSWORD', 'rcon-port': 'AUREN_RCON_PORT',
 };
@@ -230,6 +250,13 @@ function takeRunLock() {
 // The foreman (`foreman/foreman_world.js`) owns proving the world — starting a local server or reaching
 // a remote one, and saying why when it cannot. This file sweeps the records and raises the foreman.
 (async () => {
+  // A test that looks at the last run's world is refused on any other start here, before a record is swept.
+  const test = process.env.AUREN_TEST || WORLD.test;
+  const testStart = test === 'off' ? null : require('./foreman/utils/test_modes').startFor(test);
+  if (testStart && (process.env.AUREN_START || WORLD.start) !== testStart) {
+    die(`'--test ${test}' looks at the world the last run left, so it needs --start ${testStart}. Nothing was started or cleared.\n`
+      + `  The short way:  node start_auren.js ${test}`);
+  }
   takeRunLock();
   // A ROLLBACK START IS THE ONE THING THAT EMPTIES fleet_logs/ (STANDING): swept here, since this is the one
   // door that starts a whole fleet before any bot exists. Every writer appends (watcher.js, crew_launch.js)

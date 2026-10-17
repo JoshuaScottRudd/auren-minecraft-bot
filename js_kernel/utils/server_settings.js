@@ -45,11 +45,13 @@ const FLEET_PROPS = [
 // to both a fresh server and one already running, and is re-asserted every launch because a snapshot
 // rollback restores whatever value it held in level.dat. mob_griefing is off so build terrain stays the
 // same between trials; spawn_phantoms is off since death_manager already returns a body, so no bed is needed.
+// advance_weather is off and the weather is cleared with it (foreman_world), so no run films or works in rain.
+// show_advancement_messages is off so the chat carries the foreman's announcements and nothing else.
 //
 // Names match `architect_config.SERVER_MINECRAFT_VERSION` (Law 16): 26.1 renamed every gamerule from
 // camelCase to snake_case, so an older server rejects these — the read-back below turns that into a named
 // warning instead of a silent no-op.
-const REQUIRED_GAMERULES = { mob_griefing: 'false', spawn_phantoms: 'false' };
+const REQUIRED_GAMERULES = { mob_griefing: 'false', spawn_phantoms: 'false', advance_weather: 'false', show_advancement_messages: 'false' };
 
 // Every property a world needs, in one list: the two a person's own server must have for the bots to join at
 // all, then the fleet's own. `prepare` writes all of them; `REQUIRED_PROPS` is the same list as a lookup,

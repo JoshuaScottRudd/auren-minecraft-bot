@@ -236,6 +236,7 @@ function shutdown(why, code) {
     plan.note({ closing: why });
     // Kept before the bots are sent home: a fleet going home is not reporting on its work.
     runWatch.freeze(() => foremanDesk.fleetState());
+    require('./utils/run_announcer').stop();
     const r = foremanDesk.stopFleet(why);
     if (r && r.sent > 0) {
       log(`'stop' reached ${r.sent} bot(s); giving them ${FLEET_STOP_GRACE_MS / 1000}s to leave.`);
@@ -247,7 +248,7 @@ function shutdown(why, code) {
     await foremanDesk.flushMemory();
     await crewLaunch.releaseFetchedAsync();
     // The cameras come down after the bots and before the world: a recording is finalised while its windows exist.
-    if (plan.CONFIG.record !== 'off') await adminSteps.stopCameras(why, log);
+    if (plan.record() !== 'off') await adminSteps.stopCameras(why, log);
     if (bot && BODY.present) bot.quit('the foreman is shutting down');
     const s = await world.stopServer(log);
     if (!s.stopped) log(`the world was not stopped: ${s.reason}.`);
@@ -422,7 +423,7 @@ bot.once('spawn', () => {
     if (!name || name === FOREMAN_NAME || Object.prototype.hasOwnProperty.call(BOT_SENIORITY, name)) return;
     // The camera is placed where the crew is and is not greeted, including a late join (observer.js).
     if (observer.isObserver(name)) {
-      observer.atSite().then(r => log(r.ok ? `camera: ${r.why}` : `camera: ${name} joined but is not placed — ${r.why}`));
+      observer.atSite(name).then(r => log(r.ok ? `camera: ${r.why}` : `camera: ${name} joined but is not placed — ${r.why}`));
       return;
     }
     // Greeted once per foreman lifetime, not once per join; not persisted, so a restart re-greets.
@@ -455,8 +456,11 @@ bot.once('spawn', () => {
 }
 
 // THE SOAK: how long the run lasts once its crew is working, then the one shutdown road. 0 = until stopped.
-function startSoak() {
+function armMachineHour() {
   require('./utils/machine_hour').armPause(plan.CONFIG.machineHour, { soakEndsAt: () => plan.progressNow().soakEndsAt, shutdown, log });
+}
+function startSoak() {
+  armMachineHour();
   const min = plan.CONFIG.soak;
   if (!(min > 0)) return;
   const endsAt = new Date(Date.now() + min * 60000);
@@ -516,6 +520,14 @@ world.onUnexpectedExit((reason, lines) => {
     log(`test ${plan.CONFIG.test} — what the fleet holds:`);
     for (const line of found.lines) log(line);
     runWatch.testDone(plan.CONFIG.test, found);
+    // A test that stays open has no end of its own: it is up for a person to look, and ends when stopped.
+    if (found.ok && testModes.staysOpen(plan.CONFIG.test)) {
+      plan.note({ crew: 'waiting' });
+      armMachineHour();
+      log(`test ${plan.CONFIG.test} — open until stopped, nobody raised. To end it: `
+        + `node Auren_Workshop/fleet_control.js verb shutdown, or Ctrl-C in the terminal that started it.`);
+      return;
+    }
     shutdown(`the ${plan.CONFIG.test} test finished`, found.ok ? 0 : 2);
     return;
   }

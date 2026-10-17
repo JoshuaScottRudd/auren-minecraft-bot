@@ -1,6 +1,7 @@
 // Auren_Bot/monitoring/tree_search_lens.js
 // --trees: every tree search the fleet made — how far out the rings had to open before a tree was
-// taken, what the reading cost, and how each search ended. Reads the tree-search ledger: one
+// taken, what the reading cost, and how each search ended; and the tree farm — what planting cost and
+// what share of the picks stood on a planted cell (sapling_planter's `PLANTED` line). Reads the tree-search ledger: one
 // `tree_search` line per search, written by tree_feller at the search's end. Inputs as ARGUMENTS, render,
 // RETURN; no process.argv, no process.exit.
 //
@@ -16,6 +17,8 @@ const UNREACHED_RE = /unreached tree=(\S+) stand=(\S+) from=(\S+) flat=(-?\d+) r
 const UNREACHED_ROWS = 20;
 const VALVE_RE = /trip_size at=(\S+) item=(\S+) walk=(\d+) walk_s=(\d+) elapsed_s=(\d+) owed_s=(-?\d+) taken=(\d+) held=(\d+) free_slots=(\d+) stays_out=(\d) pace=(\S+)/;
 
+// The sapling planter's ledger line, one per tree harvest that held a primary sapling and stood on a sited farm.
+const PLANTED_RE = /PLANTED n=(\d+) of=(\d+) sapling=(\S+) pocket=(\d+) held_before=(\d+) grid_cells_in_reach=(\d+) peer_held=(\d+) misses=(\d+)(?: no_stand=(\d+))?(?: near_lava=\d+ near_water=\d+)? walk=(\d+) ms=(\d+) stopped=(\S+)(?: cells=(.*))?$/;
 const RING_BLOCKS = 16;     // the ring width tree_feller's search reads by (surface_filter.RING_BLOCKS)
 const WINDOW_MIN = 5;        // the run is cut into windows this long, so a receding forest reads as a column
 const SLOW_ROWS = 10;
@@ -187,6 +190,69 @@ function runTreeSearch({ seg = [], traceName = '?', bot: botFilter = null, verbo
       const g = valve.filter(v => valveKey(v) === k);
       const b = g.filter(v => !v.stayed);
       return [g[0].at, g[0].item, g.length, avg(g.map(v => v.walk)), max(g.map(v => v.walk)), avg(g.map(v => v.walkS)), g.length - b.length, b.length, avg(b.map(v => v.held)), avg(b.map(v => v.elapsed + v.walkS)), avg(b.filter(v => v.pace === 'measured').map(share))];
+    }));
+
+  // The tree farm: what planting cost, and what of the fleet's wood came back from a planted cell. A pick
+  // is a farm pick when its trunk stands on a column a sapling was planted in earlier in the run.
+  const plantings = [];
+  for (const l of seg) {
+    if (botFilter && l.bot !== botFilter) continue;
+    const m = PLANTED_RE.exec(l.raw);
+    if (m) plantings.push({ bot: l.bot, wallSec: l.wallSec, n: +m[1], inReach: +m[6], peerHeld: +m[7], misses: +m[8], noStand: +(m[9] || 0), walk: +m[10], ms: +m[11],
+      stopped: m[12], cells: m[13] ? m[13].trim().split(' ') : [] });
+  }
+  const column = (cell) => { const p = cell.replace(/[()]/g, '').split(','); return `${p[0]},${p[2]}`; };
+  const events = [
+    ...plantings.flatMap(p => p.cells.map(c => ({ at: p.wallSec, kind: 'plant', col: column(c) }))),
+    ...picked.filter(s => s.tree && s.tree !== '-').map(s => ({ at: s.wallSec, kind: 'pick', col: column(s.tree), s })),
+  ].filter(e => Number.isFinite(e.at)).sort((a, b) => a.at - b.at || (a.kind === 'plant' ? -1 : 1));
+  const standing = new Map();          // column → second its sapling went in
+  const everPlanted = new Set();
+  const farmPicks = [], growSec = [];
+  for (const e of events) {
+    if (e.kind === 'plant') { standing.set(e.col, e.at); everPlanted.add(e.col); continue; }
+    if (!standing.has(e.col)) continue;
+    growSec.push(e.at - standing.get(e.col));
+    standing.delete(e.col);
+    farmPicks.push(e.s);
+  }
+  const farmSet = new Set(farmPicks);
+  const wildPicks = picked.filter(s => !farmSet.has(s));
+  const saplings = sum(plantings.map(p => p.n));
+  const pct = (a, b) => (b ? +(100 * a / b).toFixed(1) : null);
+  out.section('tree_farm');
+  out.kv('harvests_that_could_plant', plantings.length);
+  out.kv('harvests_that_planted', count(plantings, p => p.n > 0));
+  out.kv('saplings_planted', saplings);
+  out.kv('distinct_cells_planted', everPlanted.size);
+  out.kv('saplings_still_standing_at_end', standing.size);
+  out.kv('planting_bot_min_total', +(sum(plantings.map(p => p.ms)) / 60000).toFixed(1));
+  out.kv('planting_sec_per_sapling', saplings ? +(sum(plantings.map(p => p.ms)) / 1000 / saplings).toFixed(1) : null);
+  out.kv('planting_walk_blocks_total', sum(plantings.map(p => p.walk)));
+  out.kv('planting_walk_blocks_per_sapling', saplings ? +(sum(plantings.map(p => p.walk)) / saplings).toFixed(1) : null);
+  out.kv('walks_to_a_cell_failed', sum(plantings.map(p => p.misses)));
+  out.kv('cells_passed_no_standing_place', sum(plantings.map(p => p.noStand)));
+  out.kv('cells_refused_held_by_peer', sum(plantings.map(p => p.peerHeld)));
+  out.kv('farm_trees_picked', farmPicks.length);
+  out.kv('wild_trees_picked', wildPicks.length);
+  out.kv('farm_percent_of_picks', pct(farmPicks.length, picked.length));
+  out.kv('farm_trees_per_sapling_planted', saplings ? +(farmPicks.length / saplings).toFixed(2) : null);
+  out.kv('sapling_to_pick_min_avg', growSec.length ? +(sum(growSec) / growSec.length / 60).toFixed(1) : null);
+  out.kv('sapling_to_pick_min_min', growSec.length ? +(Math.min(...growSec) / 60).toFixed(1) : null);
+  out.kv('sapling_to_pick_min_max', growSec.length ? +(Math.max(...growSec) / 60).toFixed(1) : null);
+  out.table(['source', 'picked', 'dist_avg_blocks', 'dist_max_blocks', 'search_sec_avg', 'search_bot_min_total'],
+    [['farm', farmPicks], ['wild', wildPicks]].map(([name, g]) => [name, g.length, avg(g.map(s => s.dist)), max(g.map(s => s.dist)),
+      avg(g.map(s => s.searchMs / 1000)), +(sum(g.map(s => s.searchMs)) / 60000).toFixed(1)]));
+  out.table(['stopped', 'harvests', 'saplings'],
+    [...new Set(plantings.map(p => p.stopped))].sort().map(k => [k, count(plantings, p => p.stopped === k), sum(plantings.filter(p => p.stopped === k).map(p => p.n))]));
+  out.section('tree_farm_by_window');
+  const farmWindows = [...new Set([...plantings, ...picked].filter(x => Number.isFinite(x.wallSec)).map(x => Math.floor(x.wallSec / 60 / WINDOW_MIN)))].sort((a, b) => a - b);
+  const inWin = (x, w) => Number.isFinite(x.wallSec) && Math.floor(x.wallSec / 60 / WINDOW_MIN) === w;
+  out.table(['from_min', 'saplings_planted', 'farm_picked', 'wild_picked', 'farm_percent', 'farm_dist_avg', 'wild_dist_avg', 'farm_search_sec_avg', 'wild_search_sec_avg'],
+    farmWindows.map(w => {
+      const f = farmPicks.filter(s => inWin(s, w)), wd = wildPicks.filter(s => inWin(s, w));
+      return [w * WINDOW_MIN, sum(plantings.filter(p => inWin(p, w)).map(p => p.n)), f.length, wd.length, pct(f.length, f.length + wd.length),
+        avg(f.map(s => s.dist)), avg(wd.map(s => s.dist)), avg(f.map(s => s.searchMs / 1000)), avg(wd.map(s => s.searchMs / 1000))];
     }));
 
   if (verbose) {

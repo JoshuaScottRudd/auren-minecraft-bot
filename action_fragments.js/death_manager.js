@@ -178,10 +178,8 @@ async function recoveryPoint(bot) {
     return noHome(bot, `no contractor house is sited yet and ${owner} could not be located (${read.ok ? 'not in the world' : read.reason}) — nothing to come back to`);
   }
 
-  // THIS CREW'S OWN HOME — 'headframe' was hardcoded here, and the branch above already peels off the
-  // CONTRACTOR by species, so a BUILDER fell straight through to a structure it never raises: no centre
-  // locked, no tier 1, `noHome` on every death for the whole run. `homeBlueprint()` answers for all three
-  // species from the one tuple, and the message now names whichever home was actually missing (Law 16).
+  // The mandate owns this crew's recovery home; the missing-home report names that same structure
+  // so recovery and diagnosis use one species-specific answer (Law 16).
   const home = require('@kernel/bot_mandate').homeBlueprint();
   const transposeOrigin = readTransposeOrigin(home);
   if (!transposeOrigin || typeof transposeOrigin.x !== 'number') {

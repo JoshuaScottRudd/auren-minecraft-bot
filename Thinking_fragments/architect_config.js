@@ -250,14 +250,15 @@ const BUILDING_REQUIREMENTS = [
     { field: 'headframe', type: TYPE_BLUEPRINT_PASTED,   order: 1 },
     { field: 'headframe', type: TYPE_STRUCTURE_COMPLETE, order: 2, execute_key: 'headframe_execute',
       job_type: 'building_headframe', supply_job_type: 'building_headframe_supply' },
+    // The builder's waste pit (WASTE_PIT below), sited by the foreman beside the yard. Built first: it is
+    // digging only and needs no material, and the yard waits on stations that have to be crafted.
+    { field: 'waste_pit', type: TYPE_COORDINATES,        order: 0 },
+    { field: 'waste_pit', type: TYPE_BLUEPRINT_PASTED,   order: 1 },
+    { field: 'waste_pit', type: TYPE_STRUCTURE_COMPLETE, order: 2, execute_key: 'waste_pit_execute' },
     // The builder's alpha structure (ALPHA_STRUCTURE below), sited by the foreman beside the downloaded building.
-    { field: 'laydown_yard', type: TYPE_COORDINATES,        order: 0 },
-    { field: 'laydown_yard', type: TYPE_BLUEPRINT_PASTED,   order: 1 },
-    { field: 'laydown_yard', type: TYPE_STRUCTURE_COMPLETE, order: 2, execute_key: 'laydown_yard_execute' },
-    // The builder's waste pit (WASTE_PIT below), sited by the foreman beside the yard and built after it.
-    { field: 'waste_pit', type: TYPE_COORDINATES,        order: 3 },
-    { field: 'waste_pit', type: TYPE_BLUEPRINT_PASTED,   order: 4 },
-    { field: 'waste_pit', type: TYPE_STRUCTURE_COMPLETE, order: 5, execute_key: 'waste_pit_execute' },
+    { field: 'laydown_yard', type: TYPE_COORDINATES,        order: 3 },
+    { field: 'laydown_yard', type: TYPE_BLUEPRINT_PASTED,   order: 4 },
+    { field: 'laydown_yard', type: TYPE_STRUCTURE_COMPLETE, order: 5, execute_key: 'laydown_yard_execute' },
 ];
 
 // ── WHICH STRUCTURES A PERSON MAY ASK FOR: AN AUTHORED WHITELIST ─────────────────────────────────────
@@ -285,15 +286,16 @@ const REQUIREMENT_CATEGORIES = {
     stock: [
     // ── A TOOL ROW NAMES THE TIERS IT ACCEPTS, IN ORDER (`tiers`) ─────────────────────────────────────
     // A body short of a tool walks the row's `tiers` and takes the first it can have (assessors/shared.kitTier):
-    //   'copper' — crafted when three copper ingots are held or banked;
+    //   'copper' — crafted when three copper ingots are held or banked. No row takes it: a building's copper is
+    //              its own, and the mine's pickaxes had spent more copper than the castle was short;
     //   'stone'  — crafted when cobblestone is held or banked;
     //   'wooden' — crafted from planks.
     // A row whose tiers it can have none of posts nothing, and the body works with what it holds — for the
     // shovel that is its fists. `countInInventory` counts the family. `max_tier` still bounds what an UPGRADE
     // may craft. The mine is entered with the pickaxe row's `deficit_below` in the pocket
     // (mining_manager.canEnterMine), and the body digs the set down to MINING_LAST_PICKAXE before surfacing.
-    { item: 'pickaxe',        holder: 'bot', kind: 'tool', tiers: ['copper', 'stone', 'wooden'], deficit_below: 3, dump_threshold: 3, max_tier: 'wooden', mode: 'active', spare_mode: 'active', stone_level: 3 },
-    { item: 'axe',            holder: 'bot', kind: 'tool', tiers: ['copper', 'stone', 'wooden'], deficit_below: 2, dump_threshold: 2, max_tier: 'wooden', mode: 'active' },
+    { item: 'pickaxe',        holder: 'bot', kind: 'tool', tiers: ['stone', 'wooden'], deficit_below: 3, dump_threshold: 3, max_tier: 'wooden', mode: 'active', spare_mode: 'active', stone_level: 3 },
+    { item: 'axe',            holder: 'bot', kind: 'tool', tiers: ['stone', 'wooden'], deficit_below: 2, dump_threshold: 2, max_tier: 'wooden', mode: 'active' },
     { item: 'tools',          holder: 'bot', dump_threshold: 99 },
     // NO TABLE IN A POCKET: every craft that needs one is made at the home blueprint's table.
     // TORCHES ARE CRAFTED FOR THE TRIP THAT PLACES THEM (mining_manager.takeMiningLight); a pocket keeps
@@ -304,7 +306,9 @@ const REQUIREMENT_CATEGORIES = {
     // and the next trip draws that much less from the chests. `deficit_below` is the walking reserve a cube
     // trip is priced to arrive with (assessors/downloaded_build.trashOf).
     { item: 'planks',        holder: 'bot', deficit_below: 12, dump_threshold: 256, job_type: 'resource_pillaring_stock', mode: 'active' },
-    { item: 'stick',          holder: 'bot', dump_threshold: 8 },
+    // STICKS FLOAT IN THE POCKET, NEVER IN A CHEST: a body keeps one stack for the crafts that need them
+    // (leaves drop most of them, planks make the rest when a craft asks) and the waste pit takes the rest.
+    { item: 'stick',          holder: 'bot', dump_threshold: 64 },
     // Unpledged dirt is banked; a builder discards it once the building and standby are supplied.
     { item: 'dirt',           holder: 'bot', dump_threshold: 0 },
     // A passive keep, never an errand — a deficit_below here would require a shaft pierce.
@@ -319,8 +323,9 @@ const REQUIREMENT_CATEGORIES = {
     // walking to anyway (assessors/shared.kitTier). MADE_TO_ORDER below is the list; waste_pit and the chest
     // housekeeping both read it.
     { item: 'bread',         holder: 'storage', deficit_below: 8, dump_threshold: 8, mode: 'active' },
-    // One stack of charcoal stands by: it is the fuel after coal and the building's own material.
-    { item: 'charcoal',      holder: 'storage', deficit_below: 32, fill_to: 64, dump_threshold: 64, mode: 'active' },
+    // Three stacks of charcoal stand by: it is the fuel after coal and the building's own material, and ten
+    // furnaces loaded by the full stack burn eighty of it a round.
+    { item: 'charcoal',      holder: 'storage', deficit_below: 192, fill_to: 256, dump_threshold: 256, mode: 'active' },
     ],
   },
   homestead: {
@@ -334,10 +339,11 @@ const REQUIREMENT_CATEGORIES = {
   },
   builder: {
     crews: ['builder'],
-    work: ['waste_disposal', 'chest_housekeeping', 'compost'],
+    // No compost: a builder's saplings and leaf litter go to the waste pit (WASTE_PIT.items, sapling_planter).
+    work: ['waste_disposal', 'chest_housekeeping'],
     stock: [
       // A stone shovel speeds the builder's excavation without ordering a wooden shovel.
-      { item: 'shovel', holder: 'bot', kind: 'tool', tiers: ['copper', 'stone'], deficit_below: 2, dump_threshold: 2, max_tier: 'stone', mode: 'active' },
+      { item: 'shovel', holder: 'bot', kind: 'tool', tiers: ['stone'], deficit_below: 2, dump_threshold: 2, max_tier: 'stone', mode: 'active' },
     ],
   },
 };
@@ -447,9 +453,9 @@ const MINING_LAST_PICKAXE = 1;
 const MINING_PASSES_PER_DISPATCH = 3;
 
 // ── THE WASTE PIT (custom_api/waste_pit) — WHERE A POCKET'S TRASH GOES INSTEAD OF A CHEST ─────────────
-// The pit is the `structure` blueprint (building_blueprints.json): a 3×3 pad with one hole in the centre,
-// sited by the foreman beside the yard (WASTE_PIT_SITING) and built by the crew after the yard. A body
-// stands on one of the four pad cells that share a side with the hole and tosses into it; an item resting
+// The pit is the `structure` blueprint (building_blueprints.json): a 4×3 pad with a trench two blocks long
+// down its middle, sited by the foreman beside the yard (WASTE_PIT_SITING) and built by the crew. A body
+// stands on the pad cell at one end of the trench and tosses along it at the far wall; an item resting
 // on the pit floor is under the thrower's feet, past the reach of a player's pickup box, and despawns on
 // its own after five minutes.
 // `items` is what the pit takes, and only past what the pocket's own row keeps; a wooden pickaxe is
@@ -458,7 +464,7 @@ const WASTE_PIT = Object.freeze({
     structure: 'waste_pit',
     items: Object.freeze(['wooden_pickaxe', 'gravel', 'flint', 'diorite', 'granite', 'andesite', 'tuff',
         'calcite', 'smooth_basalt', 'lapis_lazuli', 'apple', 'egg', 'amethyst_block', 'amethyst_shard',
-        'red_mushroom', 'brown_mushroom', 'white_wool', 'mutton']),
+        'red_mushroom', 'brown_mushroom', 'white_wool', 'mutton', 'leaf_litter', 'stick']),
 });
 
 // ── THE MINE'S UNIT: 'cell' (5×5×5 rooms) OR 'strip' (1×2 trunk and branches) — mining_cell_graph ──────────
@@ -699,8 +705,39 @@ const YARD_SITING = Object.freeze({ min_gap: 5, alert_gap: 25, search_to: 63, ri
 
 // Where the builder's waste pit may go, relative to the yard: the nearest spot min_gap or more from the yard's
 // footprint, outside the building's ring, its pad within ±rise of the yard floor. Every trip's leftovers are
-// carried from the yard to the pit, so the nearest level spot wins.
-const WASTE_PIT_SITING = Object.freeze({ min_gap: 2, search_to: 24, rise: 1, scrape_max: 2, fill_max: 1 });
+// carried from the yard to the pit, so the nearest level spot wins. fill_max is 0: the pad is cut, never filled,
+// so the pit is built with no material.
+const WASTE_PIT_SITING = Object.freeze({ min_gap: 2, search_to: 24, rise: 1, scrape_max: 2, fill_max: 0 });
+
+// ── THE TREE FARM (custom_api/sapling_planter) — A CREW REPLANTS BESIDE ITS HOME STRUCTURE ────────────────
+// A species with a row here plants saplings when a tree harvest ends; a species with no row plants nothing
+// and handles saplings as its stock rows say. The farm is the ground past `yard_clear` from the home
+// structure (ALPHA_STRUCTURE) on the three sides that do not face `away_from`, so the layers read
+// `away_from`, home, clear ground, farm. Planting at the end of a tree harvest is the one way a sapling is planted.
+//   away_from   the structure the farm keeps the home between itself and
+//   keep        primary saplings a pocket keeps; the primary is the sapling of the fleet's wood (the wood
+//               the build is made of); every other sapling, and the primary past this, goes to the waste pit
+//   yard_clear  blocks round the home's footprint that hold no sapling; every sapling stands farther out
+//   building_gap  nearest a sapling stands to any other building's footprint, in blocks
+//   spacing     blocks, centre to centre, between a sapling and any other sapling or trunk
+//   search      how far from where the harvest ended a planting cell is looked for; none inside it, none planted
+//   plantings   the most saplings one harvest plants
+const TREE_FARM = Object.freeze({
+    [BOT_MODES.BUILDER]: Object.freeze({
+        away_from: require('../foreman_config').builder.build,
+        keep: 64, yard_clear: 15, building_gap: 2, spacing: 4, search: 20, plantings: 5,
+    }),
+});
+for (const [mode, row] of Object.entries(TREE_FARM)) {
+    for (const k of ['keep', 'yard_clear', 'building_gap', 'spacing', 'search', 'plantings']) {
+        if (!Number.isInteger(row[k]) || row[k] < 0) {
+            throw new Error(`[architect_config] CODING VIOLATION (Law 13): TREE_FARM.${mode}.${k} is ${row[k]}; it is a whole number of zero or more.`);
+        }
+    }
+    if (typeof row.away_from !== 'string' || !row.away_from || row.spacing < 1) {
+        throw new Error(`[architect_config] CODING VIOLATION (Law 13): TREE_FARM.${mode} needs an away_from structure and a spacing of at least 1.`);
+    }
+}
 
 // Where the builder's mineshaft may go: its whole diagonal run keeps min_gap from the castle, the yard and the pit.
 const SHAFT_SITING = Object.freeze({ min_gap: 15 });
@@ -807,6 +844,7 @@ module.exports = {
     STONE_SOURCE,
     YARD_SITING,
     WASTE_PIT_SITING,
+    TREE_FARM,
     SHAFT_SITING,
     SERVER_SILENCE,
     HEADFRAME_CLOCK,

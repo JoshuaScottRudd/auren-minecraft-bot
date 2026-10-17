@@ -303,6 +303,12 @@ async function receive(signalType) {
   for (const it of bot.inventory.items()) {
     if (surplusCompostable(it.name)) held[it.name] = (held[it.name] || 0) + it.count;
   }
+  // A crew that replants keeps its primary sapling's pocket stack: only what it holds past that is fed.
+  for (const keep of require('@api/sapling_planter').pocketRow()) {
+    if (!(keep.item in held)) continue;
+    held[keep.item] -= keep.dump_threshold;
+    if (held[keep.item] <= 0) delete held[keep.item];
+  }
   const want = Object.entries(held).map(([name, count]) => ({ name, count }));
   if (!want.length) { _route(false, 'no compostable reached the pocket — a peer withdrew the batch first'); return; }
 

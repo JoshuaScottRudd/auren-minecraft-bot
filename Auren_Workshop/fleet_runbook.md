@@ -370,6 +370,27 @@ after 5 s is taken as it stands and its picture rewritten, once per chest per ru
 (`chest_forgiveness:<station>` in `foreman_brain`, spent, never held). The body warns `CHEST PICTURE
 FORGIVEN`; a second mismatch on that chest in that run is the coding violation it was.
 
+### 3a-bis. The inspection run — looking over what the last run built
+
+```
+node start_auren.js inspect            # the page's crew; or: inspect homesteader
+node Auren_Workshop/fleet_control.js down
+```
+
+`inspect` is `--test inspect --start continue --clock day` (`foreman/utils/test_modes.js`, row `inspect`).
+The ordinary startup runs up to "the camera is at the build" and stops there with the run left open:
+
+- the world comes up as the last run left it, and nothing is put back, emptied or swept;
+- the base is read back from the fleet's memory and proved whole, with no body raised;
+- the one camera window a person flies (`Cam_Architect`) is raised with no bot window, whatever
+  `record`, `cameras` and `architect.enable` say, and the foreman puts it at the base's alpha structure
+  (a builder's laydown yard, a homesteader's headframe);
+- midday is pinned, and the run stays up until `verb shutdown`, `down` or Ctrl-C.
+
+Any other `start` is refused before a record is swept. A contractor crew is refused: its base belongs
+to whoever asked for it. On every camera run, a seat the cameras step raised is placed at the build
+when no `observer` is named.
+
 ### 3b. What the foreman adds around the run — the same page, after the sentence
 
 `windowsPriority` in `foreman_config.js` selects `high` (default) or `normal`, overridden for a
@@ -571,6 +592,11 @@ node Auren_Workshop/tools/lanista_conductor.js ladder record
 node Auren_Workshop/tools/record_overlay.js    stop        # THE closer — from any other terminal
 node Auren_Workshop/tools/record_overlay.js    status      # what is filming, and who is holding it
 ```
+
+**A held start (`--go held`, `foreman_config.go`)** raises every bot and places it at the build before any
+of them works, so the cameras are set up while the crew arrives. Once every body stands, the foreman sets the
+clock back to dawn (rollback) and releases the bodies one at a time, each after the one before has moved
+(step "the crew has its go"). The soak counts from the release.
 
 **The Architect's eye (`Cam_Architect`)** is one more spectator client, built and launched like a bot
 camera, that the director **arms and then never commands**. It is absent from the rig's shot list, so

@@ -40,6 +40,38 @@ const DIG_TIMED_OUT = Symbol('dig_timed_out');
 // Keeps the budget from falling below the dig's own expected time, so a slow dig is never aborted early.
 const DIG_TIMEOUT_ESTIMATE_FLOOR = 1.25;
 
+// ── THE SERVER'S WORD ON A DIG ───────────────────────────────────────────────────────────────────────
+// The library writes air into this body's copy of the world when its own dig timer ends, and the server
+// breaks the block when it next ticks. A body that moves into the cell between the two is moved back by
+// the server. So a dig is finished when the server has said what stands in the cell: a block change for
+// that cell, alone or inside a section's batch. listenForServerWord is armed before the swing;
+// heard(ms) resolves true on the server's word and false when none came inside `ms`.
+const DIG_CONFIRM_MS = 5000;        // server_pulse's own line for a server that has gone silent
+function listenForServerWord(bot, pos) {
+  const client = bot._client;
+  let spoken = false, wake = null;
+  const hear = () => { spoken = true; if (wake) wake(); };
+  const onBlock = (p) => { const l = p && p.location; if (l && l.x === pos.x && l.y === pos.y && l.z === pos.z) hear(); };
+  const onSection = (p) => {
+    const c = p && p.chunkCoordinates;
+    if (!c || c.x !== pos.x >> 4 || c.y !== pos.y >> 4 || c.z !== pos.z >> 4) return;
+    const local = ((pos.x & 15) << 8) | ((pos.z & 15) << 4) | (pos.y & 15);
+    if ((p.records || []).some(rec => typeof rec !== 'number' || (rec & 0xFFF) === local)) hear();
+  };
+  client.on('block_change', onBlock);
+  client.on('multi_block_change', onSection);
+  return {
+    async heard(ms) {
+      let timer = null;
+      if (!spoken) await new Promise(resolve => { wake = resolve; timer = setTimeout(resolve, ms); });
+      clearTimeout(timer);
+      client.removeListener('block_change', onBlock);
+      client.removeListener('multi_block_change', onSection);
+      return spoken;
+    },
+  };
+}
+
 async function digBounded(bot, block, tag = 'dig_authority') {
   if (!block) return false;
   const pos = block.position;
@@ -309,7 +341,7 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
   // A dig never opens a face onto water: water beside or above the block pours into the hole and makes
   // a flow trap. The same predicate A* reads, so a route never plans a dig this refuses (Law 16).
   if (require('@utils/pathfinding_utils').opensOntoWater(bot, pos.x, pos.y, pos.z)) {
-    watcher.warn(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} has water beside or above it, or beside the loose column that would fall when it breaks; breaking it would let the water flow.`);
+    watcher.summary(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} has water beside or above it, or beside the loose column that would fall when it breaks; breaking it would let the water flow.`);
     return false;
   }
   // Ground a working peer has closed is that peer's alone to dig (foreman_link.closeClaimedArea).
@@ -375,8 +407,16 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
   // cell that opened, which is how it knows a fleet-placed block came back out.
   const book = require('@kernel/item_book');
   await book.open();
+  const word = guardExternalSync(tag, `listen for the server's word on (${pos.x},${pos.y},${pos.z})`, () => listenForServerWord(bot, pos));
   await digBounded(bot, block, tag);                 // bounded — never hang the signal on one cell
-  await sleep(100);                                  // let a server-side revert (rejected break) land
+  // The cell is read after the server has spoken for it: an accepted break and a refused one both arrive
+  // as its word, and the body does not move on a break only its own copy of the world holds.
+  // A cell this body's copy still shows standing was never opened here, so there is no word to wait for.
+  const copy = bot.blockAt(pos);
+  const opened = !copy || copy.name === 'air' || copy.boundingBox === 'empty';
+  if (word.ok && !(await word.value.heard(opened ? DIG_CONFIRM_MS : 0)) && opened) {
+    watcher.summary(tag, `DIG_UNCONFIRMED ${block.name} at (${pos.x},${pos.y},${pos.z}) — the server said nothing for the cell in ${DIG_CONFIRM_MS}ms; the cell is read from this body's copy.`);
+  }
   await book.close('dig', 'worn_out', undefined, false);
   const after = bot.blockAt(pos);
   if (!after || after.name === 'air' || after.boundingBox === 'empty') {
@@ -395,6 +435,7 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
 }
 
 module.exports = {
+  listenForServerWord,
   ensureNoOpenWindow,
   performDig,
   bobbing,

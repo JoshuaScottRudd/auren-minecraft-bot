@@ -9,11 +9,11 @@
 'use strict';
 
 const Vec3 = require('vec3');
-const { performPlace } = require('@utils/movement/place_authority');
+const { performPlace, clearCell } = require('@utils/movement/place_authority');
 const watcher = require('@kernel/watcher');
 const { isFluid } = require('@utils/gravity_utils');
 const { sleep, isNonFullBlock, isPunchThroughDebris, STATION_TYPES, group_to_item, BLOCK_REACH } = require('@utils/fragment_utils');
-const { performDig } = require('@utils/movement/dig_authority');
+const { performDig, listenForServerWord } = require('@utils/movement/dig_authority');
 const { jumpTap, microCenter, waitUntilSettled } = require('@utils/movement/motion_primitives');
 const { BRIDGE_PREFS, pillarConfig } = require('@utils/movement/movement_config');
 const { isNotSafeSurface } = require('@utils/movement/terrain_predicates');
@@ -104,6 +104,8 @@ async function placeAtApex(bot, referenceBlock, faceVector, opts = {}) {
 // Retry budget for recoverable failures (mistimed jump, transient place miss, headroom hiccup).
 // Baked into the utility, not the callers, so every user retries identically without duplication.
 const PILLAR_MAX_ATTEMPTS = 3;
+// How long a fired apex placement waits for the server to say what stands in the cell before it is judged.
+const PILLAR_SERVER_WORD_MS = 2000;
 
 // pillarStep: rise one block by placing a support underfoot mid-jump; retries internally.
 // Returns { success, reason, placedPosition, itemName, newY, oldY }.
@@ -113,7 +115,8 @@ async function pillarStep(bot, opts = {}) {
   let last = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // A pocket with logs and no plank gets one log split, so the step spends trash before anything else.
-    await require('@utils/trash').ready(bot);
+    // A cube trip climbing its own shaft has counted its pocket at the yard and nothing is made for it.
+    if (!opts.ownShaft) await require('@utils/trash').ready(bot);
     await require('@kernel/item_book').open();
     last = await _pillarAttempt(bot, opts);
     // The block under the feet left the pocket outside performPlace, so the item book is told here.
@@ -124,17 +127,19 @@ async function pillarStep(bot, opts = {}) {
       return last;
     }
     // Deterministic failures a retry cannot fix — stop now and let the caller decide.
-    if (last.reason === 'no_item' || last.reason === 'no_solid_support' || last.reason === 'equip_fail') return last;
+    // A refused headroom dig is refused again 150 ms later: the block is protected or holds a peer up.
+    if (last.reason === 'no_item' || last.reason === 'no_solid_support' || last.reason === 'equip_fail' || last.reason === 'body_in_cell'
+        || String(last.reason).startsWith('headroom_blocked')) return last;
     // Recoverable: retry. _pillarAttempt re-settles and re-centers at the top of every attempt,
     // so all that's needed here is a short delay between tries.
     if (attempt < maxAttempts) {
-      watcher.warn('scaffold_movement', `pillarStep attempt ${attempt}/${maxAttempts} failed (${last.reason}) — retrying`);
+      watcher.summary('scaffold_movement', `pillarStep attempt ${attempt}/${maxAttempts} failed (${last.reason}) — retrying`);
       await sleep(150);
     }
   }
   // Exhausted every retry without rising — surface it loudly so a pillar stall is never silent.
   if (last && !last.success) {
-    watcher.warn('scaffold_movement', `pillarStep timed out — failed after ${maxAttempts} attempt(s), last reason=${last.reason}`);
+    watcher.warn('scaffold_movement', `pillarStep timed out — failed after ${maxAttempts} attempt(s), last reason=${last.reason}${last.detail ? ` ${last.detail}` : ''}`);
   }
   return last;
 }
@@ -298,6 +303,13 @@ async function _pillarAttempt(bot, opts = {}) {
   if (!equipped.ok) return { success: false, reason: 'equip_fail', error: equipped.reason, placedPosition: null, itemName: item.name, newY: oldY, oldY };
   // Re-center: placing under the feet needs precise alignment. microCenter is ours; a throw is a defect.
   await microCenter(bot, { eps: 0.08 });
+  // A creature overlapping the pillar cell makes the server refuse the block, so it is moved out first
+  // through place_authority's own cell clearing (Law 16). One that stays is a terminal reason.
+  const cleared = await clearCell(bot, startFeet, 'scaffold_movement');
+  if (!cleared.ok) {
+    watcher.warn('scaffold_movement', `pillarStep fail reason=body_in_cell cell=(${startFeet.x},${startFeet.y},${startFeet.z}) — ${cleared.reason}`);
+    return { success: false, reason: 'body_in_cell', placedPosition: null, itemName: item.name, newY: oldY, oldY };
+  }
   // Place the support at the apex of the rise, not a fixed fraction of the jump hold. On land that is
   // the top of the jump; in water it is the top of a buoyancy bob, and there is no onGround to time a
   // fixed delay against. placeAtApex owns the whole crest-to-packet path, including re-firing on the
@@ -309,6 +321,9 @@ async function _pillarAttempt(bot, opts = {}) {
   const holdMs = inWater
     ? Math.max(1600, (cfg.jumpHoldMs || pillarConfig.jumpHoldMs || 320) + 1300)   // room for several bobs
     : Math.max(360, cfg.jumpHoldMs || pillarConfig.jumpHoldMs || 320);
+  // The server's word on the cell is listened for from before the jump: a slow server accepts the block
+  // after the settle below, and the cell read then would call a placed block a failure (Law 25).
+  const word = listenForServerWord(bot, startFeet);
   bot.setControlState('jump', true);
   const apex = await placeAtApex(bot, support, new Vec3(0, 1, 0), { timeoutMs: holdMs, minRiseAboveY: clearOfCellY });
   bot.setControlState('jump', false);
@@ -316,6 +331,9 @@ async function _pillarAttempt(bot, opts = {}) {
   const placeErr = apex.error;
   const crests = apex.crests;
   await sleep(cfg.postJumpSettleMs || 120);
+  const fired = crests > 0 && !(bot.blockAt(startFeet)?.boundingBox === 'block');
+  await word.heard(fired ? PILLAR_SERVER_WORD_MS : 0);
+  if (fired) await sleep(cfg.postJumpSettleMs || 120);
   const finalFeet = bot.entity.position.floored();
   const newY = Math.floor(finalFeet.y);
   const placedBlock = bot.blockAt(new Vec3(startFeet.x, startFeet.y, startFeet.z));
@@ -326,15 +344,31 @@ async function _pillarAttempt(bot, opts = {}) {
   const heightGained = newY > oldY;
   const success = blockPlaced || heightGained;
   const reason = success ? undefined : (placed ? 'no_height_gain' : 'place_fail');
-  if (!success && cfg.debug) {
+  // A failed attempt states its cause (Law 13). Zero crests identifies a rise/headroom failure; positive
+  // crests with no block identifies rejected apex placements; a body other than this one inside the cell
+  // is a placement the server refuses.
+  let detail = null;
+  if (!success) {
     const supportNow = bot.blockAt(new Vec3(startFeet.x, startFeet.y - 1, startFeet.z));
     const feetNow = bot.blockAt(startFeet);
-    // crests is the discriminator the old trace lacked: 0 crests = the body never rose clear of the
-    // cell (a bob/headroom problem); crests>0 with no block = the server rejected every apex packet
-    // (an aim/reach/timing problem). Without it, both read as a bare place_fail.
-    watcher.warn('scaffold_movement', `pillarStep fail reason=${reason} item=${item.name} oldY=${oldY} newY=${newY} crests=${crests} apex=${apex.reason || 'placed'} support=${supportNow?.name || 'null'} feet=${feetNow?.name || 'null'} placeErr=${placeErr?.message || 'none'}`);
+    detail = `item=${item.name} cell=(${startFeet.x},${startFeet.y},${startFeet.z}) oldY=${oldY} newY=${newY} crests=${crests} apex=${apex.reason || 'placed'} support=${supportNow?.name || 'null'} feet=${feetNow?.name || 'null'} bodies_in_cell=${bodiesInCell(bot, startFeet).join(',') || 'none'} placeErr=${placeErr?.message || 'none'}`;
+    if (cfg.debug) watcher.warn('scaffold_movement', `pillarStep fail reason=${reason} ${detail}`);
   }
-  return { success, placedPosition: blockPlaced ? placedBlock.position.clone() : null, itemName: item.name, reason, newY, oldY };
+  return { success, placedPosition: blockPlaced ? placedBlock.position.clone() : null, itemName: item.name, reason, detail, newY, oldY };
+}
+
+// bodiesInCell(bot, cell) → names of the other living bodies whose box overlaps the cell.
+function bodiesInCell(bot, cell) {
+  const names = [];
+  for (const e of Object.values(bot.entities)) {
+    if (e === bot.entity || !e.position || !['player', 'mob', 'animal', 'hostile'].includes(e.type)) continue;
+    const half = (e.width || 0.6) / 2;
+    const overlaps = e.position.x + half > cell.x && e.position.x - half < cell.x + 1
+      && e.position.z + half > cell.z && e.position.z - half < cell.z + 1
+      && e.position.y + (e.height || 1.8) > cell.y && e.position.y < cell.y + 1;
+    if (overlaps) names.push(e.username || e.name || e.type);
+  }
+  return names;
 }
 
 // Descent is owned solely by locomotion's exact-goTo, which digs straight down with the hardened
@@ -382,7 +416,7 @@ async function tryPillarAscent(bot) {
 //      speed. Java's jump clears one block of rise about four ticks in, so the boundary has to be
 //      v × ~0.2 s ahead: 0.86 blocks walking, 1.12 sprinting.
 //
-// ONE FUNCTION, NOT A SECOND MOVER (Law 16): driveRun with a single cell and strictFinal is the old
+// ONE FUNCTION, NOT A SECOND MOVER (Law 16): driveRun with a single cell and strictFinal provides the
 // per-cell step exactly. The lookahead depth is a number, not a mode, so careful walking and sprinting
 // parkour are the same code at two settings.
 //
@@ -394,6 +428,8 @@ async function tryBridgeStep(bot, dx, dz) {
   const items = bot.inventory?.items?.() || [];
   const item = BRIDGE_PREFS.map(name => items.find(i => i.name === name && i.count > 0)).find(Boolean) || null;
   if (!item) return { success: false, reason: 'no_blocks' };
+  // A bridge places against a block face, and a diagonal has none: the server never answers such a click.
+  if (Math.abs(dx) + Math.abs(dz) !== 1) return { success: false, reason: 'diagonal_no_face' };
   const feet = bot.entity.position.floored();
   const curSupportPos = new Vec3(feet.x, feet.y - 1, feet.z);
   const ref = bot.blockAt(curSupportPos);

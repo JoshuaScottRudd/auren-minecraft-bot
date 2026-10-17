@@ -4,14 +4,17 @@
 // Called directly by preconstruction, build_executor, delivery_executor, supply_manager,
 // furnace_executor, and any fragment that needs chest deposit/withdrawal. No signal-bus entry.
 //
-// Every chest is interchangeable — selection is by room, consolidation and locks, never by role.
+// Every chest is interchangeable in role; the pool is ordered by chest NUMBER (station_registry.chestNumbers).
 // Nested API (Law 15): calls the locomotion API to reach chests; an unreachable chest abandons the
 // caller, originating a fresh signal to recursive_judge.
 // Invariants: depositItems/retrieveItems throw only on coding violations (missing bot), every other
-// outcome is environmental (Law 13 + Law 15). Deposit fills the lowest-ID chest with room; retrieve
-// picks the first chest containing the item. A locked chest is a legal candidate (unlocked preferred);
-// a pick on one queues — walk there, wait for release (waitUntilChestFree), re-read the fresh
-// snapshot, proceed — bounded by LOCK_QUEUE_TIMEOUT_MS.
+// outcome is environmental (Law 13 + Law 15). A deposit tops an existing part stack of its item first,
+// then fills the lowest-numbered chest with room, with that room claimed before the walk
+// (chest_ledger.claimRoom); what does not fit goes on to the next chest. A withdrawal draws from the
+// highest-numbered chest holding the item, capped at what no other body has claimed. NO LOCK AND NO
+// QUEUE: any number of bodies open one chest and act in it at once, and the claims are what keep them
+// apart. A body says which chest it is using before it walks (station_registry.claimSpot); that spot is
+// read only to know whether a peer may be moving the chest under this body's window.
 
 'use strict';
 
@@ -24,7 +27,6 @@ const { group_to_item, substitutes_for, furnace_chain_items } = require('@utils/
 function _groupOf(token) {
     return (token && !furnace_chain_items.has(token) && Array.isArray(group_to_item[token])) ? group_to_item[token] : null;
 }
-const { waitUntilChestFree } = require('@utils/chest_lock_utils');
 const { routeToJudge } = require('@utils/signal_utils');
 const { guardExternal, guardExternalSync, withCleanup } = require('@utils/external_library_guard');
 
@@ -37,18 +39,22 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const CONTENTS_ARRIVAL_MS = 5000;
 // The server sends its time once a second; a gap past this is a server that is not ticking.
 const SERVER_HEARD_WITHIN_MS = 1500;
-const WINDOW_POLL_MS = 10;   // poll rate for a wait queued behind a held lock, one server tick
+const WINDOW_POLL_MS = 10;   // poll rate for a window or its contents to arrive
+// A peer's part take holds its whole stack in its pocket until the surplus goes back, so a stack can be out
+// of the chest for a few hundred milliseconds. A withdrawal that finds none waits this long for it once.
+const PEER_RETURN_MS = 500;
 // Three server ticks after a stack-moving click (pick up, drop, halve, shift-click). One tick let a
 // halve-and-drop pair outrun the server: the client showed the stack in the chest, the server kept it in
 // the pocket, and the picture recorded a deposit that never landed.
 const TRANSFER_DELAY_MS = 150;
 const CLOSE_SETTLE_MS = 80;
 const MAX_CLOSE_TRIES = 8;
-// Bounds a wait at a locked chest — catches a lock that is never releasing (a body killed mid-window,
-// cleared only by clearMagnet).
-const LOCK_QUEUE_TIMEOUT_MS = 120000;
-// Poll rate for a body waiting at a locked chest, read from the in-memory boardroom (`getLockHolder`).
-const LOCK_QUEUE_POLL_MS = 50;
+// A window the server did not hand over is asked for again this many times. The server never refuses a
+// second opener, so a missing window is lag or a moved block, never a peer.
+const OPEN_TRIES = 3;
+const OPEN_RETRY_MS = 250;
+// Rounds of the deposit fallback: each round re-plans what did not fit, skipping the chests already tried.
+const DEPOSIT_MAX_ROUNDS = 6;
 
 // ---------------------------------------------------------------------------
 // SECTION 1 — Station selection
@@ -59,45 +65,76 @@ function _parsePos(posId) {
     return { x, y, z };
 }
 
-// ── EVERY ITEM IS SPREAD ONE STACK TO A CHEST, AND A STACK IS FILLED BEFORE ANOTHER IS STARTED ────────────
-// A deposit goes first to a chest holding a stack of that item short of full, so no chest carries two part
-// stacks of one item. With every stack full it goes to the chest holding the least of the item, so each chest
-// gets its first stack before any gets a second: a withdrawal then finds the item in many chests and queues at
-// none.
-// Room for `item` in a chest's picture: a free slot, or a stack of that exact item short of full.
-function _hasRoom(bot, entry, item) {
-    const items = Array.isArray(entry.items) ? entry.items : [];
-    if (items.length < (entry.capacity || 27)) return true;
-    const def = bot.registry && bot.registry.itemsByName && bot.registry.itemsByName[item];
-    const stackSize = (def && def.stackSize) || 64;
-    return items.some(i => i.name === item && (i.count || 0) < stackSize);
-}
-// Units of `item` in a chest's picture; a group token (`logs`) counts every member.
-function _countIn(entry, item) {
-    const members = _groupOf(item);
-    return (Array.isArray(entry.items) ? entry.items : [])
-        .reduce((n, i) => n + ((i.name === item || (members && members.includes(i.name))) ? (i.count || 0) : 0), 0);
+// ── THE CHESTS FILL IN NUMBER ORDER, AND A PART STACK IS TOPPED BEFORE A SLOT IS STARTED ──────────────────
+// A deposit tops every part stack of its item first, lowest number first, wherever the stack sits: a stack of
+// 23 in chest 2 is filled before chest 1 gets a fresh slot. What is left takes fresh slots in the
+// lowest-numbered chest with room. Withdrawals draw from the highest number, so stock consolidates toward
+// chest 1. Room is the chest's picture less the fresh slots other depositors have claimed
+// (chest_ledger.reservedSlotsAt), so two bodies never walk to the same last slot.
+function _stackSizeOf(item) {
+    const def = global.bot && global.bot.registry && global.bot.registry.itemsByName && global.bot.registry.itemsByName[item];
+    return (def && def.stackSize) || 64;
 }
 
-// Among chests with room: one holding a part stack of the item, then the one holding the least of it. Equal
-// candidates are equal (Law 27): an unlocked one is taken over a locked one, and among the rest the pick is
-// random, which is also what keeps a fleet of bodies from converging on the same empty chest.
-function _selectDepositTarget(stations, item) {
-    const def = global.bot && global.bot.registry && global.bot.registry.itemsByName && global.bot.registry.itemsByName[item];
-    const stackSize = (def && def.stackSize) || 64;
-    const candidates = [];
-    for (const [id, entry] of Object.entries(stations)) {
-        if (!require('@perception/station_registry').isStorage(entry)) continue;
-        if (!_hasRoom(global.bot, entry, item)) continue;
-        const partStack = Array.isArray(entry.items) && entry.items.some(i => i.name === item && (i.count || 0) < stackSize);
-        candidates.push({ id, ...entry, partStack, held: _countIn(entry, item), draw: Math.random() });
+// Room for `item` at one numbered chest: the headroom inside its part stacks of the item, and its fresh
+// slots after other bodies' claims and `takenSlots` this plan already spent there.
+function _roomAt(chest, item, takenSlots) {
+    const items = Array.isArray(chest.items) ? chest.items : [];
+    const size = _stackSizeOf(item);
+    const headroom = items.reduce((n, i) => n + ((i.name === item && (i.count || 0) < size) ? size - (i.count || 0) : 0), 0);
+    const reserved = require('@perception/chest_ledger').reservedSlotsAt(chest.id);
+    const freeSlots = Math.max(0, (chest.capacity || 27) - items.length - reserved - takenSlots);
+    return { headroom, freeSlots, size };
+}
+
+// The storage chests as numbered rows, ascending, less any in `exclude`.
+function _numberedChests(stations, exclude) {
+    const numbers = stationRegistry.chestNumbers();
+    return Object.entries(stations)
+        .filter(([id, e]) => stationRegistry.isStorage(e) && numbers.has(id) && !(exclude && exclude.has(id)))
+        .map(([id, e]) => ({ id, ...e, number: numbers.get(id) }))
+        .sort((a, b) => a.number - b.number);
+}
+
+// _planDeposits(stations, wants {item: n}, exclude) → { rows: [{station, number, item, amount, slots}]
+// ascending by number, unplaced: {item: n} } — where every unit goes, and the fresh slots each row claims.
+function _planDeposits(stations, wants, exclude = null) {
+    const chests = _numberedChests(stations, exclude);
+    const taken = new Map();      // chest id → fresh slots this plan already uses
+    const topped = new Map();     // `${id}|${item}` → part-stack headroom this plan already uses
+    const rows = [];
+    const unplaced = {};
+    const add = (chest, item, amount, slots) => {
+        const row = rows.find(r => r.station === chest.id && r.item === item);
+        if (row) { row.amount += amount; row.slots += slots; return; }
+        rows.push({ station: chest.id, number: chest.number, item, amount, slots });
+    };
+    for (const [item, want] of Object.entries(wants)) {
+        let left = want;
+        for (const chest of chests) {
+            if (left <= 0) break;
+            const k = `${chest.id}|${item}`;
+            const head = _roomAt(chest, item, 0).headroom - (topped.get(k) || 0);
+            if (head <= 0) continue;
+            const n = Math.min(left, head);
+            topped.set(k, (topped.get(k) || 0) + n);
+            add(chest, item, n, 0);
+            left -= n;
+        }
+        for (const chest of chests) {
+            if (left <= 0) break;
+            const room = _roomAt(chest, item, taken.get(chest.id) || 0);
+            if (room.freeSlots <= 0) continue;
+            const n = Math.min(left, room.freeSlots * room.size);
+            const slots = Math.ceil(n / room.size);
+            taken.set(chest.id, (taken.get(chest.id) || 0) + slots);
+            add(chest, item, n, slots);
+            left -= n;
+        }
+        if (left > 0) unplaced[item] = left;
     }
-    if (candidates.length === 0) return null;
-    candidates.sort((a, b) => (a.partStack === b.partStack ? 0 : (a.partStack ? -1 : 1))
-        || (a.held - b.held)
-        || ((!a.locked_by === !b.locked_by) ? 0 : (a.locked_by ? 1 : -1))
-        || (a.draw - b.draw));
-    return candidates[0];
+    rows.sort((a, b) => a.number - b.number);
+    return { rows, unplaced };
 }
 
 // The members a retrieve of `item` may take: the order's own `only` list when it carries one (a furnace's
@@ -114,21 +151,12 @@ function _unclaimedFor(item, only) {
     return require('@perception/chest_ledger').unclaimedOf(names);
 }
 
-// Retrieve: first unlocked chest holding the item; when only a locked chest holds it, returns that
-// one instead of reporting no source.
+// Retrieve: the highest-numbered chest holding the item, whoever else is using it.
 function _selectRetrieveTarget(stations, item, only = null) {
     const variants = _retrieveVariants(item, only);
-    let lockedFallback = null;
-    for (const [id, entry] of Object.entries(stations)) {
-        if (!require('@perception/station_registry').isStorage(entry) || !Array.isArray(entry.items)) continue;
-        const hasItem = entry.items.some(i =>
-            i.name === item || (variants && variants.includes(i.name))
-        );
-        if (!hasItem) continue;
-        if (!entry.locked_by) return { id, ...entry };
-        if (!lockedFallback) lockedFallback = { id, ...entry };
-    }
-    return lockedFallback;
+    const holding = _numberedChests(stations, null).filter(c => Array.isArray(c.items)
+        && c.items.some(i => i.name === item || (variants && variants.includes(i.name))));
+    return holding.length ? holding[holding.length - 1] : null;
 }
 
 // No chest→chest courier: retrieveItems and depositItems/dumpExcess are the only chest movements, and
@@ -138,15 +166,14 @@ function _selectRetrieveTarget(stations, item, only = null) {
 // SECTION 2 — Window management
 // ---------------------------------------------------------------------------
 
-// Polls for the window instead of sleeping a fixed delay before checking (Invariant B) — the lock is
-// already held, so every millisecond here is paid by the queue behind this body.
+// Polls for the window instead of sleeping a fixed delay before checking (Invariant B).
 // ── A WINDOW IS OPEN WHEN ITS SLOTS HAVE ARRIVED, NOT WHEN IT EXISTS ─────────────────────────────────
 // mineflayer sets `bot.currentWindow` on the open packet and fills its slots on the next one, emitting
 // `windowOpen` only then. Reading the window at the first moment sees an empty chest and an empty pocket,
 // and the transfer moves nothing through a window the queue already paid for — so the wait is for the
 // `windowOpen` event, listened for before the click so it cannot be missed.
-// A chest that never opens (no window by CONTENTS_ARRIVAL_MS) is a peer holding it and is queued for; a
-// window that opened is owed its slots within the same ceiling.
+// A chest that never opens (no window by CONTENTS_ARRIVAL_MS) is asked again (OPEN_TRIES); a window that
+// opened is owed its slots within the same ceiling.
 async function _openWindow(bot, pos, stationId) {
     const block = bot.blockAt(new Vec3(pos.x, pos.y, pos.z));
     if (!block) return { ok: false, reason: 'block_not_found' };
@@ -178,10 +205,12 @@ async function _openWindow(bot, pos, stationId) {
 }
 
 // ── THE LAST BODY OUT PHOTOGRAPHS THE CHEST; THE NEXT BODY IN WAITS FOR THAT PICTURE ──────────────────
-// Every window closes on a snapshot of the container (snapshotStation), sent to the fleet with the lock's
-// release in one update, so the next body reads the chest's contents before it arrives. On opening, the
-// window's contents must match that picture: the body acts the moment they do, and a window still
-// disagreeing after CONTENTS_ARRIVAL_MS means the record and the world have split (Law 13).
+// Every window closes on a snapshot of the container (snapshotStation), sent to the fleet with the spot's
+// release in one update. When no peer's spot is this chest, nothing else can be moving it, so the window
+// must match the newest picture: the body acts the moment it does, and a window still disagreeing after
+// CONTENTS_ARRIVAL_MS means the record and the world have split (Law 13). The picture is re-read on every
+// poll, since the last body's picture can arrive a moment late. With a peer's spot on the chest, the chest
+// is legitimately moving under the window and the window itself is the contents.
 function _tally(items) {
     const t = {};
     for (const i of items || []) t[i.name] = (t[i.name] || 0) + (i.count || 0);
@@ -198,7 +227,7 @@ function _describeTally(t) {
 // ── EACH CHEST IS FORGIVEN ONE MISMATCH PER RUN ───────────────────────────────────────────────────────
 // A run can end while a body has a chest open, before the picture or the world is saved, so the next run
 // finds the two apart. A chest that opened a window is forgiven that once: the window is taken as the
-// chest's contents (Invariant B) and the picture is rewritten from it under the lock this body holds.
+// chest's contents (Invariant B) and the picture is rewritten from it.
 // The foreman counts the one — its 'chest_forgiveness:' key is spent, never held — so a second mismatch
 // on the same chest in the same run is the defect it always was. A body with no foreman is the whole
 // fleet, and the chests it has itself been forgiven are the count.
@@ -214,12 +243,19 @@ async function _spendForgiveness(stationId) {
     return true;
 }
 
-// → { ms, forgiven }: how long the window took to match the picture, or that it never did and was forgiven.
-async function _awaitPicture(win, stationId, picture, clickedAt) {
-    const want = _tally(picture);
-    // The ceiling runs from the window's arrival: an open the server answered late has used none of it.
+// → { ms, forgiven }: how long the window took to match the newest picture, or that it never did and was
+// forgiven. `ms` runs from `since`, the moment this body could first act on the window.
+async function _awaitPicture(win, stationId, since) {
+    const pictureNow = () => {
+        const row = stationRegistry.getStations()[stationId];
+        return (row && Array.isArray(row.items)) ? row.items : [];
+    };
+    let want = _tally(pictureNow());
     const arrivedAt = Date.now();
     while (!_sameTally(_tally(_snapshotItems(win)), want)) {
+        want = _tally(pictureNow());
+        // A peer that came to this chest after the window opened may already be moving it.
+        if (stationRegistry.spotHolders(stationId).length) return { ms: Date.now() - since, forgiven: false, peer: true };
         if (Date.now() - arrivedAt >= CONTENTS_ARRIVAL_MS) {
             const seen = _snapshotItems(win);
             const apart = `picture [${_describeTally(want)}], window [${_describeTally(_tally(seen))}]`;
@@ -232,11 +268,11 @@ async function _awaitPicture(win, stationId, picture, clickedAt) {
             watcher.warn(TAG, `CHEST PICTURE FORGIVEN — chest ${stationId} did not match its last picture within `
                 + `${CONTENTS_ARRIVAL_MS}ms: ${apart}. The window is taken as the chest's contents and the picture `
                 + `is rewritten from it. This chest's one forgiveness for this run is now spent.`);
-            return { ms: Date.now() - clickedAt, forgiven: true };
+            return { ms: Date.now() - since, forgiven: true };
         }
         await sleep(WINDOW_POLL_MS);
     }
-    return { ms: Date.now() - clickedAt, forgiven: false };
+    return { ms: Date.now() - since, forgiven: false };
 }
 
 async function _closeWindow(bot) {
@@ -246,9 +282,7 @@ async function _closeWindow(bot) {
     if (typeof bot.closeWindow === 'function') {
         guardExternalSync(TAG, 'closeWindow', () => bot.closeWindow(bot.currentWindow));
     }
-    // Polled at a tick, for the reason `_openWindow` gives: the caller's `withCleanup` releases the
-    // chest lock only after this returns, so every millisecond here is paid by the queue behind this
-    // body. Budget is unchanged — the same MAX_CLOSE_TRIES × CLOSE_SETTLE_MS ceiling as before.
+    // Polled at a tick rather than slept in full; the ceiling is MAX_CLOSE_TRIES × CLOSE_SETTLE_MS.
     const closeBy = Date.now() + MAX_CLOSE_TRIES * CLOSE_SETTLE_MS;
     while (bot.currentWindow && Date.now() < closeBy) await sleep(WINDOW_POLL_MS);
 }
@@ -261,6 +295,16 @@ async function _closeWindow(bot) {
 // after, every packet the server sent for the window, and the pocket before the open and at the close.
 // It names a window the server corrected after its picture matched (container or pocket slots), or
 // whose pocket at the close did not change by what the window said moved.
+// A CORRECTION IS NOT A FAULT: every transfer here is a shift-click, and mineflayer's guess of a shift-click
+// is routinely wrong (see _shiftClick), so the server correcting the window is the ordinary answer to a
+// wrong guess and is written on the audit line. The fault is the pocket at the close not having changed by
+// what the window says moved, because that is material appearing or vanishing. The server's container is
+// rebuilt from its packets alone, so it misses every slot where mineflayer guessed right; it is printed for
+// reading and decides nothing.
+// A CONTENDED window (a peer's spot was this chest while it was open) has the chest moving under it, so
+// the window's change is two bodies' work and the pocket cannot be checked against it. The item book's
+// pocket audits (every 30 s, off the body's own reading) and the container check at the next uncontended
+// window are what catch material appearing or vanishing there.
 // The pocket is read at the close itself, before this body can act again, so the next craft or place
 // never lands inside the reading. The server's word on the window is still heard this long after the
 // close, since a correction for the last click can be in flight; packets for this window id are the
@@ -319,7 +363,7 @@ function _tallyDelta(before, after) {
     return d;
 }
 function _describeDelta(d) { return Object.entries(d).map(([n, c]) => `${n} ${c > 0 ? '+' : ''}${c}`).join(', ') || 'none'; }
-function _reportAudit(bot, audit, stationId, orderType, picture) {
+function _reportAudit(bot, audit, stationId, orderType, picture, contendedNow) {
     const pictureTally = _tally(picture);
     const containerDelta = _tallyDelta(audit.atOpen || {}, pictureTally);
     const expectedPocket = {};
@@ -338,11 +382,11 @@ function _reportAudit(bot, audit, stationId, orderType, picture) {
         settled = true;
         if (_pendingPocketCheck === check) _pendingPocketCheck = null;
         _releaseAudit(bot, audit);
+        const contended = contendedNow();   // asked at the verdict, not at the close (see _executeTransfer)
         const server = _serverContainer(audit);
         const winPackets = audit.packets.filter(p => p.windowId === audit.winId && (p.kind === 'window_items' || p.kind === 'set_slot'));
         const corrections = winPackets.filter(p => p.t > audit.readyAt);
         const pocketCorrections = corrections.filter(p => p.kind === 'window_items' || p.slot >= audit.containerEnd);
-        const pictureAgrees = corrections.length === 0 || (server ? _sameTally(server, pictureTally) : true);
         const heardMs = Date.now() - audit.closedAt;
         const packets = audit.packets.map(p => p.kind === 'open_window' || p.kind === 'close_window'
             ? `+${p.t - audit.openedAt}ms ${p.kind}(w${p.windowId})`
@@ -350,16 +394,14 @@ function _reportAudit(bot, audit, stationId, orderType, picture) {
             : p.kind === 'window_items'
             ? `+${p.t - audit.openedAt}ms items#${p.stateId}[${_describeTally(_tally(p.items.slice(0, audit.containerEnd).filter(Boolean)))}]`
             : `+${p.t - audit.openedAt}ms slot${p.slot}#${p.stateId}=${_slotDesc(p.item)}`).join(' ');
-        const line = `transfer audit ${orderType} ${stationId} window#${audit.winId}: `
+        const line = `transfer audit ${orderType} ${stationId} window#${audit.winId}${contended ? ' (contended)' : ''}: `
             + `at open [${_describeTally(audit.atOpen || {})}] · picture written [${_describeTally(pictureTally)}] · `
             + `server's last word [${server ? _describeTally(server) : 'no container packet'}] · `
             + `pocket change expected [${_describeDelta(expectedPocket)}] at the close [${_describeDelta(actual)}] · picture matched at +${audit.readyAt - audit.openedAt}ms · `
             + `clicks ${audit.clicks.length} {${clicks}} · server packets ${winPackets.length}, ${corrections.length} after the picture matched `
             + `(${pocketCorrections.length} touching the pocket), heard until ${heardMs}ms after the close {${packets}}`;
         const faults = [];
-        if (!pictureAgrees) faults.push('the server corrected the window after it opened and the picture differs from the corrected container');
-        if (pocketCorrections.length) faults.push('the server corrected the pocket after the picture matched');
-        if (!pocketAgrees) faults.push('the pocket at the close did not change by what the window said moved');
+        if (!contended && !pocketAgrees) faults.push('the pocket at the close did not change by what the window said moved');
         if (faults.length) watcher.warn(TAG, `TRANSFER AUDIT MISMATCH — ${faults.join(' and ')}. ${line}`);
         else watcher.summary(TAG, line);
     };
@@ -382,15 +424,26 @@ function _snapshotItems(win) {
 // ---------------------------------------------------------------------------
 // SECTION 3 — Item transfer
 //
-// _click: promise wrapper around bot.clickWindow.
-// _moveExact / _moveExactDeposit: pick up a stack, place count items onto dest slot(s), put remainder
-// back. Deposit and retrieve both shift-click when the stack fits within the remaining amount, and
-// fall back to _moveExact(Deposit) only when it exceeds it.
+// ── EVERY CROSSING OF THE WINDOW IS ONE SHIFT-CLICK; EVERY SPLIT HAPPENS IN THE POCKET ───────────────────
+// No lock keeps peers out of a chest, so any number of bodies click in one chest at once. The server applies
+// clicks one at a time, and a shift-click is one click that moves a whole stack across in a single step, so
+// nothing can come between its start and its end. A stack held on the cursor can: lifting a chest stack
+// to take part of it leaves its slot empty, a peer can deposit a different item there, and putting the
+// rest back swaps the two. So no chest stack is ever held on the cursor here. A part of a stack is cut in
+// the POCKET, which is this body's alone (_splitInPocket), and crosses with one shift-click:
+//   deposit n of a bigger stack   → split n off in the pocket, shift-click that slot into the chest
+//   take n of a bigger stack      → shift-click the whole stack into the pocket, split off the surplus,
+//                                   shift-click the surplus back
+// Every move is measured off the pocket, never off a chest slot a peer may be moving.
+//
+// Law 13 here: what this body's own pocket shows is this body's doing alone. A pocket that changes by more
+// than a click could move, a split that does not land, or a cursor left holding a stack at the end is a
+// defect in this file and stops the run. A short move (a full chest, a stack a peer took first) is the
+// world, and is reported and worked around.
 // ---------------------------------------------------------------------------
 
 // mineflayer's clickWindow(slot, button, mode) is a promise that resolves once the click is applied to the
-// window; it takes no callback. Every transfer is verified against the window's slots afterward, and the
-// next body's picture check verifies the whole window against the server.
+// window; it takes no callback.
 async function _click(bot, slot, button, mode) {
     const win = bot.currentWindow;
     const before = win ? _slotDesc(win.slots[slot]) : '?';
@@ -410,176 +463,246 @@ function _findEmpty(win, start, end) {
     return -1;
 }
 
-// A slot already holding `itemName` below its max stack size. Topping this off before opening a fresh
-// empty slot is what consolidates repeated partial deposits (torch:3,3,3 → torch:9). Matches the
-// concrete name only — never merges variants (oak_log tops oak_log, not birch_log).
-function _findPartialStack(win, itemName, start, end) {
-    for (let i = start; i < end; i++) {
+// The bounds of a window: the container's slots, then the pocket's 36.
+function _bounds(win) {
+    const total = win.slots.length;
+    return { containerEnd: Math.max(0, total - 36), total };
+}
+
+// How many of `names` the pocket holds, as the window shows it.
+function _pocketCount(win, names) {
+    const { containerEnd, total } = _bounds(win);
+    let n = 0;
+    for (let i = containerEnd; i < total; i++) {
         const it = win.slots[i];
-        if (!it || it.name !== itemName) continue;
-        const max = it.stackSize || 64;
-        if (it.count < max) return i;
+        if (it && names.includes(it.name)) n += it.count;
     }
-    return -1;
+    return n;
 }
 
-async function _moveExact(bot, win, sourceSlot, count, destStart, destEnd) {
-    const destSlot = _findEmpty(win, destStart, destEnd);
-    if (destSlot === -1) return 0;
-
-    await _click(bot, sourceSlot, 0, 0);   // pick up full stack
-    await sleep(TRANSFER_DELAY_MS);
-
-    for (let i = 0; i < count; i++) await _click(bot, destSlot, 1, 0);   // right-click places 1 item
-
-    await _click(bot, sourceSlot, 0, 0);   // put remainder back
-    await sleep(TRANSFER_DELAY_MS);
-    const destItem = win.slots[destSlot];
-    return destItem ? destItem.count : 0;
+// Waits until `ok()` holds, polled at a tick for up to `ms` — a click's result can take a server answer to
+// show. → true when it held.
+async function _settle(ok, ms = 1000) {
+    const by = Date.now() + ms;
+    while (!ok()) {
+        if (Date.now() >= by) return false;
+        await sleep(WINDOW_POLL_MS);
+    }
+    return true;
 }
 
-// Deposit variant of _moveExact. Picks up the source stack once, then pours `count` items first onto
-// existing partial stacks of the same item (respecting stackSize headroom), and only spills the
-// remainder into a fresh empty slot. Returns the amount actually deposited, measured off the source
-// slot delta.
-async function _moveExactDeposit(bot, win, sourceSlot, count, itemName, destStart, destEnd) {
-    const before = win.slots[sourceSlot] ? win.slots[sourceSlot].count : 0;
-
-    // Bulk chunks first: right-click lifts ceil(n/2) off the source, left-click on an empty dest drops
-    // the whole held stack, so a chunk costs two clicks regardless of size (plan computed in
-    // stack_split_calculator, checkable without a world — Law 26). Empty slots only: merging onto a
-    // partial stack would leave leftover in hand and falsify the source-delta measurement below
-    // (Law 25); topping off partials is what the singles loop below is for. No empty slot → the plan is
-    // skipped and the original path runs.
-    const { planStackSplit, naiveClickCost } = require('@utils/calculators/stack_split_calculator');
-    const plan = planStackSplit(before, Math.min(count, before));
-    if (plan.strategy === 'halve' && plan.chunks.length) {
-        let placed = 0;
-        for (const chunk of plan.chunks) {
-            const destSlot = _findEmpty(win, destStart, destEnd);
-            if (destSlot === -1) break;
-            await _click(bot, sourceSlot, 1, 0);   // right-click source → hold ceil(source/2)
-            await sleep(TRANSFER_DELAY_MS);
-            await _click(bot, destSlot, 0, 0);     // left-click empty dest → drop the whole held stack
-            await sleep(TRANSFER_DELAY_MS);
-            placed += chunk;
-        }
-        if (placed > 0) {
-            watcher.summary(TAG, `stack split: ${placed} of ${count} ${itemName} moved in ${plan.chunks.length} bulk chunk(s) `
-                + `[${plan.chunks.join('+')}] — ${plan.clicks} click(s) against ${naiveClickCost(count)} one at a time`);
-        }
-    }
-
-    // Remainder finishes one at a time, off the current slot contents.
-    const stillThere = (win.slots[sourceSlot] && win.slots[sourceSlot].name === itemName) ? win.slots[sourceSlot].count : 0;
-    const alreadyMoved = before - stillThere;
-    if (alreadyMoved >= count || stillThere === 0) return alreadyMoved;
-
-    await _click(bot, sourceSlot, 0, 0);   // pick up what remains of the stack
+// A shift-click on one slot, and what it moved of `name`, read off the pocket: `out` is how many left the
+// pocket (a pocket slot clicked), `in` how many arrived (a chest slot clicked).
+// ── A SHIFT-CLICK IS MEASURED ON THE SERVER'S WORD, NOT MINEFLAYER'S GUESS ──────────────────────────────
+// mineflayer applies its own guess of a shift-click to the window at once, and the guess is often wrong: it
+// moves a whole stack into a chest with no room for it, and it passes over a chest's last empty slot that
+// the server then fills. The server answers a
+// wrong guess with corrected slots one tick and a round trip later, and a right guess with nothing. So
+// the pocket is read only after TRANSFER_DELAY_MS with the server ticking: a server silent past
+// SERVER_HEARD_WITHIN_MS (a disk stall) has not answered yet, and the reading waits until it has, up to
+// SHIFT_ANSWER_MS.
+// A body standing at a chest can pick up a drop while its window is open, and that changes the pocket too:
+// a pocket change no click explains is a defect only when no pickup happened during the click.
+const SHIFT_ANSWER_MS = 10000;
+async function _shiftClick(bot, win, slot, name, direction) {
+    const before = _pocketCount(win, [name]);
+    const held = win.slots[slot] ? win.slots[slot].count : 0;
+    let pickedUp = 0;
+    const onCollect = (collector) => { if (collector === bot.entity) pickedUp++; };
+    bot.on('playerCollect', onCollect);
+    await _click(bot, slot, 0, 1);
     await sleep(TRANSFER_DELAY_MS);
-
-    let toPlace = count - alreadyMoved;
-    // 1) top off existing partial stacks of the same item
-    let guard = 0;
-    while (toPlace > 0 && guard < 64) {
-        guard++;
-        const partial = _findPartialStack(win, itemName, destStart, destEnd);
-        if (partial === -1) break;
-        const slot = win.slots[partial];
-        const room = ((slot && slot.stackSize) || 64) - (slot ? slot.count : 0);
-        if (room <= 0) break;
-        const n = Math.min(room, toPlace);
-        for (let i = 0; i < n; i++) await _click(bot, partial, 1, 0);
-        toPlace -= n;
-    }
-    // 2) spill remainder into a fresh empty slot
-    if (toPlace > 0) {
-        const destSlot = _findEmpty(win, destStart, destEnd);
-        if (destSlot !== -1) {
-            for (let i = 0; i < toPlace; i++) await _click(bot, destSlot, 1, 0);
+    const pulse = require('@kernel/server_pulse');
+    if (pulse.silentMs() >= SERVER_HEARD_WITHIN_MS) {
+        const heard = await _settle(() => pulse.silentMs() < SERVER_HEARD_WITHIN_MS, SHIFT_ANSWER_MS);
+        if (!heard) {
+            watcher.warn(TAG, `shift-click of slot ${slot} (${name}): the server has been silent ${pulse.silentMs()}ms — measuring without its answer; the pocket at the close is the truth the item book keeps.`);
         }
+        await sleep(TRANSFER_DELAY_MS);   // its answer to this click follows the first tick it sends
     }
+    bot.removeListener('playerCollect', onCollect);
+    const after = _pocketCount(win, [name]);
+    const moved = direction === 'out' ? before - after : after - before;
+    if (moved < 0 || (direction === 'out' && moved > held)) {
+        const what = `a shift-click of slot ${slot} (${name} x${held}, ${direction === 'out' ? 'pocket to chest' : 'chest to pocket'}) `
+            + `changed the pocket's ${name} from ${before} to ${after}`;
+        if (pickedUp) {
+            watcher.warn(TAG, `${what}, with ${pickedUp} pickup(s) during the click — counted as ${Math.max(0, Math.min(moved, held))}; the item book has the pickup.`);
+            return Math.max(0, Math.min(moved, held));
+        }
+        throw new Error(`[${TAG}] CODING VIOLATION (Law 13): ${what}, and nothing was picked up. The pocket is this `
+            + `body's alone, so one shift-click can only move that slot's stack in its own direction.`);
+    }
+    return moved;
+}
 
-    await _click(bot, sourceSlot, 0, 0);   // put remainder back onto source slot
-    await sleep(TRANSFER_DELAY_MS);
-    const after = (win.slots[sourceSlot] && win.slots[sourceSlot].name === itemName)
-        ? win.slots[sourceSlot].count : 0;
-    return before - after;
+// ── _splitInPocket: ONE POCKET SLOT HOLDING EXACTLY `k`, CUT FROM POCKET SLOT `slot` ───────────────────────
+// The stack is lifted and the smaller part is dropped one at a time into an empty pocket slot, then the
+// rest goes back: min(k, S−k)+2 clicks, all inside the pocket, where no peer can reach. → the slot holding
+// exactly k, or -1 when the pocket has no empty slot (said by the caller).
+async function _splitInPocket(bot, win, slot, k) {
+    const { containerEnd, total } = _bounds(win);
+    const it = win.slots[slot];
+    if (!it || k <= 0 || k >= it.count) {
+        throw new Error(`[${TAG}] CODING VIOLATION (Law 13): _splitInPocket asked to cut ${k} from slot ${slot} `
+            + `holding ${it ? `${it.name} x${it.count}` : 'nothing'} — a split is strictly smaller than its stack.`);
+    }
+    const empty = _findEmpty(win, containerEnd, total);
+    if (empty === -1) return -1;
+    const { name, count } = it;
+    const moveK = k <= count - k;           // drop k into the empty slot, or drop the S−k kept back
+    const drops = moveK ? k : count - k;
+    await _click(bot, slot, 0, 0);          // lift the whole pocket stack
+    for (let i = 0; i < drops; i++) await _click(bot, empty, 1, 0);   // one at a time into the empty pocket slot
+    await _click(bot, slot, 0, 0);          // the rest back where it was
+    const at = moveK ? empty : slot;
+    const landed = await _settle(() => !win.selectedItem
+        && win.slots[at] && win.slots[at].name === name && win.slots[at].count === k);
+    if (!landed) {
+        throw new Error(`[${TAG}] CODING VIOLATION (Law 13): splitting ${k} off ${name} x${count} in the pocket `
+            + `(slot ${slot} → ${empty}) left slot ${at} holding ${_slotDesc(win.slots[at])} and the cursor holding `
+            + `${_slotDesc(win.selectedItem)} after 1s. The pocket is this body's alone, so the split cannot have `
+            + `been disturbed by a peer.`);
+    }
+    return at;
+}
+
+// ── _shiftOut: EXACTLY `n` OF `name` FROM THE POCKET INTO THE CHEST ────────────────────────────────────
+// Smallest pocket stack first, so part stacks leave before full ones. A stack that fits within what is left
+// crosses whole; a bigger one is split first. A shift-click that moves less than its stack means the chest
+// has no more room for it: that ends the move, and the caller sends the rest to the next chest. → moved.
+async function _shiftOut(bot, win, name, n) {
+    const { containerEnd, total } = _bounds(win);
+    let moved = 0;
+    for (let guard = 0; moved < n && guard < 36; guard++) {
+        let slot = -1;
+        for (let i = containerEnd; i < total; i++) {
+            const it = win.slots[i];
+            if (it && it.name === name && (slot === -1 || it.count < win.slots[slot].count)) slot = i;
+        }
+        if (slot === -1) break;
+        const left = n - moved;
+        let from = slot;
+        if (win.slots[slot].count > left) {
+            from = await _splitInPocket(bot, win, slot, left);
+            if (from === -1) {
+                watcher.warn(TAG, `deposit: no empty pocket slot to cut ${left} ${name} from a stack of `
+                    + `${win.slots[slot].count} — ${moved} of ${n} moved; the rest stays in the pocket.`);
+                break;
+            }
+        }
+        const want = win.slots[from].count;
+        const got = await _shiftClick(bot, win, from, name, 'out');
+        moved += got;
+        if (got < want) break;   // the chest is full for this item
+    }
+    return moved;
 }
 
 async function _transferDeposit(bot, win, item, amount) {
-    const total = win.slots.length;
-    const containerEnd = Math.max(0, total - 36);
-    const invStart = containerEnd;
+    const { containerEnd, total } = _bounds(win);
     const variants = _groupOf(item);
-    let deposited = 0;
-
-    for (let i = invStart; i < total; i++) {
-        if (deposited >= amount) break;
+    const names = [];
+    for (let i = containerEnd; i < total; i++) {
         const it = win.slots[i];
-        if (!it) continue;
-        const match = (it.name === item) || (variants && variants.includes(it.name));
-        if (!match) continue;
-
-        const remaining = amount - deposited;
-        let moved = 0;
-
-        if (it.count <= remaining) {
-            const countBefore = it.count;
-            await _click(bot, i, 0, 1);
-            await sleep(TRANSFER_DELAY_MS);
-            const afterSlot = win.slots[i];
-            const countAfter = (afterSlot && afterSlot.name === it.name) ? afterSlot.count : 0;
-            moved = countBefore - countAfter;
-            if (moved === 0) watcher.warn(TAG, `shift-click had no effect — ${it.name} still in slot ${i}`);
-        } else {
-            moved = await _moveExactDeposit(bot, win, i, remaining, it.name, 0, containerEnd);
-        }
-
-        deposited += moved;
+        if (it && (it.name === item || (variants && variants.includes(it.name))) && !names.includes(it.name)) names.push(it.name);
+    }
+    let deposited = 0;
+    for (const name of names) {
+        if (deposited >= amount) break;
+        const want = Math.min(amount - deposited, _pocketCount(win, [name]));
+        const got = await _shiftOut(bot, win, name, want);
+        deposited += got;
+        if (got < want) break;   // the chest is full: the rest of this kind goes to the next chest
     }
     return deposited;
 }
 
+// ── A WITHDRAWAL TAKES WHOLE STACKS AND HANDS THE SURPLUS BACK ────────────────────────────────────────────
+// The smallest chest stack first, so a part stack empties before a full one is cut. A stack bigger than
+// what is left is shift-clicked whole into the pocket and the surplus goes back through _shiftOut. A
+// surplus the chest has no room to take back (a peer filled the slot in the moment between) stays in the
+// pocket, and is said: it is an over-take, banked again by this body's next drop-off.
 async function _transferRetrieve(bot, win, item, target, only = null) {
-    const total = win.slots.length;
-    const containerEnd = Math.max(0, total - 36);
-    const invStart = containerEnd;
+    const { containerEnd } = _bounds(win);
     const variants = _retrieveVariants(item, only);
+    const isWanted = (it) => it && ((it.name === item) || (variants && variants.includes(it.name)));
     let retrieved = 0;
+    const dry = new Set();   // chest slots a shift-click moved nothing from this window
+    let waited = false;
+    // An order by a group's name (logs) is capped as a group, so each member it lands as is also held to what
+    // no other body has claimed by that member's own name: a take for fuel never empties another body's
+    // claimed oak_wood.
+    const tookOf = {};
+    const memberLeft = (name) => (name === item ? Infinity
+        : require('@perception/chest_ledger').memberUnclaimed(name) - (tookOf[name] || 0));
 
-    // THE SMALLEST STACK IS TAKEN FIRST, so a withdrawal empties a part stack before it cuts into a full one
-    // and the chest is left with fewer slots taken, never more.
-    const matching = [];
-    for (let s = 0; s < containerEnd; s++) {
-        const it = win.slots[s];
-        if (it && ((it.name === item) || (variants && variants.includes(it.name)))) matching.push({ s, count: it.count });
-    }
-    matching.sort((a, b) => a.count - b.count || a.s - b.s);
-
-    for (const { s } of matching) {
-        if (retrieved >= target) break;
-        const it = win.slots[s];
-        if (!it) continue;
-
-        const remaining = target - retrieved;
-        let moved = 0;
-
-        if (it.count <= remaining) {
-            const countBefore = it.count;
-            await _click(bot, s, 0, 1);
-            await sleep(TRANSFER_DELAY_MS);
-            const afterSlot = win.slots[s];
-            const countAfter = (afterSlot && afterSlot.name === it.name) ? afterSlot.count : 0;
-            moved = countBefore - countAfter;
-            if (moved === 0) watcher.warn(TAG, `shift-click had no effect — ${it.name} still in slot ${s}`);
-        } else {
-            moved = await _moveExact(bot, win, s, remaining, invStart, total);
+    for (let guard = 0; retrieved < target && guard < containerEnd; guard++) {
+        let slot = -1;
+        for (let s = 0; s < containerEnd; s++) {
+            const it = win.slots[s];
+            if (!dry.has(s) && isWanted(it) && memberLeft(it.name) > 0 && (slot === -1 || it.count < win.slots[slot].count)) slot = s;
         }
-
-        retrieved += moved;
+        if (slot === -1) {
+            // None in sight: a peer's part take may be holding the stack and about to hand its surplus back,
+            // often into the very slot that came back dry. Waited for once; then none is left here.
+            if (waited) break;
+            waited = true;
+            const back = await _settle(() => win.slots.slice(0, containerEnd).some(it => isWanted(it) && memberLeft(it.name) > 0), PEER_RETURN_MS);
+            if (!back) break;
+            dry.clear();
+            watcher.summary(TAG, `retrieve: ${item} came back into the chest while this window waited — taking it.`);
+            continue;
+        }
+        const name = win.slots[slot].name;
+        const want = Math.min(target - retrieved, memberLeft(name));
+        // Taking part of a stack lands the whole stack and cuts the surplus off in the pocket, which needs
+        // an empty slot for the stack and one to cut into. Without both, the surplus could not go back and
+        // the withdrawal would over-take, keeping the whole stack for a take of a few. So part
+        // of a stack is taken only with two empty pocket slots; otherwise the take stops short and says so.
+        if (win.slots[slot].count > want) {
+            let empty = 0;
+            for (let i = containerEnd; i < win.slots.length; i++) if (!win.slots[i]) empty++;
+            if (empty < 2) {
+                watcher.warn(TAG, `retrieve: ${want} ${name} wanted from a stack of ${win.slots[slot].count}, and the pocket `
+                    + `has ${empty} empty slot(s) — two are needed to cut a part off a stack, so the take stops at ${retrieved} of ${target}.`);
+                break;
+            }
+        }
+        const got = await _shiftClick(bot, win, slot, name, 'in');
+        if (got === 0) {
+            // A peer took this stack in the same instant, or the pocket has no room for it.
+            dry.add(slot);
+            if (_findEmpty(win, containerEnd, win.slots.length) === -1) {
+                watcher.warn(TAG, `retrieve: the pocket has no room for ${name} — ${retrieved} of ${target} taken.`);
+                break;
+            }
+            watcher.summary(TAG, `retrieve: chest slot ${slot} (${name}) moved nothing — a peer took it in the same instant; trying the next stack.`);
+            continue;
+        }
+        retrieved += got;
+        tookOf[name] = (tookOf[name] || 0) + got;
+        if (got > want) {
+            const surplus = got - want;
+            const back = await _shiftOut(bot, win, name, surplus);
+            retrieved -= back;
+            tookOf[name] -= back;
+            if (back < surplus) {
+                watcher.warn(TAG, `retrieve: OVER-TAKE — ${surplus - back} ${name} beyond the ${target} asked for could `
+                    + `not go back (the chest filled between the take and the return, or the pocket had no slot to cut `
+                    + `the surplus into); they stay in the pocket and are banked at this body's next drop-off.`);
+            }
+        }
     }
     return retrieved;
+}
+
+// The cursor ends every window empty: every click here that lifts a stack puts it down in the same call.
+// A stack still held at the close is a defect in this file (Law 13), never a peer's doing.
+async function _assertCursorEmpty(win, stationId) {
+    if (await _settle(() => !win.selectedItem)) return;
+    throw new Error(`[${TAG}] CODING VIOLATION (Law 13): the cursor still holds ${_slotDesc(win.selectedItem)} at the `
+        + `close of chest ${stationId}. Every lift in the transfer section puts its stack down before it returns.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -593,74 +716,54 @@ function _abandon(reason, expected = false) {
     routeToJudge(TAG, { result: TAG, success: false, readable: `${TAG}: ${reason}` });
 }
 
-// Queue at a peer-locked chest: walk there first, then wait for the holder's magnet to clear
-// (waitUntilChestFree — the one wait primitive, Law 16). Returns { ok, waited } on release,
-// { ok:false, reason } for the caller to _abandon; `waited` flags that the caller's pre-call
-// snapshot is stale.
-async function _queueAtChest(bot, stationId, pos, orderType, deadline) {
-    const holder = stationRegistry.getLockHolder(stationId);
-    if (!holder) return { ok: true, waited: false };
-    watcher.summary(TAG, `chest ${stationId} is in use by ${holder} — moving there to queue for release.`);
-    const locomotion = require('@locomotion/locomotion_dispatcher');
-    const moveResult = await locomotion.goToStationStance({ x: pos.x, y: pos.y, z: pos.z });
-    if (!moveResult.arrived) {
-        return { ok: false, reason: `cannot_reach_locked_${orderType}_chest_at_(${pos.x},${pos.y},${pos.z})_${moveResult.reason}` };
-    }
-    const wait = await waitUntilChestFree(stationId, {
-        timeoutMs: deadline - Date.now(), pollMs: LOCK_QUEUE_POLL_MS,
-    });
-    if (!wait.released) {
-        return { ok: false, reason: `timeout_queueing_for_locked_chest_${stationId}_held_by_${wait.holder || 'unknown'}` };
-    }
-    watcher.summary(TAG, `chest ${stationId} released after ${Math.round(wait.waitedMs / 1000)}s in queue — proceeding.`);
-    return { ok: true, waited: true };
-}
-
-// Deterministic per-bot stagger for lock-retry rounds, so two bots that collide once don't re-collide
-// the same way (acquireChestLock never preempts a holder, so both back off). A positional string hash
-// keeps the delay fixed per bot and distinct between bots — no randomness (Law 19).
-function _lockRetryStaggerMs() {
-    const id = process.env.BOT_ID || 'default';
-    let h = 0;
-    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-    return 100 + (h % 900);
-}
-
 // ---------------------------------------------------------------------------
 // SECTION 5 — Core transfer logic (shared by both API entry points)
 // ---------------------------------------------------------------------------
 
-// ── ONE BODY HOLDS A CHEST, AND THE FOREMAN IS WHO SAYS WHICH ─────────────────────────────────────────
-// The magnet's chest lock is what peers read to queue and to skip a chest's stock, but it reaches them
-// only through the relay, so two bodies can each write one before seeing the other's. The foreman's
-// `chest:<id>` claim is granted to one body at a time; a body holds both before it opens the window.
-const _chestClaimKey = (id) => `chest:${id}`;
-async function _takeChest(id) {
-    if (!stationRegistry.acquireChestLock(id)) return false;
-    const link = require('@kernel/foreman_link');
-    const grant = await link.requestClaim(_chestClaimKey(id));
-    if (grant.granted) { link.sendUpdate(); return true; }
-    stationRegistry.unlockChest(id, undefined, `the foreman holds it for a peer (${grant.reason})`);
-    return false;
+// ── THE CHEST TIMER: WHERE EVERY SECOND OF A VISIT WENT ──────────────────────────────────────────────
+// One line per window, splitting the visit: `walk` to the chest's stance, `open` from the click to the
+// window, `picture` from the window to its contents matching the chest's record, `work` from there to the
+// close. `peers_at_open` / `peers_at_close` count the bodies whose spot was this chest at those moments.
+// There is no queue term because nothing waits on a peer: two bodies work one chest at once. inventory_lens
+// reads it (CHEST_TIMER_RE) and sums it into one table beside the old queue figures.
+const _sec = (ms) => (ms / 1000).toFixed(2);
+
+// The pocket's tally as the open window shows it (the slots past the container's).
+function _pocketInWindow(win) {
+    const t = {};
+    const containerEnd = Math.max(0, win.slots.length - 36);
+    for (let i = containerEnd; i < win.slots.length; i++) {
+        const it = win.slots[i];
+        if (it) t[it.name] = (t[it.name] || 0) + it.count;
+    }
+    return t;
+}
+
+async function _openWithRetry(bot, target) {
+    let res = await _openWindow(bot, target.pos, target.id);
+    for (let tries = 1; !res.ok && tries < OPEN_TRIES; tries++) {
+        await sleep(OPEN_RETRY_MS);
+        res = await _openWindow(bot, target.pos, target.id);
+    }
+    return res;
 }
 
 // One window carries as many kinds as the caller has: `orders` is always a list of {item, amount} — a
 // single move is a list of one, not a second signature (Law 16). Opening a window is a fixed cost paid
-// per visit, so batching multiple kinds into one window matters.
+// per visit, so batching multiple kinds into one window matters. A deposit always names its chest (the
+// planner in SECTION 6 chose it and claimed its room); a withdrawal may leave the choice here.
 async function _executeTransfer(bot, orderType, orders, targetStationId) {
-    const stations = stationRegistry.getStations();
-    let queuedForLock = false;
     if (!Array.isArray(orders) || orders.length === 0) {
         throw new Error(`[${TAG}] CODING VIOLATION: _executeTransfer needs a non-empty list of {item, amount}.`);
     }
-    // Selection needs one representative kind to pick a chest by; the transfer loop uses every entry —
-    // a batch is already grouped by destination, so picking the first is not an arbitrary tiebreak.
+    if (orderType === 'deposit' && !targetStationId) {
+        throw new Error(`[${TAG}] CODING VIOLATION (Law 16): a deposit reaches the window with its chest already `
+            + `chosen by _planDeposits, which also claims the room it fills. Route it through depositItems or dumpExcess.`);
+    }
+    const stations = stationRegistry.getStations();
+    // Selection needs one representative kind to pick a chest by; the transfer loop uses every entry.
     const item = orders[0].item;
-
-    // Stamps the start of everything before the window opens (lock acquire, stagger, queue, walk),
-    // reported separately from time-in-window so queueing time and clicking time are never conflated
-    // (Law 25).
-    const waitStartedAt = Date.now();
+    const startedAt = Date.now();
 
     let target;
     if (targetStationId) {
@@ -682,109 +785,59 @@ async function _executeTransfer(bot, orderType, orders, targetStationId) {
                 + `key from the registry instead of rebuilding it.`);
         }
         if (!entry) {
-            // Named distinctly from the selector's no-target case below — the caller's chest being gone
-            // and there being no suitable chest are different facts (Law 25).
             _abandon(`station_row_gone_${targetStationId}`);
             return;
         }
         target = { id: targetStationId, ...entry };
-        // Every storage chest is one pool, so a deposit named at a storage chest is placed by the pool's own
-        // rule (spread materials to the least-holding chest, everything else together), read off the
-        // pictures before walking; a named chest is kept only when that rule picks it.
-        if (orderType === 'deposit' && stationRegistry.isStorage(entry)) {
-            const pick = _selectDepositTarget(stations, item);
-            if (pick && pick.id !== targetStationId) {
-                watcher.summary(TAG, `deposit of ${item} named ${targetStationId}${_hasRoom(bot, entry, item) ? '' : ' (no room per its picture)'}`
-                    + ` — the pool rule places it at ${pick.id}.`);
-            }
-            target = pick;
-        }
     } else {
-        // Selection sees locked chests too; the selectors prefer an unlocked equivalent, falling back
-        // to a locked one only when it's the sole match.
-        target = (orderType === 'deposit')
-            ? _selectDepositTarget(stations, item)
-            : _selectRetrieveTarget(stations, item, orders[0].only || null);
+        target = _selectRetrieveTarget(stations, item, orders[0].only || null);
     }
 
-    // No target: for retrieve this is the ordinary multi-bot race (a peer can empty a chest's snapshot
-    // between the decision to withdraw and this selector running), so it reports a shortfall for the
-    // caller to re-plan instead of escalating through `_abandon` — the shape ({success:false,
-    // transferred:0}) is one `supply_manager._withdrawFromChest` (falls back to harvest) and
-    // `delivery_executor` (routes a shortfall report) already handle (Law 16). Deposit still abandons:
-    // nowhere to put something has no fallback (Law 13).
+    // No source for a withdrawal is the ordinary multi-bot race (a peer emptied the pool between the
+    // decision and here): a shortfall the caller re-plans from — supply_manager falls back to harvest and
+    // delivery_executor routes a shortfall report (Law 16).
     if (!target) {
-        if (orderType === 'retrieve') {
-            watcher.summary(TAG, `no chest holds ${item} when the selector looked — a peer emptied the pool `
-                + `between the decision and here; reporting a shortfall so the caller re-plans.`);
-            return { success: false, order_type: orderType, item, moved: [], transferred: 0,
-                     station_id: null, snapshot_items: 0 };
-        }
-        _abandon(`no_${orderType}_target_for_${item}`);
-        return;
+        watcher.summary(TAG, `no chest holds ${item} when the selector looked — a peer emptied the pool `
+            + `between the decision and here; reporting a shortfall so the caller re-plans.`);
+        return { success: false, order_type: orderType, item, moved: [], transferred: 0,
+                 station_id: null, snapshot_items: 0 };
     }
 
-    // Wait-to-act: the plan may count a locked chest, but acting on it requires the lock to clear —
-    // queue at the chest, then act on the fresh post-release snapshot.
-    const lockDeadline = Date.now() + LOCK_QUEUE_TIMEOUT_MS;
-    if (target.locked_by) {
-        const q = await _queueAtChest(bot, target.id, target.pos, orderType, lockDeadline);
-        if (!q.ok) { _abandon(q.reason); return; }
-        queuedForLock = q.waited;
-        const fresh = stationRegistry.getStations()[target.id];
-        if (fresh) target = { id: target.id, ...fresh };   // holder snapshots on close — refresh
-    }
+    const number = stationRegistry.chestNumbers().get(target.id) || null;
+    const label = `${target.type}${number ? ` #${number}` : ''}`;
+    const link = require('@kernel/foreman_link');
+    // The spot is said before the walk, so every peer already knows by the time this body opens the window.
+    stationRegistry.claimSpot(target.id, orderType);
+    link.sendUpdate();
 
-    // Reserves the chest to this bot's magnet so peers wait on it in turn; release is automatic when
-    // the magnet clears. First-come wins — a rival winning the race between the stations read and here
-    // sends this bot back to queue and retry.
-    while (!(await _takeChest(target.id))) {
-        if (Date.now() > lockDeadline) { _abandon(`timeout_acquiring_lock_on_chest_${target.id}`); return; }
-        const q = await _queueAtChest(bot, target.id, target.pos, orderType, lockDeadline);
-        if (!q.ok) { _abandon(q.reason); return; }
-        queuedForLock = queuedForLock || q.waited;
-        await sleep(_lockRetryStaggerMs());   // de-collide a simultaneous double-grab round
-        const fresh = stationRegistry.getStations()[target.id];
-        if (fresh) target = { id: target.id, ...fresh };   // holder snapshots on close — refresh
-    }
-
-    // From here the lock is held and every exit must drop it — withCleanup instead of a release before
-    // each return, since this body has several exits (Law 16: only the guard's catch may swallow, so
-    // this catches nothing and a throw passes straight through).
     let audit = null;   // started at the first open, stopped at the close or by the cleanup below
     return await withCleanup(TAG, `chest window on ${target.id}`, async () => {
 
-    // A requested item not present when the lock is finally taken is environmental, not a throw — locks
-    // are scoped to the window, so a peer may legitimately empty a chest between a caller's pre-check
-    // and this acquire (Law 13).
+    // A named withdrawal whose kinds are all gone from the chest's picture is a peer's take landing first,
+    // which is environmental (Law 13).
     if (orderType === 'retrieve' && targetStationId && Array.isArray(target.items)) {
         const missing = orders.filter(o => {
             const variants = _retrieveVariants(o.item, o.only || null);
             return !target.items.some(i => i.name === o.item || (variants && variants.includes(i.name)));
         });
         if (missing.length === orders.length) {
-            _abandon(`nothing_of_[${orders.map(o => o.item).join(',')}]_left_in_${targetStationId}`
-                + `_when_the_lock_was_taken (a peer emptied it — window-scoped locks, so this is expected)`, true);
+            _abandon(`nothing_of_[${orders.map(o => o.item).join(',')}]_left_in_${targetStationId} (a peer emptied it first)`, true);
             return;
         }
-        // A partial hit still proceeds — the kinds that survived are worth the window already paid for.
         if (missing.length) {
             watcher.warn(TAG, `retrieve: ${missing.map(o => o.item).join(', ')} gone from ${targetStationId} `
-                + `before the lock was taken — taking the ${orders.length - missing.length} kind(s) still there.`);
+                + `before this body got there — taking the ${orders.length - missing.length} kind(s) still there.`);
             orders = orders.filter(o => !missing.includes(o));
         }
     }
 
     watcher.summary(TAG, `${orderType} ${orders.map(o => `${o.amount}x ${o.item}`).join(', ')} `
-        + `→ ${target.type} at (${target.pos.x},${target.pos.y},${target.pos.z})`);
+        + `→ ${label} at (${target.pos.x},${target.pos.y},${target.pos.z})`);
 
     // Always walks to the anchor stance, never an LOS goal — a raycast goal can be satisfied from up to
     // 4.5 blocks away, so A* would report `arrived: true` with an empty path and the open then fails at
-    // the server. No speculative open before the walk either, for the same reason: succeeding from
-    // wherever the body happens to stand is not a stance the bot should be using a chest from. The
-    // retry loop below still waits out a chest a peer genuinely holds open.
+    // the server.
     const locomotion = require('@locomotion/locomotion_dispatcher');
-    // The walk is travel, not waiting — clocked on its own so the wait figure holds only standing time.
     const walkStartedAt = Date.now();
     const moveResult = await locomotion.goToStationStance({ x: target.pos.x, y: target.pos.y, z: target.pos.z });
     const walkMs = Date.now() - walkStartedAt;
@@ -794,42 +847,26 @@ async function _executeTransfer(bot, orderType, orders, targetStationId) {
     }
 
     audit = _startAudit(bot);
-    let openRes = await _openWindow(bot, target.pos, target.id);
-
-    // A chest that won't open is a chest a peer has open right now — Minecraft allows one window per
-    // container and the registry lock is only advisory, so the server's refusal is the authoritative
-    // in-use signal and gets the same answer as everywhere else in this file: queue and take a turn
-    // (Law 16). The stagger pairs with `_queueAtChest` because the registry may not yet record the
-    // holder that produced this failure, so without it two bots that collided once would re-collide on
-    // the same cadence.
-    while (!openRes.ok && Date.now() <= lockDeadline) {
-        const q = await _queueAtChest(bot, target.id, target.pos, orderType, lockDeadline);
-        if (!q.ok) { _abandon(q.reason); return; }
-        await sleep(_lockRetryStaggerMs());
-        openRes = await _openWindow(bot, target.pos, target.id);
-    }
+    const openStartedAt = Date.now();
+    let openRes = await _openWithRetry(bot, target);
     if (!openRes.ok) {
-        _abandon(`open_failed_after_queue: ${openRes.reason} at (${target.pos.x},${target.pos.y},${target.pos.z})`);
+        _abandon(`open_failed: ${openRes.reason} after ${OPEN_TRIES} tries at (${target.pos.x},${target.pos.y},${target.pos.z})`);
         return;
     }
-    // The picture is read under the lock, so no peer can move it between this read and the window.
-    let row = stationRegistry.getStations()[target.id];
-    let pictured = (row && Array.isArray(row.items))
-        ? await _awaitPicture(openRes.window, target.id, row.items, openRes.clickedAt)
-        : null;
-    // The transfer works in the window the server has open — the one mineflayer's clicks go to. A later
-    // window for this chest replaces the first, and its contents are checked against the picture again.
+    // The transfer works in the window the server has open — the one mineflayer's clicks go to.
     if (bot.currentWindow && bot.currentWindow !== openRes.window) {
         watcher.warn(TAG, `chest ${target.id}: the server replaced window #${openRes.window.id} with #${bot.currentWindow.id} — working in #${bot.currentWindow.id}.`);
         openRes = { ...openRes, window: bot.currentWindow };
-        // Read again: a forgiven first window rewrote the picture.
-        row = stationRegistry.getStations()[target.id];
-        if (row && Array.isArray(row.items)) pictured = await _awaitPicture(openRes.window, target.id, row.items, openRes.clickedAt);
     }
+    const windowAt = Date.now();
+    const openMsClick = windowAt - openStartedAt;
 
-    // Measured open→close, never around the clicks — the chest is locked for the whole window, so
-    // occupancy is the cost charged to the fleet and clicking is only what fills it.
-    const openedAt = Date.now();
+    // With no peer on this chest the window must match the newest picture; with one, the window is the
+    // contents (see _awaitPicture).
+    const peersAtOpen = stationRegistry.spotHolders(target.id);
+    const pictured = peersAtOpen.length ? null : await _awaitPicture(openRes.window, target.id, windowAt);
+
+    const workStartedAt = Date.now();
     audit.winId = openRes.window.id;
     audit.containerEnd = Math.max(0, openRes.window.slots.length - 36);
     audit.atOpen = _tally(_snapshotItems(openRes.window));
@@ -842,53 +879,81 @@ async function _executeTransfer(bot, orderType, orders, targetStationId) {
 
     let transferred = 0;
     const moved = [];
+    const spent = {};   // item → what this window took of this body's claim, published after the picture
     for (const order of orders) {
-        // Read at the open window, after the walk and the queue: what peers claimed on the way counts.
+        // Read at the open window, after the walk: what peers claimed on the way counts.
         let amount = order.amount;
         if (orderType === 'retrieve') {
-            const free = _unclaimedFor(order.item, order.only || null);
+            let free = _unclaimedFor(order.item, order.only || null);
+            // A peer's part take reads as missing stock until its surplus goes back; with a peer at this
+            // chest the claim cap is read again after that moment.
+            if (free < amount && stationRegistry.spotHolders(target.id).length) {
+                await _settle(() => (free = _unclaimedFor(order.item, order.only || null)) >= amount, PEER_RETURN_MS);
+            }
             if (free < amount) {
                 watcher.summary(TAG, `retrieve of ${order.item} held to ${free} of ${amount} at the window — the rest is claimed by other bodies.`);
                 amount = free;
             }
             if (amount <= 0) continue;
         }
+        const pocketBefore = orderType === 'retrieve' ? _pocketInWindow(openRes.window) : null;
         const got = orderType === 'deposit'
             ? await _transferDeposit(bot, openRes.window, order.item, order.amount)
             : await _transferRetrieve(bot, openRes.window, order.item, amount, order.only || null);
         transferred += got;
         if (got > 0) moved.push({ item: order.item, transferred: got });
-        // What this body took is no longer in the chests for its claim to hold.
-        if (got > 0 && orderType === 'retrieve') require('@perception/chest_ledger').drawn(order.item, got);
+        // What this body took is no longer in the chests for its claim to hold, spent by the names that
+        // reached the pocket: an order for `logs` that took birch spends no claim on oak. Read off the
+        // pocket, because a peer may be moving the same chest slots.
+        // The spend is published after the chest's new picture (below): a peer that read the claim spent and
+        // the old picture would file a claim on blocks already in this pocket.
+        if (got > 0 && orderType === 'retrieve') {
+            const gained = _tallyDelta(pocketBefore, _pocketInWindow(openRes.window));
+            for (const [name, n] of Object.entries(gained)) if (n > 0) spent[name] = (spent[name] || 0) + n;
+        }
     }
 
+    await _assertCursorEmpty(openRes.window, target.id);
     await sleep(100); // 2 server ticks — let slot updates settle before snapshot
     const snapshot = _snapshotItems(openRes.window);
     stationRegistry.snapshotStation(target.id, snapshot);
+    for (const [name, n] of Object.entries(spent)) require('@perception/chest_ledger').drawn(name, n);
+    const peersAtClose = stationRegistry.spotHolders(target.id);
 
     await _closeWindow(bot);
-    _reportAudit(bot, audit, target.id, orderType, snapshot);
-    // The window's own contents go with the move, so the foreman checks its figure for this chest.
+    const closedAt = Date.now();
+    // Contended is any peer's spot overlapping this window at any moment (station_registry.spotsDuring).
+    // The audit asks again when its verdict settles, by which time a peer's release has had time to arrive.
+    const peersDuring = () => stationRegistry.spotsDuring(target.id, windowAt, closedAt).length;
+    const contended = peersAtOpen.length > 0 || peersDuring() > 0;
+    _reportAudit(bot, audit, target.id, orderType, snapshot, () => contended || peersDuring() > 0);
+    // The window's own contents go with the move, so the foreman checks its figure for this chest. A
+    // contended window's contents carry a peer's moves the book has not yet heard, so it is checked at the
+    // next window no peer shares.
     await book.close(orderType, `container:${target.id}`);
-    book.report({ k: 'ca', id: target.id, items: _tally(snapshot) });
+    if (!contended) book.report({ k: 'ca', id: target.id, items: _tally(snapshot) });
     book.flush();
 
     const snapshotSummary = snapshot.length > 0
         ? snapshot.map(i => `${i.name} x${i.count}`).join(', ')
         : 'empty';
-    const openMs = Date.now() - openedAt;
-    const waitMs = openedAt - waitStartedAt;
-    // One line per window, not per kind — the window is what a peer queues behind, so a per-kind line
-    // would inflate the contention figure (Law 25); the kind list carries what actually moved.
+    const openMs = closedAt - workStartedAt;
+    const waitMs = workStartedAt - startedAt;
+    // One line per window, not per kind (Law 25); inventory_lens reads it (TX_RE).
     watcher.summary(TAG, `${orderType} complete — ${orders.length} kind(s), ${transferred} item(s) `
         + `[${moved.length ? moved.map(m => `${m.item} x${m.transferred}`).join(', ') : 'nothing moved'}] `
         + `in ${(openMs / 1000).toFixed(1)}s open `
         + `(${transferred > 0 ? Math.round(openMs / transferred) : openMs}ms/item) after ${(waitMs / 1000).toFixed(1)}s waiting to get in. `
         + `Chest ${target.id}: ${snapshot.length} stack(s) [${snapshotSummary}].`
-        + (pictured == null ? ' No picture on record.'
+        + (pictured == null ? ` Picture not checked — ${peersAtOpen.length} peer(s) using this chest.`
+            : pictured.peer ? ` Picture not matched — a peer came to this chest after ${pictured.ms}ms.`
             : pictured.forgiven ? ` Contents did not match the picture and were forgiven after ${pictured.ms}ms.`
             : ` Contents matched the picture in ${pictured.ms}ms.`)
         + ` Walked ${(walkMs / 1000).toFixed(1)}s of the wait.`);
+    watcher.summary(TAG, `chest timer ${orderType} ${label} ${target.id}: walk=${_sec(walkMs)} open=${_sec(openMsClick)} `
+        + `picture=${_sec(workStartedAt - windowAt)} work=${_sec(openMs)} total=${_sec(closedAt - startedAt)} `
+        + `peers_at_open=${peersAtOpen.length} peers_at_close=${peersAtClose.length} contended=${contended ? 1 : 0} items=${transferred} `
+        + `peers_during=${peersDuring()}`);
 
     return {
         success: transferred > 0,
@@ -900,15 +965,10 @@ async function _executeTransfer(bot, orderType, orders, targetStationId) {
         snapshot_items: snapshot.length,
     };
     }, () => {
-        // clearMagnet() is still the backstop for a bot that dies mid-window; this is the ordinary
-        // release.
         if (audit) _stopAudit(bot, audit);
-        stationRegistry.unlockChest(target.id, undefined, 'chest window closed');
-        // The picture and the release reach the fleet in one update, so the next body sees both at once;
-        // the foreman's grant is dropped after it, so the next holder already has the picture.
-        const link = require('@kernel/foreman_link');
+        // The picture and the spot's release reach the fleet in one update.
+        stationRegistry.releaseSpot(target.id);
         link.sendUpdate();
-        link.releaseClaim(_chestClaimKey(target.id));
     });
 }
 
@@ -916,10 +976,76 @@ async function _executeTransfer(bot, orderType, orders, targetStationId) {
 // SECTION 6 — Exported API (Law 15 entry points)
 // ---------------------------------------------------------------------------
 
+// ── A DEPOSIT IS PLANNED, CLAIMED, WALKED, AND WHAT DID NOT FIT GOES TO THE NEXT CHEST ─────────────────
+// _planDeposits places every unit against the chests' pictures less every peer's claimed room; that plan is
+// filed as this body's deposit claim (chest_ledger.claimRoom) before the first step; the chests are visited
+// in number order, each one's room released as its window closes. A chest that took less than planned
+// (a peer filled it, a body without a magnet claimed nothing, a picture a moment stale) is the world: the
+// next round re-plans the remainder over the chests not yet tried. → { moved, unplaced, last, abandoned }.
+function _pocketWants(bot, wants) {
+    const have = {};
+    for (const it of bot.inventory.items()) have[it.name] = (have[it.name] || 0) + it.count;
+    const out = {};
+    for (const [item, n] of Object.entries(wants)) {
+        const members = _groupOf(item);
+        const held = members ? members.reduce((s, m) => s + (have[m] || 0), 0) : (have[item] || 0);
+        const w = Math.min(n, held);
+        if (w > 0) out[item] = w;
+    }
+    return out;
+}
+
+async function _depositPlanned(bot, wants) {
+    const ledger = require('@perception/chest_ledger');
+    const tried = new Set();
+    const moved = [];
+    let last = null;
+    let left = _pocketWants(bot, wants);
+    return await withCleanup(TAG, 'deposit claim', async () => {
+        for (let round = 0; round < DEPOSIT_MAX_ROUNDS && Object.keys(left).length; round++) {
+            const plan = _planDeposits(stationRegistry.getStations(), left, tried);
+            if (!plan.rows.length) break;
+            ledger.claimRoom(plan.rows);
+            const stationsInOrder = [...new Set(plan.rows.map(r => r.station))];
+            if (round > 0) {
+                watcher.summary(TAG, `deposit fallback round ${round + 1}: ${Object.entries(left).map(([k, v]) => `${v} ${k}`).join(', ')} `
+                    + `did not fit where planned — going on to chest(s) ${stationsInOrder.map(id => `#${plan.rows.find(r => r.station === id).number}`).join(', ')}.`);
+            }
+            for (const stationId of stationsInOrder) {
+                const orders = plan.rows.filter(r => r.station === stationId).map(r => ({ item: r.item, amount: r.amount }));
+                const r = await _executeTransfer(bot, 'deposit', orders, stationId);
+                ledger.releaseRoom(stationId);
+                tried.add(stationId);
+                if (r === undefined) return { moved, unplaced: left, last, abandoned: true };
+                last = r;
+                for (const m of r.moved) moved.push(m);
+            }
+            left = _pocketWants(bot, Object.fromEntries(Object.entries(left).map(([k, v]) => {
+                const done = moved.filter(m => m.item === k).reduce((s, m) => s + m.transferred, 0);
+                return [k, Math.max(0, (wants[k] || 0) - done)];
+            })));
+        }
+        return { moved, unplaced: left, last, abandoned: false };
+    }, () => ledger.releaseRoom(null));
+}
+
+// A storage chest named by the caller is a suggestion: every storage chest is one pool, and the pool's
+// order decides. A non-storage station is used as named.
 async function depositItems(bot, item, amount, stationId) {
     bot = bot || global.bot;
     if (!bot) throw new Error('[inventory_swapper] CODING VIOLATION: depositItems called with no bot loaded.');
-    return _executeTransfer(bot, 'deposit', [{ item, amount: amount || 64 }], stationId);
+    const named = stationId ? stationRegistry.getStations()[stationId] : null;
+    if (named && !stationRegistry.isStorage(named)) {
+        return _executeTransfer(bot, 'deposit', [{ item, amount: amount || 64 }], stationId);
+    }
+    const result = await _depositPlanned(bot, { [item]: amount || 64 });
+    if (result.abandoned) return undefined;   // already routed to the judge (Law 15)
+    const transferred = result.moved.reduce((n, m) => n + m.transferred, 0);
+    if (!result.last) {
+        _abandon(`no_deposit_target_for_${item} — no chest has room`);
+        return undefined;
+    }
+    return { ...result.last, success: transferred > 0, item, moved: result.moved, transferred };
 }
 
 // A named station is one window. With none named, the withdrawal goes on to the next chest holding the
@@ -1058,10 +1184,8 @@ async function dumpExcess(bot) {
     // use it stays in the pocket and is banked below like the rest.
     await require('@api/waste_pit').discardTrash(bot);
 
-    // Every registered chest is a destination — no role filtering. Read once for the whole dump
-    // (Invariant B): every kind is placed against one consistent snapshot of what's full and locked, so
-    // two kinds can't pick the same last free slot.
-    const stations = stationRegistry.getStations();
+    // Every registered chest is a destination — no role filtering; the planner reads one snapshot for the
+    // whole dump, so two kinds can't pick the same last free slot.
     if (stationRegistry.findChests().length === 0) {
         watcher.summary(TAG, 'dumpExcess: no chest registered — nowhere to bank anything');
         // noChest tells the caller its own zero total needs no separate line — with no chest the
@@ -1090,39 +1214,19 @@ async function dumpExcess(bot) {
 
     watcher.summary(TAG, `dumpExcess: ${Object.entries(excess).map(([k, v]) => `${k}x${v}`).join(', ')}`);
 
-    const dumpResults = [];
-
-    // One window per chest, never one per kind — items are grouped by chosen destination and moved
-    // together, since each window pays the fixed open/close cost regardless of item count.
-    const byChest = new Map();
-    for (const [item, amount] of Object.entries(excess)) {
-        // Consolidate this kind where it already sits if that chest has room, else any chest with room
-        // — `_selectDepositTarget` is the fleet's one which-chest selector (Law 16).
-        const targetStation = _selectDepositTarget(stations, item);
-        if (!targetStation) {
-            watcher.summary(TAG, 'dumpExcess: every chest is full — stopping');
-            break;
-        }
-        if (!byChest.has(targetStation.id)) byChest.set(targetStation.id, []);
-        byChest.get(targetStation.id).push({ item, amount });
+    // One window per chest, never one per kind: the planner groups every kind by the chest it goes to, so
+    // each window pays the fixed open/close cost once (_depositPlanned).
+    const result = await _depositPlanned(bot, excess);
+    // Per-kind rows, not one row per window — the caller's report is per-kind.
+    const dumpResults = result.moved.map(m => ({ item: m.item, transferred: m.transferred }));
+    // Abandonment propagates instead of being swallowed: _executeTransfer returns undefined only after
+    // already routing a fresh signal to recursive_judge (Law 15), so the caller must not route again (Law 4).
+    if (result.abandoned) {
+        watcher.warn(TAG, `dumpExcess: a deposit was abandoned to the judge — stopping the dump and reporting it so the caller does not route again.`);
+        return { dumped: dumpResults.length, items: dumpResults, abandoned: true };
     }
-
-    // A deposit announces nothing — material counts once it's in the chest, and peers see it the moment
-    // `_executeTransfer` snapshots it; the transfer itself is the announcement.
-    for (const [stationId, orders] of byChest) {
-        const item = orders.map(o => o.item).join('+');   // for the abandonment message only
-        const result = await _executeTransfer(bot, 'deposit', orders, stationId);
-
-        // Abandonment propagates instead of being swallowed: _executeTransfer returns undefined only
-        // after already routing a fresh signal to recursive_judge (Law 15 caller abandonment), so this
-        // line must stop instead of letting the caller route a second signal (Law 4: one signal).
-        if (result === undefined) {
-            watcher.warn(TAG, `dumpExcess: transfer of ${item} abandoned to the judge — stopping the dump and reporting it so the caller does not route again.`);
-            return { dumped: dumpResults.length, items: dumpResults, abandoned: true };
-        }
-        // Per-kind rows, not one row per window — the caller's report and the compost row above are
-        // both per-kind.
-        for (const m of (result.moved || [])) dumpResults.push({ item: m.item, transferred: m.transferred });
+    if (Object.keys(result.unplaced).length) {
+        watcher.summary(TAG, `dumpExcess: no chest has room for ${Object.entries(result.unplaced).map(([k, v]) => `${v} ${k}`).join(', ')} — it stays in the pocket.`);
     }
 
     if (dumpResults.length > 0) {

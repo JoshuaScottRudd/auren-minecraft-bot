@@ -52,27 +52,32 @@
 // 'grass:' — seed_picker, one key per tuft, held for a single punch. Exact-block:
 // peers punch neighbouring tufts of one patch without interfering, so no footprint.
 // tree/stone_column/grass are taken through js_kernel/utils/target_claims, the one claim-reach-release walk.
-// 'chest:' — inventory_swapper, one key per storage station id, held for one window, so exactly one body
-// has a container open at a time.
 // 'prep:' — preconstruction, one key per unit of a crafted block a pledge-approved anchor still needs, so
 // each unit is crafted by one body.
 // 'dirt:' — harvest_executor, one key per ground tile it shaves, so each patch of ground has one digger.
 // 'column:' — build_column_executor, one key per building column, held for one trip up its stand shaft.
 // 'line:' — mining_manager, one key per strip tunnel (its origin segment, kind and direction), held for a whole trip
 // down it, so one body digs one tunnel and no peer is handed the segment beyond a body still working it.
-// 'chest_forgiveness:' — inventory_swapper, one key per storage station id, and the one key that is SPENT
-// rather than held (ONCE_KEY_PREFIX below).
+// 'chest_forgiveness:' — inventory_swapper, one key per storage station id, SPENT rather than held
+// (ONCE_KEY_PREFIXES below).
+// 'pit_report:' — waste_pit, one key per item entity lying in the pit that the pit does not authorize,
+// SPENT by the first body to report it, so the crew reports each such item once.
 // 'bill:' — column_preparation, one key per building, held while one body reads the chests against every
 // claim and files its own (chest_ledger), so two bodies never price the same material before either has claimed it.
-const OBJECT_KEY_PREFIXES = ['anchor:', 'tree:', 'cell:', 'stone_column:', 'grass:', 'chest:', 'prep:', 'dirt:', 'column:', 'line:', 'bill:', 'chest_forgiveness:'];
+// 'sapling:' — sapling_planter, one key per tree-farm grid cell, held from before the walk to the cell until it is planted.
+// 'climb_stall:' — build_column_executor, one key per failed climb toward one cube (structure, column, cube, count),
+// SPENT, so the count a body is granted is the crew's count of failed climbs on that cube.
+const OBJECT_KEY_PREFIXES = ['anchor:', 'tree:', 'cell:', 'stone_column:', 'grass:', 'prep:', 'dirt:', 'column:', 'line:', 'bill:', 'chest_forgiveness:', 'sapling:', 'pit_report:', 'climb_stall:'];
 // The tree key and its footprint are `@utils/tree_footprint`, which a body choosing a trunk reads too (Law 16).
 const { TREE_KEY_PREFIX, parseTreeFootprint, inFootprint } = require('@utils/tree_footprint');
 
-// ── A CHEST IS FORGIVEN ONE MISMATCH PER RUN, AND THIS IS WHERE THE ONE IS COUNTED ─────────────────────
+// ── KEYS GRANTED ONCE PER RUN, AND THIS IS WHERE EACH ONE IS COUNTED ──────────────────────────────────
 // A run can end while a body has a chest open, so the next run's picture of that chest and the world's
-// chest differ. The first body to find a chest that way asks for this key; it is granted once for the
-// life of this process, which is one run, and never again to anyone — a release does not give it back.
-const ONCE_KEY_PREFIX = 'chest_forgiveness:';
+// chest differ. The first body to find a chest that way asks for its forgiveness key. An item in the
+// waste pit that the pit does not authorize is reported by the first body to ask for its report key.
+// Each key is granted once for the life of this process, which is one run, and never again to anyone —
+// a release does not give it back.
+const ONCE_KEY_PREFIXES = ['chest_forgiveness:', 'pit_report:', 'climb_stall:'];
 const _spentOnce = new Map();   // key → { bot_id, spent_at }
 
 // Object claims: object key → { bot_id, claimed_at, footprint }
@@ -123,7 +128,7 @@ function handleClaimRequest(botId, key) {
     return { granted: false, fault: 'claimant', reason: `unknown claim key '${key}'` };
   }
 
-  if (key.startsWith(ONCE_KEY_PREFIX)) {
+  if (ONCE_KEY_PREFIXES.some(p => key.startsWith(p))) {
     const spent = _spentOnce.get(key);
     if (spent) {
       log(`Once-per-run key rejected for '${botId}': '${key}' was spent by '${spent.bot_id}' ${Date.now() - spent.spent_at} ms ago.`);

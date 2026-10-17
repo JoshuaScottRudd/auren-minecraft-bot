@@ -120,7 +120,7 @@ module.exports = {
   //                     so 640 to 1,280 blocks away). Ground that will not hold the base is rolled again,
   //                     up to 8 times, and the foreman says what was wrong with each.
   //                                                   environment override: AUREN_LANDING
-  landing: process.env.AUREN_LANDING || 'random',
+  landing: process.env.AUREN_LANDING || 'usual',
 
   // 6. TEST — 'off': an ordinary run, the crew is raised and the soak runs.
   //           a test name: the foreman does everything up to that test's last step, shuts down without
@@ -129,6 +129,10 @@ module.exports = {
   //           'scan': the world comes up, the body finds a standing spot, and the base is sited — for a
   //                   homesteader that is the wheat field and the headframe. Answers "does siting still
   //                   work" in the time a world takes to come up.
+  //           'inspect': for looking over what the last run built. Needs start 'continue'. The world comes
+  //                   up as it was left, the one camera window a person flies is opened and put at the
+  //                   base (a builder's laydown yard, a homesteader's headframe), and it stays up with no
+  //                   bot raised until stopped. The short way: node start_auren.js inspect
   //                                                   environment override: AUREN_TEST
   test: process.env.AUREN_TEST || 'off',
 
@@ -160,9 +164,17 @@ module.exports = {
   //                                                   environment override: AUREN_RECORD
   record: process.env.AUREN_RECORD || 'off',
 
+  // GO — 'now': each body starts work the moment it stands at the build.  'held': every body is raised
+  //      and placed at the build first, doing nothing, so the cameras are set up while the crew arrives;
+  //      once every body stands, the clock is set back to the run's start and the foreman releases them
+  //      one at a time, spaced so the server is never asked to plan for the whole crew at once. The soak
+  //      counts from that release. 'held' is the default.
+  //                                                   environment override: AUREN_GO
+  go: process.env.AUREN_GO || 'held',
+
   // CAMERAS — how many DIRECTED camera windows `record` raises, the ones the rig frames and cuts between.
   //           'crew': one per body, so every bot is on film.
-  //           'none': not one, so the only window is the seat a person flies (camera_configure's
+  //           'none': not one, so the only windows are the seats a person flies (camera_configure's
   //                   `architect`) — watching a run rather than filming it.
   //           a number: that many, framed on the first bots in seniority order.
   //           Read only when `record` is not 'off'. Whichever it is, every window is up and PROVED

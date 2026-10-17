@@ -180,6 +180,8 @@ function _claimJob(botId, job, pledge) {
         // What this body has spoken for at a station (chest_ledger); clearMagnet() voids it with the
         // claim and every chest lock.
         bank_claim:  null,
+        // Room this body has spoken for in the chests before walking to deposit (chest_ledger.claimRoom).
+        deposit_claim: null,
         claimed_at:  new Date().toISOString(),
     };
     hq.writeBoardroomChair(botId, existing);

@@ -63,6 +63,22 @@ function deskEvents(lines) {
   return out;
 }
 
+// announcements(lines) → [{ at, kind, structure, layer, of, text }] in the order said. `kind` is
+// 'structure' (a structure finished) or 'layer' (a layer released); the fields the other kind does not
+// carry are null. The run's milestones, which a timelapse cuts on.
+function announcements(lines) {
+  return deskEvents(lines)
+    .filter(e => e.verb === 'announced')
+    .map(e => ({
+      at: e.at,
+      kind: e.fields.kind,
+      structure: e.fields.structure || null,
+      layer: e.fields.layer == null ? null : Number(e.fields.layer),
+      of: e.fields.of == null ? null : Number(e.fields.of),
+      text: decodeText(e.fields.text),
+    }));
+}
+
 function readForemanTrace(dir) {
   return readForemanView(dir || TRACE_DIR);
 }
@@ -89,6 +105,8 @@ function reduceForeman(lines, opts = {}) {
   };
 
   for (const e of events) {
+    // An announcement is said to the world, not in a person's session; `announcements()` reads those.
+    if (e.verb === 'announced') continue;
     const who = e.fields.who;
     if (!who) { orphans.push(e); continue; }
     if (opts.person && who.toLowerCase() !== String(opts.person).toLowerCase()) continue;
@@ -251,4 +269,4 @@ function runForeman(opts = {}) {
   return folded;
 }
 
-module.exports = { runForeman, reduceForeman, deskEvents, readForemanTrace };
+module.exports = { runForeman, reduceForeman, deskEvents, announcements, readForemanTrace };

@@ -46,9 +46,8 @@ module.exports = {
     // keep level; it is not staging a structure that must be complete before the first block is placed.
     // So a short craft is material the fleet KEEPS and progress it does not repeat, and the remainder is
     // re-posted by the board when more input arrives — the pull chain running, not a failure to retry.
-    // Withholding here is what made the whole run torchless: a threshold held fuel back, nothing spent
-    // it, and a bar one unit from opening was indistinguishable from a broken one (Law 25 — the asker
-    // owns the criterion, and this asker's criterion is "whatever we can make now").
+    // Partial crafts report the material actually made, so supply can retain progress and re-post
+    // the remaining shortfall when input arrives (Law 25).
     const result = await craftItems(bot, targetItem, quantity, payload);
 
     // craft_handler returns undefined on caller abandonment — guard just in case

@@ -224,6 +224,12 @@ const FALLING_BLOCKS = new Set([
   'brown_concrete_powder', 'green_concrete_powder', 'red_concrete_powder', 'black_concrete_powder',
 ]);
 
+// isLooseTread: a gravity block resting on nothing solid. It holds only until a block update next to
+// it, and a stair step digs beside its tread, so a stair never lands on one.
+function isLooseTread(bot, tread) {
+  return FALLING_BLOCKS.has(tread.name) && !isBlockSolid(bot.blockAt(tread.position.offset(0, -1, 0)));
+}
+
 // isCeilingDiggable: safe to dig a block sitting ABOVE the bot — solid, diggable, not a hazard or a
 // gravity block. Gates the upward dig edges only; a sideways dig has no such risk.
 function isCeilingDiggable(block) {
@@ -671,6 +677,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
       if (depthFloorArmed && belowDepthFloor(fy)) return null;
       const tread = bot.blockAt(new Vec3(fx, fy, fz));
       if (!tread || !isBlockSolid(tread) || !isFloorSafe(tread) || HAZARD_BLOCKS.has(tread.name)) return null;
+      if (isLooseTread(bot, tread)) return null;
       if (vy > 0 && !isFullHeightFloor(tread)) return null;
       // The cells this step opens. Down: over the new tread. Up: the origin's ceiling, then feet and head.
       const cells = vy < 0
@@ -975,7 +982,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
         const headDug = downClass !== 'jumpable' && !fromWater;
         const over = headDug ? bot.blockAt(new Vec3(nx, cy + 2, nz)) : null;
         const headFlow = headDug ? flowPrice(bot, [[nx, cy + 2, nz]]) : 0;
-        const offered = !headDug || (allowDig && !submerged && !closed(nx, cy + 2, nz) && headFlow !== null
+        const offered = !(headDug && isLooseTread(bot, downFloor)) && (!headDug || allowDig && !submerged && !closed(nx, cy + 2, nz) && headFlow !== null
           && isBlockSolid(over) && over.diggable && !HAZARD_BLOCKS.has(over.name));
         if (offered && !visited.has(dk)) {
           const headOwned = headDug && ((protectedBlocks && protectedBlocks.has(`${nx},${cy + 2},${nz}`)) || STATION_TYPES.has(over.name));

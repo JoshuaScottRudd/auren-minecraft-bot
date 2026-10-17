@@ -338,10 +338,50 @@ function closedBox() {
   return { min: lo, max: hi };
 }
 
+// ── THE BUILDING'S OWN LOGS ARE NEVER A TREE ────────────────────────────────────────────────────────
+// buildWoodCells() → Map of world "x,y,z" → the log the plan stands there, or null while no plan is loaded
+// or sited. Read off the plan and the locked row alone, so it answers the same for every body whether or
+// not that body's tree latch has closed: a census or a feller asking "is this log a tree" asks here first.
+const BUILD_LOG = /(.*_)?log$/;
+let _buildWood = null;   // { key, cells }
+function buildWoodCells() {
+  if (!registry) return null;
+  const plan = registry.data();
+  const row = require('@kernel/corporate_headquarters').readBuildingChair(plan.name, 'set_buildspot');
+  if (!row || !row.footprint || !row.footprint.corner) return null;
+  const f = siteFrame(row);
+  const key = `${plan.name}@${row.footprint.corner.x},${row.footprint.ground_floor_y},${row.footprint.corner.z}:${f.wood}`;
+  if (_buildWood && _buildWood.key === key) return _buildWood.cells;
+  const cells = new Map();
+  const add = (bx, by, bz, name) => {
+    const block = f.blockOf(name, by);
+    if (!BUILD_LOG.test(block)) return;
+    const p = f.worldOf(bx, by, bz);
+    cells.set(`${p.x},${p.y},${p.z}`, block);
+  };
+  for (const anchor of plan.anchors) for (const v of anchor.voxels) add(v[0], v[1], v[2], v[3]);
+  for (const column of plan.columns) for (const v of column.descent) add(column.stand[0], v[1], column.stand[1], v[3]);
+  _buildWood = { key, cells };
+  return cells;
+}
+
 // The plan's own sections, so a reader never indexes the document itself.
 const anchors = () => getPlan().anchors;
 const columns = () => getPlan().columns;
 const ground = () => getPlan().ground;
 const dimensions = () => getPlan().dimensions;
+// mouthCell — the building's one way in, in plan coordinates [bx, by, bz]: the cell just outside the box on the
+// face nearest the first column's stand, feet ENTRY_FEET_BELOW under layer 0. Pure geometry of the plan, so the
+// foreman (which holds no wood and no mandate) marks it from the same answer the trips walk to.
+function mouthCell() {
+  const { ENTRY_FEET_BELOW } = require('@kernel/blueprint_anchor_calculator');
+  const [sx, sz] = columns()[0].stand;
+  const { w, l } = dimensions();
+  const faces = [
+    { d: sx, b: [-1, sz] }, { d: w - 1 - sx, b: [w, sz] },
+    { d: sz, b: [sx, -1] }, { d: l - 1 - sz, b: [sx, l] },
+  ].sort((a, b) => a.d - b.d);
+  return [faces[0].b[0], -ENTRY_FEET_BELOW, faces[0].b[1]];
+}
 
-module.exports = { load, isLoaded, getPlan, planPathFor, siteFrame, siteWood, closedBox, anchors, columns, ground, dimensions, supportsOf, supportSummary, materialRatio, SCHEMA };
+module.exports = { load, isLoaded, getPlan, planPathFor, siteFrame, mouthCell, siteWood, closedBox, buildWoodCells, anchors, columns, ground, dimensions, supportsOf, supportSummary, materialRatio, SCHEMA };

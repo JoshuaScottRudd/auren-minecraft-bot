@@ -89,7 +89,7 @@ function withinReach(bot, p) { return eyeDist2(bot, p) <= REACH * REACH; }
 // Flood-fills every log connected to the base through 26-neighbour adjacency — this is what defines
 // "the tree", so a neighbouring unconnected tree is never touched. Bounded against a mega-canopy.
 const MAX_TREE_LOGS = 512;
-function collectTreeLogs(bot, base, inObjective) {
+function collectTreeLogs(bot, base, inObjective, isBuildWood = () => false) {
   const seen = new Set();
   const logs = [];
   const stack = [{ x: base.x, y: base.y, z: base.z }];
@@ -100,6 +100,7 @@ function collectTreeLogs(bot, base, inObjective) {
     seen.add(key);
     const b = bot.blockAt(new Vec3(p.x, p.y, p.z));
     if (!b || !b.name || !inObjective(b.name)) continue;
+    if (isBuildWood(p)) continue;                        // the building's log beside a tree is not the tree
     logs.push(new Vec3(p.x, p.y, p.z));
     for (let dx = -1; dx <= 1; dx++)
       for (let dy = -1; dy <= 1; dy++)
@@ -195,7 +196,7 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
 
   // The tree is flood-filled BEFORE the entry cuts into it, or the two cells the entry removes are never
   // members of the set and the count comes back two short of the tree that actually fell (Law 25).
-  const treeLogs = collectTreeLogs(bot, base, inObjective);
+  const treeLogs = collectTreeLogs(bot, base, inObjective, buildWoodTest(protectedSet));
 
   const entry = await enterTrunkColumn(bot, base, inObjective);
   minedCount += entry.mined;
@@ -257,11 +258,13 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
     }
     if (minedThisCycle > 0) { stuckPillars = 0; continue; }   // clearing may bring more into reach
 
-    // Pillaring raises the reach envelope upward only; if every residual log is at/below feet level,
-    // climbing further only moves away from them, so this concedes instead.
-    const anyAbove = rem.some(p => p.y > feet.y);
-    if (!anyAbove) {
-      watcher.warn(TAG, `fell_incomplete residual_logs=${rem.length} all at/below feet (y=${feet.y}) — pillaring cannot reach them, conceding (leaves decay).`);
+    // Pillaring raises the reach envelope upward only, so it is worth a block only while a log above
+    // also lies within reach sideways. Otherwise the climb ends here and the descent below takes what
+    // comes into reach on the way down.
+    const sideways = (p) => Math.hypot(p.x + 0.5 - (feet.x + 0.5), p.z + 0.5 - (feet.z + 0.5));
+    const climbable = rem.some(p => p.y > feet.y && sideways(p) <= REACH);
+    if (!climbable) {
+      watcher.summary(TAG, `climb ends: residual_logs=${rem.length}, none above feet (y=${feet.y}) within ${REACH} blocks sideways — descending.`);
       break;
     }
 
@@ -276,7 +279,7 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
       stuckPillars = 0; await sleep(CONFIG.ascentPause);
     }
     else if (++stuckPillars >= CONFIG.pillarRetry) {
-      watcher.warn(TAG, `fell_incomplete residual_logs=${rem.length} — could not reach or pillar to them (reason=${res?.reason || 'unknown'}).`);
+      watcher.summary(TAG, `climb ends: residual_logs=${rem.length}, the pillar would not rise (reason=${res?.reason || 'unknown'}) — descending.`);
       break;
     } else {
       await sleep(120);
@@ -298,10 +301,20 @@ async function climbAndFell(bot, base, objectiveList, protectedSet) {
     }
     cleaned++;
     await sleep(CONFIG.cleanupPause);
+    // Each block lowered brings a new band of the tree into reach; what is in reach now is cut before the
+    // next block comes out (the support column below stays).
+    const low = bot.entity.position.floored();
+    for (const p of present().filter(q => !(q.x === low.x && q.z === low.z && q.y < low.y) && withinReach(bot, q))) {
+      const lb = bot.blockAt(p);
+      if (!lb || !inObjective(lb.name)) continue;
+      await guardExternal(TAG, 'lookAt log', () => bot.lookAt(new Vec3(p.x + 0.5, p.y + 0.5, p.z + 0.5)));
+      if (await digBlock(bot, lb)) { minedCount++; await sleep(CONFIG.digPause); }
+    }
   }
+  const left = present();
   if (placedPillar.length) watcher.summary(TAG, `Cleaned pillar blocks count=${cleaned} of ${placedPillar.length}`);
 
-  return { minedCount, pillarCount: placedPillar.length };
+  return { minedCount, pillarCount: placedPillar.length, treeLogs: treeLogs.length, left };
 }
 
 // ── Trunk approach: walk to a walkable skirt cell beside the trunk ──────────
@@ -400,6 +413,30 @@ function ledgerUnreached(bot, base, skirt, from, res, heldMs) {
 // Object lock (arbiter flavor a — physical exclusivity, foreman_brain.js taxonomy): claimed by base
 // block, through target_claims, the one claim-reach-release walk trees/stone/grass share (Law 16).
 const treeKeyOf = (pos) => `tree:${pos.x},${pos.y},${pos.z}`;
+
+// treeRootOf — the lowest log of the tree a log belongs to (collectTreeLogs' flood fill). A tree is claimed
+// under its root, so a hanging log a peer's felling is about to take is the same claim as that peer's trunk.
+function treeRootOf(bot, pos) {
+  const logs = collectTreeLogs(bot, pos, (name) => LOG_REGEX.test(name));
+  return logs.reduce((low, l) => (!low || l.y < low.y ? l : low), null) || pos;
+}
+
+// A SKY LOG IS CHASED: a log hanging in the air is cut from a pillar raised on the ground under it
+// (groundUnder), so no stub of wood is left floating in its leaves. The one log not walked to is a log
+// within reach of a tree a peer is felling right now, hanging or grounded: that peer's flood fill and its
+// re-stands already hold it and cut it while this body would still be walking. A peer felling from the
+// bottom up leaves its claim key on a trunk base that may already be gone, so the reach is wider than a
+// claim's own footprint.
+const PEER_FELLING_RADIUS = 8;   // blocks, sideways, from a peer's claimed trunk: a big oak's spread
+const RESTAND_MAX = 3;           // new stands a fell takes under the logs its first stand could not reach
+function isPeersLog(pos) {
+  const { TREE_KEY_PREFIX, parseTreeFootprint } = require('@utils/tree_footprint');
+  for (const key of require('@kernel/foreman_link').peerClaimKeys()) {
+    const f = key.startsWith(TREE_KEY_PREFIX) ? parseTreeFootprint(key) : null;
+    if (f && Math.hypot(f.x - pos.x, f.z - pos.z) <= PEER_FELLING_RADIUS) return true;
+  }
+  return false;
+}
 // standAtTreeBase answers in its own shape; the walk reads { ok, reason }.
 const approachTree = (bot, dispatcher) => async (pos) => {
   const approach = await standAtTreeBase(bot, dispatcher, pos);
@@ -432,8 +469,8 @@ function isWetStump(bot, p) {
 async function selectReachableTree(bot, dispatcher, ranked, excludeTrees) {
   const approach = approachTree(bot, dispatcher);
   const walk = await claimFirst(ranked.map(r => r.c), {
-    keyOf: c => treeKeyOf(c.position),
-    skip: (c, key) => !!(excludeTrees && excludeTrees.has(key)) || isWetStump(bot, c.position),
+    keyOf: c => treeKeyOf(treeRootOf(bot, c.position)),
+    skip: (c, key) => !!(excludeTrees && (excludeTrees.has(key) || excludeTrees.has(treeKeyOf(c.position)))) || isWetStump(bot, c.position) || isPeersLog(c.position),
     approach: c => approach(c.position),
   });
   const boxed = walk.failures.no_skirt || 0;
@@ -481,20 +518,27 @@ async function repositionToOpenGround(bot, dispatcher, ranked) {
   return false;
 }
 
-// Blueprint self-protection: a blueprint can contain LOG voxels stacked like a trunk, which
-// surface_filter would otherwise see as fellable. Loads every locked blueprint's solid voxels into
-// one Set (Law 16); null = nothing locked. Unguarded — a swallowed throw would read as "nothing
-// protected" and let the feller mine the base (Law 13).
-function loadBlueprintProtected() {
-  return require('@perception/blueprint_survey').getAllProtectedBlocks();
+// Self-protection: a blueprint can contain LOG voxels stacked like a trunk, and the mine's walls take logs
+// as fill, so either would otherwise read as fellable. Every locked blueprint's solid voxels and every
+// voxel the navigator protects (buildings, the mine staircase, the mine cells) go into one Set (Law 16);
+// null = nothing protected. Unguarded — a swallowed throw would read as "nothing protected" and let the
+// feller mine the base (Law 13).
+function loadBlueprintProtected(bot) {
+  const set = new Set(require('@perception/blueprint_survey').getAllProtectedBlocks() || []);
+  for (const key of require('@locomotion/navigator').loadProtectedBlocks(bot) || []) set.add(key);
+  return set.size ? set : null;
 }
 
 // buildWoodTest — (position) => true for a log that is the fleet's own wood and never a tree: a cell in
 // the downloaded building's box (no route enters the box), or a locked blueprint's block. Handed to the
 // scan as its `exclude`, so the scan's count of usable trees is a count of trees (Law 25).
 function buildWoodTest(protectedSet) {
-  const box = require('@kernel/downloaded_plan_registry').closedBox();
+  const planRegistry = require('@kernel/downloaded_plan_registry');
+  const box = planRegistry.closedBox();
+  // The plan's own log cells answer before the box closes and for a body whose tree latch never closed.
+  const planned = planRegistry.buildWoodCells();
   return (p) => (!!box && p.x >= box.min.x && p.x <= box.max.x && p.y >= box.min.y && p.y <= box.max.y && p.z >= box.min.z && p.z <= box.max.z)
+    || (!!planned && planned.has(`${p.x},${p.y},${p.z}`))
     || (!!protectedSet && protectedSet.has(`${p.x},${p.y},${p.z}`));
 }
 
@@ -615,7 +659,7 @@ function getPreferredWoodSpecies() {
 // fell(bot, target, opts) — approach, fell, with options
 // De-confliction is claim-before-walk: the tree is locked at selection, not on arrival.
 async function fell(bot, target, opts = {}) {
-  const protectedSet = opts.protectedBlocks || loadBlueprintProtected();
+  const protectedSet = opts.protectedBlocks || loadBlueprintProtected(bot);
   const excludeTrees = (Array.isArray(opts.excludeTrees) && opts.excludeTrees.length)
     ? new Set(opts.excludeTrees) : null;
   const dispatcher = require('@locomotion/locomotion_dispatcher');
@@ -625,12 +669,12 @@ async function fell(bot, target, opts = {}) {
   if (target) {
     // ── Specific target mode: claim this trunk, then go fell it ─────────
     const pos = target instanceof Vec3 ? target : new Vec3(target.x, target.y, target.z);
-    if (protectedSet && protectedSet.has(`${pos.x},${pos.y},${pos.z}`)) {
+    if (buildWoodTest(protectedSet)(pos)) {
       watcher.summary(TAG, `Target (${pos.x},${pos.y},${pos.z}) is a blueprint block — refusing to fell the build.`);
       return { success: false, reason: 'target_is_blueprint', position: pos };
     }
     watcher.summary(TAG, `Claiming and approaching trunk at (${pos.x},${pos.y},${pos.z})`);
-    const walk = await claimFirst([pos], { keyOf: treeKeyOf, approach: approachTree(bot, dispatcher), maxUnreachable: 1 });
+    const walk = await claimFirst([pos], { keyOf: c => treeKeyOf(treeRootOf(bot, c)), approach: approachTree(bot, dispatcher), maxUnreachable: 1 });
     if (walk.peerHeld) {
       watcher.summary(TAG, `Tree at (${pos.x},${pos.y},${pos.z}) held by a peer — abandoning target`);
       return { success: false, reason: 'tree_claimed_by_peer', position: pos };
@@ -686,7 +730,28 @@ async function fell(bot, target, opts = {}) {
   const objectiveList = [chosenName].filter(o => LOG_REGEX.test(o));
   watcher.summary(TAG, `Begin felling at (${chosenPos.x},${chosenPos.y},${chosenPos.z}) species=${chosenName}`);
 
-  const { minedCount } = await climbAndFell(bot, chosenPos, objectiveList, protectedSet);
+  // Read before the fell: what stood at the picked cell is the cause a fell that cuts nothing states (Law 13).
+  const baseBlock = bot.blockAt(new Vec3(chosenPos.x, chosenPos.y, chosenPos.z));
+  let { minedCount, treeLogs, left } = await climbAndFell(bot, chosenPos, objectiveList, protectedSet);
+  // WHAT THE FIRST STAND COULD NOT REACH IS CUT FROM A NEW ONE: the body walks under the nearest log left
+  // and climbs again, so the tree comes down whole and no sky log is left in its leaves.
+  for (let round = 1; left.length && round <= RESTAND_MAX; round++) {
+    const me = bot.entity.position;
+    const next = left.slice().sort((a, b) => a.distanceTo(me) - b.distanceTo(me))[0];
+    const stood = await standAtTreeBase(bot, dispatcher, next);
+    if (!stood.arrived) {
+      watcher.summary(TAG, `re-stand ${round}: no stand reached under (${next.x},${next.y},${next.z}) (${stood.reason}); ${left.length} log(s) left.`);
+      break;
+    }
+    const again = await climbAndFell(bot, next, objectiveList, protectedSet);
+    watcher.summary(TAG, `re-stand ${round} under (${next.x},${next.y},${next.z}): mined ${again.minedCount}, ${again.left.length} log(s) left.`);
+    minedCount += again.minedCount;
+    if (again.minedCount === 0) { left = again.left; break; }
+    left = again.left;
+  }
+  if (left.length) {
+    watcher.warn(TAG, `fell_incomplete residual_logs=${left.length} of ${treeLogs} — no stand within ${RESTAND_MAX} re-stand(s) reached them (leaves decay).`);
+  }
 
   // ── Post-fell: clip vegetation, collect drops ─────
   const clippedVegetation = await clipGroundVegetation(bot);
@@ -699,7 +764,7 @@ async function fell(bot, target, opts = {}) {
   releaseTarget(treeKey);
 
   if (minedCount === 0) {
-    watcher.warn(TAG, `No blocks mined at (${chosenPos.x},${chosenPos.y},${chosenPos.z})`);
+    watcher.warn(TAG, `No blocks mined at (${chosenPos.x},${chosenPos.y},${chosenPos.z}) picked_as=${chosenName} stood_there=${baseBlock ? baseBlock.name : 'unloaded'} tree_logs=${treeLogs}`);
     return { success: false, reason: 'no_blocks_mined', position: chosenPos, species: chosenName };
   }
 

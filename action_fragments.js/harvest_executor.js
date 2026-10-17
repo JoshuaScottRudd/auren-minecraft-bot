@@ -527,7 +527,7 @@ module.exports = {
       let result = await fellLogLadder(bot, excludeTrees);
       for (let miss = 1; result && !result.success && result.reason === 'no_blocks_mined' && result.position && miss < TREE_MISS_CHANCES; miss++) {
         const p = result.position;
-        watcher.warn(TAG, `TREE_MISSED chance=${miss} of=${TREE_MISS_CHANCES} tree=(${p.x},${p.y},${p.z}) species=${result.species} — nothing to cut at the trunk; trying the next tree`);
+        watcher.summary(TAG, `TREE_MISSED chance=${miss} of=${TREE_MISS_CHANCES} tree=(${p.x},${p.y},${p.z}) species=${result.species} — nothing to cut at the trunk; trying the next tree`);
         excludeTrees = [...excludeTrees, `tree:${p.x},${p.y},${p.z}`];
         capsule.failed_trees = excludeTrees;
         result = await fellLogLadder(bot, excludeTrees);
@@ -561,6 +561,10 @@ module.exports = {
       }
 
       capsule.drop_collector = result.drops;
+
+      // THE HARVEST ENDS WITH A REPLANT: a crew with a tree farm plants its primary sapling in the farm
+      // cells near where it stands (sapling_planter owns who, where and how many).
+      await require('@api/sapling_planter').plantAfterHarvest(bot);
 
       // Trunk-base coord keeps consecutive same-species/height fells from reading as a stalled loop (Law 12).
       const at = result.position ? ` @${result.position.x},${result.position.y},${result.position.z}` : '';

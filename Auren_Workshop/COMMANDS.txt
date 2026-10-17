@@ -55,6 +55,16 @@
       <server folder>\world_snapshots\<world>\<world>_fresh_start
   when that copy exists. Make one with world_rollback.ps1 (SNAPSHOTS, below).
 
+--------------------------------------------------------------------------------
+  THE INSPECTION RUN — look over what the last run built
+--------------------------------------------------------------------------------
+  node start_auren.js inspect
+
+  The world comes up as the last run left it. No bot is raised, nothing is put
+  back or emptied. Your flying camera (Cam_Architect) opens and is put at the
+  base: a builder's laydown yard, a homesteader's headframe. Midday is pinned.
+  It stays up until you end it (END A RUN, below).
+
 
 
 ================================================================================

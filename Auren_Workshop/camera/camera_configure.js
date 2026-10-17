@@ -35,7 +35,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE OPERATOR'S EYE, THE HOST SEAT, and THE TWO MODES
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// `architect.*` — a spectator camera a human flies; the rig arms it (spectator, night vision) but never
+// `architect.*` — spectator cameras a human flies; the rig arms each (spectator, night vision) but never
 // commands it, so it never enters the shot list (Law 16, Law 19). Off by default (Law 13); armed only at
 // launch (`-Architect` / `--architect`), never by a config edit (Law 26).
 // `host.*` — the client a human PLAYS from. Unlike the eye it is a real player, never armed and passed to
@@ -58,8 +58,22 @@ const LENS_ASPECT = 16 / 9;
 module.exports = {
 
   architect: {
-    camName: 'Cam_Architect',
-    enable:  false,
+    // One window per name, each its own spectator a person flies, placed at the base when the run sites
+    // it. The name is the window title, the player name and the recorded file's prefix, so it says
+    // which shot it is: the wide fixed view of the build, the mine below it, and the roaming view.
+    // AUREN_SEATS (comma list) replaces the list for one run, e.g. one seat flown for a tour.
+    camNames: process.env.AUREN_SEATS
+      ? process.env.AUREN_SEATS.split(',').map(s => s.trim()).filter(Boolean)
+      : ['Cam_Timelapse', 'Cam_Mine', 'Cam_Roam'],
+    // A seat named here is put at this spot (feet position, then yaw and pitch) once when it joins, on a
+    // rollback or a continue alike, and is never moved to the base. The values are a spot the seat held,
+    // read off the server while the seat held it.
+    fixed: {
+      Cam_Timelapse: { pos: [-34.88116654255924, 88.72645739256133, 61.411492822985444], rotation: [-72.599915, 25.350014] },
+      Cam_Mine:      { pos: [40.748757245635154, 32.489533977156825, 30.131399416931973], rotation: [91.95084, 48.900032] },
+      Cam_Roam:      { pos: [30.762377766378066, 65.51713535994239, 69.4721473995003], rotation: [-58.651432, 28.049944] },
+    },
+    enable:   false,
   },
 
   host: {

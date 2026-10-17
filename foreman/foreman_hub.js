@@ -52,24 +52,44 @@ const COMBINED_FLUSH_MS = 1000;   // matches the bots' cadence
 let _unwritten = [];
 let _combinedWriteScheduled = false;
 
-function persistCombined(line) {
-  _unwritten.push(line);
+const recordClaims = require('../js_kernel/utils/record_claims');
+const READER_HOLD_RETRY_MS = 100;   // how soon an append held back by a reader of the record asks again
+let _combinedInFlight = false;
+
+function scheduleCombined(afterMs) {
   if (_combinedWriteScheduled) return;   // debounce bursts into one append
   _combinedWriteScheduled = true;
   const t = setTimeout(() => {
     _combinedWriteScheduled = false;
+    if (!_unwritten.length) return;
+    // ONE APPEND AT A TIME, AND NONE WHILE A READER HOLDS THE RECORD (record_claims): the lines stay
+    // queued and the flush asks again.
+    const claimed = !_combinedInFlight && guardExternalSync('foreman_hub', 'record_claims.beginWrite(combined trace)',
+      () => recordClaims.beginWrite(COMBINED_LOG_FILE));
+    if (!claimed || !claimed.ok || !claimed.value) { scheduleCombined(READER_HOLD_RETRY_MS); return; }
+    _combinedInFlight = true;
     const chunk = _unwritten;
     _unwritten = [];
+    const landed = () => {
+      _combinedInFlight = false;
+      guardExternalSync('foreman_hub', 'record_claims.endWrite(combined trace)', () => recordClaims.endWrite(COMBINED_LOG_FILE));
+    };
     // `fs.appendFile` is third-party and can throw synchronously (Law 16 guard).
     const appended = guardExternalSync('foreman_hub', 'fs.appendFile(combined trace)', () => {
       fs.appendFile(COMBINED_LOG_FILE, chunk.map(l => JSON.stringify(l)).join('\n') + '\n', (err) => {
         // Failed lines go back, unshifted, for the next flush to retry.
-        if (err) _unwritten = chunk.concat(_unwritten);
+        if (err) { _unwritten = chunk.concat(_unwritten); scheduleCombined(COMBINED_FLUSH_MS); }
+        landed();
       });
     });
-    if (!appended.ok) _unwritten = chunk.concat(_unwritten);
-  }, COMBINED_FLUSH_MS);
+    if (!appended.ok) { _unwritten = chunk.concat(_unwritten); landed(); }
+  }, afterMs);
   if (t.unref) t.unref();
+}
+
+function persistCombined(line) {
+  _unwritten.push(line);
+  scheduleCombined(COMBINED_FLUSH_MS);
 }
 
 // Per-bot state: { bot_id: { ws, boardroom_chair, connected_at, last_sync } }
@@ -701,6 +721,8 @@ function fleetState() {
     built: (c.boardroom_chair && c.boardroom_chair.built) || null,
     // The body's last count of finished cubes of the building it makes (downloaded_build); null before its first count.
     cubes_finished: (c.boardroom_chair && c.boardroom_chair.cubes_finished) || null,
+    // The highest layer of that building the body has seen released for building (downloaded_build); null before.
+    layer_released: (c.boardroom_chair && c.boardroom_chair.layer_released) || null,
     ...tallyOf(id),
   }));
   // Departed bots ride beside the roster, never inside it (Law 8).
@@ -968,6 +990,8 @@ const desk = Object.freeze({
   lockSite: (rows, ownerKey) => lockSite(rows, ownerKey),
   // ── THE FLEET STOPS WHEN THE RUN ENDS ──
   // `why` rides to the bodies so each records the real cause of its own stop.
+  // The foreman's own start for one body: a held crew's release, the operator's staggered `start` given by the run.
+  startBody: (botId) => runOperatorVerb('start', 'foreman-body', { bot: botId }, ORIGIN.TERMINAL),
   stopFleet: (why) => {
     warn(`STOPPING THE FLEET — ${why}`);
     return runOperatorVerb('stop', 'foreman-body', { why }, ORIGIN.TERMINAL);

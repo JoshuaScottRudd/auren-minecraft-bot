@@ -28,14 +28,31 @@ const TAG = 'observer';
 // handler having to know how the site was found. Null until the run has a site.
 let siteCell = null;
 
-function name() {
+// The seats the run's own cameras raised for a person to fly. They are watchers nobody had to name: the
+// named observer comes first, and with none named every one of these seats is placed.
+let flownSeats = [];
+function seatsRaised(list) { flownSeats = Array.isArray(list) ? list.filter(Boolean) : []; }
+
+function names() {
   const n = require('../../foreman_config').observer;
-  return n && String(n).trim() ? String(n).trim() : null;
+  return n && String(n).trim() ? [String(n).trim()] : flownSeats;
 }
 
-const isObserver = (who) => !!who && who === name();
+const isObserver = (who) => !!who && names().includes(who);
 
-function remember(cell) { siteCell = cell; }
+// Seats already put on the site, so the startup step's retries move only the ones still missing and a
+// person already flying one is not pulled back. A new site clears it.
+const placed = new Set();
+
+function remember(cell) {
+  if (!siteCell || !cell || siteCell.x !== cell.x || siteCell.y !== cell.y || siteCell.z !== cell.z) placed.clear();
+  siteCell = cell;
+}
+
+// THE CAMERA FLOATS ABOVE THE CREW'S CELL, NOT ON IT. The crew is placed on this same cell, and a spectator's
+// left-click on a player inside it spectates that player: with a held crew standing in the camera, any click
+// locked the seat inside a bot's head until Shift was pressed. Lifted clear, the crew is below the camera.
+const OBSERVER_LIFT = 8;
 
 // place(who, cell) → { ok, why } — spectator, then the teleport, then READ THE SERVER BACK (Law 25).
 // Arrival is proved off the server's own copy of that entity, since a `tp` addressed to a player who is
@@ -49,7 +66,7 @@ async function place(who, cell) {
   const sent = await guardExternal(TAG, `place the observer ${who}`, () =>
     require('@utils/rcon_link').once([
       `gamemode spectator ${who}`,
-      `tp ${who} ${cell.x} ${cell.y + 1} ${cell.z}`,
+      `tp ${who} ${cell.x} ${cell.y + OBSERVER_LIFT} ${cell.z}`,
     ]));
   if (!sent.ok) return { ok: false, why: `the server console refused: ${sent.reason}` };
 
@@ -67,8 +84,26 @@ async function place(who, cell) {
     : { ok: false, why: `${who} reads (${here.x},${here.y},${here.z}), ${off.toFixed(0)} blocks from the site` };
 }
 
-// atSite() — place the named observer at the remembered site. The one call both the startup step and the
-// join handler make, so where the camera goes is decided once (Law 16).
-const atSite = () => place(name(), siteCell);
+// atSite(who) — place one watcher at the remembered site; a joining seat is placed on arrival.
+// atSite() — place every watcher not yet placed, ok only when all are. The startup step and the join
+// handler make these calls, so where the cameras go is decided once (Law 16).
+async function atSite(who) {
+  if (who) {
+    const r = await place(who, siteCell);
+    if (r.ok) placed.add(who);
+    return r;
+  }
+  const all = names();
+  if (!all.length) return { ok: false, why: 'no observer is named in foreman_config' };
+  const missing = [];
+  for (const seat of all) {
+    if (placed.has(seat)) continue;
+    const r = await atSite(seat);
+    if (!r.ok) missing.push(r.why);
+  }
+  return missing.length
+    ? { ok: false, why: missing.join('; ') }
+    : { ok: true, why: `${all.join(', ')} ${all.length > 1 ? 'are' : 'is'} in spectator over the site` };
+}
 
-module.exports = { name, isObserver, remember, place, atSite };
+module.exports = { names, isObserver, seatsRaised, remember, place, atSite };

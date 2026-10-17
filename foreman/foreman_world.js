@@ -28,7 +28,7 @@ const settings = require('@utils/server_settings');
 const rcon = require('@utils/rcon_link');
 const { RECORDS_DIR } = require('@utils/record_homes');
 const consoleWindow = require('@utils/console_window');
-const { guardExternal } = require('@utils/external_library_guard');
+const { guardExternal, guardExternalSync } = require('@utils/external_library_guard');
 const { runSteps } = require('./foreman_steps');
 const plan = require('./foreman_plan');
 const processPriority = require('./utils/process_priority');
@@ -53,8 +53,23 @@ const LAG_RE = /Can't keep up!.*Running (\d+)ms or (\d+) ticks behind/;
 //                   thread waits. Read with the JDK's own `jfr print --events <name> server.jfr`.
 // Both land in fleet_logs, so they belong to this run like every other record there. The GC log's path is
 // written relative to the server folder when it can be: `-Xlog` reads a colon as its own separator.
+// A continue start appends to the run's records, and Java would start both files over: the last segment's pair
+// is kept beside them, named by when it was last written (`server.<time>.jfr`, `server_gc.<time>.log`).
+// The lenses read the newest pair.
+function keepPrevious(file) {
+  return guardExternalSync('foreman_world', `keep the last segment's ${path.basename(file)}`, () => {
+    if (!fs.existsSync(file) || fs.statSync(file).size === 0) return null;
+    const stamp = fs.statSync(file).mtime.toISOString().replace(/[:.]/g, '-');
+    const ext = path.extname(file);
+    const kept = path.join(path.dirname(file), `${path.basename(file, ext)}.${stamp}${ext}`);
+    fs.renameSync(file, kept);
+    return kept;
+  });
+}
 function javaRecordArgs(serverDir) {
   const gc = path.join(RECORDS_DIR, 'server_gc.log');
+  keepPrevious(gc);
+  keepPrevious(path.join(RECORDS_DIR, 'server.jfr'));
   const rel = path.relative(serverDir, gc);
   const gcPath = rel.includes(':') ? `"${gc}"` : rel;
   return [
@@ -325,6 +340,8 @@ function gamerulesStep(log) {
       for (const [rule, want] of Object.entries(settings.REQUIRED_GAMERULES)) {
         await guardExternal('foreman_world', `gamerule ${rule}`, () => rcon.once([`gamerule ${rule} ${want}`]));
       }
+      // The weather is frozen by advance_weather; clearing it here makes what is frozen clear sky.
+      await guardExternal('foreman_world', 'weather clear', () => rcon.once(['weather clear']));
       return null;
     },
     proof: async () => {
@@ -375,6 +392,7 @@ function launchServer(ctx, log) {
     if (lag) {
       log(`SERVER LAG behind_ms=${lag[1]} ticks=${lag[2]} — server_gc.log and server.jfr hold what Java was doing`);
       if (pulseTimer) samplePulse(log, 'lag');
+      require('./machine_pulse').atLag(log, +lag[1]);
     }
   };
   for (const stream of [child.stdout, child.stderr]) {

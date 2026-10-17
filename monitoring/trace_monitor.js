@@ -25,6 +25,7 @@
 //   node trace_monitor.js --inventory [--bot=B] [--all]
 //   node trace_monitor.js --walking [--bot=B] [--all]
 //   node trace_monitor.js --trees [--bot=B] [--all]
+//   node trace_monitor.js --throughput [--bucket=10] [--all]
 //   node trace_monitor.js --steps [--bot=B] [--all]
 //   node trace_monitor.js --gate [--all]
 //   node trace_monitor.js --lag
@@ -122,10 +123,10 @@ const CONTEXT = parseInt(opt('context', '80'), 10);
 const QUIET = has('quiet');
 // --follow implies --watch: following IS watching with the echo filter removed.
 const WATCH = has('watch') || has('follow');
-// This is a post-mortem instrument: nothing reads the trace monitor while the fleet is online.
-// --watch/--follow declare themselves live and pass through. Gated only when this file is the command
-// being run (Law 26 — the CLI is the reader, the module is parts).
-if (require.main === module) require('./post_mortem_gate').refuseIfLive(TRACE_FILE, { live: WATCH });
+// A lens reads a record at any time, each file under its claim (trace_read.parseStoryFile). A read of a
+// record a fleet is still adding to says so; --watch/--follow are the streaming views and say nothing.
+// Said only when this file is the command being run (Law 26 — the CLI is the reader, the module is parts).
+if (require.main === module && !WATCH) require('./live_record').noteIfLive(TRACE_FILE);
 const WATCH_INTERVAL_SEC = parseInt(opt('interval', has('follow') ? '2' : '5'), 10);
 // --exit-on-flag [=sig,sig] — end the watch the moment a wake-worthy signature fires. Bare, any of
 // WAKE_SIGS may end it; with a list, only the named signatures may.
@@ -148,6 +149,8 @@ const PATHFINDING = has('pathfinding');
 const WALKING = has('walking');
 // --trees — every tree search: the ring a tree was taken in, what the reading cost, how it ended.
 const TREES = has('trees');
+// --throughput — every material as a flow: gathered, placed, through the chests, and the stock's cover.
+const THROUGHPUT = has('throughput');
 // --steps — every step a body planned and did not complete: what stopped it, on which move, at which cell.
 const STEPS = has('steps');
 // --gate — the planning gate: every entry and its exit, time inside, the line, any overlap.
@@ -1201,6 +1204,7 @@ if (require.main === module) {
   else if (PATHFINDING) runLens(locomotionLenses.runPathfinding);
   else if (WALKING) runLens(require('./walking_lens').runWalking, { verbose });
   else if (TREES) runLens(require('./tree_search_lens').runTreeSearch, { verbose });
+  else if (THROUGHPUT) runLens(require('./throughput_lens').runThroughput, { verbose, bucketMin: parseInt(opt('bucket', '10'), 10) || 10 });
   else if (STEPS) runLens(require('./step_failure_lens').runSteps, { verbose });
   else if (GATE) runLens(require('./planning_gate_lens').runGate, { verbose });
   else if (LAG) runLens(require('./server_lag_lens').runLag, { verbose });

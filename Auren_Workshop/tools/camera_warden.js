@@ -132,7 +132,8 @@ function runScript(name, args, label) {
 // How many windows this run has standing, counting the seats that are not bots. The ceiling is about
 // the GPU, and the GPU does not care which of them a director is driving.
 function windowsFor(botCount) {
-  return botCount + (HOST_ON ? 1 : 0) + (ARCHITECT_ON ? 1 : 0);
+  return botCount + (HOST_ON ? 1 : 0)
+    + (ARCHITECT_ON ? require(paths.workshop('camera', 'camera_configure.js')).architect.camNames.length : 0);
 }
 
 // Ask the world who is standing. A registry that cannot be reached is NOT an empty registry — reading

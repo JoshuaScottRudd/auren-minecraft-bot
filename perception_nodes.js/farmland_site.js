@@ -37,7 +37,7 @@ function loadBuilding(blueprintName) {
 //
 // growingSlots is the SET of those crop-slot positions, returned so the 'clear' action can prove
 // a block it is about to dig sits in a blueprint-declared crop slot and therefore can never be
-// structure. The same set now decides which dirt IS a row cell (the tine row's land block is dirt
+// structure. The same set decides which dirt IS a row cell (the tine row's land block is dirt
 // with no slot above it), so 'clear' and 'till' can never reach a cell the blueprint does not crop.
 // roomKey is the farm INSTANCE's conference-room key (16 wheat_tine_row rows each have a distinct locked
 // center). Defaults to the phase-1 blueprint name — instance 0's key and every single-farm caller — so this
@@ -52,10 +52,8 @@ function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
     throw new Error(`[farmland_site] CODING VIOLATION: No locked transpose_origin for farm instance "${roomKey}". set_buildspot must run before any farming verb.`);
   }
   // WHICH blueprint geometry this instance is — read from the blueprint_paster chair set_buildspot stamped
-  // when it locked the site. THERE IS NO FALLBACK: since the tine row became four direction blueprints
-  // a guess is a guess about WHICH WAY the row reaches, and three guesses in four would lay
-  // the dirt on the wrong side of the bank while every reader agreed with itself. An unstamped chair is
-  // a coding violation, not a default (Law 13).
+  // when it locks the site. The stamped blueprint owns the row's direction; a missing stamp
+  // throws before farming can select cells against guessed geometry (Law 13).
   const paster = hq.readBuildingChair(roomKey, 'blueprint_paster');
   const blueprintName = paster?.building_name;
   if (!blueprintName) {
@@ -132,8 +130,8 @@ function classifyCell(bot, c, growingSlots) {
 }
 
 // getFarmState(bot, roomKey) -> census the job_board tend-gate and farm_manager routing read (Law 16 — the
-// executor reads getFieldPlan off the SAME classifier). harvestReady fires on ANY mature crop
-// (whole-field all-or-nothing removed — harvest whatever's ripe).
+// executor reads getFieldPlan off the SAME classifier). Harvest selects ripe cells independently
+// of the rest of the field.
 //
 // `blocked` is a SEPARATE axis, not a fifth bucket: an obstructed cell is still counted as untilled
 // or emptyTilled by its ground state, and blocked says the crop slot above it is stoppered. It is
