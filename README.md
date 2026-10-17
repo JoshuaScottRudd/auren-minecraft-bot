@@ -1,28 +1,30 @@
 # Auren
 
-A Minecraft bot that decides what to do on its own.
+**Intelligence isn't magic. It can be built, one principle at a time.**
 
-It is not a macro and not a scripted routine. It looks at the world, works out the gap between what is
-there and what should be there, picks one job, does it, and looks again. Left alone on a fresh world it
-will find a place to live, chop wood, build a house, farm, mine, and defend itself — because it decided
-to, not because a list told it to in that order.
+A crew of Minecraft bots that decide what to do on their own. It is not a macro and not a scripted
+routine. Each bot looks at the world, works out the gap between what is there and what should be there,
+picks one job, does it, and looks again. Started on an empty survival world, a crew digs a mine, cuts and
+replants trees, smelts, crafts its own tools, and builds: a headframe and a farm, or a whole downloaded
+building.
+
+**There is no AI inside it.** The bots make **zero LLM calls at runtime**. Nothing here phones an API,
+wants a key, or costs anything per decision. Every decision comes from the planners, judges and
+perception nodes in this repository, running as plain code on your machine. The rules they were built
+to obey are in `Auren_Structural_Laws.md`.
 
 ---
 
-## AI built it. AI doesn't run it.
+## How this repository is meant to be used: with an LLM
 
-**I wrote none of this code. I don't read code. I direct an AI and I judge what comes back.**
+**This repository is built to be set up and worked on together with an LLM coding assistant.** That is
+how it was made, and it is the only way I use it. Open this folder in one, have it read this README and
+`Auren_Structural_Laws.md`, and let it set up your machine, start the runs, and read the traces with you.
 
-That is the whole method and I'd rather state it than let you discover it: this is prompt engineering.
-I decide what should exist and how it should behave, an AI writes it, and my job is telling it when the
-result is wrong — which is a different skill from programming and the only one I brought. Every design
-rule it works under is in `Auren_Structural_Laws.md`, because that is the actual artifact I author.
-
-**And there is no AI inside it.** The bot makes **zero LLM calls at runtime**. Nothing here phones an API,
-wants a key, or costs a fraction of a cent per decision. Everything it does comes from the planners,
-judges and perception nodes in this repository, running as plain code on your machine.
-
-Two verbs, and they are the whole argument: **AI as the developer, not the pilot.**
+**Without one, you are on your own.** You can run everything by hand, and the commands are below, but I
+make no promise that it is easy. I can't make that promise honestly: I don't write code, so the only way I
+could check whether this is easy by hand is to ask an LLM, which is the very thing I'd be checking it
+without. If you download source code, I'm assuming you're a developer and can find your way.
 
 ---
 
@@ -70,29 +72,51 @@ If people outside your home can reach your server, keep in mind that offline mod
 with that server's address and the console password its owner gives you. The foreman then only joins it —
 it never starts or stops a world it did not start.
 
-That starts a **foreman** — a clerk that joins your world and waits. **No bots yet.** Walk to where you
-want them, and ask in chat:
+That starts a **foreman**: a clerk that runs the world, raises the crew, and ends the run. **What it runs
+is one sentence at the top of `foreman_config.js`:** where (your world or someone else's), how it starts
+(from a clean world or where the last run stopped), how long it lasts, and which crew. The foreman says
+the sentence back before it starts.
+
+**The crew** is the field you will change most:
+
+- **`builder`** (the default): a crew of up to 20 that builds a downloaded building from nothing. The
+  foreman sites the building and brings the crew in itself. **The building is not in this repository** —
+  see the next section.
+- **`homesteader`**: a crew of 2 that answers to nobody. It builds a headframe over its mineshaft and a
+  farm. The foreman sites the base and brings them in, and anyone in the world can also ask for them with
+  `foreman get homesteader`. They have no ear at all: talking to one does nothing.
+- **`contractor`**: nobody is brought in. A person in the world asks in chat, and a crew of 2 that works
+  for them is brought to where they stand:
 
 ```
 foreman get contractor     a crew of 2 that works for you
-foreman get homesteader    a crew of 2 that answers to nobody
 foreman help               the words it knows
 foreman stop               send your contractors home
 ```
 
-The crew is brought to **where you are standing** and starts working when it arrives. You place them by
-walking somewhere, which is the only part of this a person should have to decide.
+  A contractor hears its owner in chat: say a bot's name and then what you want. The owner is stamped
+  into the bot at birth and every order is filtered on it.
 
-The one word chooses who they answer to, and it is the only difference:
+### Building a downloaded building
 
-- **contractors** belong to you. They hear you in chat — say a bot's name and then what you want.
-- **homesteaders** answer to nobody. They have no ear at all: the chat listener is not mounted, so
-  talking to one does nothing. Run these if you want to watch the thing work on its own.
+The builder crew builds from a **build plan** made once from a downloaded blueprint (a `.litematic`
+file). **No blueprint ships with this repository, because each one is somebody else's work.** You
+download it yourself, under the terms of the site you got it from, and turn it into a plan:
 
-**Everything is hired from inside the game, and that is the only way.** A contractor exists because
-somebody in the world asked for it — the owner is stamped into the bot at birth and every order is
-filtered on it. There is no terminal flag for that, because there is no owner to name from a terminal,
-and no coordinate to type because you are standing on it.
+```
+node developer_mode.js on
+node Auren_Workshop/tools/import_blueprint.js "<path to the .litematic>" --name=<name>
+node Auren_Workshop/tools/plan_blueprint.js "<folder of the .litematic>/downloaded_blueprints.json" --name=<name>
+```
+
+Then put `<name>` in `builder.build` in `foreman_config.js`, and the path of the
+`<name>.build_plan.json` the last command wrote in `builder.plan`. The plan builds only from what a crew
+can gather in survival: one kind of wood, stone, dirt, glass and a little iron. Other blocks are swapped
+for the nearest of those or left out, and `<name>.build_plan.md` lists every swap.
+
+The default names `overgrown_survival_castle`, which is
+[BiggyDiggy7's "Overgrown Survival Castle"](https://abfielder.com/Products/ProductDetails.php?id=2159) on
+abfielder.com. Without a plan, the foreman stops, says where it looked, and prints the plan command.
 
 **Everything the foreman needs is in one file: `foreman_config.js`,** at the top level beside this
 README — local or remote, your server folder, the address, the port. Everything in this project reads it.
@@ -263,3 +287,10 @@ in your head; a patch written without it costs more to review than to rewrite.
 
 **Do send problems.** An issue with a trace attached is the most useful thing you can give me, and it is
 what this bot is written to produce.
+
+---
+
+## How this was built
+
+AI models wrote every line of this bot under my strict Structural Laws and prompt guidance. There is no
+runtime LLM.
