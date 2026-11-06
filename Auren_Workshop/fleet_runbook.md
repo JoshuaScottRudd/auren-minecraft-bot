@@ -44,7 +44,7 @@ complete work units. Each process adapts its slice to scheduling delay, up to 50
 macrotask without a fixed sleep. Claims and immediate safety checks remain indivisible. Runtime HQ,
 player memory, and item-book snapshots write asynchronously in order; shutdown awaits their drains.
 The local Java server starts with a 512 MB heap and grows with demand up to 4 GB. Capacity runs use
-`--builder-count 2` or `--builder-count 4` and keep desktop applications open while the machine-load
+`--count 2` or `--count 4` and keep desktop applications open while the machine-load
 sampler records CPU, memory, paging, and disk response. Yielding helps the Node event loop stay
 responsive; server ticks, garbage collection, and operating-system memory pressure remain measured
 limits of each machine.
@@ -341,10 +341,11 @@ teardown with nothing to steer. A flag on `start_auren.js` overrides one field f
 |---|---|---|
 | `where` | `local` · `remote` | the foreman starts the server in `serverFolder` and stops it at the end · it joins somebody else's world and never starts or stops it |
 | `start` | `rollback` · `continue` | the bots start knowing nothing, and a local world is put back to its clean copy · nothing is emptied or put back |
-| `soak` | minutes | how long the run lasts once the crew is working (a contractor run: once the world is open). `0` runs until stopped |
-| `crew` | `homesteader` · `builder` · `contractor` | the foreman raises a homestead crew itself · the same, with a building in place of the farm · nobody is raised; a person asks in chat |
-| `builder.build` | `overgrown_survival_castle` | read only for a builder crew: what it builds (architect_config.BUILDER_BUILDS) |
-| `builder.count` | whole number, 2 through the available roster | how many builders the foreman raises; defaults to 20, overridden for one run with `--builder-count 2` |
+| `soak` | minutes | how long the run lasts once the crew is working. `0` runs until stopped |
+| `crew` | `homesteader` · `builder` | the foreman raises a homestead crew · the same crew and kit, with a downloaded building first and working through the night on peaceful |
+| `homesteader.difficulty` | `normal` · `hard` | read only for a homesteader crew: the difficulty the foreman writes into server.properties; the night gate closes outdoor work. A builder crew is always `peaceful` with no night gate (architect_config.CREW_DIFFICULTY). The difficulty changes nothing else: both crews carry the same kit, sword and shield included, stock the same chests and light their mine and base alike |
+| `builder.build` | `medieval_house_with_full_interior_from_abfielder` | read only for a builder crew: what it builds (architect_config.BUILDER_BUILDS) |
+| `count` | whole number, 2 through the available roster | how many homesteaders or builders the foreman raises; defaults to 15 for both, the one standard so the two crews are measured alike, overridden for one run with `--count 2` |
 | `landing` | `usual` · `random` | a rollback start of a crew the foreman raises: the nearest good ground to world spawn · a spot rolled each run 2 to 4 loaded areas (two view-distances wide each) from the usual one, re-rolled up to 8 times when the ground refuses the base (`startup_steps` "a random landing that holds the base is found"; the door publishes `run.landing`) |
 
 **The clean copy** a rollback start restores is `<server folder>/world_snapshots/<world>/<world>_fresh_start`
@@ -355,15 +356,24 @@ no clean copy is used as it is, and the foreman says so. Make one with `world_ro
 
 **The foreman carries it out** (`foreman/foreman.js` `runThePlan`): check the sentence (a field that makes no
 sense stops everything before the memory, the ports or the world are touched) → empty the memory on a rollback
-start → restore and start the world → join → for a homestead or builder crew, stand its own body on the nearest
-person-spot clear of world spawn (`person_spot`, the rule the stand-in person is held to), wait for the ground
-there, and raise the crew through the same `getCrew` a chat `get` uses → start the soak timer → at its end,
+start → restore and start the world → join → stand its own body on the nearest
+landing spot clear of world spawn (`landing_spot`), wait for the ground there, and raise the crew through
+`getCrew` → start the soak timer → at its end,
 the one shutdown road. The door publishes where it has got to as `run` (`crew`, `soakEndsAt`, `closing`).
 
 **A `continue` start moves nobody.** The foreman's body stays where it logs in, the spot search and the
 stand are not part of the run, and the crew is launched with no placement, so each body starts on the cell
 the last run left it on (`getCrew` `resume`, `foreman_plan.continues`). The base is the one in memory; a
 continue with no base in memory is refused at "the base is sited and in memory" (`nothing_to_continue`).
+
+**After a crash, the kind of crash picks the next start** (Architect 2026-10-21: *"if theres a loop crash then
+you make a change then you can continue to see if you broke the loop. if theres a law 13 coding violation or
+something else that isnt looping then you have to code something then restart."*):
+
+| the run stopped on | next start | why |
+|---|---|---|
+| an INFINITE LOOP (a body stuck repeating one job) | fix, then `--start continue` | the world and the bodies keep the state that made the loop, so the continue reproduces it at once and shows whether the fix broke it, without replaying the run up to that point |
+| a CODING VIOLATION (Law 13) or any other fault that is not a loop | fix, then `--start rollback` | nothing about the stopping state needs reproducing; the fix is proved on a clean run |
 
 **Each chest is forgiven one mismatch per run.** A chest whose window does not match its last picture
 after 5 s is taken as it stands and its picture rewritten, once per chest per run — the foreman counts it
@@ -382,13 +392,12 @@ The ordinary startup runs up to "the camera is at the build" and stops there wit
 
 - the world comes up as the last run left it, and nothing is put back, emptied or swept;
 - the base is read back from the fleet's memory and proved whole, with no body raised;
-- the one camera window a person flies (`Cam_Architect`) is raised with no bot window, whatever
+- the one camera window a person flies (`Cam_Inspector`) is raised with no bot window, whatever
   `record`, `cameras` and `architect.enable` say, and the foreman puts it at the base's alpha structure
   (a builder's laydown yard, a homesteader's headframe);
 - midday is pinned, and the run stays up until `verb shutdown`, `down` or Ctrl-C.
 
-Any other `start` is refused before a record is swept. A contractor crew is refused: its base belongs
-to whoever asked for it. On every camera run, a seat the cameras step raised is placed at the build
+Any other `start` is refused before a record is swept. On every camera run, a seat the cameras step raised is placed at the build
 when no `observer` is named.
 
 ### 3b. What the foreman adds around the run — the same page, after the sentence
@@ -413,7 +422,6 @@ startup step the foreman proves like any other (`foreman/utils/admin_steps.js`),
 | `record` | `off` · `cameras` · `film` | nothing · cameras only · cameras plus a recorder writing files (a machine with a recorder; a download refuses `film`). Raised as a child process (`record_overlay.js raise`), taken down in shutdown |
 | `watch` | `true` · `false` | the foreman ENDS the run when a wake fires · soak blind, the verdict says it all |
 | `wake` | `error` · `death` | which facts end a watched run. A bot that leaves and does not come back always does |
-| `machineHour` | `00:00-01:00` · `off` | the hour a day the computer has to itself (Windows). `start_auren.js` switches off Windows' own starting of upkeep and gives Windows two daily jobs, start all upkeep at the opening and stop it at the closing (`foreman/utils/machine_hour.js` `ensure`, an administrator terminal once per computer). A run that is up at the opening is shut down on the one shutdown road, the launcher waits the hour out and raises the foreman again as a `continue` start with the soak that was left · the computer picks its own time |
 
 **Before any of that, the foreman refuses to start while a terminal from an earlier run is open** — it
 names them and closes nothing (*"check but not close"*, 2026-09-11); `fleet_control.js down` closes them.
@@ -435,8 +443,7 @@ before anything moves (Law 13).
   ran `run.js` as a child. The foreman now starts and restores the world for everybody.
 - **`run.js` and `run_config.js` are deleted** (same day, later). The clock, the cameras, the open-terminal
   check, the watch and the verdict moved into the foreman (§3b). **Dropped, not moved:** the stand-in person
-  (`person`, `standing`) — a contractor crew is fetched by a real person typing `foreman get contractor`,
-  and `tools/proxy_human.js` still seats one by hand; `stream` and `teardown: leave-up` (a wake now always
+  (`person`, `standing`) — `tools/proxy_human.js` still seats one by hand; `stream` and `teardown: leave-up` (a wake now always
   ends the run); the preflight gate (preflight is the workshop's, and the bot does not reach the workshop —
   run it yourself after a code change); and the headframe clock grade at the end (a lens reads a finished
   run: `trace_monitor.js --milestones`).
@@ -444,26 +451,15 @@ before anything moves (Law 13).
 
 ### 3e. The bots arrive the way a stranger's bots arrive, and there is no other door
 
-> *"the process is a players joins their server, they start up the bots. starting up the bots only bring
-> up foreman and overseer. in either case. a human must then call foreman get homesteader or foreman get
-> contractor. that is the only way to get the bots. when i have you place a faux player called architect,
-> you are doing that part on my behalf."* — Architect, 2026-09-10
-
-**2026-09-18 superseded the faux player for every crew the foreman raises itself:** *"no more spawning
-player and typing foreman get. its an uneseccary step for the speedrun process… the foreman finds a spot,
-places the bots no faux human needed. foreman get homesteader shall still work in the game tough."* So:
-
-- **a homestead or builder crew:** the foreman stands its own body on a person-spot clear of world spawn
-  and raises the crew through the same `getCrew` a person's chat `get` reaches;
-- **a contractor crew:** nobody is raised — a real person in the world types `foreman get contractor`
-  (`tools/proxy_human.js` seats one from a terminal when you want to do it by hand);
-- **`foreman get homesteader` in chat still works**, on any run, exactly as it did.
+The foreman stands its own body on a landing spot clear of world spawn and raises the crew its run page
+names through `getCrew`. It hears nothing in chat; it says the run's beats there (a structure built, a
+layer released: `utils/run_announcer`), for the recording.
 
 You and a stranger launch the same `start_auren.js` with the same page, so there is no environment the
 run can inherit that a download does not have.
 
 **There is no privileged entrance left.** The old named tests ran `start_bot.js` and handed it a mandate,
-which is a door nobody who downloads this has. If the desk refuses, the run has failed — there is
+which is a door nobody who downloads this has. If the foreman refuses, the run has failed — there is
 nothing to fall back to, deliberately. *"i dont want to test in a way that a public user wont be using."*
 
 **THE DOWNLOAD COPY IS GONE (2026-09-10) and the two paragraphs that stood here with it.** They explained
@@ -490,7 +486,7 @@ Nothing was lost; each was one frozen combination of the settings above.
 | `test scan` | foreman_config `soak: 1` |
 | `test record` | `run.record: 'film'` |
 | `test spawnzone` | `run.standing: "<coords inside the square>"` |
-| the two foreman tests | the desk comes up in every run before any crew is asked for |
+| the two foreman tests | the foreman comes up in every run before any crew is raised |
 | the two let's-play runs | `run.record: 'cameras'`, `run.teardown: 'leave-up'` |
 | `test arena` | `lanista` still owns the arena — it asks `foreman_plan.freshWorld` which world and clean copy |
 | the conductors' soak / capture / triage | foreman_config `soak`, `run.record`, `run.watch` |
@@ -498,7 +494,7 @@ Nothing was lost; each was one frozen combination of the settings above.
 | `stranger_bench` | this is it — the method became the plumbing |
 
 **Deleted on 2026-09-10:** `tools/stranger_bench.js`, `tools/test_conductor.js`,
-`tools/contractor_standard_run.js`, `scripts/fresh_start.ps1`, `scripts/scan_test.ps1`,
+`scripts/fresh_start.ps1`, `scripts/scan_test.ps1`,
 `scripts/start_fleet.ps1`, `fleet_runbook.js`, and `fleet_control`'s `test`, `run` and `runbook` verbs.
 Each of them started a fleet, and each carried its own bring-up order — which is how this repository came
 to hold three separate answers to *"is the world restored before or after the bots come down"*.
@@ -538,34 +534,35 @@ gets a snapshot copy of `Auren_Bot/` with no history, the day a build works.
 
 ## 3h. The local server — a world on this machine, for testing
 
-`node start_auren.js --start continue --crew contractor --soak 0` brings up this machine's own world with the foreman and **no bots**; `down`
+`node start_auren.js --start continue --test world` brings up this machine's own world with the foreman and **no bots**; `down`
 takes it away again. Address `localhost`, Java Edition 26.1, world folder under `MinecraftServer/`. It prints
 no ONLINE — that word belongs to a server strangers can reach, and on a world only this machine can reach
 every step of that check is meaningless or cannot fail.
 
 **The hazard, and the guard.** `AUREN_SERVER_HOST`/`PORT` override where every body connects, and
 `fleet_control` hands children `{...process.env}` — so a shell pointed at some other server earlier would
-start a world on this machine and send the bots, the foreman and every contractor into **that** world. The
+start a world on this machine and send the bots and the foreman into **that** world. The
 foreman reads where the world is from `foreman_config.js` (`where: 'local'`), so a local start is local.
 
 ```
-node start_auren.js --start continue --crew contractor --soak 0   # world + foreman, NO bots
+node start_auren.js --start continue --test world   # world + foreman, NO bots
 node Auren_Workshop/fleet_control.js down                             # world + foreman down
-# there is no -Count any more: a crew is asked for in chat, or by a configured run (§3)
+# there is no -Count any more: a crew is raised by a configured run (§3)
 ```
 
-Then join in Minecraft at **`localhost`** (Java Edition **26.1**) and say `foreman get` in ordinary chat.
+Then join in Minecraft at **`localhost`** (Java Edition **26.1**) if you want to look around.
 
-**It comes up with zero bots on purpose**, exactly like a world serving people: the thing under test is
-`foreman get`, the path a real arrival walks. `-Count N` is for the other kind of test, where
-homesteaders are the subject.
+**It comes up with zero bots on purpose**: the foreman's `world` test brings the world up, reads its spawn and
+stays open until stopped, for a bench whose subject is the world itself. A crew is raised by an ordinary
+configured run (§3).
 
 **A rollback start opens a WORLD's records** — `start_auren.js` empties `fleet_logs/` on a rollback start
-and on nothing else. A continue start adds a segment to every file; nothing else deletes a record.
+and on nothing else. A continue start adds a segment to every file; nothing else deletes a record. A fleet
+run from its own copy of the bot keeps its own `fleet_logs/`; a lens reads it with `--records=<dir>`.
 
 **A note the proving produced:** a bot launch returns when the PROCESS is launched, while a
 body enters the foreman's registry only after it connects, spawns and `master_core` initialises — those
-are seconds apart. The desk polls the registry for up to 90s rather than reading it once. **Only a real
+are seconds apart. The foreman polls the registry for up to 90s rather than reading it once. **Only a real
 player slot catches faults of this shape**: `preflight` passed throughout, every process window was
 clean, and the only thing wrong was a sentence said to a human about a fact that had not happened yet.
 
@@ -640,7 +637,7 @@ clock:  'dawn'
 record: 'off'          | 'cameras' for a seat to watch from | 'film' for footage
 ```
 
-Then `node start_auren.js`. There is no `-Count`: two is what the desk raises for a crew.
+Then `node start_auren.js`. There is no `-Count`: the run page's `count` is what the foreman raises.
 
 **`.\Auren_Workshop\scripts\fresh_start.ps1` used to be this command and is deleted** (2026-09-10). It
 raised bots by running `start_bot.js` directly — a door nobody who downloads this repository has — so a
@@ -662,11 +659,11 @@ sets the cycle as well as the time rather than only the half it cares about.
 The steps it composes, for running one in isolation:
 
 1. **Restore the world snapshot, empty the memory and bring the foreman up** — one start, each step proved
-   before the next: `node start_auren.js --start rollback --crew contractor --soak 0`
+   before the next: `node start_auren.js --start rollback --test world`
 2. *(folded into 1)*
 3. *(folded into 1 — a rollback start empties the memory before the world restores)*
 4. **Wire check:** `node Auren_Workshop/tools/preflight.js` — every fragment must load before trusting a run.
-5. **Raise a crew:** join at `localhost` and say `foreman get homesteader` in chat. There is no launcher verb for this — asking the desk is the only way (§3c).
+5. **Raise a crew:** an ordinary configured run (§3) — `node start_auren.js --start continue --crew homesteader`.
 6. **Watch for errors** (§5) and **inspect** (§6).
 
 
@@ -780,6 +777,22 @@ Two ways to run the watch:
 ran — the dead-bot fingerprint), `regression` (a structure's correct-count fell), `halt` (recursive_judge
 parked a bot). Thresholds are calibrated at the top of `trace_monitor.js`.
 
+### Working while a run is going — the standard (Architect 2026-10-19)
+
+A run is not a wait. While the soak runs, inspect its traces through the lenses and keep making changes,
+above all while a subsystem is new: a fresh subsystem is watched until it is reliable. Check-ins are
+periodic; their spacing varies with what is being watched (about every 10 minutes while a subsystem is
+fresh). At each check-in, in this order:
+
+1. Errors, deaths and new warnings since the last check-in (the list above).
+2. **Every job taken since the last check-in**, with its claims and bot-minutes
+   (`trace_monitor --accounting`, `labour_by_job` and `waste_by_job`), read for waste: a job that should
+   not exist, a job taken more often than its work warrants, a job that states no result.
+3. The subsystem being hardened, read through its own lines or lens.
+
+A code change made mid-run reaches the next run. A file the run loaded at its start (a build plan, a
+blueprint) is changed for the next start only.
+
 ### 5a. Wake on death
 
 **A bot dying is not an error in the trace** — the construct respawns and carries on. The death wake
@@ -801,6 +814,8 @@ node Auren_Workshop/tools/lanista.js --bot=AurenBot                          # o
 node Auren_Workshop/tools/lanista.js --bot=AurenBot --mob=creeper --rounds=3 # three fights, re-sited each time
 node Auren_Workshop/tools/lanista.js --bot=AurenBot --mob=skeleton --hand=minecraft:bow --range=15
 node Auren_Workshop/tools/lanista.js --bot=AurenBot --mob=zombie --count=3   # three at once, spread by bearing
+node Auren_Workshop/tools/lanista.js --bot=AurenBot --buddy=TessaBot --buddy-gap=1 --wave=zombie:3 --rounds=3 --same-ground --kit=iron_axe,shield,iron_helmet,iron_chestplate,iron_leggings,iron_boots
+                                                                             # two bodies in one fight; --same-ground pays the arena search once
 node Auren_Workshop/tools/lanista.js --cleanup                               # kill anything it left behind
 ```
 
@@ -876,6 +891,20 @@ finding:
 
 A high ◹ count means the stance is cell-aligned; re-run from `--at` elsewhere.
 
+### 5b-ter-bis. One behaviour inside a real crew — the test module
+
+`--module <name>` raises the crew as usual, but every time a body would plan, `recursive_judge` hands the turn to
+`action_fragments.js/test_module` instead of `job_board`. The module runs its one test under every rule and reports
+back to the judge; once it has run, the chain ends and the body stands where the test left it.
+
+```
+node start_auren.js --start rollback --soak 0 --only VedaBot --module walk --module-biome jungle
+node monitoring/trace_monitor.js --finder        # [decoration_locates] / [decoration_walks] carry TEST_LOCATE / TEST_WALK
+```
+
+`walk`: the foreman asks the server for the nearest `--module-biome` and the body walks there by the finder's own
+walk (`sector_finder.walkToward`), timed. A run with a module is not judged on walking against working.
+
 ### 5b-quater. Testing one piece of a bot live — `testbot`
 
 > *"read fleet runbook and use testbot. thats how you test individual pieces of bots live"* — Architect,
@@ -883,15 +912,14 @@ A high ◹ count means the stance is cell-aligned; re-run from `--at` elsewhere.
 
 **A `testbot` is a standalone mineflayer client that joins the running server and `require`s the REAL unit
 under test.** It is not a roster entry and never boots `master_core`. **It needs the SERVER only** —
-`node start_auren.js --start continue --crew contractor --soak 0` is the whole bring-up. That independence matters because a fleet bot's
+`node start_auren.js --start continue --test world` is the whole bring-up. That independence matters because a fleet bot's
 login can be bricked by its own playerdata, and then every verb-driven bench is unavailable for a reason
 unrelated to the thing being measured.
 
 ```
-node start_auren.js --start continue --crew contractor --soak 0   # the entire prerequisite
+node start_auren.js --start continue --test world   # the entire prerequisite
 node Auren_Workshop/tools/water_pillar_probe.js                   # scaffold_movement.pillarStep, live
 node Auren_Workshop/tools/combat_drive_probe.js                   # combat_navigator + gunner, live
-node Auren_Workshop/tools/stone_column_probe.js                   # stone_column_scanner's verdict, live
 node Auren_Workshop/tools/build_bench.js <blueprint> [--keep]     # build_executor on any blueprint, ~1 min
 ```
 
@@ -903,13 +931,10 @@ direction and both halves, and a chest, all from one stand). It names no bluepri
 carries no expected count, so it moves with the code. Its header holds why the materials are given rather
 than simulated, and why it stands in for `recursive_judge` in its own process.
 
-**A probe that drives a SCANNER audits the verdict independently or it proves nothing.**
-`stone_column_probe` re-derives every field of the returned column from `bot.blockAt` directly, never
-through the scanner's own voxel reader — sharing the reader would make a reader defect invisible. It
-teleports the body across a spread of terrain (`PROBE_SAMPLES`/`PROBE_SPREAD`, or `PROBE_AT="x,z;x,z"` to
-aim at ocean, swamp or a mountain face) and reports find rate separately from soundness rate: **a high
-find rate with one unsound column is a FAILING result.** It audits every column in the list and
-re-derives the ranking from the rows, because the executor claims down the list until one is free.
+**A probe that drives a SCANNER audits the verdict independently or it proves nothing.** It re-derives every
+field of the scanner's answer from `bot.blockAt` directly, never through the scanner's own voxel reader — sharing
+the reader would make a reader defect invisible — and reports find rate separately from soundness rate: **a high
+find rate with one unsound answer is a FAILING result.**
 
 **The four seams every probe has** (long form:
 `Documentation/Refurbishing planning/live_test_bench_design_note.md`): **connect** the client · **author**
@@ -1108,4 +1133,6 @@ recover it.
 `MinecraftServer/` (it writes `level-name` before launch — a live server cannot be re-pointed). **An
 unknown name makes Minecraft generate a fresh world of that name**, which is how a new test world is born;
 each world keeps its own `rollback.ps1` snapshots. With no `--world`, `fleet_control` runs whatever world
-is already selected.
+is already selected. **A test world stays.** A world or test server a session raised is not a throwaway: it is left
+in place, and up, after the test (Architect, 2026-10-27); a flat world is the one exception. A throwaway helper
+script still goes in the turn that made it.

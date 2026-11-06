@@ -8,7 +8,7 @@ delegates here.
 
 'use strict';
 
-const { group_to_item, furnace_chain_items } = require('@utils/fragment_utils');
+const { group_to_item, furnace_chain_items, agedForms } = require('@utils/fragment_utils');
 
 // assertCountMap validates the shape once per object (Law 13): zero is a legal answer here, so a caller
 // that hands the wrong object gets a confident "holds none", indistinguishable from an empty bag, and
@@ -45,7 +45,7 @@ function countInInventory(token, invCounts, groupMap = group_to_item) {
   const members = !furnace_chain_items.has(token) && groupMap && groupMap[token];   // a smelted item is only itself
   return Array.isArray(members)
     ? members.reduce((sum, m) => sum + (invCounts[m] || 0), 0)
-    : (invCounts[token] || 0);
+    : agedForms(token).reduce((sum, form) => sum + (invCounts[form] || 0), 0);
 }
 
 // craftsAffordable — the same pile, counted in crafts, one variant at a time.

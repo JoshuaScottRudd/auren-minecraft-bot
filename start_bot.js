@@ -46,20 +46,20 @@ const FLAGS = [
   { flag: 'host',     env: 'AUREN_SERVER_HOST',        def: WORLD.host, help: 'server address the bot connects to' },
   { flag: 'port',     env: 'AUREN_SERVER_PORT',        def: String(WORLD.port), help: 'server port' },
   { flag: 'name',     env: 'BOT_ID',                   def: 'AurenBot',  help: "the bot's name in the world" },
-  { flag: 'mode',     env: 'BOT_MODE',                 def: 'homesteader', help: 'homesteader | builder | contractor' },
-  { flag: 'owner',    env: 'BOT_OWNER',                def: null,        help: 'your Minecraft name — REQUIRED for contractor, forbidden for homesteader' },
-  { flag: 'near',     env: 'BOT_START_NEAR',           def: null,        help: 'a player in the world, or a cell written "x y z" — the bot is teleported there and confirmed before it starts working (a contractor uses its owner when this is absent)' },
+  { flag: 'mode',     env: 'BOT_MODE',                 def: 'homesteader', help: 'homesteader | builder' },
+  { flag: 'cell',     env: 'BOT_START_CELL',           def: null,        help: 'a cell written "x y z" — the bot is teleported there and confirmed before it starts working' },
   { flag: 'version',  env: 'AUREN_MINECRAFT_VERSION',  def: null,        help: "the server's Minecraft version (default: 26.1, set in architect_config)" },
   { flag: 'foreman', env: 'FOREMAN_URL',             def: null,        help: 'ws://host:port of a running foreman — omit it and the bot runs alone' },
   // BOT_AUTOSTART is not a flag here: `foreman.js` stamps it into a fetched body's environment, and
-  // `bot_mandate` reads it once at birth. Standing in the world and asking the desk (`foreman get
-  // homesteader`) is the one door to a working bot (Law 16).
+  // `bot_mandate` reads it once at birth. The foreman raising its crew is the one door to a working
+  // bot (Law 16). BOT_HOME_CELL is stamped the same way on a continued crew (get_crew): the alpha structure's cell a
+  // body is put on if it logs in at world spawn (start_injector).
 
-  // Needed only when this bot has somebody to be placed beside (`--near`, or a contractor's owner):
+  // Needed only when this bot has somewhere to be placed (`--cell`):
   // reaching a server console is what a teleport costs. `start_auren.js` carries the same two flags and
-  // proves the link before it opens the desk; here they are simply passed through, because a bot launched
-  // by hand may legitimately have nobody to stand with and then never asks for a console at all.
-  { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', def: null,        help: "your server's rcon.password — required to place this bot beside a player" },
+  // proves the link before it raises the foreman; here they are simply passed through, because a bot launched
+  // by hand may legitimately have no cell and then never asks for a console at all.
+  { flag: 'rcon-password', env: 'AUREN_RCON_PASSWORD', def: null,        help: "your server's rcon.password — required to place this bot on a cell" },
   { flag: 'rcon-port',     env: 'AUREN_RCON_PORT',     def: null,        help: "your server's rcon.port  (default: 25575)" },
 ];
 
@@ -83,14 +83,11 @@ function usage() {
     node start_bot.js --host mc.example.com --name Iris
         a homesteader on somebody else's server.
 
-    node start_bot.js --mode contractor --owner YourMinecraftName
-        a contractor: it hears you in chat and works your orders.
-
   The two species:
-    homesteader   answers to nobody and works its own agenda. It mounts no chat
-                  listener at all, so it does not ignore you — it has no ear.
-    contractor    the same bot with the human channels added. It hears you, takes
-                  your orders, and belongs to the name you pass as --owner.
+    homesteader   answers to nobody and works its own agenda: a headframe, its
+                  mine and a farm. It has no ear: talking to one does nothing.
+    builder       answers to nobody and builds a downloaded building, with the
+                  same mine and farm behind it.
 
   Running more than one bot:
     Start the fleet once (node start_auren.js — the foreman runs inside
@@ -129,9 +126,8 @@ const given = parse(process.argv.slice(2));
 if (given === null) { usage(); process.exit(0); }
 
 // ── Stamping ───────────────────────────────────────────────────────────────────────────────────────────
-// Flag wins, then existing environment, then the default. `owner`, `version` and `foreman` have no
-// default on purpose — an absent one must stay absent, because `bot_mandate` reads the difference between
-// a homesteader with no owner set and a homesteader with an empty owner, and refuses the second.
+// Flag wins, then existing environment, then the default. `version` and `foreman` have no default on
+// purpose — an absent one must stay absent.
 for (const f of FLAGS) {
   const value = given[f.flag] !== undefined ? given[f.flag]
               : process.env[f.env] !== undefined ? process.env[f.env]
@@ -147,16 +143,8 @@ for (const f of FLAGS) {
 // an actionable sentence; the rule itself is not restated or re-implemented.
 const mode = (process.env.BOT_MODE || '').toLowerCase();
 // The foreman raises a builder crew from foreman_config's `crew`, and this launcher is its one birth too.
-if (mode !== 'homesteader' && mode !== 'contractor' && mode !== 'builder') {
-  die(`--mode must be 'homesteader', 'builder' or 'contractor' (got '${process.env.BOT_MODE}').`);
-}
-if (mode === 'contractor' && !process.env.BOT_OWNER) {
-  die("a contractor belongs to somebody: add --owner <YourMinecraftName>.\n"
-    + "  Or start a homesteader instead, which answers to nobody: --mode homesteader");
-}
-if (mode === 'homesteader' && process.env.BOT_OWNER) {
-  die(`a homesteader answers to nobody, so it cannot have --owner '${process.env.BOT_OWNER}'.\n`
-    + "  Drop --owner, or start a contractor instead: --mode contractor");
+if (mode !== 'homesteader' && mode !== 'builder') {
+  die(`--mode must be 'homesteader' or 'builder' (got '${process.env.BOT_MODE}').`);
 }
 
 // ── Third-party packages ───────────────────────────────────────────────────────────────────────────────
@@ -168,7 +156,6 @@ if (mode === 'homesteader' && process.env.BOT_OWNER) {
 require('./js_kernel/utils/node_module_homes').bootstrapModulePath();
 
 console.log(`\n  Auren — starting '${process.env.BOT_ID}' as a ${mode}`
-  + `${process.env.BOT_OWNER ? ` for ${process.env.BOT_OWNER}` : ''}`
   + `\n  connecting to ${process.env.AUREN_SERVER_HOST}:${process.env.AUREN_SERVER_PORT}`
   + `${process.env.FOREMAN_URL ? `\n  foreman: ${process.env.FOREMAN_URL}` : '\n  no foreman — this bot plans alone'}`
   + `\n  everything it does is written to ${path.join(__dirname, 'fleet_logs', 'traces')}\n`);

@@ -1,27 +1,35 @@
-// sapling_planter — a crew replants beside its home structure when a tree harvest ends. Law 15 sub-loop
-// API, sibling to tree_feller / seed_picker; harvest_executor calls plantAfterHarvest(bot) directly (no
-// signal-bus entry point).
+// sapling_planter — a crew plants its build's two woods: one where each tree was felled, and the rest in the home band
+// of its tree farm. Law 15 sub-loop API, sibling to tree_feller / seed_picker; harvest_executor calls
+// plantWhereFelled(bot, felled) directly after each felling, and sapling_plant_executor calls plantFarm(bot) for the
+// chest job (no signal-bus entry point here).
 //
 // ── WHO PLANTS ────────────────────────────────────────────────────────────────────────────────────────
 // A species with a row in architect_config.TREE_FARM. A species with no row plants nothing and its
 // saplings are handled as its stock rows say.
 //
 // ── WHAT IS PLANTED ───────────────────────────────────────────────────────────────────────────────────
-// The primary sapling only: the sapling of the fleet's wood (set_wood_preference), the wood the build is
-// made of. A pocket keeps the row's `keep` of it (pocketRow, read by job_board's whitelist); every other
-// sapling, and the primary past the keep, goes to the waste pit (tossedSaplings, read by waste_pit).
+// The farm saplings: one per build wood (architect_config.BUILD_WOOD, oak and birch), planted in equal numbers so
+// the forest grows back in the two tones the build is made of. A pocket keeps the row's `keep` of each (pocketRow,
+// read by job_board's whitelist) and banks the rest; the chests keep the row's `bank` of each before the composter may
+// have any (compost_executor.bankedCompostables). Every other sapling is banked for the composter. Every tree is
+// felled whatever its species; only these two are planted.
 //
 // ── WHERE ─────────────────────────────────────────────────────────────────────────────────────────────
-// The farm is the ground farther than yard_clear blocks from the home structure's footprint, on the three
-// sides that do not face the row's `away_from` structure: the layers read `away_from`, home, clear ground, farm.
-// A planting cell is a point of a grid `spacing` blocks apart counted from the home's corner, so the farm
-// stands in rows a body walks between. A body claims a cell (`sapling:x,z`, target_claims) before it walks
-// to it and releases it once the cell is planted or given up, so each cell has one planter. A cell qualifies when its ground is dirt or grass under open sky,
-// no other building's footprint holds it, and no sapling or trunk stands within `spacing` of it.
+// Never within GATHER_KEEPOUT of a sited footprint (the lights box included), never past GATHER_REACH of home
+// (perception_nodes/tree_farm_ground owns the farm's geometry and what a cell holds).
+//   - plantWhereFelled: after each felling outside the keep-out, the harvester plants ONE farm sapling where the tree
+//     stood, so the forest it takes from stays as it was and never grows thicker. The rest it carries rides home and
+//     is banked.
+//   - plantFarm: the chest job plants the home band's open cells nearest home first. Which cells are open, and
+//     whether the band has reached TREE_FARM.saturation, is the integrity keeper's map (the `tree_farm` verdict); a
+//     body with no foreman reads the band itself, nearest first. At the target nothing is planted.
+// A body claims a cell (`sapling:x,z`, target_claims) before it walks to it and releases it once the cell is planted or
+// given up, so each cell has one planter. The cell is read again by the body before the claim and on arrival
+// (Invariant B); a cell that does not qualify or could not be planted is refused by this body for REFUSAL_MS.
 //
 // ── HOW MUCH ──────────────────────────────────────────────────────────────────────────────────────────
-// One harvest plants at most `plantings` saplings, nearest cell first, in cells no farther than `search`
-// blocks from where the harvest ended. No cell inside that distance: nothing is planted and no walk is made.
+// A felling plants one. The chest job plants every farm sapling it took out (plantingTrip: up to `batch`, both woods
+// alike), alternating so neither tone runs ahead.
 //
 // Returns { planted, reason } — reason names why nothing more was planted, null when the limit was reached.
 
@@ -34,129 +42,99 @@ const { performDig } = require('@utils/movement/dig_authority');
 const { classifyFloor } = require('@utils/movement/terrain_predicates');
 const { group_to_item } = require('@utils/fragment_utils');
 const { claimFirst, releaseTarget } = require('@utils/target_claims');
+const ground = require('@perception/tree_farm_ground');
 
 const TAG = 'sapling_planter';
 
-// A dark oak grows only as four saplings in a square, so it is never the primary.
+// A dark oak grows only as four saplings in a square, so it is never a farm sapling.
 const SINGLE_SAPLINGS = (group_to_item.saplings || []).filter(n => n !== 'dark_oak_sapling');
-const PLANTABLE = new Set(['dirt', 'grass_block', 'coarse_dirt', 'podzol']);
-const AIR = new Set(['air', 'cave_air', 'void_air']);
-const TUFT = /^(short_grass|tall_grass|fern)$/;       // dug out of the cell before the sapling goes in
-const LEAF = /(.*_)?leaves$/;
-const TRUNK_OR_SAPLING = /(.*_)?log$|_sapling$/;
+const { PLANTABLE, TUFT } = ground;
 const SKY_ABOVE = 8;        // open cells a column is read through above the body's feet
 const GROUND_BELOW = 8;     // and how far under them its ground is looked for
-const TRUNK_BAND = { below: 1, above: 3 };   // the heights round a cell's ground a neighbouring trunk is read at
-const MISS_LIMIT = 3;       // cells one harvest may walk to and fail at
+const BAND_SKY = 24;        // a body with no foreman reads the band this far over and under the home's origin, as the keeper does
+const MISS_LIMIT = 3;       // cells one planting may walk to and fail at
+// A refused cell stays so this long (Law 8: module memory, bounded on write). A sapling takes minutes to grow and a
+// cleared bank or a felled trunk opens ground again, so the refusal lapses.
+const REFUSAL_MS = 5 * 60 * 1000;
+const _refused = new Map();   // cell key → when refused
+function refuse(key, now) {
+  _refused.set(key, now);
+  for (const [k, at] of _refused) if (now - at > REFUSAL_MS) _refused.delete(k);
+}
+const isRefused = (key, now) => _refused.has(key) && now - _refused.get(key) <= REFUSAL_MS;
 const EIGHT = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
-// NO SAPLING NEAR LAVA OR WATER. Lava sets fire to what burns near it, and a grown tree's canopy reaches a few
-// blocks out from its trunk, so a sapling planted beside surface lava becomes a forest fire that spreads tree to
-// tree. The clearance is the canopy plus lava's reach; water keeps a sapling off a bank. Read in a band round the
-// sapling's ground, from below it to the height of a grown crown.
-const FLUID_CLEAR = { lava: 8, water: 2 };
-const FLUID_BAND = { below: 2, above: 6 };
-// One claim key per grid cell (foreman_brain OBJECT_KEY_PREFIXES), asked through target_claims.
+// One claim key per cell (foreman_brain OBJECT_KEY_PREFIXES), asked through target_claims.
 const KEY_PREFIX = 'sapling:';
 const keyOfCell = c => `${KEY_PREFIX}${c.x},${c.z}`;
+const OPEN_LIST = 64;       // the open cells a body with no foreman reads before it stops, as the keeper lists them
 
-// This species' TREE_FARM row, or null for a species that does not replant.
+// The TREE_FARM row.
 function farmRow() {
-  const { TREE_FARM } = require('@thinking/architect_config');
-  return TREE_FARM[require('@kernel/bot_mandate').currentMode()] || null;
+  return require('@thinking/architect_config').TREE_FARM;
 }
 
-// The one sapling this crew plants and keeps, or null: no farm row, no wood chosen yet, or a wood whose
-// sapling does not grow alone.
-function primarySapling() {
-  if (!farmRow()) return null;
-  const pref = require('@action/set_wood_preference').readWoodPreference();
-  const name = pref && pref.species ? `${String(pref.species).replace(/_log$/, '')}_sapling` : null;
-  return name && SINGLE_SAPLINGS.includes(name) ? name : null;
+// The saplings this crew plants and keeps, primary first: one per build wood whose sapling grows alone.
+function farmSaplings() {
+  const { BUILD_WOOD } = require('@thinking/architect_config');
+  return [BUILD_WOOD.primary, BUILD_WOOD.accent].map(w => `${w}_sapling`).filter(n => SINGLE_SAPLINGS.includes(n));
 }
 
-// The pocket row that keeps the primary sapling, as a list of none or one. It stands ahead of the
-// `saplings` group row in the whitelist, so the primary answers to it and the group row to the rest.
+// The pocket rows that keep the farm saplings. They stand ahead of the `saplings` group row in the whitelist, so
+// each farm sapling answers to its own row and the group row to the rest.
 function pocketRow() {
-  const primary = primarySapling();
-  return primary ? [{ item: primary, dump_threshold: farmRow().keep }] : [];
+  return farmSaplings().map(item => ({ item, dump_threshold: farmRow().keep }));
 }
 
-// The saplings whose surplus is trash for this crew: every one of them once a primary is known.
-function tossedSaplings() {
-  return primarySapling() ? [...(group_to_item.saplings || [])] : [];
+// bankKept(name) → how many of a sapling the chests keep for the farm before the composter may have any: the row's
+// `bank` for a farm sapling, 0 for any other.
+function bankKept(name) {
+  return farmSaplings().includes(name) ? farmRow().bank : 0;
 }
 
-// The farm's ground, or null before the home and the `away_from` structure are both sited.
+// zone() → the farm (tree_farm_ground.farmOf: cells, band, start, gapOf, outsideKeepout) with `origin`, or null before
+// the home structure is sited. Read again only when the sited footprints change.
+let _zone = null;   // { sig, zone }
 function zone() {
   const row = farmRow();
-  if (!row) return null;
   const { buildingRoomKey, homeBlueprint } = require('@kernel/bot_mandate');
+  const { GATHER_KEEPOUT, GATHER_REACH } = require('@thinking/architect_config');
   const boxes = require('@action/find_buildingspot').getExistingFootprints(0);
   const home = boxes.find(b => b.key === buildingRoomKey(homeBlueprint()));
-  const away = boxes.find(b => b.key === buildingRoomKey(row.away_from));
-  if (!home || !away) return null;
-  // The side of the home that faces `away_from`, along the axis the two lie farthest apart on.
-  const dx = (home.minX + home.maxX) / 2 - (away.minX + away.maxX) / 2;
-  const dz = (home.minZ + home.maxZ) / 2 - (away.minZ + away.maxZ) / 2;
-  const axis = Math.abs(dx) >= Math.abs(dz) ? 'x' : 'z';
-  const sign = (axis === 'x' ? dx : dz) >= 0 ? 1 : -1;
-  const edge = axis === 'x' ? (sign > 0 ? home.minX : home.maxX) : (sign > 0 ? home.minZ : home.maxZ);
-  const others = boxes.filter(b => b !== home);
-  const mod = (n, m) => ((n % m) + m) % m;
-
-  // inFarm — true for a column past the clear ground that is a grid point and is no other building's ground.
-  function inFarm(x, z) {
-    if (sign * ((axis === 'x' ? x : z) - edge) < 0) return false;
-    const gap = Math.max(home.minX - x, x - home.maxX, home.minZ - z, z - home.maxZ, 0);
-    if (gap <= row.yard_clear) return false;
-    if (mod(x - home.minX, row.spacing) !== 0 || mod(z - home.minZ, row.spacing) !== 0) return false;
-    const g = row.building_gap;
-    return !others.some(b => x >= b.minX - g && x <= b.maxX + g && z >= b.minZ - g && z <= b.maxZ + g);
-  }
-  return { row, inFarm };
+  if (!home) return null;
+  const origin = require('@utils/fragment_utils').readTransposeOrigin(homeBlueprint());
+  if (!origin) return null;
+  const sig = JSON.stringify([boxes, origin, row]);
+  if (_zone && _zone.sig === sig) return _zone.zone;
+  const z = { ...ground.farmOf({ boxes, home, origin, row, keepout: GATHER_KEEPOUT, reach: GATHER_REACH }), origin };
+  _zone = { sig, zone: z };
+  return z;
 }
 
-// The y of a column's ground when a sapling can stand on it, or null: the column is read down through
-// open sky from above the body's feet, and the first block met must be plantable.
+const readerOf = (bot) => (x, y, z) => bot.blockAt(new Vec3(x, y, z));
+
+// band(bot, farm) → { full, saturation, open_cells }: the home band as the integrity keeper's `tree_farm` verdict
+// keeps it, or, for a body with no foreman, read by this body nearest first until OPEN_LIST open cells are found.
+function band(bot, farm) {
+  const verdicts = require('@kernel/keeper_verdicts');
+  if (verdicts.required()) {
+    const v = verdicts.get('tree_farm');
+    if (!v || !v.sited) return { full: true, saturation: null, open_cells: [] };
+    return { full: v.full, saturation: v.saturation, open_cells: v.open_cells };
+  }
+  const at = readerOf(bot), y = Math.floor(farm.origin.y);
+  const open = [];
+  for (const c of farm.band) {
+    if (open.length >= OPEN_LIST) break;
+    const r = ground.cellState(at, c, y + BAND_SKY, y - BAND_SKY, farm.row.spacing);
+    if (r.state === 'open') open.push({ x: c.x, y: r.y, z: c.z, gap: c.gap });
+  }
+  return { full: open.length === 0, saturation: null, open_cells: open };
+}
+
+// groundOf — the y of a column's ground a sapling can stand on, read round the body's feet, or null.
 function groundOf(bot, x, z, feetY) {
-  for (let y = feetY + SKY_ABOVE; y >= feetY - GROUND_BELOW; y--) {
-    const b = bot.blockAt(new Vec3(x, y, z));
-    if (!b) return null;
-    if (AIR.has(b.name) || LEAF.test(b.name) || TUFT.test(b.name)) continue;
-    if (y === feetY + SKY_ABOVE || !PLANTABLE.has(b.name)) return null;
-    const over = bot.blockAt(new Vec3(x, y + 1, z));
-    return over && (AIR.has(over.name) || TUFT.test(over.name)) ? y : null;
-  }
-  return null;
-}
-
-// True when a sapling or a trunk stands within `spacing` of the column, centre to centre.
-function crowded(bot, x, groundY, z, spacing) {
-  for (let dx = -(spacing - 1); dx < spacing; dx++) {
-    for (let dz = -(spacing - 1); dz < spacing; dz++) {
-      for (let y = groundY - TRUNK_BAND.below; y <= groundY + TRUNK_BAND.above; y++) {
-        const b = bot.blockAt(new Vec3(x + dx, y, z + dz));
-        if (b && TRUNK_OR_SAPLING.test(b.name)) return true;
-      }
-    }
-  }
-  return false;
-}
-
-// The fluid within its clearance of the column, or null (FLUID_CLEAR).
-function nearFluid(bot, x, groundY, z) {
-  const reach = Math.max(...Object.values(FLUID_CLEAR));
-  for (let dx = -reach; dx <= reach; dx++) {
-    for (let dz = -reach; dz <= reach; dz++) {
-      const far = Math.max(Math.abs(dx), Math.abs(dz));
-      for (let y = groundY - FLUID_BAND.below; y <= groundY + FLUID_BAND.above; y++) {
-        const b = bot.blockAt(new Vec3(x + dx, y, z + dz));
-        if (!b) continue;
-        for (const [fluid, clear] of Object.entries(FLUID_CLEAR)) if (far <= clear && b.name === fluid) return fluid;
-      }
-    }
-  }
-  return null;
+  const y = ground.groundOf(readerOf(bot), x, z, feetY + SKY_ABOVE, feetY - GROUND_BELOW);
+  return y === 'unknown' ? null : y;
 }
 
 // The feet cell a body plants `cell` from: one of the eight columns round it whose floor is level with the
@@ -182,88 +160,153 @@ function pocketCount(bot, name) {
   return bot.inventory.items().filter(i => i.name === name).reduce((n, i) => n + i.count, 0);
 }
 
-// plantAfterHarvest — called where a tree harvest ended. Plants the primary sapling in the farm cells
-// nearest the body, within the row's two limits.
-async function plantAfterHarvest(bot) {
-  const primary = primarySapling();
-  if (!primary) return { planted: 0, reason: 'no_primary_sapling' };
+// plantWhereFelled(bot, felled) — called after each felling ({ position, species }, tree_feller.fell's result). Where
+// the tree stood outside the keep-out, the harvester plants one farm sapling: the felled wood's own when it is a farm
+// wood and held, else the farm sapling it holds most of. Everything else it carries rides home.
+async function plantWhereFelled(bot, felled) {
+  const saplings = farmSaplings();
+  if (!saplings.length) return { planted: 0, reason: 'no_farm_sapling' };
   const farm = zone();
   if (!farm) return { planted: 0, reason: 'farm_not_sited' };
-  const { row } = farm;
-  const held = pocketCount(bot, primary);
-  if (held === 0) return { planted: 0, reason: 'no_sapling_in_pocket' };
+  const p = felled && felled.position;
+  if (!p || !farm.outsideKeepout(p.x, p.z)) return { planted: 0, reason: 'inside_keepout' };
+  const own = typeof felled.species === 'string' ? felled.species.replace(/_(log|wood)$/, '_sapling') : null;
+  const held = saplings.filter(n => pocketCount(bot, n) > 0).sort((a, b) => pocketCount(bot, b) - pocketCount(bot, a));
+  const sapling = held.includes(own) ? own : held[0];
+  if (!sapling) return { planted: 0, reason: 'no_sapling_in_pocket' };
+  const cells = [{ x: p.x, z: p.z, gap: farm.gapOf(p.x, p.z), ring: 0 }];
+  return plantCells(bot, farm, cells, { [sapling]: 1 }, 'felled', Date.now());
+}
 
+// plantFarm — the chest job's planting: every farm sapling in the pocket, alternating, into the home band's open cells
+// nearest home, until the band reaches its saturation.
+async function plantFarm(bot) {
+  const saplings = farmSaplings();
+  if (!saplings.length) return { planted: 0, reason: 'no_farm_sapling' };
+  const farm = zone();
+  if (!farm) return { planted: 0, reason: 'farm_not_sited' };
+  const quota = Object.fromEntries(saplings.map(n => [n, pocketCount(bot, n)]));
+  if (Object.values(quota).every(q => q === 0)) return { planted: 0, reason: 'no_sapling_in_pocket' };
   const startedAt = Date.now();
-  const start = bot.entity.position.clone();
-  const feetY = Math.floor(start.y);
-  const sx = Math.floor(start.x), sz = Math.floor(start.z);
-  // The grid points of the farm inside the search distance, read once from where the harvest ended.
-  const cells = [];
-  for (let x = sx - row.search; x <= sx + row.search; x++) {
-    for (let z = sz - row.search; z <= sz + row.search; z++) {
-      if ((x - sx) ** 2 + (z - sz) ** 2 > row.search ** 2 || !farm.inFarm(x, z)) continue;
-      cells.push({ x, z });
-    }
-  }
-  if (!cells.length) return { planted: 0, reason: 'no_farm_cell_in_reach' };
+  const b = band(bot, farm);
+  if (b.full) return { planted: 0, reason: 'band_saturated' };
+  const cells = b.open_cells.filter(c => !isRefused(keyOfCell(c), startedAt))
+    .map(c => ({ x: c.x, z: c.z, gap: c.gap, ring: Math.floor((c.gap - farm.start) / farm.row.ring) }));
+  if (!cells.length) return { planted: 0, reason: 'no_open_cell' };
+  return plantCells(bot, farm, cells, quota, 'job', startedAt);
+}
 
+// plantCells(bot, farm, cells, quota, via, startedAt) — plants up to `quota` of each farm sapling in `cells`, ring by
+// ring from ring 0, and says what it did on the PLANTED line.
+async function plantCells(bot, farm, cells, quota, via, startedAt) {
+  const saplings = farmSaplings();
+  const { row } = farm;
+  const at = readerOf(bot);
+  const held = () => saplings.reduce((n, s) => n + pocketCount(bot, s), 0);
+  const heldBefore = held();
+  const feetY = Math.floor(bot.entity.position.y);
+  const rings = Math.max(...cells.map(c => c.ring));
   const locomotion = require('@locomotion/locomotion_dispatcher');
   const spent = new Set();
   const plantedAt = [];
+  const plantedOf = Object.fromEntries(saplings.map(n => [n, 0]));
   let misses = 0, peerHeld = 0, walked = 0, noStand = 0, nearLava = 0, nearWater = 0, reason = null;
+  // A cell no body can plant is refused for REFUSAL_MS; a cell this planting walked to is passed for the planting.
+  const pass = (c) => { spent.add(keyOfCell(c)); refuse(keyOfCell(c), Date.now()); return true; };
   // A cell this body cannot use is passed before any claim is asked for, and its ground is read then.
   const unusable = (c) => {
     if (spent.has(keyOfCell(c))) return true;
     const groundY = groundOf(bot, c.x, c.z, feetY);
-    if (groundY === null || crowded(bot, c.x, groundY, c.z, row.spacing)) { spent.add(keyOfCell(c)); return true; }
-    const fluid = nearFluid(bot, c.x, groundY, c.z);
-    if (fluid) { if (fluid === 'lava') nearLava++; else nearWater++; spent.add(keyOfCell(c)); return true; }
+    if (groundY === null || ground.crowded(at, c.x, groundY, c.z, row.spacing)) return pass(c);
+    const fluid = ground.nearFluid(at, c.x, groundY, c.z);
+    if (fluid) { if (fluid === 'lava') nearLava++; else nearWater++; return pass(c); }
     c.y = groundY + 1;
     // A cell no body can stand beside is passed like a cell with no ground: no claim and no walk.
     c.stand = standBeside(bot, c);
-    if (!c.stand) { noStand++; spent.add(keyOfCell(c)); return true; }
+    if (!c.stand) { noStand++; return pass(c); }
     return false;
   };
   const approach = async (c) => {
-    spent.add(keyOfCell(c));   // one walk at a cell per harvest, reached or not
+    spent.add(keyOfCell(c));   // one walk at a cell per planting, reached or not
     const stand = c.stand;
     const from = bot.entity.position.clone();
     const nav = await locomotion.goTo({ x: stand.x, y: stand.y, z: stand.z, exact: true, leg: 'work' });
     walked += Math.hypot(bot.entity.position.x - from.x, bot.entity.position.z - from.z);
+    if (!(nav && nav.arrived)) refuse(keyOfCell(c), Date.now());
     return { ok: !!(nav && nav.arrived), reason: 'path_failed' };
   };
-  while (plantedAt.length < row.plantings) {
-    if (pocketCount(bot, primary) === 0) { reason = 'pocket_empty'; break; }
+  // The sapling planted next: the one with the most of its share still to plant, the primary on a tie.
+  const nextSapling = () => saplings.filter(n => quota[n] > 0 && pocketCount(bot, n) > 0)
+    .sort((a, b) => quota[b] - quota[a])[0] || null;
+  let ring = 0;
+  while (ring <= rings) {
+    const sapling = nextSapling();
+    if (!sapling) break;
     if (misses >= MISS_LIMIT) { reason = 'cells_unreachable'; break; }
-    // Nearest first from where the body stands now. The cell is claimed before the walk, so one body
-    // walks to it and plants it (Invariant A); the grid keeps two claimed cells a full spacing apart.
+    // Inside the ring, nearest the yard first, and among cells as near, nearest the body. The cell is claimed
+    // before the walk, so one body walks to it and plants it (Invariant A).
     const here = bot.entity.position;
-    const order = cells.filter(c => !spent.has(keyOfCell(c)))
-      .sort((p, q) => ((p.x - here.x) ** 2 + (p.z - here.z) ** 2) - ((q.x - here.x) ** 2 + (q.z - here.z) ** 2));
+    const order = cells.filter(c => c.ring === ring && !spent.has(keyOfCell(c)))
+      .sort((p, q) => (p.gap - q.gap)
+        || (((p.x - here.x) ** 2 + (p.z - here.z) ** 2) - ((q.x - here.x) ** 2 + (q.z - here.z) ** 2)));
     const walk = await claimFirst(order, { keyOf: keyOfCell, skip: unusable, approach, maxUnreachable: MISS_LIMIT - misses });
     for (const key of walk.peerHeldKeys) spent.add(key);
     peerHeld += walk.peerHeld;
     misses += walk.unreachable;
-    if (!walk.pick) { reason = misses >= MISS_LIMIT ? 'cells_unreachable' : (walk.peerHeld ? 'cells_held_by_peers' : 'no_open_cell'); break; }
+    if (!walk.pick) { ring++; continue; }   // this ring holds no open cell: the next ring out
     spent.add(walk.key);
     const pick = new Vec3(walk.pick.x, walk.pick.y, walk.pick.z);
 
     // The cell is read again on arrival (Invariant B): the ground it was chosen for may have changed during the walk.
-    const ground = bot.blockAt(pick.offset(0, -1, 0));
+    const under = bot.blockAt(pick.offset(0, -1, 0));
     const inCell = bot.blockAt(pick);
-    const open = ground && PLANTABLE.has(ground.name) && !crowded(bot, pick.x, pick.y - 1, pick.z, row.spacing)
+    const open = under && PLANTABLE.has(under.name) && !ground.crowded(at, pick.x, pick.y - 1, pick.z, row.spacing)
       && (!inCell || !TUFT.test(inCell.name) || await performDig(bot, pick, inCell, TAG));
     if (open) {
-      const place = await performPlace(bot, pick, ground, new Vec3(0, 1, 0), primary, TAG);
+      const place = await performPlace(bot, pick, under, new Vec3(0, 1, 0), sapling, TAG);
       const after = bot.blockAt(pick);
-      if (after && after.name === primary) plantedAt.push(`${pick.x},${pick.y},${pick.z}`);
-      else { misses++; watcher.warn(TAG, `PLANT_MISSED cell=(${pick.x},${pick.y},${pick.z}) sapling=${primary} reason=${place.reason || 'the cell does not hold the sapling'}`); }
+      if (after && after.name === sapling) { plantedAt.push(`${pick.x},${pick.y},${pick.z}`); quota[sapling]--; plantedOf[sapling]++; }
+      else { misses++; refuse(walk.key, Date.now()); watcher.warn(TAG, `PLANT_MISSED cell=(${pick.x},${pick.y},${pick.z}) sapling=${sapling} reason=${place.reason || 'the cell does not hold the sapling'}`); }
     }
     releaseTarget(walk.keys);
   }
+  if (reason === null && nextSapling()) reason = 'no_open_cell';
 
-  watcher.summary(TAG, `PLANTED n=${plantedAt.length} of=${row.plantings} sapling=${primary} pocket=${pocketCount(bot, primary)} held_before=${held} grid_cells_in_reach=${cells.length} peer_held=${peerHeld} misses=${misses} no_stand=${noStand} near_lava=${nearLava} near_water=${nearWater} walk=${Math.round(walked)} ms=${Date.now() - startedAt} stopped=${reason || 'limit'}${plantedAt.length ? ` cells=${plantedAt.join(' ')}` : ''}`);
+  const split = saplings.map(n => `${n}:${plantedOf[n]}`).join(',');
+  const of = Object.values(quota).reduce((n, q) => n + q, 0) + plantedAt.length;
+  watcher.summary(TAG, `${via} PLANTED n=${plantedAt.length} of=${of} sapling=${split} pocket=${held()} held_before=${heldBefore} grid_cells_in_reach=${cells.length} peer_held=${peerHeld} misses=${misses} no_stand=${noStand} near_lava=${nearLava} near_water=${nearWater} walk=${Math.round(walked)} ms=${Date.now() - startedAt} stopped=${reason || 'limit'}${plantedAt.length ? ` cells=${plantedAt.join(' ')}` : ''}`);
   return { planted: plantedAt.length, reason };
 }
 
-module.exports = { plantAfterHarvest, primarySapling, pocketRow, tossedSaplings, zone, TAG };
+// openCell(bot, farm) → the home band's open cell nearest home that this body has not refused, or null while the band
+// is at its saturation (band).
+function openCell(bot, farm) {
+  const b = band(bot, farm);
+  if (b.full) return null;
+  const now = Date.now();
+  return b.open_cells.find(c => !isRefused(keyOfCell(c), now)) || null;
+}
+
+// farmStand(bot, farm) → the open cell nearest home, where the chest job walks before it plants (a cell's ground is
+// read round the body's feet), or null when the band has none.
+function farmStand(bot, farm) {
+  const c = openCell(bot, farm);
+  return c ? { x: c.x, y: c.y, z: c.z } : null;
+}
+
+// plantingTrip(banked) → [{ name, count }] the chest job takes out: up to `batch` farm saplings, the two woods in turn
+// so neither runs ahead, of what the chests hold (`banked`, name → count).
+function plantingTrip(banked) {
+  const row = farmRow();
+  const take = Object.fromEntries(farmSaplings().map(n => [n, 0]));
+  let left = row.batch;
+  for (let added = true; left > 0 && added;) {
+    added = false;
+    for (const n of Object.keys(take)) {
+      if (left > 0 && take[n] < (banked[n] || 0)) { take[n]++; left--; added = true; }
+    }
+  }
+  return Object.entries(take).filter(([, c]) => c > 0).map(([name, count]) => ({ name, count }));
+}
+
+module.exports = { plantWhereFelled, plantFarm, openCell, farmStand, plantingTrip, farmSaplings, pocketRow, bankKept, zone, TAG };

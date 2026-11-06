@@ -47,8 +47,10 @@ const ROSTER = Object.keys(BOT_SENIORITY).sort((a, b) => BOT_SENIORITY[a] - BOT_
 // through. 'fleet-console' is included so `down` reaps that read-only observer window too.
 const FLEET_PROCESSES = ['trace', 'fleet-console', ...ROSTER, 'foreman'];
 const FLEET_PROCESSES_WITH_SERVER = [...FLEET_PROCESSES, 'server'];
-const SERVER_PORT = 25565;
-const FOREMAN_PORT_DEFAULT = 3001;
+// The foreman's port: FOREMAN_PORT when set, else the pair the run up in this copy took (port_book reads it off
+// the run lock start_auren.js writes), else the usual 3001.
+const FOREMAN_PORT_DEFAULT = Number(process.env.FOREMAN_PORT)
+  || require('../js_kernel/utils/port_book').runForemanPort() || 3001;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -69,6 +71,16 @@ const WORLD = opt('world', null);
 // server folder come from the workstation resolver, asked only when a command needs them.
 const workstation = require(paths.bot('js_kernel/utils/workstation'));
 function serverDir() { return workstation.needServerDir(); }
+
+// The game port is this fleet's own server's `server-port`, so a status, down or takeover probes and
+// kills only the server this tree runs, never another fleet's on the same machine. Minecraft's default
+// 25565 when no server folder is found.
+const SERVER_PORT = (() => {
+  const dir = workstation.findServerDir().dir;
+  const file = dir && path.join(dir, 'server.properties');
+  const m = file && fs.existsSync(file) && /^server-port=(\d+)\s*$/m.exec(fs.readFileSync(file, 'utf8'));
+  return m ? Number(m[1]) : 25565;
+})();
 
 // Both module-home questions go to @utils/node_module_homes — one list, two verbs off it (Law 16).
 const moduleHomes = require(paths.bot('js_kernel/utils/node_module_homes'));
@@ -357,15 +369,38 @@ async function sendVerb(verb, args = {}) {
     return false;
   }
   const WebSocket = requireWs();
-  const { createEnvelope } = require(paths.bot('foreman/message_schema'));
+  const { createEnvelope, parseEnvelope } = require(paths.bot('foreman/message_schema'));
+  // The verb names this copy, so a foreman of another copy on a guessed port refuses it; --deliberate addresses
+  // another copy's fleet on purpose.
+  const copy = path.resolve(__dirname, '..');
   const sent = await new Promise((resolve) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    let settled = false;
+    const finish = (ok) => { if (!settled) { settled = true; ws.close(); resolve(ok); } };
     ws.on('open', () => {
-      ws.send(JSON.stringify(createEnvelope('operator_command', 'fleet_control', { verb, args })));
-      // The foreman answers nothing on this path; give the send a beat to land, then leave.
-      setTimeout(() => { ws.close(); console.log(`verb: '${verb}' sent to foreman.`); resolve(true); }, 500);
+      ws.send(JSON.stringify(createEnvelope('operator_command', 'fleet_control', { verb, args, copy, deliberate: has('deliberate') })));
+      // An older foreman answers nothing on this path: past the wait, the send is reported as delivered.
+      setTimeout(() => { console.log(`verb: '${verb}' sent to foreman (no answer read).`); finish(true); }, verb.startsWith('camera-') ? 10000 : 2000);
     });
-    ws.on('error', (e) => { console.error(`verb: socket error — ${e.message}`); resolve(false); });
+    ws.on('message', (raw) => {
+      const parsed = parseEnvelope(raw.toString());
+      if (!parsed.ok || parsed.msg.type !== 'command_result') return;
+      const reason = parsed.msg.payload && parsed.msg.payload.reason;
+      if (parsed.msg.payload && parsed.msg.payload.said) {
+        console.log(`verb: '${verb}': ${parsed.msg.payload.said}.`);
+        finish(reason !== 'camera_refused');
+        return;
+      }
+      if (reason === 'other_copy') {
+        console.error(`verb: REFUSED — the foreman on port ${port} belongs to ${parsed.msg.payload.copy}, not this copy (${copy}). `
+          + `Nothing was sent to its bots. To command that fleet on purpose, add --deliberate.`);
+        finish(false);
+        return;
+      }
+      console.log(`verb: '${verb}' sent to foreman${reason ? ` (${reason})` : ''}.`);
+      finish(true);
+    });
+    ws.on('error', (e) => { console.error(`verb: socket error — ${e.message}`); finish(false); });
   });
   if (!sent) return false;
 
@@ -569,7 +604,11 @@ async function down() {
   // The foreman takes its own run down: `shutdown` sends its bots home, stops and saves the world it
   // started, and exits — proved by its port going quiet. What is left after it is `serverStop`'s job.
   if (await probePort(port)) {
-    await sendVerb('shutdown');
+    // A foreman of another copy refuses the shutdown, and nothing else of that fleet is touched here.
+    if (!(await sendVerb('shutdown'))) {
+      console.error('down: the foreman did not take the shutdown — stopping here; no process or server was touched.');
+      return false;
+    }
     const gone = await waitFor(`the foreman to finish its shutdown (port ${port} closes)`,
       async () => !(await probePort(port)), SHUTDOWN_WAIT_MS + 60000, 2000);
     console.log(gone ? 'down: the foreman shut its run down.' : 'down: ⚠ the foreman is still answering — continuing with what is left.');
@@ -774,8 +813,8 @@ async function takeover() {
 
 // ── Configuration and bring-up live elsewhere ───────────────────────────────
 // One way to run the fleet and one way to configure it (Law 16): `run_config.js` authors every setting
-// before anything starts, and `run.js` reads it once and performs the whole run, raising bots through the
-// foreman's desk like any other player. What lives here is the plumbing: `snapshot`, `clock`, `down`,
+// before anything starts, and `run.js` reads it once and performs the whole run, the foreman raising the
+// crew its run page names. What lives here is the plumbing: `snapshot`, `clock`, `down`,
 // `status`, `rcon`, `memory-wipe`, `verb`. `runScript` survives only because `stopAnyRecording` uses it.
 const SCRIPTS_DIR = paths.workshop('scripts');
 
@@ -817,7 +856,9 @@ async function worldSpawn(worldName) {
     // through.
     'verb': () => (positional[0] === 'start' && !opt('bot'))
       ? startStaggered()
-      : sendVerb(positional[0], opt('bot') ? { bot: opt('bot') } : {}),
+      : sendVerb(positional[0], positional[0].startsWith('camera-')
+        ? { number: opt('number') || positional[1], seat: opt('seat') }
+        : opt('bot') ? { bot: opt('bot') } : {}),
     // Cold and offline; pairing this with a world restore is enforced by the caller that owns both
     // halves, since only it knows which world is being restored.
     'memory-wipe': () => wipeMemory(),

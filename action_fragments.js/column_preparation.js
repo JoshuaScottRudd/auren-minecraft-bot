@@ -34,7 +34,7 @@ const hq = require('@kernel/corporate_headquarters');
 const planRegistry = require('@kernel/downloaded_plan_registry');
 const inventorySwapper = require('@api/inventory_swapper');
 const { craftBatch } = require('@api/craft_handler');
-const { remainingRawInSpecies, isRawMaterial, isChainOwned } = require('@utils/calculators/build_material_calculator');
+const { remainingRawInSpecies, madeIngredients, isRawMaterial, isChainOwned } = require('@utils/calculators/build_material_calculator');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const { buildPoolChests, chestItemCounts, getBotInventory, sleep, group_to_item } = require('@utils/fragment_utils');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
@@ -77,7 +77,7 @@ module.exports = {
 
     const row = hq.readBuildingChair(structure, 'set_buildspot');
     const frame = planRegistry.siteFrame(row);
-    if (!frame.wood) return routeIdle(`"${structure}" has no wood decided yet — the column waits on the fleet's wood preference`);
+    if (!frame.wood) return routeIdle(`"${structure}" has no wood — its plan names none`);
 
     const column = planRegistry.columns().find(c => c.column === index);
     const anchor = planRegistry.anchors()[magnet?.anchor_index];
@@ -87,7 +87,8 @@ module.exports = {
 
     // The same question the assessor asked before it posted this cube (Law 16).
     const { cubeMaterials, trashOf, endsColumn } = require('@thinking/assessors/downloaded_build');
-    const need = await cubeMaterials(bot, frame, column, anchor, await endsColumn(bot, frame, column, { anchor, seal: false }));
+    // A basement cell's own trip carries no cube and spends what it digs (assessors/downloaded_build.cellJobs).
+    const need = magnet.cell_only ? {} : await cubeMaterials(bot, frame, column, anchor, await endsColumn(bot, frame, column, { anchor, seal: false }));
     // The chests are read fresh at every use: a peer's update replaces a station's entry, so a list kept from
     // the start of the trip would go on reading a chest as it was.
     const chestsNow = () => buildPoolChests(structure);
@@ -101,7 +102,7 @@ module.exports = {
     // ── THE TRIP'S WHOLE BILL, THE CUBE AND ITS TRASH, IS PRICED BEFORE ANYTHING IS TAKEN OR MADE ────────
     // trash.shortWith is the question the board posted this cube on (Law 16), asked of the pool now and,
     // once the withdrawals are in, of the pocket alone. A craft starts only on a pocket that covers both.
-    const trashNeed = trashOf(bot, frame, anchor);
+    const trashNeed = magnet.cell_only ? 0 : trashOf(bot, frame, anchor);
     const billShort = holdings => trash.shortWith(need, trashNeed, holdings, frame.wood);
     const listOf = short => Object.entries(short).map(([raw, n]) => `${raw}:${n}`).join(', ');
     const ledger = require('@perception/chest_ledger');
@@ -121,6 +122,11 @@ module.exports = {
     const unpaid = priced();
     if (unpaid) return notStaged(unpaid);
 
+    // ── THE TRIP'S TORCHES, MADE BEFORE THE POCKET IS PRICED ─────────────────────────────────────────────
+    // The body hangs its basement cell's torch (build_column_executor.digBasementCell). It goes with what it has when
+    // no fuel or wood can be had: a lighting visit takes the rest.
+    if (await require('@action/lighting_manager').takeTorches(bot, planRegistry.basementCell(column).lamps.length, 'cube trip', { wood: frame.wood }) === null) return;   // already with the judge (Law 15)
+
     // What the build's chests hold of one item that no other body has claimed (chest_ledger).
     const freeInChests = item => Math.max(0,
       chestsNow().reduce((n, { station }) => n + countInInventory(item, chestItemCounts(station)), 0) - ledger.claimedByOthers(item));
@@ -138,8 +144,14 @@ module.exports = {
         if (taken > 0) take[item] = taken;
         if (gap - taken > 0) stillToMake[item] = count - taken;   // the raw walk nets the pocket itself
       }
-      // ── STEP 2: the raw for whatever is left, in the site's wood ───────────────────────────────────
-      for (const [raw, count] of Object.entries(remainingRawInSpecies(stillToMake, pocket, frame.wood))) {
+      // ── STEP 2: the made ingredients the chests hold (a bookshelf's books), then the raw for whatever is
+      // left, in the site's wood ──────────────────────────────────────────────────────────────────────
+      // Out of what step 1 leaves in the chests: a stone brick it takes for the cube's own cell is not also taken
+      // for the stairs it is made into.
+      const made = madeIngredients(stillToMake, pocket, item => Math.max(0, freeInChests(item) - (take[item] || 0)));
+      const withMade = { ...pocket };
+      for (const [item, n] of Object.entries(made)) { take[item] = (take[item] || 0) + n; withMade[item] = (withMade[item] || 0) + n; }
+      for (const [raw, count] of Object.entries(remainingRawInSpecies(stillToMake, withMade, frame.wood))) {
         take[raw] = (take[raw] || 0) + count;
       }
       return take;
@@ -147,11 +159,14 @@ module.exports = {
     let toWithdraw = withdrawalsFor();
 
     // ── A WITHDRAWAL NEEDS A FREE SLOT TO LAND IN ───────────────────────────────────────────────────
-    // Each kind this trip takes may need a slot of its own, so a pocket with fewer free slots than kinds is
-    // banked into the pool first and the trip's withdrawals are read again off the emptied pocket.
+    // Each kind this trip takes may need a slot of its own: the cube's withdrawals, and every kind of trash the trip
+    // may draw after them (utils/trash.takeOrder), which is planned only at the bill desk below, where nothing is
+    // awaited. A take cut off a stack needs one slot more (inventory_swapper). A pocket with fewer free slots than
+    // that is banked into the pool first and the trip's withdrawals are read again off the emptied pocket.
     const freeSlots = () => bot.inventory.emptySlotCount();
-    if (freeSlots() < Object.keys(toWithdraw).length) {
-      watcher.summary(TAG, `Column ${index}: ${freeSlots()} free slot(s) for ${Object.keys(toWithdraw).length} kind(s) to withdraw — banking the pocket first.`);
+    const slotsWanted = Object.keys(toWithdraw).length + new Set(trash.takeOrder(frame.wood).map(([item]) => item)).size + 1;
+    if (freeSlots() < slotsWanted) {
+      watcher.summary(TAG, `Column ${index}: ${freeSlots()} free slot(s) for up to ${slotsWanted} the trip may take — banking the pocket first.`);
       const banked = await inventorySwapper.dumpExcess(bot);
       if (banked && banked.abandoned) return;   // a signal is already with the judge (Law 15)
     }

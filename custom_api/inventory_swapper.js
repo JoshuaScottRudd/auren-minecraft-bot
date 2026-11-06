@@ -21,10 +21,12 @@
 const Vec3 = require('vec3');
 const watcher = require('@kernel/watcher');
 const stationRegistry = require('@perception/station_registry');
-const { group_to_item, substitutes_for, furnace_chain_items } = require('@utils/fragment_utils');
+const { group_to_item, substitutes_for, furnace_chain_items, agedForms } = require('@utils/fragment_utils');
 // The members a token stands for when a chest is counted, filled or emptied: countInInventory's own rule (Law 16) —
-// a group token is its members, and a smelted item is only itself ('stone' the block, never granite or diorite).
+// a group token is its members, a smelted item is only itself ('stone' the block, never granite or diorite), and a copper
+// block is every form of it.
 function _groupOf(token) {
+    if (token && agedForms(token).length > 1) return agedForms(token);
     return (token && !furnace_chain_items.has(token) && Array.isArray(group_to_item[token])) ? group_to_item[token] : null;
 }
 const { routeToJudge } = require('@utils/signal_utils');
@@ -135,6 +137,13 @@ function _planDeposits(stations, wants, exclude = null) {
     }
     rows.sort((a, b) => a.number - b.number);
     return { rows, unplaced };
+}
+
+// roomFor(item, amount) → how many of `amount` the storage chests take now: the deposit plan's own answer, so
+// a job that ends in a deposit is posted only while the pool has room for it.
+function roomFor(item, amount) {
+    const plan = _planDeposits(stationRegistry.getStations(), { [item]: amount });
+    return amount - (plan.unplaced[item] || 0);
 }
 
 // The members a retrieve of `item` may take: the order's own `only` list when it carries one (a furnace's
@@ -995,8 +1004,30 @@ function _pocketWants(bot, wants) {
     return out;
 }
 
-async function _depositPlanned(bot, wants) {
+// _litterToBin(bot, wants) → { wants, litter }: LEAF LITTER NEVER TAKES A CHEST SLOT. What a deposit would bank of it goes to
+// the composter, what the bin did not take stays in the pocket for the next drop-off, and a group naming it is banked as
+// its other members. litter is null when the deposit holds none.
+async function _litterToBin(bot, wants) {
+    const compost = require('@action/compost_executor');
+    const held = {};
+    for (const it of bot.inventory.items()) held[it.name] = (held[it.name] || 0) + it.count;
+    const litterHeld = held[compost.LEAF_LITTER] || 0;
+    const naming = Object.keys(wants).filter(k => k === compost.LEAF_LITTER || (_groupOf(k) || []).includes(compost.LEAF_LITTER));
+    if (!naming.length || litterHeld === 0) return { wants, litter: null };
+    const fed = await compost.compostLeafLitter(bot, litterHeld);
+    const rest = { ...wants };
+    for (const name of naming) {
+        delete rest[name];
+        for (const member of _groupOf(name) || []) {
+            if (member !== compost.LEAF_LITTER && held[member]) rest[member] = Math.min(wants[name], held[member]);
+        }
+    }
+    return { wants: rest, litter: { fed, kept: litterHeld - fed } };
+}
+
+async function _depositPlanned(bot, asked) {
     const ledger = require('@perception/chest_ledger');
+    const { wants, litter } = await _litterToBin(bot, asked);
     const tried = new Set();
     const moved = [];
     let last = null;
@@ -1016,7 +1047,7 @@ async function _depositPlanned(bot, wants) {
                 const r = await _executeTransfer(bot, 'deposit', orders, stationId);
                 ledger.releaseRoom(stationId);
                 tried.add(stationId);
-                if (r === undefined) return { moved, unplaced: left, last, abandoned: true };
+                if (r === undefined) return { moved, unplaced: left, last, litter, abandoned: true };
                 last = r;
                 for (const m of r.moved) moved.push(m);
             }
@@ -1025,7 +1056,7 @@ async function _depositPlanned(bot, wants) {
                 return [k, Math.max(0, (wants[k] || 0) - done)];
             })));
         }
-        return { moved, unplaced: left, last, abandoned: false };
+        return { moved, unplaced: left, last, litter, abandoned: false };
     }, () => ledger.releaseRoom(null));
 }
 
@@ -1041,6 +1072,9 @@ async function depositItems(bot, item, amount, stationId) {
     const result = await _depositPlanned(bot, { [item]: amount || 64 });
     if (result.abandoned) return undefined;   // already routed to the judge (Law 15)
     const transferred = result.moved.reduce((n, m) => n + m.transferred, 0);
+    if (!result.last && result.litter) {
+        return { success: true, order_type: 'deposit', item, moved: [], transferred: result.litter.fed, station_id: null, snapshot_items: 0 };
+    }
     if (!result.last) {
         _abandon(`no_deposit_target_for_${item} — no chest has room`);
         return undefined;
@@ -1168,8 +1202,8 @@ function computeExcess(invCounts, whitelist, wanted = null) {
 // item; group tokens distribute keep across concrete members. Everything not covered by any whitelist
 // entry is dumped entirely. Called explicitly by fragments after completing work. No double handling by
 // construction: there is one pool, so depositing anywhere satisfies any request for that material.
-// Compostables are banked like everything else; the compost job (assessors/compost) empties them into
-// the composter in one batch.
+// Compostables are banked like everything else but leaf litter (_litterToBin); the compost job
+// (assessors/compost) empties them into the composter in one batch.
 
 async function dumpExcess(bot) {
     bot = bot || global.bot;
@@ -1179,6 +1213,9 @@ async function dumpExcess(bot) {
     // assessors → this file).
     const { INVENTORY_WHITELIST } = require('@thinking/job_board.js');
     const hq = require('@kernel/corporate_headquarters');
+
+    // Armor in the pocket goes on before anything is banked, so a chest never takes what the body can wear.
+    await require('@api/armor').wearArmor(bot);
 
     // Trash goes to the waste pit before anything is banked, so no chest slot holds it; with no pit to
     // use it stays in the pocket and is banked below like the rest.
@@ -1210,6 +1247,17 @@ async function dumpExcess(bot) {
         const held = Object.keys(wanted).length ? ` — ${magnet.what} order still wants ${Object.entries(wanted).map(([k, v]) => `${v}x ${k}`).join(', ')}` : '';
         watcher.summary(TAG, `dumpExcess: nothing to dump — all items whitelisted or spoken for${held}`);
         return { dumped: 0, items: [] };
+    }
+
+    // SURPLUS SEEDS GO TO THE COMPOSTER, NOT A CHEST (architect_config COMPOST_SEED_KEEP): fed before the bank, and what
+    // the bin did not take is banked with the rest. Required lazily and upward, as above.
+    if (excess.wheat_seeds) {
+        const fed = await require('@action/compost_executor').compostSurplusSeeds(bot, excess.wheat_seeds);
+        if (fed > 0) {
+            excess.wheat_seeds -= fed;
+            if (excess.wheat_seeds <= 0) delete excess.wheat_seeds;
+            if (Object.keys(excess).length === 0) return { dumped: 0, items: [], composted: fed };
+        }
     }
 
     watcher.summary(TAG, `dumpExcess: ${Object.entries(excess).map(([k, v]) => `${k}x${v}`).join(', ')}`);
@@ -1322,6 +1370,7 @@ async function dropOffHaul(bot, opts = {}) {
 module.exports = {
     depositItems,
     retrieveItems,
+    roomFor,
     dumpExcess,
     dropOffHaul,
     computeExcess,

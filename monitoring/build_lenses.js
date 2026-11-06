@@ -8,7 +8,8 @@
 //   SITE LOCKED        set_buildspot        — the site exists, clock starts
 //   ANCHOR N GATED     job_board            — materials-blocked, with what it is short of
 //   FIRST PLACEMENT    building_integrity   — first scan reporting a placed count above zero
-//   ANCHOR N COMPLETE  building_manager     — the anchor released to the next one
+//   ANCHOR N COMPLETE  job_board            — the board names a later anchor next (older records:
+//                                             building_manager's release line)
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --milestones [--bot=B] [--deadline=10m] [--all]
 
 'use strict';
@@ -21,6 +22,10 @@ const MS_LOCK_RE = /Locked (\S+) build site — transpose_origin \(([^)]+)\)/;
 const MS_GATE_RE = /"([^"]+)" anchor (\d+) gated — order \(short\): (.+)$/;
 const MS_PLACED_RE = /"([^"]+)" — (\d+)\/(\d+) structure placed/;
 const MS_ANCHOR_DONE_RE = /'([^']+)' anchor (\d+) has no gating work left/;
+// The job board's next-anchor line (assessors/building): anchors build in order, so the board naming anchor N
+// says every anchor below N owes nothing. The clock reads it since building_manager's release line went;
+// records before that still carry MS_ANCHOR_DONE_RE, read as before.
+const MS_NEXT_ANCHOR_RE = /"([^"]+)" next anchor (\d+) — anchors before it owe nothing/;
 // The GATE line names the BLUEPRINT (assessors/building: `"headframe" anchor 0 gated`); the DONE line
 // names the JOB KEY (building_manager: `'headframe_execute' anchor 2 has no gating work left`). The job
 // key is the structure plus the stage that builds it, so stripping that suffix gives the same structure
@@ -36,9 +41,9 @@ const MS_START_RE = /🧪 Injected autonomous start signal/;
 // criterion, read here, not invented (Law 25).
 // START: earliest `🧪 Injected autonomous start signal` from any ROSTER bot (start_injector's line),
 // wall-clock ISO, since the [Nm Ss] tag instead counts from each bot's own birth.
-// END: earliest `'headframe' anchor <graded_anchor> has no gating work left` — building_manager's
-// release line, the only line that states an anchor is DONE instead of implying it (graded_anchor is
-// authored in architect_config.HEADFRAME_CLOCK).
+// END: earliest `"headframe" next anchor <N>` with N above graded_anchor — the job board's own statement
+// that every anchor below N owes nothing (graded_anchor is authored in architect_config.HEADFRAME_CLOCK).
+// Older records carry building_manager's `'headframe' anchor <graded_anchor> has no gating work left`.
 // Whole-build time is also tracked: earliest `🏁 STRUCTURE BUILT: 'headframe'` from any bot, kept as
 // `fullSec` and reported beside the grade, never graded itself. A headframe already standing at a bot's
 // first sweep is a continued world and reported untimed. A grade only: no caller may turn it into a
@@ -56,6 +61,11 @@ function headframeClock(seg) {
     if (Number.isNaN(t)) continue;
     if (lastMs === null || t > lastMs) lastMs = t;
     let m;
+    // The shell is closed when the board first moves past the graded anchor.
+    if ((m = l.raw.match(MS_NEXT_ANCHOR_RE))) {
+      if (m[1] === clock.structure && +m[2] > clock.graded_anchor && (shellMs === null || t < shellMs)) { shellMs = t; shellBy = l.bot; }
+      continue;
+    }
     if (MS_START_RE.test(l.raw) && (startMs === null || t < startMs)) startMs = t;
     else if ((m = l.raw.match(MS_ANCHOR_DONE_RE)) && structureOfJobKey(m[1]) === clock.structure && +m[2] === clock.graded_anchor
              && (shellMs === null || t < shellMs)) { shellMs = t; shellBy = l.bot; }
@@ -119,10 +129,11 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
     if (!s) { s = { locked: null, center: null, by: null, gates: 0, firstGate: null, lastGate: null, first: null, last: null, total: null, anchors: new Map() }; sites.set(name, s); }
     return s;
   };
-  // The farm's row sites are measured by farm_lens as ONE structure, printed after the buildings, so their lock
+  // The wheat field is measured by farm_lens, printed after the buildings, so its lock
   // lines are left out of this site map instead of printed twice.
   const farmLens = require('./farm_lens');
-  const { FARM_BLUEPRINT_NAME: farmRowPrefix, FARM_STRUCTURE: farmStructure } = require(require('./lens_paths').bot('Thinking_fragments/architect_config.js'));
+  const farmFields = new Set(Object.values(require(require('./lens_paths').bot('Thinking_fragments/architect_config.js')).FARM_FIELD)
+    .filter(Boolean).map(f => f.structure));
   let maxRel = 0;
   for (const l of seg) {
     if (l.relSec == null) continue;
@@ -130,8 +141,18 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
     if (PASSIVE_LINE.test(l.raw)) continue;
     maxRel = Math.max(maxRel, l.relSec);
     let m;
+    if ((m = l.raw.match(MS_NEXT_ANCHOR_RE))) {
+      // Every anchor below the one the board names next is done; the first body to say so dates it.
+      const s = site(m[1]);
+      for (let idx = 0; idx < +m[2]; idx++) {
+        const a = s.anchors.get(idx) || { gates: 0, firstGate: null, lastGate: null, shortFirst: null, shortLast: null, done: null, doneBy: null };
+        if (a.done === null) { a.done = l.relSec; a.doneBy = l.bot; }
+        s.anchors.set(idx, a);
+      }
+      continue;
+    }
     if ((m = l.raw.match(MS_LOCK_RE))) {
-      if (m[1].startsWith(farmRowPrefix)) continue;
+      if (farmFields.has(m[1])) continue;
       const s = site(m[1]);
       if (s.locked === null) { s.locked = l.relSec; s.center = m[2]; s.by = l.bot; }
     } else if ((m = l.raw.match(MS_GATE_RE))) {
@@ -148,7 +169,7 @@ function runMilestones({ seg = [], traceName = '?', bot: botFilter = null, deadl
       // First placement is the first count above zero; a zero-count scan is not it, since the scan runs
       // from the moment the site locks.
       if (s.first === null && +m[2] > 0) s.first = { t: l.relSec, c: +m[2], by: l.bot };
-    } else if ((m = l.raw.match(MS_BUILT_RE)) && m[1] !== farmStructure) {
+    } else if ((m = l.raw.match(MS_BUILT_RE)) && !farmFields.has(m[1])) {
       // job_board's false→true edge — the one line that says the whole structure stands, not one anchor of it.
       const s = site(m[1]);
       if (!s.built) s.built = { t: l.relSec, by: l.bot };

@@ -134,7 +134,10 @@ module.exports = {
 
     // ── GATE 1: is there a route ──
     const { priceRouteTo } = require('@api/drop_collector.js');
-    const priced = await priceRouteTo(bot, at, ITEM_DESPAWN_MS);
+    // Priced under the walk's own search clock, never the despawn window: the search holds the planning gate,
+    // which the foreman stops the fleet over after timeout_crash.LIMIT_MS, and a route not found inside the
+    // navigator's clock is one the walk would not find either.
+    const priced = await priceRouteTo(bot, at, require('@locomotion/navigator').NAV_SEARCH_DEADLINE_MS);
     if (!priced.reachable) {
       // A DROP THIS BODY COULD NOT GET A ROUTE TO IS LEFT, whichever way the search ended — proved
       // unreachable, or out of clock. It is an ordinary outcome of picking things up off the ground: the

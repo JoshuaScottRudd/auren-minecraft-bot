@@ -6,8 +6,8 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/zone
 // one bulk voxel reader, and judged with site_geometry's own definition of ground.
 //
 // ── WHAT THE ZONES ARE, AND THE BIAS THEY CARRY ─────────────────────────────────────────────────────
-// A snapshot is centred on a PERSON SPOT, and person_spot only accepts architect_config.ACCEPTABLE_BIOMES (the plains
-// and forest family). So every zone is centred on that family by construction, and another biome appears only where
+// A snapshot is centred on a PERSON SPOT, and landing_spot refuses architect_config.BANNED_BIOMES (what is left is
+// the plains and oak or spruce forest family). So every zone is centred on that family by construction, and another biome appears only where
 // it lies within ~185 blocks of one. A biome absent from this report says where the capture may stand, not what the
 // seed holds.
 //

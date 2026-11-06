@@ -9,13 +9,18 @@ const Vec3 = require('vec3');
 const watcher = require('@kernel/watcher');
 const { WORLD_DEPTH_FLOOR_Y } = require('@thinking/architect_config');
 const { STATION_TYPES } = require('@utils/fragment_utils');
+// Required once here: a require inside isWalkableSurface resolves the module path again on every floor a route search reads.
+const { isLeafBlock, isPhantom } = require('@utils/movement/leaf_authority');
 
 // ── THE DEPTH FLOOR (one predicate, Law 16) ─────────────────────────────────────────────────────
 // The constant lives in architect_config; the question lives here, so the route search, dig authority
 // and drop sweep agree on which cells exist. Takes a bare Y so a caller can ask before fetching a block.
+let depthFloorY = WORLD_DEPTH_FLOOR_Y;
 function belowDepthFloor(y) {
-  return WORLD_DEPTH_FLOOR_Y !== null && Math.floor(y) < WORLD_DEPTH_FLOOR_Y;
+  return depthFloorY !== null && Math.floor(y) < depthFloorY;
 }
+// openDepthFloor() → the world goes on down for this body: its deep shaft is open (assessors/mining). Holds for the process.
+function openDepthFloor() { depthFloorY = null; }
 
 // ── SECTION 2: Terrain Predicates ──
 // Single source of truth for walkability, hazards, clearance and floor type (Law 16).
@@ -118,7 +123,7 @@ function isWalkableSurface(block, ctx) {
   if (isOpenTopContainer(block)) return false;
   // A leaf is never a floor: it decays once its tree is cut and a passing body punches it as foliage,
   // so ground that can leave on its own is kept out of every route (Law 17).
-  if (require('@utils/movement/leaf_authority').isLeafBlock(block)) return false;
+  if (isLeafBlock(block)) return false;
   return true;
 }
 
@@ -167,7 +172,6 @@ function getClearance(bot, block, levels = 3) {
     'fire','soul_fire','campfire','soul_campfire',
     'cobweb','powder_snow'
   ]);
-  const { isPhantom } = require('@utils/movement/leaf_authority');
   for (let i = 1; i <= levels; i++) {
     const above = bot.blockAt(block.position.offset(0, i, 0));
     if (!above) return false;
@@ -258,6 +262,17 @@ function eyePos(entity) {
 let _lastBlock = null;
 function lastSightlineBlock() { return _lastBlock; }
 
+// eyeLineHit(bot, start, end, maxDist) → the block the eye-to-eye ray from `start` to `end` stops on, or null when
+// nothing stands between them. The ray stops AT the far eye, never past it: a wall behind it is not between them.
+// The one cast under hasEntityLineOfSight, and under the driver's ray for a stuck body (Law 16). The caller owns the loaded-chunk gate.
+function eyeLineHit(bot, start, end, maxDist) {
+  const dir = end.minus(start);
+  const len = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+  if (len === 0) return null;
+  const norm = new Vec3(dir.x / len, dir.y / len, dir.z / len);
+  return bot.world.raycast(start, norm, Math.min(len, maxDist + 1, 20)) || null;
+}
+
 function hasEntityLineOfSight(bot, entity, maxDist) {
   if (!bot || !bot.entity || !entity || !entity.position) {
     throw new Error('[terrain_predicates] CODING VIOLATION: hasEntityLineOfSight requires a bot body and an entity. Check caller.');
@@ -278,12 +293,7 @@ function hasEntityLineOfSight(bot, entity, maxDist) {
     return false;
   }
 
-  const dir = end.minus(start);
-  const len = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-  if (len === 0) return true;
-  const norm = new Vec3(dir.x / len, dir.y / len, dir.z / len);
-  // Stop the ray AT the far body, never past it: a wall behind the mob is not between us.
-  const hit = bot.world.raycast(start, norm, Math.min(len, maxDist + 1, 20));
+  const hit = eyeLineHit(bot, start, end, maxDist);
   if (!hit) return true;
   // `dy` tells a mob-in-a-ravine blocker (ground) apart from a real wall at eye level.
   _lastBlock = {
@@ -323,6 +333,13 @@ function isAir(name) {
   return name === null || name === undefined || name === 'air' || name === 'cave_air' || name === 'void_air';
 }
 
+// A cell a placed block takes over as it stands: air, or the plant cover and snow layer Minecraft replaces on a
+// place. Not a torch or a sapling, which refuse a block. The driver's cover wall sets blocks into these.
+const REPLACED_ON_PLACE = new Set(['short_grass', 'grass', 'tall_grass', 'fern', 'large_fern', 'dead_bush', 'snow', 'vine']);
+function isReplaceable(block) {
+  return !!block && (isAir(block.name) || REPLACED_ON_PLACE.has(block.name));
+}
+
 function dist3(a, b) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
 }
@@ -338,10 +355,13 @@ module.exports = {
   hasLineOfSight,
   hasEntityLineOfSight,
   lastSightlineBlock,
+  eyeLineHit,
   // No production caller outside this file; kept for tools/raycast_crucible.js to measure live.
   eyePos, EYE_HEIGHT, EYE_HEIGHT_RATIO,
   calculateApproach,
   isAir,
+  isReplaceable,
   dist3,
   belowDepthFloor,
+  openDepthFloor,
 };

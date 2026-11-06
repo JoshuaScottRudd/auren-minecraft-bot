@@ -19,13 +19,47 @@ const hq   = require('@kernel/corporate_headquarters');
 const blueprintRegistry = require('@kernel/blueprint_registry');
 const { transposeVoxelsForCandidate } = require('@perception/blueprint_survey');
 const { group_to_item, getWheatAge } = require('@utils/fragment_utils');
-const { FARM_BLUEPRINT_NAME } = require('@thinking/architect_config');
 
 // The station_registry's chest-key shape, reused so a voxel position has ONE spelling here.
 const slotKey = (x, y, z) => `${x}|${y}|${z}`;
 
 function loadBuilding(blueprintName) {
   return blueprintRegistry.getBuilding(blueprintName, 'farmland_site');
+}
+
+// ── THE CROPS A FIELD IS PLANTED WITH ── The blueprint's `crop` names one; a blueprint naming none is wheat, and one
+// naming 'none' (the water pool) grows nothing: it has no seed and no crop slot.
+//   seed    the item planted, ordered and kept in the pocket for a planting visit
+//   block   the crop's block in the slot
+//   tilled  whether the ground is hoed to farmland first (wheat) or planted as it lies (sugar cane on dirt or sand
+//           beside water)
+// Wheat is ripe at age 7 and cut whole, the seed replanted. Sugar cane is ripe once two tall and cut from the second
+// block up, so the bottom block stays and grows again. THE LAST CUT (CANE_LAST_CUT): once the cane standing and held
+// reaches the build's need (calculators/ingredient_keep caneHold), every cane field but the first (FARM_FIELD.cane) is
+// cut to the ground, its bottom blocks too, and nothing is planted in it; the first keeps its bottom blocks to grow
+// again.
+const CROPS = Object.freeze({
+  wheat:      Object.freeze({ name: 'wheat', seed: 'wheat_seeds', block: 'wheat', tilled: true }),
+  sugar_cane: Object.freeze({ name: 'sugar_cane', seed: 'sugar_cane', block: 'sugar_cane', tilled: false }),
+  none:       Object.freeze({ name: 'none', seed: null, block: null, tilled: false }),
+});
+const CANE_LAST_CUT = Object.freeze({ ...CROPS.sugar_cane, last_cut: true });
+
+// lastCut(roomKey, crop) → true for a cane field other than the first once the build's cane is all grown.
+function lastCut(roomKey, crop) {
+  if (crop !== CROPS.sugar_cane || roomKey === require('@thinking/architect_config').FARM_FIELD.cane) return false;
+  return require('@utils/calculators/ingredient_keep').caneHold().reached;
+}
+// The ground sugar cane stands on, besides the dirt family.
+const CANE_SOIL = new Set(['sand', 'red_sand', 'suspicious_sand']);
+// isCaneSoil(name) → whether sugar cane stands on a block of this name: the dirt family or CANE_SOIL.
+const isCaneSoil = name => !!name && (group_to_item.dirt.includes(name) || CANE_SOIL.has(name));
+function cropOf(blueprintName) {
+  const name = loadBuilding(blueprintName).crop || 'wheat';
+  if (!CROPS[name]) {
+    throw new Error(`[farmland_site] CODING VIOLATION (Law 13): blueprint '${blueprintName}' names the crop '${name}', which CROPS does not know. Known: ${Object.keys(CROPS).join(', ')}.`);
+  }
+  return CROPS[name];
 }
 
 // getFarmlandCells(bot, roomKey) -> { waterCell: {x,y,z}, rowCells: [{x,y,z}], growingSlots: Set<"x|y|z"> }
@@ -37,15 +71,16 @@ function loadBuilding(blueprintName) {
 //
 // growingSlots is the SET of those crop-slot positions, returned so the 'clear' action can prove
 // a block it is about to dig sits in a blueprint-declared crop slot and therefore can never be
-// structure. The same set decides which dirt IS a row cell (the tine row's land block is dirt
-// with no slot above it), so 'clear' and 'till' can never reach a cell the blueprint does not crop.
-// roomKey is the farm INSTANCE's conference-room key (16 wheat_tine_row rows each have a distinct locked
-// center). Defaults to the phase-1 blueprint name — instance 0's key and every single-farm caller — so this
-// stays backward-compatible. WHICH geometry an instance uses is read per-instance from the locked chair (see
-// below), NOT from a module const — so instances of DIFFERENT geometries can coexist under one subsystem.
-function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
+// structure. The same set decides which dirt IS a row cell (dirt with no slot above it is a
+// walkway), so 'clear' and 'till' can never reach a cell the blueprint does not crop.
+// roomKey is the field's conference-room key (architect_config.FARM_FIELD keys). WHICH geometry it uses is read
+// from the locked chair (see below), NOT from a module const.
+function getFarmlandCells(bot, roomKey) {
   if (!bot || !bot.blockAt) {
     throw new Error('[farmland_site] CODING VIOLATION: bot must be initialized before getFarmlandCells().');
+  }
+  if (typeof roomKey !== 'string' || !roomKey) {
+    throw new Error(`[farmland_site] CODING VIOLATION (Law 13): getFarmlandCells needs the field's room key, got ${JSON.stringify(roomKey)}.`);
   }
   const setBuildspot = hq.readBuildingChair(roomKey, 'set_buildspot');
   if (!setBuildspot?.transpose_origin || typeof setBuildspot.transpose_origin.x !== 'number') {
@@ -59,28 +94,32 @@ function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
   if (!blueprintName) {
     throw new Error(`[farmland_site] CODING VIOLATION (Law 13): farm instance "${roomKey}" has a locked transpose_origin but no blueprint_paster.building_name, so which direction its row reaches is unknown. site_chairs stamps both together.`);
   }
+  const cells = fieldCellsAt(blueprintName, setBuildspot.transpose_origin);
+  return lastCut(roomKey, cells.crop) ? { ...cells, crop: CANE_LAST_CUT } : cells;
+}
+
+// fieldCellsAt(blueprintName, origin) → the same cells for the field `blueprintName` locked at `origin`: the one
+// layout a body reads off its chairs (getFarmlandCells) and the integrity keeper reads off its plans.
+function fieldCellsAt(blueprintName, origin) {
   const building = loadBuilding(blueprintName);
 
-  const voxels = transposeVoxelsForCandidate(building, setBuildspot.transpose_origin);
+  const voxels = transposeVoxelsForCandidate(building, origin);
 
   let waterCell = null;
+  const waterCells = [];
   const dirtCells = [];
   const growingSlots = new Set();
   for (const v of voxels) {
-    if (v.type === 'water') waterCell = { x: v.x, y: v.y, z: v.z };
+    if (v.type === 'water') { waterCell = { x: v.x, y: v.y, z: v.z }; waterCells.push(waterCell); }
     else if (v.type === 'dirt') dirtCells.push({ x: v.x, y: v.y, z: v.z });
     else if (v.type === 'growing') growingSlots.add(slotKey(v.x, v.y, v.z));
   }
-  // A ROW CELL IS DIRT WITH A CROP SLOT ON IT. Not every dirt voxel is one: a wheat_tine_row's land block is dirt
-  // with air above — the next row's stand — and tilling it would turn the walkway into farmland. The crop
-  // slot is what makes soil a field cell, so that is what is read.
+  // A ROW CELL IS DIRT WITH A CROP SLOT ON IT. Not every dirt voxel is one: dirt with air above is a walkway, and
+  // tilling it would turn the walkway into farmland. The crop slot is what makes soil a field cell, so that is what is read.
   const rowCells = dirtCells.filter(c => growingSlots.has(slotKey(c.x, c.y + 1, c.z)));
-  // waterCell is OPTIONAL. A blueprint MAY declare its own water voxel (a source the builder places by bucket);
-  // a wheat_tine_row does NOT — the wheat_trident_scanner only ever sites plots into open NATURAL
-  // water, so hydration is guaranteed by the siter, not by a declared voxel. Absent water is therefore a valid
-  // phase-1 field, not a coding violation: it is returned null and no field phase reads it (grep-confirmed:
-  // waterCell has no consumers — the field phases use only rowCells + growingSlots).
-  return { waterCell, rowCells, growingSlots };
+  // waterCell is the blueprint's declared water voxel (a source the builder places by bucket), or null for a blueprint
+  // that declares none. waterCells is every water voxel (a channel declares several).
+  return { waterCell, waterCells, rowCells, growingSlots, crop: cropOf(blueprintName) };
 }
 
 // classifyCell(bot, c, growingSlots) -> the live state of one row cell plus the corrective FIELD
@@ -101,11 +140,12 @@ function getFarmlandCells(bot, roomKey = FARM_BLUEPRINT_NAME) {
 // never passes as ripe wheat here. The extra `aname !== 'wheat'` guard on the dig is redundant belt and
 // braces: a wheat block whose age is unreadable must never be dug as an obstruction — never clearing our
 // own crop is worth one extra string compare.
-function classifyCell(bot, c, growingSlots) {
+function classifyCell(bot, c, growingSlots, crop = CROPS.wheat) {
   const ground = bot.blockAt(new Vec3(c.x, c.y, c.z));
   const above  = bot.blockAt(new Vec3(c.x, c.y + 1, c.z));
   const gname = ground && ground.name;
   const aname = above && above.name;
+  if (!crop.tilled) return classifyPlantedCell(bot, c, growingSlots, crop, gname, aname);
 
   const age    = getWheatAge(above);          // null unless this IS wheat with a readable stage
   const mature = age === 7;
@@ -129,6 +169,22 @@ function classifyCell(bot, c, growingSlots) {
   return { gname, aname, age, mature, obstructed, actions };
 }
 
+// A crop planted on the ground as it lies (sugar cane): the slot holds the crop once planted, and it is ripe once the
+// block over the slot is the crop too. `planted` is that the slot holds it; `age` stays null (no stage to read).
+// Under THE LAST CUT every planted cell is ripe and an empty one is left empty.
+function classifyPlantedCell(bot, c, growingSlots, crop, gname, aname) {
+  const planted = aname === crop.block;
+  const mature = planted && (crop.last_cut || bot.blockAt(new Vec3(c.x, c.y + 2, c.z))?.name === crop.block);
+  const slotClear = !aname || aname === 'air';
+  const obstructed = !slotClear && !planted && growingSlots.has(slotKey(c.x, c.y + 1, c.z));
+  const soil = isCaneSoil(gname);
+  const actions = [];
+  if (obstructed) actions.push('clear');
+  if (mature) actions.push('harvest');
+  else if (slotClear && soil && !crop.last_cut) actions.push('plant');
+  return { gname, aname, age: null, mature, planted, obstructed, soil, actions };
+}
+
 // getFarmState(bot, roomKey) -> census the job_board tend-gate and farm_manager routing read (Law 16 — the
 // executor reads getFieldPlan off the SAME classifier). Harvest selects ripe cells independently
 // of the rest of the field.
@@ -137,13 +193,34 @@ function classifyCell(bot, c, growingSlots) {
 // or emptyTilled by its ground state, and blocked says the crop slot above it is stoppered. It is
 // reported because a buried field is otherwise invisible in the digest (Law 6): the same untilled count
 // can mean an open field or one entirely blocked by rock, and only the blocked count distinguishes them.
-function getFarmState(bot, roomKey = FARM_BLUEPRINT_NAME) {
-  const { rowCells, growingSlots } = getFarmlandCells(bot, roomKey);
-  let untilled = 0, emptyTilled = 0, growing = 0, mature = 0, blocked = 0;
+// A crop planted as the ground lies counts an unplanted cell as `emptyTilled` (ready for its seed) and never as
+// untilled; `seed` and `tilled` name the crop's item and whether a hoe is wanted.
+// THE CENSUS IS THE KEEPER'S. A body with a foreman reads the field's census off the integrity keeper's `fields`
+// verdict (foreman/integrity_keeper_worker), one reading for the whole crew; a body without one counts it itself.
+function getFarmState(bot, roomKey) {
+  // The keeper counts every field by its own crop; a field under THE LAST CUT is counted here, by the last cut.
+  const cells = getFarmlandCells(bot, roomKey);
+  const kept = cells.crop.last_cut ? null : require('@kernel/keeper_verdicts').keptEntry('fields', roomKey);
+  if (kept) return { ...kept.census };
+  return censusAt(bot, cells);
+}
+
+// censusAt(world, cells) → the census of the field `cells` (getFarmlandCells / fieldCellsAt) as `world`
+// ({ blockAt }) holds it. `standing` counts the blocks of a crop planted as the ground lies (sugar cane) standing in its
+// slots, every block of every stalk: the cane the field holds (calculators/ingredient_keep, THE CANE HOLD).
+function censusAt(world, { rowCells, growingSlots, crop }) {
+  const bot = world;
+  let untilled = 0, emptyTilled = 0, growing = 0, mature = 0, blocked = 0, standing = 0;
   for (const c of rowCells) {
-    const { gname, age, mature: m, obstructed } = classifyCell(bot, c, growingSlots);
+    const cell = classifyCell(bot, c, growingSlots, crop);
+    const { gname, age, mature: m, obstructed } = cell;
     if (obstructed) blocked++;
-    if (gname === 'farmland') {
+    if (!crop.tilled) {
+      for (let y = c.y + 1; crop.block && bot.blockAt(new Vec3(c.x, y, c.z))?.name === crop.block; y++) standing++;
+      if (m) mature++;
+      else if (cell.planted) growing++;
+      else if (cell.soil && !crop.last_cut) emptyTilled++;
+    } else if (gname === 'farmland') {
       if (m) mature++;
       else if (age !== null) growing++;     // wheat with a readable stage — never a look-alike crop
       else emptyTilled++;
@@ -154,21 +231,21 @@ function getFarmState(bot, roomKey = FARM_BLUEPRINT_NAME) {
   const total = rowCells.length;
   const needsPrep = untilled > 0 || emptyTilled > 0 || blocked > 0;
   const harvestReady = mature > 0;
-  return { total, untilled, emptyTilled, growing, mature, blocked, needsPrep, harvestReady,
-           actionable: needsPrep || harvestReady };
+  return { total, untilled, emptyTilled, growing, mature, blocked, standing, needsPrep, harvestReady,
+           actionable: needsPrep || harvestReady, seed: crop.seed, tilled: crop.tilled };
 }
 
 // getFieldPlan(bot, roomKey) -> per-cell corrective plans the executor applies from a reaching anchor. Every
 // cell whose crop slot is obstructed yields a 'clear', so a stray block never sits unaddressed in a
 // slot no fragment owns.
-function getFieldPlan(bot, roomKey = FARM_BLUEPRINT_NAME) {
-  const { rowCells, growingSlots } = getFarmlandCells(bot, roomKey);
+function getFieldPlan(bot, roomKey) {
+  const { rowCells, growingSlots, crop } = getFarmlandCells(bot, roomKey);
   const plan = [];
   for (const c of rowCells) {
-    const { actions } = classifyCell(bot, c, growingSlots);
-    if (actions.length) plan.push({ x: c.x, y: c.y, z: c.z, actions });
+    const { actions } = classifyCell(bot, c, growingSlots, crop);
+    if (actions.length) plan.push({ x: c.x, y: c.y, z: c.z, actions, crop });
   }
   return plan;
 }
 
-module.exports = { getFarmlandCells, getFarmState, getFieldPlan };
+module.exports = { getFarmlandCells, fieldCellsAt, getFarmState, censusAt, getFieldPlan, cropOf, isCaneSoil, CROPS };

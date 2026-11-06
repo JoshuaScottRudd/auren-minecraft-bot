@@ -25,7 +25,7 @@ const { sleep, BLOCK_REACH } = require('@utils/fragment_utils');
 // Entered through combatCheckpoint, never battleStations directly — the shared 500ms combat gate
 // (also held by the dig and drive primitives), with the engaging/escaping bypass.
 const { combatCheckpoint } = require('@api/battle_stations');
-const { computeAStar, drainSearchCensus, pathStillWalkable, keyOf, straightLine, classifyFloorInline, isBlockPassable, isScaffoldBlock, isDoorBlock, COST_HIGH, COST_PLACE, PROTECTED_VOXEL_DETOUR_BUDGET, LAVA_FLOW_DETOUR_BUDGET } = require('@utils/pathfinding_utils');
+const { computeAStar, drainSearchCensus, pathStillWalkable, keyOf, straightLine, classifyFloorInline, isBlockPassable, isScaffoldBlock, isDoorBlock, readAirlock, COST_HIGH, COST_PLACE, PROTECTED_VOXEL_DETOUR_BUDGET, LAVA_FLOW_DETOUR_BUDGET, besideCurrentOverDrop } = require('@utils/pathfinding_utils');
 // A forwarding router: calls route() with an upstream author's own from/to, so it cannot use
 // signal_utils' envelope helpers (they stamp `from` = the caller).
 const signalBus = require('@kernel/signal_bus');
@@ -99,7 +99,7 @@ const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 // The edge types that dig or place terrain to make a step passable. Every carve is recorded and
 // posted in one aggregated line at exit (flushCarves, Law 5). Keyed on the A* edge label, not the
 // block actually broken — a 'walk' edge bridged at execution is not counted.
-const CARVE_EDGES = new Set(['dig_through', 'dig_down', 'bridge', 'pillar', 'water_bank_out', 'dig_stair_up', 'dig_stair_down']);
+const CARVE_EDGES = new Set(['dig_through', 'dig_down', 'bridge', 'pillar', 'water_bank_out', 'water_step_up', 'dig_stair_up', 'dig_stair_down']);
 
 // ── THE LOOKAHEAD ────────────────────────────────────────────────────────────────────────────────
 // Fuses consecutive runnable edges into one continuous press instead of stopping at every cell
@@ -148,6 +148,7 @@ const PROTECTED_SOURCES = [
   ['buildings', (bot) => buildingIntegrity.getAllProtectedBlocks(bot)],  // every locked blueprint
   ['staircase', (bot) => miningIntegrity.getProtectedBlocks(bot)],
   ['cells',     ()    => miningCellGraph.getProtectedBlocks()],  // no world-diff of its own: plan-only, over-protected
+  ['basement',  ()    => require('@perception/lighting_integrity').basementWalls()],  // its cells' solid blocks: routes keep to the doors
 ];
 
 // One "x,y,z" key Set of every non-air voxel the bot has built or plans to. A* charges
@@ -179,6 +180,19 @@ function loadClosedBoxes(goal = null) {
   const goalFeet = goal && goal.type === 'position' ? { x: goal.pos.x, y: goal.pos.y + 1, z: goal.pos.z } : null;
   const lanes = survey.laneClosedBoxes(survey.getWorldLanes(), goalFeet);
   return [building, pit, ...lanes, ...peers].filter(Boolean);
+}
+
+// searchEdges — which world-altering edges a route search may use, read off the goal:
+//   walk_only — none: no dig, no place (drop_collector's strip chase);
+//   leading   — every one but the two straight-up-and-down moves, dig_down and pillar: an animal led
+//               along the route follows through a dug tunnel, up a dug stair and over a bridge, never
+//               out of a shaft or up a pillar.
+// spare_builds — any of the above, with no move that digs or covers a protected voxel: the build is no
+//               edge at all, so a goal only a cut reaches is unreached (herd_executor's walks).
+function searchEdges(goal) {
+  const spare = goal.spare_builds ? { spareBuilds: true } : {};
+  if (goal.walk_only) return { allowWorldAlteration: false, ...spare };
+  return goal.leading ? { allowWorldAlteration: true, allowDigDown: false, allowPillar: false, ...spare } : { allowWorldAlteration: true, ...spare };
 }
 
 // Queue waits allow peer claims and blueprint state to change; the admitted search reads them anew.
@@ -296,6 +310,12 @@ async function digIfObstructing(bot, pos, protectedBlocks) {
 const PILLAR_MAX = 3;
 async function closeToExactCell(bot, feetCell, protectedBlocks) {
   const headCell = feetCell.offset(0, 1, 0);
+  // TEMPORARY with pathfinding_utils RUNNING_WATER_ENTERED: the closer never steps onto a stand beside a current that runs
+  // to a drop.
+  if (!bot.entity.position.floored().equals(feetCell) && besideCurrentOverDrop(bot, feetCell.x, feetCell.y - 1, feetCell.z)) {
+    watcher.warn('navigator', `Exact cell (${feetCell.x},${feetCell.y},${feetCell.z}) stands beside running water that pours over a drop — the closer does not step onto it.`);
+    return false;
+  }
   for (let i = 0; i < 8; i++) {
     const cur = bot.entity.position.floored();
     if (cur.equals(feetCell)) return true;
@@ -357,6 +377,7 @@ function describeCell(bot, pos) {
 //   out_of_time       the body was still moving when the step's time ran out
 // Read by step_failure_lens (--steps).
 const WALK_STEP_HEIGHT = 0.6;
+const _recentStepFails = [];   // the last three, for the stranded report (strandedReport)
 function ledgerStepFailed(bot, step, from, startPos, startedAt) {
   const to = step.pos.offset(0, 1, 0);
   const p = bot.entity.position;
@@ -370,7 +391,7 @@ function ledgerStepFailed(bot, step, from, startPos, startedAt) {
   const wall = !!bot.entity.isCollidedHorizontally;
   const corrected = bot._navLastServerPosition;
   const setBack = !!corrected && corrected.at >= startedAt;
-  const levelEdge = step.edgeType === 'walk' || step.edgeType === 'bridge' || step.edgeType === 'door';
+  const levelEdge = step.edgeType === 'walk' || step.edgeType === 'wade' || step.edgeType === 'bridge' || step.edgeType === 'door' || step.edgeType === 'airlock';
   const stoppedBy = setBack ? 'server_set_back'
     : !solid(floor) ? 'no_floor'
     : solid(feet) ? `solid_feet:${name(feet)}`
@@ -383,6 +404,8 @@ function ledgerStepFailed(bot, step, from, startPos, startedAt) {
       && Math.hypot(e.position.x - (to.x + 0.5), e.position.z - (to.z + 0.5)) < 1)
     .map(e => String(e.username || e.name || e.type).replace(/\s+/g, '_'));
   const held = bot.heldItem ? bot.heldItem.name : 'nothing';
+  _recentStepFails.push(`${step.edgeType} (${from.x},${from.y},${from.z})→(${to.x},${to.y},${to.z}) stopped_by=${stoppedBy}`);
+  if (_recentStepFails.length > 3) _recentStepFails.shift();
   watcher.summary('step_fail',
     `step_failed edge=${step.edgeType} from=(${from.x},${from.y},${from.z}) to=(${to.x},${to.y},${to.z})`
     + ` body=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) stopped_by=${stoppedBy} gained=${gained} rise=${rise}`
@@ -390,6 +413,35 @@ function ledgerStepFailed(bot, step, from, startPos, startedAt) {
     + ` to_floor=${name(floor)} to_feet=${name(feet)} to_head=${name(head)}`
     + ` body_floor=${name(bot.blockAt(p.offset(0, -0.01, 0)))} body_head=${name(bot.blockAt(p.offset(0, 1.62, 0)))} body_above=${name(bot.blockAt(p.offset(0, 2.01, 0)))}`
     + ` others=${others.length ? others.join('+') : 'none'} held=${held}`);
+}
+
+// strandedReport(bot) → null, or the account of a body with NO FIRST MOVE: a dry body from whose floor the one search
+// reaches no cell at all within STRANDED_REACH (every walk, climb, dig, bridge and pillar the edges allow). A bot never
+// intentionally injures itself, so no move that hurts it frees such a body (canopy_descent's leaf drop stays the
+// leaves' alone). The run stops on it and says how the body got there.
+const STRANDED_REACH = 3;
+async function strandedReport(bot) {
+  // A body in water is the swim survival's and water_escape's, never stranded here.
+  if (bot.blockAt(bot.entity.position.floored())?.name === 'water') return null;
+  const f = bot.entity.position.floored();
+  const positions = [];
+  for (let dx = -STRANDED_REACH; dx <= STRANDED_REACH; dx++) {
+    for (let dz = -STRANDED_REACH; dz <= STRANDED_REACH; dz++) {
+      for (let dy = -STRANDED_REACH - 2; dy <= STRANDED_REACH; dy++) {
+        if (dx || dz || dy) positions.push(new Vec3(f.x + dx, f.y - 1 + dy, f.z + dz));
+      }
+    }
+  }
+  const goal = { type: 'multi', positions };
+  const r = await computeAStar(bot, f.offset(0, -1, 0), goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'diagnostic' });
+  if (r) return null;
+  let drop = 0;
+  while (drop < 64 && bot.blockAt(f.offset(0, -2 - drop, 0))?.boundingBox === 'empty') drop++;
+  const fuel = (bot.inventory?.items?.() || []).reduce((n, i) => n + (i.count > 0 && isScaffoldBlock(i.name) ? i.count : 0), 0);
+  const sides = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([dx, dz]) => describeCell(bot, f.offset(dx, -1, dz))).join(' ');
+  return `at (${f.x},${f.y},${f.z}) on ${describeCell(bot, f.offset(0, -1, 0))} with ${drop} open block(s) under it, `
+    + `side floors ${sides}, head ${describeCell(bot, f.offset(0, 1, 0))}, ${fuel} bridge/pillar block(s) carried, `
+    + `health ${bot.health}; last failed steps: ${_recentStepFails.join(' | ') || 'none'}`;
 }
 
 // diagnoseGiveUp — the give-up post-mortem, answering three questions a give-up otherwise hides:
@@ -421,7 +473,30 @@ async function diagnoseGiveUp(bot, targetPos, reason, goal, protectedBlocks) {
     `re-search ${r ? r.nodesVisited : '?'} nodes, ` +
     `${cutOff ? `cut off (nothing costs less than ${round1(r.provenBound || 0)})` : 'no reachable edge'}` +
     `${r && r.partial ? `, best ${round1(r.residual)} blocks short` : ''}.`);
+  // ── A BODY WALLED IN: what holds it, written out ───────────────────────────────────────────────────
+  // A search that dries up within ENCLOSED_NODES nodes never left the body's own pocket. The pocket is described
+  // cell by cell round the body (each side at feet and head, the three cells overhead, each marked where it
+  // touches water), and the same search is run again tracing every node, so each gate that deleted a way out
+  // names itself.
+  if (r && !cutOff && r.nodesVisited <= ENCLOSED_NODES) {
+    const lines = [];
+    await computeAStar(bot, p.offset(0, -1, 0), goal, {
+      sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'diagnostic', traceAll: true,
+      trace: (_lbl, msg) => { if (lines.length < ENCLOSED_TRACE_LINES) lines.push(msg.trim()); },
+    });
+    const wet = (c) => [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+      .some(([dx, dy, dz]) => /water/.test(bot.blockAt(c.offset(dx, dy, dz))?.name || ''));
+    const cell = (c) => `${bot.blockAt(c)?.name || 'unloaded'}${wet(c) ? '~' : ''}`;
+    const sides = [[1, 0, 'E'], [-1, 0, 'W'], [0, 1, 'S'], [0, -1, 'N']]
+      .map(([dx, dz, n]) => `${n} feet=${cell(p.offset(dx, 0, dz))} head=${cell(p.offset(dx, 1, dz))}`).join(' | ');
+    const up = [2, 3, 4].map(d => cell(p.offset(0, d, 0))).join(',');
+    watcher.warn('navigator', `ENCLOSED at (${p.x},${p.y},${p.z}): floor=${cell(p.offset(0, -1, 0))} ${sides} | overhead=${up} (~ touches water)`);
+    watcher.warn('navigator', `ENCLOSED_TRACE ${lines.length} line(s): ${lines.join(' ¦ ')}`);
+  }
 }
+// A post-mortem search this small never left the body's pocket; its trace is kept to this many lines.
+const ENCLOSED_NODES = 64;
+const ENCLOSED_TRACE_LINES = 60;
 
 // ---------------------------------------------------------------------------
 // SECTION 5: Step execution functions (edge-type walkers)
@@ -509,6 +584,20 @@ function escapeLandings(bot) {
   return out;
 }
 
+// SPARED VOXELS HOLD THROUGH THE STEP, NOT ONLY THE SEARCH. A spare_builds route plans no move that digs a build, but
+// a step digs what stands in the cell it steps to, and a body drifting off its line (a diagonal, a shove from an
+// animal) steps toward a cell the search never priced. routeSpared is the protected set of the route under way when
+// its goal spares builds (set by runNavigation, null otherwise); stepDig refuses a dig there and the step fails.
+let routeSpared = null;
+async function stepDig(bot, b) {
+  const k = `${b.position.x},${b.position.y},${b.position.z}`;
+  if (routeSpared && routeSpared.has(k)) {
+    watcher.warn('navigator', `dig refused at (${k}): ${b.name} is a build voxel and this walk spares builds.`);
+    return false;
+  }
+  return performDig(bot, b.position, b, 'navigator');   // one dig route — equips + verifies (Law 16); never throws
+}
+
 // jumpOutStep — the only edge whose job is leaving a cell, not entering one: standing in an
 // open-top container whose rim is over the 0.6 auto-step, so `forward` alone presses into the
 // wall. Jump is held (not tapped) for the whole crossing. No dig, no bridge, no place — the
@@ -535,10 +624,19 @@ async function bridgeLevelStep(bot, dir, targetFeet = null) {
   for (const c of [overFeet, overFeet.offset(0, 1, 0)]) {
     const b = bot.blockAt(c);
     if (b && b.name !== 'air' && b.boundingBox !== 'empty') {
-      await performDig(bot, b.position, b, 'navigator');   // one dig route — equips + verifies (Law 16); never throws
+      await stepDig(bot, b);
     }
   }
   return await stepToFeet(bot, overFeet);
+}
+
+// wadeStep — into running water over a floor, level or one down. A body in water floats and does not read
+// onGround, so stepToFeet (which lands first and arrives on the ground) would never see it arrive: the step ends
+// when the body's cell is the planned feet cell. The search admitted the cell (pathfinding_utils.wadeable), so
+// nothing is dug or bridged here.
+async function wadeStep(bot, feetCell) {
+  const r = await driveRun(bot, [feetCell], { timeoutMs: 2500, strictFinal: true });
+  return r.arrived || bot.entity.position.floored().equals(feetCell);
 }
 
 // headCellBlocks — the cell the head crosses on a step up or down holds a block the search did not price
@@ -567,7 +665,7 @@ async function stairUpStep(bot, dir, edgeType) {
   for (const c of [feet.offset(0, 2, 0), treadPos.offset(0, 1, 0), upFeet.offset(0, 1, 0)]) {
     const b = bot.blockAt(c);
     if (!solid(b)) continue;
-    if (!await performDig(bot, b.position, b, 'navigator')) {   // one dig route (Law 16)
+    if (!await stepDig(bot, b)) {
       watcher.warn('navigator', `stair up refused: ${b.name} at (${c.x},${c.y},${c.z}) would not clear `
         + `— the ascent is blocked by a block this body may not or cannot break, not by the step.`);
       return false;
@@ -620,7 +718,7 @@ async function stairDownStep(bot, dir, edgeType) {
   for (const c of [new Vec3(feet.x + dir.x, feet.y, feet.z + dir.z), downFeet, new Vec3(feet.x + dir.x, feet.y + 1, feet.z + dir.z)]) {
     const b = bot.blockAt(c);
     if (b && b.name !== 'air' && b.boundingBox !== 'empty') {
-      await performDig(bot, b.position, b, 'navigator');   // one dig route — equips + verifies (Law 16); never throws
+      await stepDig(bot, b);
     }
   }
   const from = bot.entity.position.clone();
@@ -675,7 +773,7 @@ async function digThroughStep(bot, dir) {
   for (const pos of [footPos, headPos]) {
     const b = bot.blockAt(pos);
     if (solid(b)) {
-      await performDig(bot, b.position, b, 'navigator');   // one dig route — equips + verifies (Law 16); never throws
+      await stepDig(bot, b);
     }
   }
   await sleep(100);
@@ -699,6 +797,76 @@ function describeDoor(bot, cell) {
   const props = guardExternalSync('navigator', 'read door properties', () => block.getProperties?.());
   if (!props.ok || !props.value) return `${block.name} (properties unreadable)`;
   return `${block.name} ${String(props.value.open) === 'true' ? 'OPEN' : 'shut'}`;
+}
+
+// ── airlockStep — one passage through an iron door and its in-line gate ─────────────────────────────
+// A stone button holds the door about a second, so the door opens only when the body is on its stand, and
+// the walk through starts at once. A door or gate is opened only with the other shut, and a villager in the
+// chamber stops the door opening: a resident getting out is worse than a body turned back (Law 17).
+const AIRLOCK_OPEN_MS = 600;
+const AIRLOCK_SHUT_MS = 3000;
+const AIRLOCK_POLL_MS = 50;
+
+function barrierOpen(bot, cell) {
+  const props = guardExternalSync('navigator', 'read airlock barrier', () => bot.blockAt(cell)?.getProperties?.());
+  return props.ok && !!props.value && String(props.value.open) === 'true';
+}
+
+async function untilBarrier(bot, cell, open, ms) {
+  const by = Date.now() + ms;
+  while (barrierOpen(bot, cell) !== open) {
+    if (Date.now() >= by) return false;
+    await sleep(AIRLOCK_POLL_MS);
+  }
+  return true;
+}
+
+async function useAirlockBlock(bot, cell, what) {
+  const r = await guardExternal('navigator', `use airlock ${what}`, async () => {
+    await bot.lookAt(new Vec3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5), true);
+    await bot.activateBlock(bot.blockAt(cell));
+  });
+  return r.ok;
+}
+
+function villagerAmong(bot, cells) {
+  return Object.values(bot.entities).find(e => e.name === 'villager' && cells.some(c =>
+    Math.floor(e.position.x) === c.x && Math.floor(e.position.z) === c.z && Math.abs(Math.floor(e.position.y) - c.y) <= 1));
+}
+
+async function airlockStep(bot, curFloor, dir) {
+  const ux = Math.sign(dir.x), uz = Math.sign(dir.z);
+  const lock = readAirlock(bot, curFloor.x, curFloor.y, curFloor.z, ux, uz);
+  const refuse = (why) => { watcher.warn('navigator', `Airlock step at (${curFloor.x},${curFloor.y},${curFloor.z}) stopped: ${why}.`); return false; };
+  if (!lock) return refuse('the airlock is no longer there');
+  // Going out through the gate: nothing opens while a villager is between the barriers.
+  const lastBarrier = lock.barriers[lock.barriers.length - 1];
+  if (lock.barriers.length > 1 && lastBarrier.kind === 'door') {
+    const inChamber = villagerAmong(bot, [...lock.chamber, lastBarrier.pos]);
+    if (inChamber) return refuse(`a villager is in the chamber at ${inChamber.position.floored()}`);
+  }
+  await microCenter(bot, { eps: 0.06 });
+  for (const b of lock.barriers) {
+    const before = b.pos.offset(-ux, 0, -uz), after = b.pos.offset(ux, 0, uz);
+    if (!bot.entity.position.floored().equals(before) && !(await stepToFeet(bot, before, { timeoutMs: 3000 }))) return refuse(`could not reach the ${b.kind}`);
+    if (b.kind === 'door') {
+      const inside = lock.barriers[0] !== b || lock.chamber.length === 0;
+      const stander = villagerAmong(bot, [before, b.pos, ...lock.chamber]);
+      if (inside && stander) return refuse(`a villager shares the chamber at ${stander.position.floored()}`);
+      await microCenter(bot, { eps: 0.06 });
+      if (!(await useAirlockBlock(bot, b.button, 'button'))) return refuse('the button press failed');
+      if (!(await untilBarrier(bot, b.pos, true, AIRLOCK_OPEN_MS))) return refuse('the button did not open the door');
+      if (!(await stepToFeet(bot, after, { timeoutMs: 1500, stallMs: null }))) return refuse('the door shut before the body was through');
+      if (!(await untilBarrier(bot, b.pos, false, AIRLOCK_SHUT_MS))) return refuse('the door stayed open behind the body');
+    } else {
+      if (!barrierOpen(bot, b.pos) && !(await useAirlockBlock(bot, b.pos, 'gate'))) return refuse('the gate would not open');
+      if (!(await untilBarrier(bot, b.pos, true, AIRLOCK_OPEN_MS))) return refuse('the gate did not open');
+      if (!(await stepToFeet(bot, after, { timeoutMs: 3000, stallMs: null }))) return refuse('could not walk through the gate');
+      if (!(await useAirlockBlock(bot, b.pos, 'gate'))) return refuse('the gate would not close');
+      if (!(await untilBarrier(bot, b.pos, false, AIRLOCK_OPEN_MS))) return refuse('the gate did not close');
+    }
+  }
+  return true;
 }
 
 // How long the body is given to fall its one block before the drop is measured — roughly 6 server
@@ -755,7 +923,7 @@ async function digDownStep(bot) {
     }
   }
 
-  await performDig(bot, floorBlock.position, floorBlock, 'navigator');   // one dig route (Law 16)
+  await stepDig(bot, floorBlock);
   await sleep(DIG_SETTLE_MS);
 
   const final = bot.entity.position.floored();
@@ -781,16 +949,28 @@ async function digDownStep(bot) {
   return false;
 }
 
-// swimStep: move the bot to a water-surface position. Works for land→water entry,
-// water→water traversal, and fall-into-water. survival_instincts handles floating.
-// Detects shallow water (head above surface) and uses wading physics — longer timeout
-// and jump control to climb out, instead of pure swim which stalls in 1-deep water.
-async function swimStep(bot, targetPos) {
-  const curFeet = bot.entity.position.floored();
-  const headBlock = bot.blockAt(curFeet.offset(0, 1, 0));
-  const headSubmerged = headBlock && (headBlock.name === 'water' || headBlock.name === 'flowing_water');
+// headUp(bot) → whether the body should press jump to keep its eye over the water: the navigator owns floating in
+// open water (underwater_swimming is only the breath override, taken when the air runs low).
+const headUp = (bot) => !!bot.entity.isInWater && require('@locomotion/underwater_swimming').submerged(bot);
+const breathTaken = (bot) => require('@locomotion/underwater_swimming').survivalHasControl(bot);
+// carried(bot) → the water unit holds the body, or it stands in running water. carriedThrough waits up to CARRIED_WAIT_MS
+// for the unit to let go and answers whether the body is still in running water after.
+const carried = (bot) => breathTaken(bot) || require('@locomotion/underwater_swimming').inCurrent(bot);
+const CARRIED_WAIT_MS = 20000;
+async function carriedThrough(bot) {
+  const end = Date.now() + CARRIED_WAIT_MS;
+  while (breathTaken(bot) && Date.now() < end && bot.health > 0) await sleep(100);
+  return carried(bot);
+}
 
-  const TIMEOUT = headSubmerged ? 1000 : 2500;
+// swimStep: move the bot to a water-surface position. Works for land→water entry,
+// water→water traversal, and fall-into-water. The step keeps the head over the water as it swims.
+// Jump is held while the target stands higher than the body: the stroke up, and the climb out onto a bank.
+// The breath override's notice ends the step at once, controls released, for the checkpoint to answer.
+async function swimStep(bot, targetPos) {
+  // A body under water starts from where it sank to, not from the surface: no reflex holds it up between steps, so a
+  // swim step has the rise to the surface in it too (about a second from a two-deep floor) before the stroke across.
+  const TIMEOUT = 2500;
   const t0 = Date.now();
   await guardExternal('navigator', 'lookAt swim target', () => bot.lookAt(new Vec3(targetPos.x + 0.5, targetPos.y + 1, targetPos.z + 0.5), true));
   // setControlState's only throw is our own bad literal, so it is unguarded (Law 13) — here and below.
@@ -802,20 +982,37 @@ async function swimStep(bot, targetPos) {
     while (Date.now() - t0 < TIMEOUT) {
       const p = bot.entity.position;
       const dx = targetPos.x + 0.5 - p.x, dz = targetPos.z + 0.5 - p.z;
-      if (Math.hypot(dx, dz) <= 0.8) { ok = true; break; }
+      // Arrived means IN the target cell: the next edge reads its direction from the cell the body is in, so a
+      // swim let go 0.8 short leaves a carve aimed two cells out from the water behind, which no dig answers.
+      if (Math.hypot(dx, dz) <= 0.8 && Math.floor(p.x) === targetPos.x && Math.floor(p.z) === targetPos.z) { ok = true; break; }
+      if (breathTaken(bot)) break;
       await guardExternal('navigator', 'look while swimming', () => bot.look(Math.atan2(-dx, -dz), 0, true));
-      if (!headSubmerged) {
-        const dy = targetPos.y + 1 - p.y;
-        bot.setControlState('jump', dy > 0.3);
-      }
+      // Jump held while the target stands higher: in water it is the stroke up and, against a bank, the climb out.
+      bot.setControlState('jump', headUp(bot) || targetPos.y + 1 - p.y > 0.3);
       await sleep(50);
     }
   }, () => {
     bot.setControlState('forward', false);
-    if (!headSubmerged) bot.setControlState('jump', false);
+    bot.setControlState('jump', false);
   });
-  if (!ok) watcher.warn('navigator', `Swim step timed out heading toward (${targetPos.x},${targetPos.y + 1},${targetPos.z}).`);
+  if (!ok) watcher.warn('navigator', `Swim step ${breathTaken(bot) ? 'ended for the breath override' : 'timed out'} heading toward (${targetPos.x},${targetPos.y + 1},${targetPos.z}).`);
   return ok;
+}
+
+// treadWater(bot, { until, ms }) → true once `until()` holds: a body that waits in water (a diver between breaths)
+// floats with its eye over the surface, pressing jump only while the eye is under. Ends on `ms`, on death, or on the
+// breath override's notice (the body is survival's then). Controls released on every exit.
+async function treadWater(bot, { until, ms }) {
+  const end = Date.now() + ms;
+  let met = false;
+  await withCleanup('navigator', 'tread water', async () => {
+    while (Date.now() < end && bot.health > 0 && !breathTaken(bot)) {
+      if (until()) { met = true; break; }
+      bot.setControlState('jump', headUp(bot));
+      await sleep(50);
+    }
+  }, () => bot.setControlState('jump', false));
+  return met || until();
 }
 
 // waterBankOutStep: out of water onto a bank that stands one block over it (pathfinding's water_bank_out).
@@ -863,6 +1060,45 @@ async function waterBankOutStep(bot, top, from) {
   return stairUpStep(bot, { x: top.x - fill.x, z: top.z - fill.z }, 'climb_up');
 }
 
+// waterStepUpStep: out of shallow water with no bank to climb (pathfinding's water_step_up). `up` is the floor the move
+// ends on (one over the water cell beside the body), `from` the water cell the plan leaves from. The block goes on the
+// ground under that neighbouring water cell, the body climbs onto it as water_bank_out climbs, then pillars once.
+async function waterStepUpStep(bot, up, from) {
+  const fill = new Vec3(up.x, up.y - 1, up.z);
+  const under = bot.blockAt(new Vec3(fill.x, fill.y - 1, fill.z));
+  const items = bot.inventory.items();
+  const item = BRIDGE_PREFS.map(name => items.find(i => i.name === name && i.count > 0)).find(Boolean);
+  if (!item) { watcher.warn('navigator', 'water_step_up: no block to place.'); return false; }
+  if (!under || !isFluid((bot.blockAt(fill) || {}).name)) {
+    watcher.warn('navigator', `water_step_up to (${up.x},${up.y + 1},${up.z}): (${fill.x},${fill.y},${fill.z}) is no longer water over ground.`);
+    return false;
+  }
+  // The server sets no block into a cell a body overlaps: the body is brought to the middle of its own cell first.
+  const mid = { x: from.x + 0.5, z: from.z + 0.5 };
+  await withCleanup('navigator', 'centre in the water cell', async () => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 1500) {
+      const p = bot.entity.position;
+      const dx = mid.x - p.x, dz = mid.z - p.z;
+      if (Math.hypot(dx, dz) <= 0.15) break;
+      await guardExternal('navigator', 'look toward the cell centre', () => bot.look(Math.atan2(-dx, -dz), 0, true));
+      bot.setControlState('forward', true);
+      await sleep(50);
+    }
+  }, () => bot.setControlState('forward', false));
+  const placed = await performPlace(bot, fill, under, new Vec3(0, 1, 0), item.name, 'navigator', { sneak: false });
+  if (!placed.ok) {
+    watcher.warn('navigator', `water_step_up: block not set at (${fill.x},${fill.y},${fill.z}) — ${placed.reason}`);
+    return false;
+  }
+  if (!(await swimStep(bot, fill))) return false;
+  await waitUntilSettled(bot);
+  const stood = bot.entity.onGround && Math.floor(bot.entity.position.y + 0.01) === fill.y + 1;
+  watcher.summary('navigator', `WATER_STEP_UP set ${item.name} at (${fill.x},${fill.y},${fill.z}), stood_on_it=${stood}, pillar to (${up.x},${up.y + 1},${up.z}).`);
+  if (!stood) return false;
+  return pillarUpStep(bot);
+}
+
 // pillarUpStep: place a block underfoot at jump peak, rise 1 block. Uses scaffold_movement.pillarStep.
 async function pillarUpStep(bot) {
   const result = await pillarStep(bot, { debug: false });
@@ -907,7 +1143,11 @@ function forwardToJudge(payload, success, distNow, reason) {
   const capsule = payload.locomotion;
   const feet = describeFeet();
   postSearchCensus();
-  watcher.summary('navigator', success
+  // A retry spends only what is left of the caller's step budget, so the budget bounds the whole walk.
+  if (!success && capsule.max_steps != null) capsule.max_steps = Math.max(1, capsule.max_steps - (capsule.steps_walked || 0));
+  watcher.summary('navigator', reason === 'step_budget_spent'
+    ? `${capsule.verb} walked its step budget (${capsule.steps_walked} step(s)) — at ${feet}, ${distNow.toFixed(1)} blocks from '${capsule.selected_target?.name}'. Reporting success to the judge.`
+    : success
     ? `${capsule.verb} reached '${capsule.selected_target?.name}' — at ${feet}, ${distNow.toFixed(1)} blocks from target. Reporting success to the judge.`
     : `${capsule.verb} gave up (${reason}) at ${feet}, ${distNow.toFixed(1)} blocks from '${capsule.selected_target?.name}'. To the judge for retry/decision.`
   );
@@ -921,7 +1161,7 @@ function forwardToJudge(payload, success, distNow, reason) {
     // abandon on a field, not by parsing prose (Law 10). Only a reason that reflects
     // forward progress is worth retrying — the judge whitelists which ones.
     fail_reason: success ? null : reason,
-    readable: success ? `navigator: success ${capsule.verb}_reached` : `navigator: fail ${reason}`,
+    readable: success ? `navigator: success ${capsule.verb}_${reason === 'step_budget_spent' ? 'step_budget_spent' : 'reached'}` : `navigator: fail ${reason}`,
     locomotion: capsule
   };
   signalBus.route(out.to, out);
@@ -964,6 +1204,7 @@ module.exports = {
     await runNavigation(payload);
   }),
   planRouteForTest,   // plan-only oracle (no execution, no bus) — see above
+  treadWater,
   waterStepsForTest: { swimStep, waterBankOutStep },   // the two water walkers, for a live probe to drive one at a time
   // Exported for locomotion_dispatcher.descendColumn, which loops it to sink a scanned column
   // straight down — reused so both pathways share one safe-descent gate and one dig-down (Law 16).
@@ -976,11 +1217,51 @@ module.exports = {
   // The boxes a route may not enter, for a caller pricing a route the navigator will later walk
   // (drop_collector.priceRouteTo) — the price and the walk read one list (Law 16).
   loadClosedBoxes,
+  // The clock every walk's search runs under, for a caller pricing a route the walk will be given
+  // (ground_salvage_executor): a price searched longer than this finds routes the walk never would.
+  NAV_SEARCH_DEADLINE_MS,
   // Whose closed ground a stand cell falls in, for a caller reporting a walk the search refused.
   closedBy,
+  // The guards every route search reads (protected voxels, closed boxes), for the combat driver's route search,
+  // which runs this pathfinder under the same guards (Law 16).
+  freshSearchState,
   // The lookahead dial, exported so a live move test can set it per run (see move_injector).
   setRunLookahead, getRunLookahead, setRunPrejump, getRunPrejump, RUN_LOOKAHEAD_DEFAULT,
 };
+
+// ── THE HELD ROUTE — a step-budgeted walk resumes its own plan instead of searching again ────────────
+// A walk that spends its step budget keeps the rest of its route here. The next walk to the same goal,
+// with the same options and also budgeted, starting on the cell where the last one stopped, walks that
+// remainder once pathStillWalkable re-reads every cell of it against the world (Invariant B). Any other
+// walk, a moved body, or a changed cell searches fresh. One held route per body; taking it clears it.
+let heldRoute = null;   // { key, fromCell, path, cut, result } — the whole route and the index the walk stopped at
+const HELD_ROUTE_COAST_STEPS = 2;   // route cells either side of the cut a stopped body may be found on
+
+function heldRouteKey(capsule) {
+  return JSON.stringify([capsule.coordinate, capsule.candidates_ref, capsule.walk_only, capsule.leading, capsule.spare_builds, capsule.exact,
+    capsule.min_y, capsule.max_y, capsule.require_los, capsule.required_side]);
+}
+const cellText = p => `${p.x},${p.y},${p.z}`;
+
+function takeHeldRoute(bot, capsule, botFloor) {
+  const held = heldRoute;
+  heldRoute = null;
+  if (!held) return null;
+  const refuse = why => { watcher.summary('navigator', `Held route not resumed: ${why} — searching fresh.`); return null; };
+  if (capsule.max_steps == null || held.key !== heldRouteKey(capsule)) return refuse('a different walk');
+  // A stopped body coasts, and a fused run credits its cells as a group, so the body is looked for on the
+  // route within HELD_ROUTE_COAST_STEPS cells either side of where the walk was cut, and resumes after it.
+  const here = cellText(botFloor);
+  let from = held.fromCell === here ? held.cut : -1;
+  const lo = Math.max(0, held.cut - HELD_ROUTE_COAST_STEPS), hi = Math.min(held.path.length - 1, held.cut + HELD_ROUTE_COAST_STEPS);
+  for (let i = lo; from < 0 && i <= hi; i++) {
+    if (cellText(held.path[i].pos) === here) from = i + 1;
+  }
+  if (from < 0) return refuse(`the body stands on (${here}), off the route left at (${held.fromCell})`);
+  const path = held.path.slice(from);
+  if (path.length === 0) return refuse('no steps left');
+  return pathStillWalkable(bot, path, 0) ? { ...held.result, path, nodesVisited: 0 } : refuse('a cell on it no longer reads walkable or is not loaded');
+}
 
 // Unguarded, deliberately: a throw here reaches master_core's crash reporter, never dressed as a
 // no-progress trip the judge would retry forever (Law 25, Law 13).
@@ -1001,12 +1282,27 @@ async function runNavigation(payload) {
     throw new Error('[navigator] CODING VIOLATION: invoked with no bot loaded.');
   }
 
+  // A body standing on leaves has no floor a search can start from: it drops to solid ground first
+  // (canopy_descent), and every step below measures from where it lands.
+  const canopy = require('@utils/movement/canopy_descent');
+  if (canopy.onCanopy(bot)) await canopy.descend(bot);
+
   // --- STEP 1: Resolve targets ---
   const targets = resolveTargets(capsule);
   const botFeet = bot.entity.position.floored();
   const botFloor = botFeet.offset(0, -1, 0);
   const nearest = pickNearest(botFeet, targets);
   const nearestDist = straightLine(botFeet, nearest.position);
+
+  // TEMPORARY, with the current reflex (underwater_swimming): NO PLAN WHILE CARRIED. A body in running water may plan
+  // only its way out, and that is the water unit's (ashore, the board's leave_current). The walk waits while that unit
+  // holds the body, then plans from where it let go; a body still standing in running water hands the walk back.
+  if (await carriedThrough(bot)) {
+    const f = bot.entity.position.floored();
+    watcher.warn('navigator', `In running water at (${f.x},${f.y},${f.z}) — no route is planned from a current; the way out is the water unit's.`);
+    capsule.selected_target = { name: nearest.name, position: nearest.position };
+    return forwardToJudge(payload, false, nearestDist, 'in_running_water');
+  }
 
   // --- STEP 2: Build A* goal ---
   const tSearch = Date.now();
@@ -1028,10 +1324,24 @@ async function runNavigation(payload) {
   if (capsule.min_y != null) goal.min_y = capsule.min_y;
   if (capsule.max_y != null) goal.max_y = capsule.max_y;
   if (capsule.walk_only) goal.walk_only = true;
+  if (capsule.leading) goal.leading = true;
+  if (capsule.spare_builds) goal.spare_builds = true;
+
+  // TEMPORARY (pathfinding_utils RUNNING_WATER_ENTERED): an exact stand beside a current that runs to a drop is refused
+  // before the search. The search deletes such a stand from every route, so it would spend its whole deadline looking
+  // for a way, and the exact closer would then walk the last cell onto it.
+  if (capsule.exact && goal.type === 'position' && !botFloor.equals(goal.pos) && besideCurrentOverDrop(bot, goal.pos.x, goal.pos.y, goal.pos.z)) {
+    watcher.warn('navigator', `Exact goal (${goal.pos.x},${goal.pos.y + 1},${goal.pos.z}) stands beside running water that pours over a drop — refused before the search.`);
+    capsule.selected_target = { name: nearest.name, position: nearest.position };
+    return forwardToJudge(payload, false, nearestDist, 'goal_beside_current_over_drop');
+  }
 
   // --- STEP 3: Run A* ---
   const protectedBlocks = loadProtectedBlocks(bot);
-  let result = await computeAStar(bot, botFloor, goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: !goal.walk_only });
+  routeSpared = goal.spare_builds ? protectedBlocks : null;
+  let result = takeHeldRoute(bot, capsule, botFloor);
+  if (result) watcher.summary('navigator', `Held route resumed: ${result.path.length} step(s) left, every cell re-read and still walkable — no search.`);
+  else result = await computeAStar(bot, botFloor, goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
 
   // An exact cell over a void or in open air needs no special mode: the single weighted search
   // reaches it and bridges/pillars the final gap as the cheapest route (Law 16: one search, one
@@ -1045,8 +1355,18 @@ async function runNavigation(payload) {
     if (await stepAwayFromGoal(bot, nearest.position)) {
       const uf = bot.entity.position.floored().offset(0, -1, 0);
       watcher.summary('navigator', `Unstick: stepped clear of a near-goal dead spot to (${uf.x},${uf.y + 1},${uf.z}), re-planning.`);
-      result = await computeAStar(bot, uf, goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: !goal.walk_only });
+      result = await computeAStar(bot, uf, goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
     }
+  }
+
+  // NO ROUTE THAT KEEPS OUT OF RUNNING WATER AND OFF ITS LIPS: wading it, or stepping across a lip, is the risky move,
+  // taken only now (the search prices each, RUNNING_WATER_DETOUR_BUDGET, so the risky part stays short), never into a
+  // current that runs to a drop and never ending on a lip. A body walled in by a spring's spread on open ground is not
+  // stranded: it steps out, and the current reflex holds it if the water takes it.
+  if (!result) {
+    const wf = bot.entity.position.floored().offset(0, -1, 0);
+    result = await computeAStar(bot, wf, goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal), wade: true });
+    if (result) watcher.warn('navigator', `No route keeps out of running water and off its lips from (${wf.x},${wf.y + 1},${wf.z}): taking the risky way, ${result.path.length} step(s).`);
   }
 
   // No route at all from a floor with running water round the feet: prevent-flow refuses every dig beside
@@ -1056,7 +1376,36 @@ async function runNavigation(payload) {
     const { stopFlow, standingInFlow } = require('@utils/movement/stop_flow');
     if (standingInFlow(bot) && (await stopFlow(bot)).stopped) {
       const df = bot.entity.position.floored().offset(0, -1, 0);
-      result = await computeAStar(bot, df, goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: true });
+      result = await computeAStar(bot, df, goal, { sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
+    }
+  }
+
+  // Still no route from inside water: the body may be TRAPPED there — barred from digging afloat, with no
+  // ordinary move to dry ground. The water unit (underwater_swimming.freeTrapped) proves that first, by the same search
+  // asked for every safe cell near it, and only then digs its fewest-dig way out, saying each move as a warning; then
+  // one re-plan. While that unit already holds the body (a swim to air) it refuses, and the caller's checkpoint answers.
+  if (!result && !goal.walk_only) {
+    const searchFrom = () => bot.entity.position.floored().offset(0, -1, 0);
+    const searchTo = (g) => computeAStar(bot, searchFrom(), g, { sense: () => freshSearchState(bot, g), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
+    // stop_flow ran above whenever it applies, so a body still standing in running water here is one it did not free.
+    const stopFlow = require('@utils/movement/stop_flow').standingInFlow(bot) ? 'tried_and_held' : 'not_applicable';
+    if ((await require('@locomotion/underwater_swimming').freeTrapped(bot, { stopFlow, searchTo, protectedBlocks })).escaped) {
+      result = await searchTo(goal);
+    }
+  }
+
+  // NO FIRST MOVE: not a route the judge can retry, so the run stops and the body's situation is the report.
+  if (!result) {
+    const stranded = await strandedReport(bot);
+    if (stranded) {
+      // Inside the spawn-protected square every block reads as bedrock (spawn_protection's mask), so a body there
+      // is walled in by the mask, not by the world. The report says so first.
+      const spawn = require('@perception/spawn_protection');
+      const atSpawn = spawn.isSpawnProtectedAt(bot, bot.entity.position);
+      if (atSpawn) {
+        throw new Error(`[navigator] STRANDED AT WORLD SPAWN — the body stands inside the spawn-protected square, where the fleet reads every block as bedrock; the work has to stand outside it. ${spawn.describeSpawnProtection(bot)} The body: ${stranded}`);
+      }
+      throw new Error(`[navigator] STRANDED — the body has no move to any cell within ${STRANDED_REACH} blocks and is never freed by a move that hurts it: ${stranded}`);
     }
   }
 
@@ -1188,6 +1537,10 @@ async function runNavigation(payload) {
   let currentPath = astarPath;
   let stepIdx = 0;
   let walkDone = false;
+  // The caller's step budget (capsule.max_steps) counts steps walked across replans; spending it ends
+  // the walk where the body stands, reported as its own outcome, never as an arrival.
+  let stepsWalked = 0;
+  let budgetSpent = false;
   let lastProgressLog = Date.now();
   const PROGRESS_INTERVAL = 3000;
 
@@ -1246,8 +1599,10 @@ async function runNavigation(payload) {
     if (goal.min_y != null) nextGoal.min_y = goal.min_y;
     if (goal.max_y != null) nextGoal.max_y = goal.max_y;
     if (goal.walk_only) nextGoal.walk_only = true;
+    if (goal.leading) nextGoal.leading = true;
+    if (goal.spare_builds) nextGoal.spare_builds = true;
     const fromFloor = bot.entity.position.floored().offset(0, -1, 0);
-    const r = await computeAStar(bot, fromFloor, nextGoal, { movePenalties, sense: () => freshSearchState(bot, nextGoal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: !goal.walk_only });
+    const r = await computeAStar(bot, fromFloor, nextGoal, { movePenalties, sense: () => freshSearchState(bot, nextGoal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
     if (!r || r.path.length === 0) return false;                   // no untried candidate reachable → exhausted
     goal = nextGoal;
     currentPath = r.path;
@@ -1267,18 +1622,23 @@ async function runNavigation(payload) {
   // since a replan landing on a different multi-goal candidate must move `selectedTarget` (Law 25).
   // Returns true when a fresh route is loaded, false when the search found nothing.
   async function replanFromHere(why) {
+    // No plan while carried (above): the walk ends here and the judge's next attempt waits out the current.
+    if (carried(bot)) return false;
     const rFeet = bot.entity.position.floored();
     const rFloor = new Vec3(rFeet.x, rFeet.y - 1, rFeet.z);
     const tReplan = Date.now();
-    const rResult = await computeAStar(bot, rFloor, goal, { movePenalties, sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: !goal.walk_only });
+    const rResult = await computeAStar(bot, rFloor, goal, { movePenalties, sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
     const replanMs = Date.now() - tReplan;
     if (!rResult || rResult.path.length === 0) return false;
     currentPath = rResult.path;
     stepIdx = 0;
+    // The candidate's own position, as STEP 4 and retargetToNextCandidate take it (Law 16). A partial route's
+    // `target` is where its search stopped, not a candidate: aiming the arrival test at the route's end would call
+    // a walk that stopped short at a timed-out frontier "arrived".
     if (targets.length > 1 && rResult.target) {
       let mt = targets[0], md = Infinity;
       for (const t of targets) { const d2 = straightLine(rResult.target, t.position); if (d2 < md) { md = d2; mt = t; } }
-      selectedTarget = { name: mt.name, position: currentPath[currentPath.length - 1].pos.offset(0, 1, 0) };
+      selectedTarget = { name: mt.name, position: mt.position };
       capsule.selected_target = selectedTarget;
     }
     // Said here, not deferred to the progress heartbeat, so a replan followed by a failed step still
@@ -1303,7 +1663,17 @@ async function runNavigation(payload) {
     // 'sentry'); kept because the `source` field separates a fight walked into from one an executor
     // polled. Safe to await here: the fight routes no signals, and on a win the tail abandons this
     // line to recursive_judge.
-    await combatCheckpoint(bot, 'locomotion');
+    // The breath override lends the body and hands it back with this walk still ours: the route is remade from where
+    // the body now floats.
+    const gate = await combatCheckpoint(bot, 'locomotion');
+    if (gate && gate.took === 'breath') {
+      if (await replanFromHere('breath override returned the body')) continue;
+      if (await retargetToNextCandidate()) continue;
+      const remainingNow = dist(bot.entity.position.floored(), selectedTarget.position);
+      watcher.warn('navigator', `No route from where the breath override left the body — ${round1(remainingNow)} blocks from '${selectedTarget.name}'. Giving up to the judge.`);
+      flushCarves(); flushRuns();
+      return forwardToJudge(payload, false, remainingNow, 'no_route_after_breath');
+    }
 
     // ── VERIFY BEFORE STEPPING, NOT AFTER ───────────────────────────────────
     // The whole route is rechecked every iteration, not one block ahead: a check run only after a
@@ -1390,6 +1760,7 @@ async function runNavigation(payload) {
         // credits n-1 here and lets that branch credit the last, so a fused run and a single step
         // account identically.
         stepIdx += r.crossed - 1;
+        stepsWalked += r.crossed - 1;
         runHandled = true;
         ok = true;
       }
@@ -1397,6 +1768,9 @@ async function runNavigation(payload) {
 
     if (!runHandled) switch (step.edgeType) {
       case 'walk':        ok = await bridgeLevelStep(bot, dir, step.pos.offset(0, 1, 0)); break;
+      // Through running water ankle- or knee-deep: the same level step, against the current's push.
+      case 'wade':
+      case 'wade_down':   ok = await wadeStep(bot, step.pos.offset(0, 1, 0)); break;
       case 'jump_out':    ok = await jumpOutStep(bot, step.pos.offset(0, 1, 0)); break;
       case 'climb_up':    ok = await stairUpStep(bot, dir, step.edgeType); break;
       case 'climb_down':  ok = await stairDownStep(bot, dir, step.edgeType); break;
@@ -1421,6 +1795,7 @@ async function runNavigation(payload) {
         }
         break;
       }
+      case 'airlock':     ok = await airlockStep(bot, curFloor, dir); break;
       case 'dig_through': ok = await digThroughStep(bot, dir); break;
       case 'bridge':      ok = await bridgeLevelStep(bot, dir, step.pos.offset(0, 1, 0)); break;
       case 'dig_down':    ok = await digDownStep(bot); break;
@@ -1433,15 +1808,34 @@ async function runNavigation(payload) {
       case 'swim':        ok = await swimStep(bot, step.pos); break;
       case 'water_exit':  ok = await swimStep(bot, step.pos); break;
       case 'water_bank_out': ok = await waterBankOutStep(bot, step.pos, stepIdx > 0 ? currentPath[stepIdx - 1].pos : curFloor); break;
+      case 'water_step_up': ok = await waterStepUpStep(bot, step.pos, stepIdx > 0 ? currentPath[stepIdx - 1].pos : curFloor); break;
       default:
         watcher.warn('navigator', `Unknown edgeType '${step.edgeType}' — attempting bridgeLevelStep.`);
         ok = await bridgeLevelStep(bot, dir);
         break;
     }
 
+    // A refused airlock ends the walk: a replan from here could dig round the barrier it just kept shut.
+    if (!ok && step.edgeType === 'airlock') {
+      flushCarves(); flushRuns();
+      return forwardToJudge(payload, false, straightLine(bot.entity.position.floored(), selectedTarget.position), 'airlock_refused');
+    }
+
     if (ok) {
       if (CARVE_EDGES.has(step.edgeType)) carves.push({ t: step.edgeType, x: step.pos.x, y: step.pos.y + 1, z: step.pos.z });
       stepIdx++;
+      stepsWalked++;
+      capsule.steps_walked = stepsWalked;
+      if (capsule.max_steps != null && stepsWalked >= capsule.max_steps && !arrived(bot.entity.position.floored(), selectedTarget.position)) {
+        budgetSpent = true;
+        walkDone = true;
+        heldRoute = {
+          key: heldRouteKey(capsule),
+          fromCell: cellText(bot.entity.position.floored().offset(0, -1, 0)),
+          path: currentPath, cut: stepIdx, result,
+        };
+        break;
+      }
       const now = Date.now();
       if (now - lastProgressLog >= PROGRESS_INTERVAL) {
         const p = bot.entity.position.floored();
@@ -1546,7 +1940,7 @@ async function runNavigation(payload) {
         if (recovered) {
           const recFeet = bot.entity.position.floored();
           const recFloor = new Vec3(recFeet.x, recFeet.y - 1, recFeet.z);
-          const recResult = await computeAStar(bot, recFloor, goal, { movePenalties, sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: !goal.walk_only });
+          const recResult = await computeAStar(bot, recFloor, goal, { movePenalties, sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
           if (recResult && recResult.path.length > 0) {
             currentPath = recResult.path;
             stepIdx = 0;
@@ -1566,7 +1960,7 @@ async function runNavigation(payload) {
       watcher.summary('navigator', `Step failed: ${step.edgeType} to (${step.pos.x},${step.pos.y + 1},${step.pos.z}) — bot at (${failFeet.x},${failFeet.y},${failFeet.z}), charged ${movePenalties.get(finedKey)} on ${step.edgeType} into that cell (other ways in stay unpriced) and re-planning (${replans}/${MAX_REPLANS}).`);
       const replanFloor = new Vec3(curFeet.x, curFeet.y - 1, curFeet.z);
       const tFailReplan = Date.now();
-      const replanResult = await computeAStar(bot, replanFloor, goal, { movePenalties, sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', allowWorldAlteration: !goal.walk_only });
+      const replanResult = await computeAStar(bot, replanFloor, goal, { movePenalties, sense: () => freshSearchState(bot, goal), deadlineMs: NAV_SEARCH_DEADLINE_MS, owner: 'navigate', ...searchEdges(goal) });
       const failReplanMs = Date.now() - tFailReplan;
       if (replanResult && replanResult.path.length > 0) {
         currentPath = replanResult.path;
@@ -1599,6 +1993,10 @@ async function runNavigation(payload) {
   const d = dist(finalFeet, selectedTarget.position);
   const startDist = nearestDist;
 
+  if (budgetSpent) {
+    capsule.step_budget_spent = true;
+    return forwardToJudge(payload, true, d, 'step_budget_spent');
+  }
   if (capsule.require_los || capsule.required_side) {
     if (d > BLOCK_REACH) return forwardToJudge(payload, false, d, 'los_out_of_range');
     if (capsule.required_side) {

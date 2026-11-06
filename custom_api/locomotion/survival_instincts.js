@@ -11,51 +11,38 @@
 //  - stop() detaches them. Logs a Law 17 warning — the caller is accepting drowning risk.
 //  - Each reflex is independently toggleable via enable/disable functions.
 //  - No signal_bus, no file I/O — pure tick-level reactions. The watcher is its one output: the fall
-//    alert's warning line.
+//    and water survival diagnostics.
 
 const Vec3 = require('vec3');
 const watcher = require('@kernel/watcher');
 const { guardExternalSync } = require('@utils/external_library_guard');
+const swimming = require('./underwater_swimming');
 
 // ---------------------------------------------------------------------------
 // SECTION 1: State
 // ---------------------------------------------------------------------------
 let attached = false;
 let tickHandler = null;
+let attachedBot = null;
+let lifecycleHandler = null;
 
 // Per-reflex enable flags. All default to ON — survival is opt-out, not opt-in.
 const reflexes = {
   antiDrown: true,
   doorHandler: true,
-  // 'autoTorch', 'shieldGuard' and 'shieldFacing' are not keys here: enable/disableReflex calls
-  // naming them are harmless no-ops via the `name in reflexes` guard below, so old callers do not
-  // break.
-  //
-  // This module writes the yaw only in doorHandlerTick, to face a door before activating it; the
-  // only other continuous yaw writer in the fleet is the gunner (custom_api/gunner.js). The door
-  // write is conditional (forward held, door within 1.5 blocks) and momentary, so a doorway fight
-  // is the one case where both could want the yaw at once, and nothing arbitrates that today —
-  // arbitration belongs to the commander's seat, not a check added here.
+  // Door facing is momentary; water survival suppresses it while the body returns to air.
 };
 
 // ---------------------------------------------------------------------------
 // SECTION 2: Reflex implementations
 // ---------------------------------------------------------------------------
 
-// antiDrown: if the bot is in water, hold jump to swim toward the surface.
-// Releases jump the tick the bot leaves water, but only if this reflex was the one holding
-// it — otherwise it would fight with navigator's climb_up steps that also use jump.
-let antiDrownHolding = false;
+// The breath override (underwater_swimming): borrowed dives, and the body taken to air only when its air runs low,
+// held there until the breath is full and released. Floating and swimming are the navigator's; nothing is pressed here
+// for a body that is breathing.
 function antiDrownTick(bot) {
   if (!reflexes.antiDrown) return;
-  const inWater = bot.entity?.isInWater;
-  if (inWater) {
-    bot.setControlState('jump', true);
-    antiDrownHolding = true;
-  } else if (antiDrownHolding) {
-    bot.setControlState('jump', false);
-    antiDrownHolding = false;
-  }
+  swimming.tick(bot);
 }
 
 // doorHandler: open closed wooden doors when the bot is within reach, close them after
@@ -185,13 +172,10 @@ function fallAlertTick(bot) {
 // SECTION 3: Tick dispatcher
 // ---------------------------------------------------------------------------
 
-// Nothing in this dispatcher writes the yaw: the only writer of the facing anywhere in the fleet
-// is the gunner. A successor adding a reflex here must not take the yaw (Invariant D) — a
-// tick-rate writer beneath the combat loop is invisible to it and outruns every check it could
-// make.
+// A survival return owns facing until breathing is restored; door work waits for that boundary.
 function onPhysicsTick(bot) {
   antiDrownTick(bot);
-  doorHandlerTick(bot);
+  if (swimming.status(bot).mode === 'floating') doorHandlerTick(bot);
   fallAlertTick(bot);
 }
 
@@ -202,6 +186,10 @@ function onPhysicsTick(bot) {
 function start(bot) {
   if (attached) return;
   tickHandler = () => onPhysicsTick(bot);
+  attachedBot = bot;
+  lifecycleHandler = () => swimming.reset(bot);
+  bot.on('spawn', lifecycleHandler);
+  bot.on('death', lifecycleHandler);
   bot.on('physicsTick', tickHandler);
   attached = true;
   console.log('[survival_instincts] Started — anti-drown, door-handler, fall-alert active.');
@@ -210,7 +198,12 @@ function start(bot) {
 function stop() {
   if (!attached || !tickHandler) return;
   console.log('[survival_instincts] WARNING: Stopping survival reflexes. The bot can now drown (Law 17 risk accepted by caller).');
-  global.bot?.removeListener('physicsTick', tickHandler);
+  attachedBot.removeListener('physicsTick', tickHandler);
+  attachedBot.removeListener('spawn', lifecycleHandler);
+  attachedBot.removeListener('death', lifecycleHandler);
+  lifecycleHandler = null;
+  swimming.reset(attachedBot);
+  attachedBot = null;
   tickHandler = null;
   attached = false;
 }

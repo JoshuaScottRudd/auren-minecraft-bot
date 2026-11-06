@@ -12,6 +12,8 @@ moduleAlias.addAliases({
   '@thinking': __dirname + '/Thinking_fragments',
   '@foreman': __dirname + '/foreman'
 });
+// Each require's resolved file is remembered once the aliases are set (require_memo).
+require('@utils/require_memo').install();
 
 // A body's console is a pipe to the foreman, and a pipe write on Windows waits on this process's own loop
 // for its reader; the lane hands each line to the thread pool so a paused reader never holds the body
@@ -76,6 +78,8 @@ bot.loadPlugin(pathfinder);
 // immediately after createBot, to catch it. `bot.spawnPoint` starts at (0,0,0), which this fleet's
 // worlds also spawn at, so reading it before the packet lands would be a well-formed falsehood (Law 26).
 require('@perception/spawn_protection').armSpawnProtection(bot);
+// The server's damage type names arrive in the same window (damage_types says how they are read).
+require('@api/damage_types').arm(bot);
 
 // Every change to this body's pocket, sent to the foreman's item book (item_book says how it is read).
 require('@kernel/item_book').arm(bot);
@@ -124,6 +128,12 @@ bot.once('spawn', () => {
   // than beside the arm because `maskWorldReads` wraps `bot.blockAt`, which mineflayer has not attached
   // until the body is whole at spawn.
   require('@perception/spawn_protection').maskWorldReads(bot);
+  // Every drowned zone the crew has marked reads as bedrock too, by the same means (hazard_zones).
+  require('@api/hazard_zones').maskReads(bot);
+  // Every head turn passes the enderman gaze guard: no look meets a calm enderman's eyes (enderman_gaze).
+  require('@api/enderman_gaze').guardGaze(bot);
+  // A mounted mob is read where its mount is (mounted_riders).
+  require('@api/mounted_riders').followMounts(bot);
 
   // Logs the spawn square once per run regardless of outcome, so a later "nothing to mine" reads as a
   // keep-out, never an empty world (Law 6). An unknown square is reported here, while it is still
@@ -174,14 +184,6 @@ bot.once('spawn', () => {
     }
   });
 
-  // A person's crew is announced once, by the foreman, in the reply to the `get` that asked for it — not
-  // here (Law 16: one arrival, one voice). See THE BOT DOES NOT SPEAK in Thinking_fragments/dispatcher.js.
-
-  // A contractor arrives where its owner is standing, fired once at birth, never posted as a job (Law 8)
-  // — a job would re-post every time the two bodies drifted apart. Not awaited: the seats below are
-  // process-lifetime listeners independent of body position, and a teleport here is allowed to fail.
-  require('@action/report_to_owner.js').announce(bot);
-
   const survivalInstincts = require('@locomotion/survival_instincts');
   survivalInstincts.start(bot);
 
@@ -189,6 +191,14 @@ bot.once('spawn', () => {
   // Commander first and unconditionally: the fleet's only monster scanner, sweeping whether or not a
   // fight is open so the gunner is never starved waiting on an engagement.
   require('@api/commander').start(bot);
+
+  // The survival seat next: it prices the board the commander just wrote, and the gunner and the driver read its
+  // flee and its goal this same tick (self_preservation, Law 17).
+  require('@api/self_preservation').start(bot);
+  // Every drowned seen marks a zone the crew never enters again (hazard_zones).
+  require('@api/hazard_zones').start(bot);
+  // The spawn-proofed ground's surface under a swelling creeper is recorded, so the blast's crater can be laid again (blast_mender).
+  require('@api/blast_mender').start(bot);
 
   // The gunner attaches once for the process and engages per wave via one boolean (Law 8), never by
   // attaching/detaching a physicsTick listener per engagement. Registered after the commander so it reads
@@ -217,34 +227,36 @@ bot.once('spawn', () => {
 
   foremanLink.connect(foremanUrl, botId);
   foremanLink.startBodyCellPublisher(bot);
+  foremanLink.watchWhileInLine(() => require('@api/battle_stations').combatCheckpoint(bot, 'waiting_in_line'));
 
   // Startup only: after peer chairs have had a moment to arrive over the foreman, announce
   // our spawn position and the distance to the nearest other bot (if one is connected).
   setTimeout(() => foremanLink.recordStartupPosition(bot), 4000);
 
-  // ── A CONTRACTOR IS BORN STARTED ──────────────────────────────────────────
-  // A contractor is defined as a body already working, so there is no un-started contractor to poll or
-  // wait on (Law 27); `beginsWorkAtBirth` on the mandate owns which species starts here. Placed after the
+  // ── A BODY THE FOREMAN STAMPED TO START STARTS HERE ───────────────────────
+  // `beginsWorkAtBirth` on the mandate owns whether this body starts at birth. Placed after the
   // seats and the foreman link so the first plan cycle claims through peer arbitration (Law 4). Reported
   // from `inject()`'s outcome, since it can refuse; chained, not awaited, since this is `spawn`'s
   // synchronous listener.
+  // Until its start, nothing this body runs asks the combat gate; it stands guard (battle_stations.standGuard).
+  require('@api/battle_stations').standGuard(bot);
   if (botMandate.beginsWorkAtBirth()) {
     // The first plan waits for the world round the body to arrive (world_ready).
     require('@kernel/world_ready').awaitWorld(bot).then(() => require('@action/start_injector.js').inject()).then((r) => {
       if (r && r.started) {
-        console.log(`🚀 ${botMandate.isContractor() ? 'Contractor — born started' : botMandate.isBuilder() ? 'Builder — launched to work' : 'Homesteader — launched to work'}.`
+        console.log(`🚀 ${botMandate.currentMode()} — launched to work.`
           + ' Autonomous start signal injected.');
       } else {
         console.log(`⛔ ${botMandate.currentMode()} did not start — ${(r && r.why) || 'the start injector refused and said nothing'}.`
           + ' Nothing was surveyed and nothing was locked; the trace carries the detail.');
       }
     });
-  } else if (botMandate.startNearPlayer()) {
+  } else if (botMandate.startCell()) {
     // A HELD BODY STANDS WHERE IT WILL WORK. Raised placed but unstarted (foreman_config `go: 'held'`), it
     // goes to its place now and waits for its `start` (the foreman's release), which passes start_injector's placement
     // gate again from here (Law 16: one placement act).
     require('@kernel/world_ready').awaitWorld(bot)
-      .then(() => require('@kernel/body_recovery').arriveAtPlace(bot, botMandate.startNearPlayer()))
+      .then(() => require('@kernel/body_recovery').arriveAtCell(bot, botMandate.startCell()))
       .then((p) => console.log(p && p.arrived ? '⏸️ Placed and held — waiting for the release.'
         : `⏸️ Held, not placed yet (${(p && p.error) || 'no answer'}) — start places it.`))
       .catch(e => console.log(`⏸️ Held, not placed yet (${e.message}) — start places it.`));
@@ -264,7 +276,7 @@ bot.once('spawn', () => {
     switch (command) {
       case 'stop':
         rl.close();
-        require('@kernel/operator_commands').execute('stop', {}, botMandate.ORIGIN.TERMINAL);
+        require('@kernel/operator_commands').execute('stop', {});
         break;
       case 'inject':
         const testInjector = require('@action/test_injector');
@@ -289,11 +301,11 @@ bot.once('spawn', () => {
         console.log(`☠️ Sent /kill command for ${bot.username}`);
         break;
       case 'start':
-        require('@kernel/operator_commands').execute('start', {}, botMandate.ORIGIN.TERMINAL);
+        require('@kernel/operator_commands').execute('start', {});
         console.log('🚀 Injected autonomous start signal.');
         break;
       case 'sentry':
-        require('@kernel/operator_commands').execute('sentry', {}, botMandate.ORIGIN.TERMINAL);
+        require('@kernel/operator_commands').execute('sentry', {});
         console.log('🛡️ Sentry mode armed — threat scan only, isolated from the planning recursion.');
         break;
       case 'see':
@@ -310,7 +322,7 @@ bot.once('spawn', () => {
         delayedChat(bot, `/tp ${bot.username} ${x} ${y} ${z}`);
         break; }
       case 'flush':
-        require('@kernel/operator_commands').execute('flush', {}, botMandate.ORIGIN.TERMINAL)
+        require('@kernel/operator_commands').execute('flush', {})
           .then(() => console.log('🧹 Flushed configured kernel JSON files.'))
           .catch((e) => console.error('❌ Flush command failed:', e.message));
         break;
@@ -341,7 +353,8 @@ bot.on('end', (reason) => {
 
   // A process that only logs and returns on disconnect keeps every async continuation running with no
   // world connection — a self-feeding cascade, since a dropped bot's idle CPU load helps drop the next
-  // one. Exiting lets the launcher restart it; deferred by a beat so the flushes above reach disk first.
+  // one. Nothing restarts it: the foreman hears an unordered departure and ends the run. Deferred by a beat
+  // so the flushes above reach disk first.
   require('@utils/body_end').endBody(`no world connection${reason ? ` (${reason})` : ''}`);
 });
 
@@ -353,7 +366,9 @@ function reportCrash(kind, err) {
   require('@kernel/watcher').error('master_core',
     `⛔ ${kind} — signal died OUTSIDE the judge (coding violation): ${detail}`);
   // Out of the foreman's gate before the flush: this process stays alive and would otherwise keep its place.
-  require('@kernel/foreman_link').standDown(`${kind.toLowerCase()} outside the judge`);
+  // The stand-down carries the error's own first line, so the run's outcome names the cause, not only the kind.
+  const said = String((err && err.message) || err).split(/\r?\n/)[0].slice(0, 600);
+  require('@kernel/foreman_link').standDown(`${kind.toLowerCase()} outside the judge: ${said}`);
   // Flushes without exiting — see `flushRecord`'s header. Registering this handler keeps node alive;
   // whether the process should end is not decided here.
   require('@utils/body_end').flushRecord(`${kind.toLowerCase()} outside the judge`);

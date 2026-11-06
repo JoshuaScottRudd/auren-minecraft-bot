@@ -15,9 +15,6 @@
 // turns planks into a barrel. The mine is the one door that can be shut: a builder's stone comes from a
 // shaft behind the laydown yard, which is behind the furnaces, which are behind the stone.
 //
-//   stone_prospect_items   cobblestone and furnace_material, whose door is decided per species by
-//                          architect_config.STONE_SOURCE — shut for a builder, open for a homesteader's
-//                          prospect dig.
 //   isUnderground          the catalogue of materials the surface never provides.
 //   a GROUP that isGatherable  `structural_fill` and `natural_block` are catalogued underground and are
 //                          ground fill the surface always supplies, so their door stays open. A bare ore
@@ -39,7 +36,7 @@
 const {
   group_to_item,
   isUnderground,
-  stone_prospect_items,
+  stone_items,
   accessibleMaterialPool,
 } = require('@utils/fragment_utils');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
@@ -47,12 +44,12 @@ const { isGatherable, isChainOwned } = require('@utils/calculators/build_materia
 const craftingRegistry = require('@kernel/crafting_blueprint_registry');
 const stationRegistry = require('@perception/station_registry');
 
-// A material's only door is the mine once the prospect, underground and ground-fill checks above all
-// close it — see the header for what each clause tests.
+// A material's only door is the mine once the underground and ground-fill checks above both close it —
+// see the header for what each clause tests.
 function mineIsTheOnlyDoor(material) {
-  // The prospect pair first, because `isUnderground` is already the species answer for them and the
-  // ground-fill clause below would give the wrong one (they are a group and they are gatherable).
-  if (stone_prospect_items.has(material)) return isUnderground(material);
+  // Stone first, because the ground-fill clause below would give the wrong answer for it (`furnace_material`
+  // is a group and it is gatherable).
+  if (stone_items.has(material)) return true;
   if (!isUnderground(material)) return false;
   return !(group_to_item[material] && isGatherable(material));
 }
@@ -100,9 +97,9 @@ function _unavailable(token, pool, seen) {
 // THE CANDIDATE SET IS THE TORCH, AND NOTHING ELSE. Every other material's absence delays a job, and a
 // delayed job costs nothing because other work exists — `affordableNow` offers no unbuildable voxel, the
 // shortfall posts as an order, and the site rank sends the body elsewhere in the same sweep. A torch's
-// absence is different: `mining_integrity` diffs a segment against the blueprint, an unlit segment never
-// diffs clean, so the shaft cannot advance past it — a completion measured inside the work itself, which
-// a rank (`STRUCTURE_PRIORITY`) cannot reach.
+// absence is different: a downloaded building declares its own torches (no hand-authored blueprint does; the
+// torch network lights those), and a building waiting on a torch never diffs clean — a completion measured
+// inside the work itself, which a rank (`STRUCTURE_PRIORITY`) cannot reach.
 //
 // THE TEST FOR ADDING ANOTHER TOKEN HERE: does the shortfall only delay a job, or does it change what
 // counts as FINISHED? Delay is a gate's business. Finished belongs here.

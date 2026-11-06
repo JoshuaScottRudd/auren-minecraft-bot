@@ -69,12 +69,37 @@ const _session = _sessionArg('--session');
 const _SESSIONS = paths.repo('Sessions');
 const _hasSessions = fs.existsSync(_SESSIONS);
 const _board = _hasSessions ? require(path.join(_SESSIONS, 'session_board.js')) : null;
+// EACH SESSION WORKS IN ITS OWN COPY (Sessions/session_branch.js). Opening a turn makes the copy when it
+// is missing, and refuses new work once the copy has parked too long: the one turn allowed past the limit
+// is declared with --landing, and its job is to make the copy pass and land.
+const _branches = _hasSessions && fs.existsSync(path.join(_SESSIONS, 'session_branch.js'))
+  ? require(path.join(_SESSIONS, 'session_branch.js')) : null;
+if (_branches && _session && _sessionArg('--doing')) {
+  const parked = _branches.parkedVerdict(_session, process.argv.includes('--landing'));
+  if (parked.refused) {
+    console.error(`REFUSED — ${_session}'s copy holds ${parked.count} commit(s) not on main, the oldest ${parked.hours.toFixed(1)} h old`);
+    console.error(`  (limit: ${_branches.PARK_TURNS} parked turns or ${_branches.PARK_HOURS} h). New work waits until this lands.`);
+    console.error(`  Declare a landing turn: add --landing, make preflight pass in ${parked.dir}, then sync from there.`);
+    process.exit(1);
+  }
+  const copy = _branches.open(_session);
+  if (!copy.ok) console.log(`!!  NO SESSION COPY — ${copy.reason}. Working in this tree as before.\n`);
+  else if (path.resolve(paths.REPO_ROOT) !== path.resolve(copy.dir)) {
+    console.log(`=== YOUR COPY: ${copy.dir} (branch ${copy.branch})${copy.created ? ' — made now' : ''} ===`);
+    if (copy.pulled) console.log(`  ${copy.pulled}.`);
+    const s = copy.seat;
+    if (s && s.seat) console.log(`  SERVER SEAT: ${s.seat} — server ${s.server}, records ${s.records}${s.moved ? ' (moved here now)' : ''}${s.shared ? ' — SHARED: every seat is held by another copy' : ''}.`);
+    console.log('  Edit, test and run the fleet there; run preflight and session_sync from there. A sync');
+    console.log('  from your copy lands on main when preflight passes and parks on your branch when it fails.\n');
+  }
+}
 if (_board) {
   if (_session) {
     const owns = (_sessionArg('--owns') || '').split(',').map((s) => s.trim()).filter(Boolean);
     _board.working(_session, _sessionArg('--doing'), owns);
   }
   _board.print(_session);
+  if (_branches) _branches.printStatus(_session);
 
   // core.hooksPath is per-clone config no commit can carry, so a second workstation can silently lack
   // the pre-commit hook that refuses a hand commit. Checked every run since the failure is otherwise
@@ -1141,10 +1166,13 @@ console.log('Dependency direction OK — no bot file requires the workshop.');
 // edit to the planner is invisible to the fleet until the plan is regenerated, however clean the headless
 // check of the planner reads. Compares each plan's own schema field against downloaded_plan_registry's
 // own export (Law 16). Silent when there are no plans.
+// A plan BUILDER_BUILDS names must also say what the config says of it (downloaded_plan_registry.agreesWithTheSurvey):
+// a plan re-made without the config following is refused at the builder's start, and passes every other check here.
 try {
   const planDir = paths.repo('html and json', 'Downloaded_Blueprints');
   if (fs.existsSync(planDir)) {
-    const { SCHEMA } = require(paths.bot('js_kernel', 'downloaded_plan_registry.js'));
+    const { SCHEMA, agreesWithTheSurvey } = require(paths.bot('js_kernel', 'downloaded_plan_registry.js'));
+    const disagree = [];
     const stale = [];
     let checked = 0;
     for (const f of fs.readdirSync(planDir).filter(n => n.endsWith('.build_plan.json'))) {
@@ -1154,9 +1182,15 @@ try {
       if (!plan || typeof plan.schema !== 'string') continue;
       checked++;
       if (plan.schema !== SCHEMA) stale.push({ name: plan.name || f.replace('.build_plan.json', ''), f, schema: plan.schema });
+      else { try { agreesWithTheSurvey(plan, plan.name); } catch (e) { disagree.push(e.message); } }
+    }
+    if (disagree.length) {
+      console.error(`\n--- BUILD PLAN AND BUILDER_BUILDS DISAGREE: ${disagree.length} plan(s) ---`);
+      for (const m of disagree) console.error(`  ${m}`);
+      process.exit(1);
     }
     if (stale.length === 0) {
-      console.log(`Build plans OK — ${checked} plan(s) made by the current planner (${SCHEMA}).`);
+      console.log(`Build plans OK — ${checked} plan(s) made by the current planner (${SCHEMA}), each agreeing with BUILDER_BUILDS.`);
     } else {
       console.error(`\n--- STALE BUILD PLAN: ${stale.length} plan(s) were made by a different planner ---`);
       console.error('  The fleet reads the PLAN FILE, not the planner. Until these are rebuilt the run refuses');
@@ -1210,6 +1244,81 @@ if (timerSites.length === 0) {
   console.error('    a periodic job (a flush, a sample)   → timeoutCrash.every(tag, what, fn, ms) / .stop(timer)');
   console.error('    "is it still alive / did it answer"  → const w = timeoutCrash.watch(tag, what); … w.done()');
   for (const s of timerSites) console.error(`      ${s.rel}:${s.line}  ${s.name}`);
+  process.exit(1);
+}
+
+// ── THE CLAIM KEY SHAPE (A GATE) ─────────────────────────────────────────────────────────────────
+// The foreman grants an object claim only under a namespace listed in foreman_brain's OBJECT_KEY_PREFIXES;
+// any other key is refused as a coding violation, which ends the run the first time a body asks. So every claim key whose namespace can be read from its source — the
+// argument of requestClaim, or what claimFirst's keyOf returns (through a const, a template's leading
+// part, or the candidates themselves under an identity keyOf) — is held against that list here, before a run.
+// A key built wholly at run time cannot be read and is not judged.
+const CLAIM_LIST_OWNER = path.join('foreman', 'foreman_brain.js');
+function scanClaimKeys() {
+  const parse = (file) => espree.parse(fs.readFileSync(file, 'utf8'), { ecmaVersion: 'latest', loc: true });
+  let listed = null;
+  _walkNode(parse(path.join(BOT_DIR, CLAIM_LIST_OWNER)), (node) => {
+    if (node.type === 'VariableDeclarator' && node.id.name === 'OBJECT_KEY_PREFIXES' && node.init.type === 'ArrayExpression') {
+      listed = node.init.elements.map(e => e.value);
+    }
+  });
+  if (!listed) return { listed: null, bad: [] };
+  const bad = [];
+  for (const file of parseTargets) {
+    const rel = path.relative(BOT_DIR, file);
+    let ast;
+    try { ast = parse(file); } catch (e) { continue; }
+    const consts = new Map();
+    _walkNode(ast, (node) => {
+      if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.init) consts.set(node.id.name, node.init);
+    });
+    const prefixOf = (node, depth = 0) => {
+      if (!node || depth > 4) return null;
+      if (node.type === 'Literal' && typeof node.value === 'string') return (node.value.match(/^([a-z_]+:)/) || [])[1] || null;
+      if (node.type === 'TemplateLiteral') {
+        const head = node.quasis[0].value.cooked;
+        if (head) return (head.match(/^([a-z_]+:)/) || [])[1] || null;
+        return node.expressions[0] && node.expressions[0].type === 'Identifier' ? prefixOf(consts.get(node.expressions[0].name), depth + 1) : null;
+      }
+      if (node.type === 'Identifier') return prefixOf(consts.get(node.name), depth + 1);
+      if (node.type === 'ArrowFunctionExpression' && node.body.type !== 'BlockStatement') return prefixOf(node.body, depth + 1);
+      return null;
+    };
+    const judge = (keyNode, line) => {
+      const p = prefixOf(keyNode);
+      if (p && !listed.includes(p)) bad.push({ rel, line, prefix: p });
+    };
+    _walkNode(ast, (node) => {
+      if (node.type !== 'CallExpression') return;
+      const callee = node.callee.type === 'MemberExpression' ? node.callee.property.name : node.callee.name;
+      if (callee === 'requestClaim') judge(node.arguments[0], node.loc.start.line);
+      if (callee !== 'claimFirst' || !node.arguments[1] || node.arguments[1].type !== 'ObjectExpression') return;
+      const keyOf = node.arguments[1].properties.find(p => p.key && p.key.name === 'keyOf');
+      if (!keyOf) return;
+      const fn = keyOf.value.type === 'Identifier' ? consts.get(keyOf.value.name) : keyOf.value;
+      const identity = fn && fn.type === 'ArrowFunctionExpression' && fn.params.length === 1 && fn.body.type === 'Identifier' && fn.body.name === fn.params[0].name;
+      if (identity && node.arguments[0].type === 'ArrayExpression') {
+        for (const el of node.arguments[0].elements) judge(el, node.loc.start.line);
+      } else {
+        judge(keyOf.value, node.loc.start.line);
+      }
+    });
+  }
+  return { listed, bad };
+}
+const claimKeys = scanClaimKeys();
+if (!claimKeys.listed) {
+  console.error(`\n--- CLAIM KEY SHAPE: OBJECT_KEY_PREFIXES was not found as an array in ${CLAIM_LIST_OWNER} ---`);
+  process.exit(1);
+}
+if (claimKeys.bad.length === 0) {
+  console.log(`Claim key shape OK — every claim key read from source names a namespace the foreman grants (${claimKeys.listed.length} listed).`);
+} else {
+  console.error(`\n--- CLAIM KEY SHAPE: ${claimKeys.bad.length} claim key(s) under a namespace the foreman refuses ---`);
+  console.error(`  The foreman refuses a key whose namespace is not in OBJECT_KEY_PREFIXES (${CLAIM_LIST_OWNER}) as a`);
+  console.error('  coding violation, and the run ends the first time a body asks. Add the namespace to that list');
+  console.error('  with its comment line naming the owner and what the key holds.');
+  for (const b of claimKeys.bad) console.error(`      ${b.rel}:${b.line}  '${b.prefix}'`);
   process.exit(1);
 }
 

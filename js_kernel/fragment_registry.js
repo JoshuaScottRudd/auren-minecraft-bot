@@ -22,7 +22,10 @@ const eatManager          = require('@action/eat_manager.js');
 // verified by sensing its outcome. It delegates to no executor; each act is a single packet with its check
 // built in.
 const deathManager        = require('@action/death_manager.js');
+// TEMPORARY: leaving running water, the one job the board posts while a body is carried (assessors/current).
+const currentManager      = require('@action/current_manager.js');
 const groundSalvageExecutor = require('@action/ground_salvage_executor.js');
+const surveyExecutor = require('@action/survey_executor.js');
 
 // ── Executors ───────────────────────────────────────────────────────────────
 const explorationExecutor = require('@action/exploration_executor.js');
@@ -34,19 +37,21 @@ const buildExecutor       = require('@action/build_executor.js');
 const deliveryExecutor    = require('@action/delivery_executor.js');
 const furnaceExecutor     = require('@action/furnace_executor.js');
 const compostExecutor     = require('@action/compost_executor.js');
+const saplingPlantExecutor = require('@action/sapling_plant_executor.js');
 const chestHousekeepingExecutor = require('@action/chest_housekeeping_executor.js');
+const homeStationsExecutor = require('@action/home_stations_executor.js');
 // find_buildingspot, set_buildspot and lock_all_buildspots are LIBRARIES: lock_all_buildspots calls the
 // other two directly (locate/lock) as the one locator (Law 16), so none carries a `receive` and none has a
 // registry entry. The foreman sites the base; `start_injector` records the handed site by calling
 // `recordHandedSite` directly.
-const setWoodPreference   = require('@action/set_wood_preference.js');
 const idlePark            = require('@action/idle_park.js');
 // land_prep and farm_executor are LIBRARIES: farm_manager owns the tend loop and calls their verbs
 // directly — land_prep.prepare() once, farm_executor.tendPlot() per plot (Law 15) — so neither has a
 // registry entry.
-const torchExecutor       = require('@action/torch_executor.js');
+// lighting_executor is a LIBRARY: lighting_manager owns the visit and calls placeTorch() once per planned torch.
+const lightingManager     = require('@action/lighting_manager.js');
+const guardManager        = require('@action/guard_manager.js');
 const canopyClearExecutor = require('@action/canopy_clear_executor.js');
-const clearGroundExecutor = require('@action/clear_ground_executor.js');
 // A downloaded building's site works — ONE verb (Law 0): work one anchor cube from beneath, removing every
 // wrong block and placing every right one. The ground is cleared by that same verb, so there is no scrape,
 // basement or seal fragment. The felling phase has no fragment of its own; it is the canopy executor above,
@@ -56,8 +61,19 @@ const buildColumnExecutor     = require('@action/build_column_executor.js');
 const columnPreparation       = require('@action/column_preparation.js');
 // supply_manager dispatches this for a cobblestone shortfall — the stone sibling of harvest_executor,
 // keyed by material.
-const stoneProspectExecutor = require('@action/stone_prospect_executor.js');
 const eatExecutor         = require('@action/eat_executor.js');
+// herd_executor is a LIBRARY: herd_manager owns the job and calls herdAnimal() once per string of animals.
+const herdManager         = require('@action/herd_manager.js');
+// shepherd_manager: holds the penned flock at the long side while a tender (bringer, shearer) works the pen.
+const shepherdManager     = require('@action/shepherd_manager.js');
+// shear_manager: the woolly penned flock shorn by the body carrying the shears; shear_executor is its LIBRARY.
+const shearManager        = require('@action/shear_manager.js');
+// cull_manager: a full meat pen's grown animals past its breeding stock slaughtered; cull_executor is its LIBRARY.
+const cullManager         = require('@action/cull_manager.js');
+// breed_manager: one pair of penned animals fed with the wheat the herd does not need.
+const breedManager        = require('@action/breed_manager.js');
+// dye_manager: the pen's white animals dyed one color; dye_executor is its LIBRARY.
+const dyeManager          = require('@action/dye_manager.js');
 
 // ── Admin ───────────────────────────────────────────────────────────────────
 // start_injector is NOT registered: it has no `receive` and nothing routes to it. master_core (on the
@@ -77,6 +93,9 @@ const fragmentTester       = require('@action/fragment_tester.js');
 // without replanning, so sentry needs no fragment of its own beyond await_aggro below.
 const awaitAggro          = require('@action/await_aggro.js');
 
+// ── Test module: one behaviour on its own, in place of the planner (foreman_config `module`) ──────────
+const testModule          = require('@action/test_module.js');
+
 // ── Locomotion sub-loop (Law 15) ────────────────────────────────────────────
 const locomotionDispatcher = require('@locomotion/locomotion_dispatcher.js');
 const locomotionJudge      = require('@locomotion/locomotion_judge.js');
@@ -92,9 +111,19 @@ module.exports = {
   building_manager: buildingManager,
   mining_manager:   miningManager,
   farm_manager:     farmManager,
+  lighting_manager: lightingManager,
+  guard_manager: guardManager,
+  herd_manager:     herdManager,
+  shepherd_manager: shepherdManager,
+  shear_manager:    shearManager,
+  cull_manager:     cullManager,
+  breed_manager:    breedManager,
+  dye_manager:      dyeManager,
   eat_manager:      eatManager,
   death_manager:    deathManager,
+  current_manager:  currentManager,
   ground_salvage_executor: groundSalvageExecutor,
+  survey_executor: surveyExecutor,
 
   // Executors
   exploration_executor: explorationExecutor,
@@ -105,16 +134,14 @@ module.exports = {
   delivery_executor:   deliveryExecutor,
   furnace_executor:    furnaceExecutor,
   compost_executor:    compostExecutor,
+  sapling_plant_executor: saplingPlantExecutor,
   chest_housekeeping_executor: chestHousekeepingExecutor,
+  home_stations_executor: homeStationsExecutor,
   build_executor:      buildExecutor,
-  set_wood_preference: setWoodPreference,
   idle_park:        idlePark,
-  torch_executor:   torchExecutor,
   canopy_clear_executor: canopyClearExecutor,
-  clear_ground_executor: clearGroundExecutor,
   build_column_executor:     buildColumnExecutor,
   column_preparation:        columnPreparation,
-  stone_prospect_executor: stoneProspectExecutor,
   eat_executor:     eatExecutor,
 
   // Admin
@@ -123,6 +150,9 @@ module.exports = {
 
   // Sentry
   await_aggro:           awaitAggro,
+
+  // Test module
+  test_module:           testModule,
 
   // Locomotion
   locomotion_dispatcher: locomotionDispatcher,

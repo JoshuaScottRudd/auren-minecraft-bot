@@ -45,6 +45,24 @@ const { GRAVITY_BLOCKS } = require('@utils/gravity_utils');
 const { guardExternal, guardExternalSync } = require('@utils/external_library_guard');
 const _placeable = (name) => !GRAVITY_BLOCKS.has(name);
 
+// ── COPPER AGES AND IT IS STILL THE SAME COPPER ───────────────────────────────────────────────────────
+// Every form of a copper block, aged or waxed, is that block to the fleet: unaged(name) → the block it is,
+// agedForms(name) → all its forms, the fresh one first; a name that does not age is only itself. A copper bulb's
+// light is the one difference that matters, and light_calculator reads it by its full name.
+const AGING_COPPER = ['copper_block', 'cut_copper', 'cut_copper_stairs', 'cut_copper_slab', 'chiseled_copper', 'copper_grate', 'copper_door',
+  'copper_trapdoor', 'copper_bulb', 'copper_bars', 'copper_chain', 'copper_lantern', 'copper_chest', 'copper_golem_statue', 'lightning_rod'];
+const COPPER_FORMS = new Map();
+const COPPER_BASE = new Map();
+for (const base of AGING_COPPER) {
+  const aged = base === 'copper_block' ? 'copper' : base;
+  const forms = [base, ...['exposed', 'weathered', 'oxidized'].map(age => `${age}_${aged}`), `waxed_${base}`,
+    ...['exposed', 'weathered', 'oxidized'].map(age => `waxed_${age}_${aged}`)];
+  COPPER_FORMS.set(base, forms);
+  for (const form of forms) COPPER_BASE.set(form, base);
+}
+const unaged = (name) => COPPER_BASE.get(name) || name;
+const agedForms = (name) => COPPER_FORMS.get(unaged(name)) || [name];
+
 // THROWAWAY PLACEMENT ORDER, two exposures in group_to_item below. PLANKS LEAD: the plank is the fleet's
 // trash block (utils/trash splits a held log into planks before a step picks). Soil and sediment stand in
 // while the pocket holds no plank; a whole log goes after them; masonry/rock sit last (need a pickaxe both
@@ -55,9 +73,10 @@ const SCAFFOLD_LAST_RESORT = [...MASONRY, ...ROCK, ...EXOTIC];
 const SCAFFOLD_ORDER = [...SCAFFOLD_SPENDABLE, ...SCAFFOLD_LAST_RESORT];
 
 const group_to_item = {
+  // No stripped log: the recipe data a body crafts from makes planks from the plain log alone, so a stripped log
+  // counted here would be wood the craft can never spend. Stripped logs stand only in built structures.
   logs: [
-    'oak_log','birch_log','spruce_log','dark_oak_log','acacia_log','jungle_log',
-    'stripped_oak_log','stripped_birch_log'
+    'oak_log','birch_log','spruce_log','dark_oak_log','acacia_log','jungle_log'
   ],
   planks: [
     'oak_planks','birch_planks','spruce_planks','jungle_planks','acacia_planks','dark_oak_planks'
@@ -132,7 +151,7 @@ const group_to_item = {
   axe: [
     'wooden_axe','stone_axe','copper_axe','iron_axe','diamond_axe','netherite_axe'
   ],
-  // The digging tool — a stock row keeps one pocketed, capped at stone (architect_config max_tier).
+  // The digging tool — a stock row keeps it pocketed; stone or copper, never a wooden one (architect_config).
   shovel: [
     'wooden_shovel','stone_shovel','copper_shovel','iron_shovel','diamond_shovel','netherite_shovel'
   ],
@@ -159,10 +178,16 @@ const group_to_item = {
   food: [
     'apple','bread','cooked_beef','cooked_porkchop','cooked_chicken','cooked_mutton',
     'cooked_rabbit','cooked_salmon','cooked_cod','baked_potato','golden_apple',
-    'beetroot','carrot','melon_slice','sweet_berries','dried_kelp'
+    'beetroot','carrot','melon_slice','sweet_berries','dried_kelp','beef','mutton'
   ],
   saplings: [
     'oak_sapling','birch_sapling','spruce_sapling','dark_oak_sapling','acacia_sapling','jungle_sapling'
+  ],
+  // What a forest run picks off the ground for the composter (assessors/compost): every one breaks by hand and drops
+  // itself. Short grass drops nothing without shears and leaves give apples only to shears, so neither is here.
+  compostables: [
+    'leaf_litter','wildflowers','pink_petals','dandelion','poppy','blue_orchid','allium','azure_bluet',
+    'red_tulip','orange_tulip','white_tulip','pink_tulip','oxeye_daisy','cornflower','lily_of_the_valley'
   ]
 };
 
@@ -180,27 +205,23 @@ const GROUND_FILL_VOXEL_TYPES = new Set([
 // `recipeForToken` resolves a group via whichever member has a recipe, which misanswers `natural_block`
 // (`stone` is a furnace product); naming the token here makes the book answer with no recipe, routing to
 // a gather. Membership is narrower than any-member-lacks-a-recipe: `pickaxe` has recipe-less tiers that
-// are not gatherable, and `structural_fill` routes through `underground_items`.
+// are not gatherable. `structural_fill` is placed as any member already held (cobblestone, planks, logs,
+// dirt), so it is priced as itself and its shortfall routes to the mine through `underground_items`, never
+// as `stone_bricks`, the first member with a recipe.
 const GATHERED_GROUPS = new Set([
     'natural_block',
+    'structural_fill',
+    'compostables',
 ]);
 
-// ── STONE_PROSPECT_ITEMS — the stone a bot fetches for itself, one column at a time ──────────────
-// Not in underground_items: cobblestone has its own producer, stone_prospect_executor.
-// `furnace_material` is here too since the furnace recipe asks for that token, not `cobblestone` directly.
-const stone_prospect_items = new Set([
+// ── STONE_ITEMS — the stone a building's order reaches the mine by ─────────────────────────────────
+// Every crew's: dug from the strip mine once the shaft is dug, and until then the furnace's share from stone
+// open to the sky (assessors/survey.stoneJobs). `furnace_material` is here since the furnace recipe asks for
+// that token, not `cobblestone` directly.
+const stone_items = new Set([
     'cobblestone', 'furnace_material',
 ]);
-
-// isUnderground(item) / isProspected(item) — the question every routing site asks, per species. A
-// species mining its stone (architect_config.STONE_SOURCE) moves prospect items underground.
-function _stoneIsMined() {
-  const source = require('@thinking/architect_config').STONE_SOURCE[require('@kernel/bot_mandate').currentMode()];
-  if (source === 'mine_after_furnace') return require('@perception/station_registry').getStationTypes().has('furnace');
-  return source === 'mine';
-}
-function isUnderground(item) { return underground_items.has(item) || (stone_prospect_items.has(item) && _stoneIsMined()); }
-function isProspected(item) { return stone_prospect_items.has(item) && !_stoneIsMined(); }
+function isUnderground(item) { return underground_items.has(item) || stone_items.has(item); }
 
 // ── UNDERGROUND_ITEMS — materials the surface can never provide ──────────────────────────────────
 // The single classification; building_planner and resource_planner both import it (Law 16). Ore
@@ -219,6 +240,7 @@ const underground_items = new Set([
     'redstone', 'redstone_ore', 'deepslate_redstone_ore',
     'lapis_lazuli', 'lapis_ore', 'deepslate_lapis_ore',
     'diamond', 'diamond_ore', 'deepslate_diamond_ore',
+    'obsidian',
     'emerald', 'emerald_ore', 'deepslate_emerald_ore',
 ]);
 
@@ -242,20 +264,25 @@ const furnace_chain_items = new Set([
     'terracotta',
 ]);
 
-// ── SUBSTITUTES_FOR — counted as stock, never ordered ────────────────────────────────────────────
+// ── SUBSTITUTES_FOR — counted as stock of the key ────────────────────────────────────────────────
 // Coal and charcoal are interchangeable at the moment of USE, not ACQUISITION: stock of any VALUE
 // answers a shortfall of KEY, but the shortfall is still ordered as KEY. Coal shrinks a charcoal
-// order and is never itself ordered, gathered or gated (Law 16).
+// order; coal itself is never ordered, only counted where the mine turns it up (Law 16).
 const substitutes_for = { charcoal: ['coal'] };
 
 // ── HUNT_ITEMS — materials off a LIVING thing; no block scan can find them ───────────────────────
 // Third sibling on the surface-punch-must-never-dispatch axis (shaft/field/hunt).
 // string — hostile drop, collected via battle_stations into a chest.
 // bone — skeleton drop, consumed by bone_meal; marks its shortfall as a gather leaf.
+// leather — a culled cow's hide (cull_executor), banked into a chest.
+// the sixteen wools — a shorn sheep's fleece (shear_executor), banked into a chest.
 // Stops build_material_calculator's decomposition walk at a craftable whose leaf is a mob drop.
 const hunt_items = new Set([
     'string',
     'bone',
+    'leather',
+    'white_wool', 'orange_wool', 'magenta_wool', 'light_blue_wool', 'yellow_wool', 'lime_wool', 'pink_wool', 'gray_wool',
+    'light_gray_wool', 'cyan_wool', 'purple_wool', 'blue_wool', 'brown_wool', 'green_wool', 'red_wool', 'black_wool',
 ]);
 
 // item → group reverse table intentionally omitted (see SINGLE SOURCE OF TRUTH above).
@@ -396,12 +423,25 @@ function _canHarvest(block, item){
   return item != null && !!ht[item.type];
 }
 
+// RESERVED TOOLS ARE KEPT FOR THE BLOCKS NO LOWER TIER HARVESTS: a body carries one iron pickaxe for gold,
+// redstone and diamond, and never swings it at a block a stone or copper pickaxe takes, even with none of those
+// left. Nor is it counted in a family's working set (assessors/shared.tierOrBetter and the pickaxe row's count in assessors/supply, mining_manager.hasPickaxe).
+const RESERVED_TOOLS = ['iron_pickaxe', 'diamond_pickaxe'];
+function onlyReservedTakes(bot, block, tool){
+  if(!block.harvestTools || !block.harvestTools[tool.type]) return false;
+  return !Object.keys(block.harvestTools).some(id => {
+    const item = bot.registry.items[id];
+    return item && !RESERVED_TOOLS.includes(item.name) && tierIndex(item.name) > tierIndex(tool.name);
+  });
+}
+
 function getBestToolForBlock(bot, block){
   if(!bot || !block || !bot.inventory) return null;
   const prefClass = heuristicPreferredClass(block);
   const bName = block.name || 'unknown_block';
   if(!prefClass) return null; // unclassified -> hand
-  const tools = bot.inventory.items().filter(i => classifyTool(i.name) === prefClass);
+  const tools = bot.inventory.items().filter(i => classifyTool(i.name) === prefClass
+    && (!RESERVED_TOOLS.includes(i.name) || onlyReservedTakes(bot, block, i)));
   if(tools.length === 0){
     return null;
   }
@@ -493,7 +533,7 @@ const NON_FULL_BLOCK_NAMES = new Set([
   'sweet_berry_bush', 'cobweb', 'snow',
   'torch', 'wall_torch', 'soul_torch', 'soul_wall_torch',
   'redstone_torch', 'redstone_wall_torch',
-  'lantern', 'soul_lantern', 'copper_lantern',
+  'lantern', 'soul_lantern', ...agedForms('copper_lantern'),
   'lever', 'tripwire', 'tripwire_hook', 'redstone_wire',
   'rail', 'powered_rail', 'detector_rail', 'activator_rail',
   'flower_pot',
@@ -505,12 +545,12 @@ const NON_FULL_BLOCK_NAMES = new Set([
 // stations a punch would wrongly destroy (each is somebody's placed state).
 const PUNCH_THROUGH_KEEP = new Set([
   'torch', 'wall_torch', 'soul_torch', 'soul_wall_torch', 'redstone_torch', 'redstone_wall_torch',
-  'lantern', 'soul_lantern', 'copper_lantern',
+  'lantern', 'soul_lantern', ...agedForms('copper_lantern'),
   'wheat', 'carrots', 'potatoes', 'beetroots', 'melon_stem', 'pumpkin_stem',
   'attached_melon_stem', 'attached_pumpkin_stem', 'torchflower_crop', 'pitcher_crop', 'nether_wart',
   'rail', 'powered_rail', 'detector_rail', 'activator_rail',
   'lever', 'tripwire', 'tripwire_hook', 'redstone_wire', 'repeater', 'comparator',
-  'flower_pot', 'end_rod', 'chain', 'iron_chain', 'copper_chain',
+  'flower_pot', 'end_rod', 'chain', 'iron_chain', ...agedForms('copper_chain'),
 ]);
 
 // Takes the BLOCK, not its name — a name goes stale. hardness 0 = one bare-handed punch.
@@ -671,6 +711,28 @@ function isInsideBlueprintKeepout(pos, boxes) {
   return false;
 }
 
+// gatherBanned() → (pos) => true when `pos` lies within GATHER_KEEPOUT (flat) of any sited structure's footprint:
+// the one test every gather that digs ground applies, so no gather tears up terrain the crew builds on (the cause is
+// at architect_config.GATHER_KEEPOUT). Read once per search. No structure sited, nothing banned.
+function gatherBanned() {
+  const boxes = harvestKeepoutBoxes(require('@thinking/architect_config').GATHER_KEEPOUT);
+  return (pos) => isInsideBlueprintKeepout(pos, boxes);
+}
+
+// isNaturalGround(name) → true for a block name GATHER_KEEPOUT holds (architect_config.GATHER_KEEPOUT_GROUND).
+function isNaturalGround(name) {
+  return typeof name === 'string' && require('@thinking/architect_config').GATHER_KEEPOUT_GROUND.test(name);
+}
+
+// beyondGatherReach() → (pos) => true when `pos` lies farther than GATHER_REACH (flat) from the home structure's
+// origin: the one test that keeps a surface gather near home, read once per trip. No home sited, no bound.
+function beyondGatherReach() {
+  const home = readTransposeOrigin(require('@kernel/bot_mandate').homeBlueprint());
+  if (!home) return () => false;
+  const r2 = require('@thinking/architect_config').GATHER_REACH ** 2;
+  return (pos) => (pos.x - home.x) ** 2 + (pos.z - home.z) ** 2 > r2;
+}
+
 // ── 8. Crop Growth Stage Classification ──────────────────────────────────────────────────────────
 // Wheat only — other crops are rare finds, not deterministic to plan around. Growth lives in the
 // "age" blockstate (0-7), 7 = mature/harvestable.
@@ -713,14 +775,14 @@ module.exports = {
   // Environment / perception helpers
   hasLineOfSightToBlock,
   // Group / inventory helpers
-  groupToReference, groupToAllItems, group_to_item, GROUND_FILL_VOXEL_TYPES, GATHERED_GROUPS, underground_items, stone_prospect_items, isUnderground, isProspected, stoneIsMined: _stoneIsMined, furnace_chain_items, substitutes_for, farm_items, hunt_items,
+  unaged, agedForms, groupToReference, groupToAllItems, group_to_item, GROUND_FILL_VOXEL_TYPES, GATHERED_GROUPS, underground_items, stone_items, isUnderground, furnace_chain_items, substitutes_for, farm_items, hunt_items,
   getBotInventory,
   // Material accounting primitives (pocket + chest counting)
   normalizeItemName, chestItemCounts, accessibleMaterialPool, hasHomeChest,
   homeChest, buildPoolChests, buildPoolChestCounts, readTransposeOrigin,
-  harvestKeepoutBoxes, isInsideBlueprintKeepout,
+  harvestKeepoutBoxes, isInsideBlueprintKeepout, gatherBanned, isNaturalGround, beyondGatherReach,
   // Tool selection
-  getBestToolForBlock, equipBestToolForBlock,
+  getBestToolForBlock, equipBestToolForBlock, RESERVED_TOOLS, onlyReservedTakes, canHarvest: _canHarvest,
   // Block name normalization
   normalizeBlockName, BLOCK_NAME_ALIASES,
   // Block surface classification

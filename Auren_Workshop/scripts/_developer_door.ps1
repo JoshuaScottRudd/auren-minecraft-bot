@@ -45,7 +45,7 @@ function Assert-DeveloperMode {
     Write-Host ''
     Write-Host '  Auren has two doors. The one you want depends on what you are doing:'
     Write-Host ''
-    Write-Host '    PLAYING          node start_auren.js        then say "foreman get" in chat'
+    Write-Host '    PLAYING          node start_auren.js        the foreman raises the crew foreman_config names'
     Write-Host '    BUILDING ON IT   node developer_mode.js on     once, then every tool works'
     Write-Host ''
     Write-Host '  Developer mode turns on the workshop: the scripted runs, the benches, the combat'

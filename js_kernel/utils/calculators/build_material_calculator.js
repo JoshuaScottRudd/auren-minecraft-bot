@@ -13,9 +13,17 @@ const craftingRegistry = require('@kernel/crafting_blueprint_registry');
 const { hunt_items, farm_items, furnace_chain_items, group_to_item, substitutes_for } = require('@utils/fragment_utils');
 
 // A token is raw when the recipe book has no recipe for it, via `recipeForToken` (which also resolves
-// the group seam).
+// the group seam). A token the game crafts and the book has no recipe for is a hole in the book, never a
+// raw material: it throws here, where every walk asks, before any body is sent out to gather a made thing
+// (craftingRegistry.mustCarryRecipe).
 function isRawMaterial(token) {
-  return !craftingRegistry.recipeForToken(token);
+  if (craftingRegistry.recipeForToken(token)) return false;
+  if (craftingRegistry.mustCarryRecipe(String(token).trim().toLowerCase())) {
+    throw new Error(`[build_material_calculator] CODING VIOLATION (Law 13): "${token}" is crafted in the game and `
+      + 'the recipe book (js_kernel/crafting_blueprints.json) has no recipe for it, so every walk would call it raw '
+      + 'and send a body out to gather a thing no scan can find. Add its recipe to the book.');
+  }
+  return true;
 }
 
 // Whether a surface scan could ever find this token: a group answers true once ANY member exists, not
@@ -82,7 +90,8 @@ function decomposeToRaw(item, quantity, depth = 0) {
 //
 // Decomposes the need to raw and nets each raw against inventory, except held intermediates
 // (planks/sticks), which credit against their own block need first — so held planks fill a planks-block
-// need but are never subtracted from a raw log-block need.
+// need but are never subtracted from a raw log-block need. A held made item (a book) also pays at its own step
+// inside a deeper recipe (decomposeNetted).
 
 // Wood intermediates net unconditionally, despite being group tokens: a held plank offsetting a plank
 // block is the one safe overlap. Every other token nets only via `_itemLevelNettable`.
@@ -113,12 +122,75 @@ function _itemLevelNettable(materialsNeeded) {
   return nettable;
 }
 
+// A HELD MADE THING PAYS AT ITS OWN STEP OF THE RECIPE. A bookshelf is planks and books, a book is paper and
+// leather: held books pay for the books inside a bookshelf, so the walk does not go on to ask for their leather
+// again. decomposeNetted(need, left) walks each need to raw as decomposeToRaw does, and at every step below the
+// top takes a held ingredient out of `left` first. Only a single named made item is taken this way: a group token
+// (the wood intermediates among them, which the top step nets) and a chain-owned or raw item are left to the
+// leaves, which are netted against the whole inventory.
+function decomposeNetted(need, left) {
+  const takes = (token) => !group_to_item[token] && !NET_INTERMEDIATES.has(token) && !isChainOwned(token) && !isRawMaterial(token);
+  const totals = {};
+  const walk = (item, quantity, depth) => {
+    const recipe = craftingRegistry.recipeForToken(item);
+    if (depth > 10 || !recipe || !recipe.ingredients || isChainOwned(item)) {
+      totals[item] = (totals[item] || 0) + quantity;
+      return;
+    }
+    const makes = recipe.sequence && recipe.sequence.length > 0 ? recipe.sequence[recipe.sequence.length - 1].makes || 1 : 1;
+    const batches = Math.ceil(quantity / makes);
+    for (const [ingredient, per] of Object.entries(recipe.ingredients)) {
+      let n = per * batches;
+      if (takes(ingredient)) {
+        const take = Math.min(left[ingredient] || 0, n);
+        left[ingredient] = (left[ingredient] || 0) - take;
+        n -= take;
+      }
+      if (n > 0) walk(ingredient, n, depth + 1);
+    }
+  };
+  for (const [item, count] of Object.entries(need)) if (typeof count === 'number' && count > 0) walk(item, count, 0);
+  return totals;
+}
+
+// madeIngredients(need, pocket, freeOf) → { item: count }, the held made ingredients (as decomposeNetted takes them)
+// a trip withdraws to make `need`: each step's ingredient comes from the pocket first, then from what the chests hold
+// free (freeOf(item)), and only what neither holds is walked on toward raw. A trip that takes these and the raw for
+// the rest makes the need with the books already made, never with new leather.
+function madeIngredients(need, pocket, freeOf) {
+  const takes = (token) => !group_to_item[token] && !NET_INTERMEDIATES.has(token) && !isChainOwned(token) && !isRawMaterial(token);
+  const inPocket = { ...pocket };
+  const took = {};
+  const walk = (item, quantity, depth) => {
+    const recipe = craftingRegistry.recipeForToken(item);
+    if (depth > 10 || !recipe || !recipe.ingredients || isChainOwned(item)) return;
+    const makes = recipe.sequence && recipe.sequence.length > 0 ? recipe.sequence[recipe.sequence.length - 1].makes || 1 : 1;
+    const batches = Math.ceil(quantity / makes);
+    for (const [ingredient, per] of Object.entries(recipe.ingredients)) {
+      let n = per * batches;
+      if (takes(ingredient)) {
+        const own = Math.min(inPocket[ingredient] || 0, n);
+        inPocket[ingredient] = (inPocket[ingredient] || 0) - own;
+        n -= own;
+        const fromChests = Math.min(Math.max(0, freeOf(ingredient) - (took[ingredient] || 0)), n);
+        if (fromChests > 0) took[ingredient] = (took[ingredient] || 0) + fromChests;
+        n -= fromChests;
+      }
+      if (n > 0) walk(ingredient, n, depth + 1);
+    }
+  };
+  for (const [item, count] of Object.entries(need || {})) if (typeof count === 'number' && count > 0) walk(item, count, 0);
+  return took;
+}
+
 function remainingRawForBuild(materialsNeeded, invCounts) {
   if (!materialsNeeded || typeof materialsNeeded !== 'object') return {};
   const inv = invCounts || {};
   const nettable = _itemLevelNettable(materialsNeeded);
 
   // Credit held intermediates and finished goods against their own block need before decomposing.
+  // `left` is what the steps below may still take of a made item: one taken here is not taken again there.
+  const left = { ...inv };
   const net = {};
   for (const [item, count] of Object.entries(materialsNeeded)) {
     if (typeof count !== 'number' || count <= 0) continue;
@@ -127,12 +199,13 @@ function remainingRawForBuild(materialsNeeded, invCounts) {
     if (nettable.has(item) && !isChainOwned(item)) {
       const still = Math.max(0, count - countInInventory(item, inv));
       if (still > 0) net[item] = still;
+      if (!group_to_item[item]) left[item] = Math.max(0, (left[item] || 0) - (count - still));
     } else {
       net[item] = count;   // decomposed & checked against full inventory independently
     }
   }
 
-  const rawNeeded = blueprintToRawMaterials(net);
+  const rawNeeded = decomposeNetted(net, left);
   const result = {};
   for (const [raw, count] of Object.entries(rawNeeded)) {
     const have = countInInventory(raw, inv);
@@ -143,11 +216,35 @@ function remainingRawForBuild(materialsNeeded, invCounts) {
 
 // remainingRawInSpecies(materialsNeeded, invCounts, wood) → { rawItem: countStillNeeded }
 //
-// Same question as remainingRawForBuild, for a build whose wood must be one named species. The recipe
-// book files wood under group tokens, so this pulls other-species logs and planks out of the pool first,
-// sums the two log roots (`logs`, `<wood>_log`), and subtracts held species logs once.
+// Same question as remainingRawForBuild, for a build whose wood is named species: `wood` is the primary, and a
+// needed item named for another species (birch_stairs) is that species' wood. Each species is asked apart, with
+// only its own logs and planks from the pool; every item named for no species is the primary's question, with
+// the rest of the pool. A recipe that needs sticks or planks inside another species' item is priced in that
+// species, so the order errs toward gathering.
+const WOOD_SPECIES = (group_to_item.planks || []).map(p => p.replace(/_planks$/, ''))
+  .sort((a, b) => b.length - a.length);   // longest first, so dark_oak_ is tried before oak_
+const woodSpeciesOf = item => WOOD_SPECIES.find(sp => item.startsWith(`${sp}_`)) || null;
 function remainingRawInSpecies(materialsNeeded, invCounts, wood) {
   if (!wood) throw new Error('remainingRawInSpecies: a species is required — the caller is asking the species question without one.');
+  const bySpecies = {};
+  for (const [item, n] of Object.entries(materialsNeeded || {})) {
+    const sp = woodSpeciesOf(item) || wood;
+    (bySpecies[sp] || (bySpecies[sp] = {}))[item] = n;
+  }
+  const out = {};
+  for (const [sp, need] of Object.entries(bySpecies)) {
+    const pool = {};
+    for (const [item, n] of Object.entries(invCounts || {})) {
+      if (sp === wood || woodSpeciesOf(item) === sp) pool[item] = n;
+    }
+    for (const [raw, n] of Object.entries(rawInOneSpecies(need, pool, sp))) out[raw] = (out[raw] || 0) + n;
+  }
+  return out;
+}
+
+// rawInOneSpecies — the one-species question: other-species logs and planks out of the pool first, the two log
+// roots (`logs`, `<wood>_log`) summed, and held species logs subtracted once.
+function rawInOneSpecies(materialsNeeded, invCounts, wood) {
   const speciesLog = `${wood}_log`;
   const speciesPlanks = `${wood}_planks`;
   const logs = new Set(group_to_item.logs || []);
@@ -197,6 +294,21 @@ function _walkToRoot(item, quantity, roots, gross, exact, depth = 0) {
   for (const [ingredient, n] of Object.entries(recipe.ingredients)) {
     _walkToRoot(ingredient, n * batches, roots, gross, exact, depth + 1);
   }
+}
+
+// billThrough(materialsNeeded) → { token: count } — how much of each item or group a bill passes through on its way to
+// its roots: the stone asked for, and the cobblestone that stone is smelted from.
+function billThrough(materialsNeeded) {
+  const gross = {};
+  for (const [item, count] of Object.entries(materialsNeeded || {})) {
+    if (typeof count === 'number' && count > 0) _walkToRoot(item, count, {}, gross, false);
+  }
+  return gross;
+}
+
+// isMade(item) — is this a thing the fleet makes, by the recipe book or the game's own recipes?
+function isMade(item) {
+  return !!craftingRegistry.recipeForToken(item) || !!craftingRegistry.mustCarryRecipe(String(item).trim().toLowerCase());
 }
 
 function familyBalance(materialsNeeded, holdings) {
@@ -390,7 +502,10 @@ module.exports = {
   blueprintToRawMaterials,
   remainingRawForBuild,
   remainingRawInSpecies,
+  madeIngredients,
   familyBalance,
+  billThrough,
+  isMade,
   familyRoot,
   craftShortfall,
   requirementTree,

@@ -1,6 +1,6 @@
 // station_registry.js (perception node)
 // Reads and writes logistics_confrence_room.stations in corporate_headquarters. Each station row is
-// keyed by voxel-then-owner ("x|y|z|owner") with { type, pos, items, owner }.
+// keyed by voxel-then-crew ("x|y|z|crew") with { type, pos, items, owner }, `owner` naming the crew whose shelf it is.
 //
 // registerStation requires an open window matching the expected block type before writing; on failure
 // nothing is written, and a block without a verified ID must not occupy a station slot (Law 16). A chest
@@ -78,11 +78,11 @@ function posId(pos) {
     return `${Math.floor(pos.x)}|${Math.floor(pos.y)}|${Math.floor(pos.z)}`;
 }
 
-// stationKey: the row key — the voxel, then whose shelf it is (owner appended, not prepended, since
+// stationKey: the row key — the voxel, then whose shelf it is (the crew appended, not prepended, since
 // inventory_swapper parses coordinates from the first three fields), read from this process's own
 // mandate (Law 27). Two rows may point at the same voxel without collision: no row stores contents.
 function stationKey(pos) {
-    return `${posId(pos)}|${require('@kernel/bot_mandate').stationOwnerKey()}`;
+    return `${posId(pos)}|${require('@kernel/bot_mandate').currentMode()}`;
 }
 
 function _getBotId() {
@@ -262,18 +262,18 @@ function registerStation(pos, type, window, blueprint, stance) {
 
     const capacity = (window && window.slots) ? Math.max(0, window.slots.length - 36) : 27;
 
-    // No guard against overwriting another owner's row: the key carries the owner, so this write always
-    // lands on this bot's own key and cannot land on anybody else's (Law 16).
+    // No guard against overwriting another crew's row: the key carries the crew, so this write always
+    // lands on this bot's own key and cannot land on any other crew's (Law 16).
     const id = stationKey(pos);
-    const key = require('@kernel/bot_mandate').stationOwnerKey();
+    const key = require('@kernel/bot_mandate').currentMode();
     const stations = hq.readConfRoomFlag('logistics_confrence_room', 'stations', {}) || {};
     stations[id] = {
         type,
         pos: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
         capacity,
         items,
-        // owner: whose shelf this is, read from this process's own mandate so a caller cannot stamp a
-        // shelf for anyone else (Law 27).
+        // owner: the crew whose shelf this is, read from this process's own mandate so a caller cannot stamp a
+        // shelf for another crew (Law 27).
         owner: key,
         blueprint: blueprint || null,
         // The floor cell the feet rest on, matching what an anchor names; null when nothing authored it.
@@ -369,19 +369,16 @@ function getStations(viewerBotId) {
     return visible;
 }
 
-// The owner gate, and the only one: every read of the station map reaches it through getStations, so the
+// The crew gate, and the only one: every read of the station map reaches it through getStations, so the
 // filter lands here once (Law 27, Invariant D). Not the lock rule: a chest locked by a peer stays visible,
-// since a peer shares your shelves; a chest belonging to another owner is simply absent. An entry with no
-// `owner` is the commons — stations written before the owner axis existed have no other true value (Law 13).
+// since a peer shares your shelves; a chest belonging to another crew is simply absent.
 function _ownStations(stations) {
-    // Lazy, like the mandate read below it: a perception node must not take a load-time dependency on
-    // the thinking layer, and `preflight` opens this file with no mandate in the environment.
-    const { BOT_MODES } = require('@thinking/architect_config');
-    const key = require('@kernel/bot_mandate').stationOwnerKey();
+    // Lazy: `preflight` opens this file with no mandate in the environment.
+    const key = require('@kernel/bot_mandate').currentMode();
     const mine = {};
     for (const [id, entry] of Object.entries(stations)) {
         if (!entry) continue;
-        if ((entry.owner || BOT_MODES.HOMESTEADER) === key) mine[id] = entry;
+        if (entry.owner === key) mine[id] = entry;
     }
     return mine;
 }

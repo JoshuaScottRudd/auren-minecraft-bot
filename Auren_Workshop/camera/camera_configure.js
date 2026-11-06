@@ -48,7 +48,9 @@
 
 'use strict';
 
-// ── THE LENS ITSELF, NAMED ONCE (Law 16) ────────────────────────────────────────────────────────────
+const cameraSpots = require('../../js_kernel/utils/camera_spots');
+
+// ── THE LENS ITSELF, NAMED ONCE (Law 16)────────────────────────────────────────────────────────────
 // The cone and the site solver both reason in the client's own frustum, so its optics are one pair of
 // constants referenced from both. `LENS_FOV_DEG` is VERTICAL field of view (horizontal, ~102° on 16:9,
 // is derived).
@@ -58,21 +60,16 @@ const LENS_ASPECT = 16 / 9;
 module.exports = {
 
   architect: {
-    // One window per name, each its own spectator a person flies, placed at the base when the run sites
-    // it. The name is the window title, the player name and the recorded file's prefix, so it says
-    // which shot it is: the wide fixed view of the build, the mine below it, and the roaming view.
-    // AUREN_SEATS (comma list) replaces the list for one run, e.g. one seat flown for a tour.
+    // One window per saved angle, `Cam_<number>`, each its own spectator. The name is the window title, the
+    // player name and the recorded file's prefix. AUREN_SEATS (comma list) replaces the list for one run,
+    // e.g. `Cam_1,Cam_4`, or one seat flown for a tour.
     camNames: process.env.AUREN_SEATS
       ? process.env.AUREN_SEATS.split(',').map(s => s.trim()).filter(Boolean)
-      : ['Cam_Timelapse', 'Cam_Mine', 'Cam_Roam'],
-    // A seat named here is put at this spot (feet position, then yaw and pitch) once when it joins, on a
-    // rollback or a continue alike, and is never moved to the base. The values are a spot the seat held,
-    // read off the server while the seat held it.
-    fixed: {
-      Cam_Timelapse: { pos: [-34.88116654255924, 88.72645739256133, 61.411492822985444], rotation: [-72.599915, 25.350014] },
-      Cam_Mine:      { pos: [40.748757245635154, 32.489533977156825, 30.131399416931973], rotation: [91.95084, 48.900032] },
-      Cam_Roam:      { pos: [30.762377766378066, 65.51713535994239, 69.4721473995003], rotation: [-58.651432, 28.049944] },
-    },
+      : cameraSpots.seatNames(),
+    // Each saved seat is put at its spot (feet position, then yaw and pitch) once when it joins, on a rollback
+    // or a continue alike, and is never moved to the base. The spots are read off the server while a seat held
+    // them, and saved through the foreman (js_kernel/utils/camera_spots.js).
+    fixed: cameraSpots.bySeat(),
     enable:   false,
   },
 
@@ -80,9 +77,20 @@ module.exports = {
     // Window/instance name (Windows, the titler, a recorder) — not what the server knows this seat as.
     camName:    'Cam_Architect_Control',
     // The name the seat joins under; must be opped (MinecraftServer/ops.json) so the presenter can run a
-    // command from inside his own window, and so `foreman get` stamps hires to the name he actually uses.
+    // command from inside his own window.
     playerName: 'KaptainKrispyjr',
     enable:     false,
+  },
+
+  // `scoutSeat.*` — ONE directed camera for the whole crew, not one per bot. It films whichever bot is doing the
+  // activity ranked highest on the operator's focus (camera/scout_focus.js, set on the Cutting Room's scout page),
+  // reading the bots' ACTIVITY lines (custom_api/activity_log.js) as they are written. Not `scout.*` below, which is
+  // the headless client that reads the world for every camera and films nothing. Raised only when the run asks for
+  // it (`--scout`, or the focus file's enable), like the eye.
+  scoutSeat: {
+    camName:    'Cam_Scout',
+    gimbalKey:  'Scout',     // its gimbal joins as gimbal.prefix + this: Gim_Scout
+    minDwellMs: 8000,        // filmed this long before a higher-ranked activity takes the seat; an ended one frees it at once
   },
 
   mode: {

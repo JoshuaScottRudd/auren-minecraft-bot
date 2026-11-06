@@ -38,6 +38,13 @@ async function readSurface(bot, pace = makeExecutionPacer()) {
   const N = W * D;
   const kind = new Uint8Array(N), height = new Int16Array(N), bed = new Int16Array(N), biome = new Uint16Array(N), state = new Int32Array(N);
   const logs = new Uint16Array(N), trunk = new Uint8Array(N);
+  // wet: water at the column's surface. buried: water within WET_DEPTH under its first land (architect_config.WATER_CLEARANCE says why).
+  const wet = new Uint8Array(N), buried = new Uint8Array(N);
+  // masked: a spawn-protected column (spawn_protection.maskWorldReads). It reads as bedrock from Y_TOP down, so its
+  // `height` is the mask's and not the ground's.
+  const masked = new Uint8Array(N);
+  const { isSpawnProtected } = require('@perception/spawn_protection');
+  const { WET_DEPTH } = require('@thinking/architect_config');
   const verdict = new Map(), stateName = new Map(), isLogState = new Map();
   const classify = (x, y, z, s) => {
     const b = reader.blockAt(x, y, z);
@@ -53,6 +60,7 @@ async function readSurface(bot, pace = makeExecutionPacer()) {
       for (let lx = 0; lx < 16; lx++) {
         await pace();
         const x = chunkX * 16 + lx, z = chunkZ * 16 + lz, i = (z - z0) * W + (x - x0);
+        if (bot._spawnMaskInstalled && isSpawnProtected(bot, x, z)) masked[i] = 1;
         let prevLog = false, logCount = 0;
         for (let y = Y_TOP; y >= Y_BOTTOM; y--) {
           const s = reader.stateIdAt(x, y, z);
@@ -71,8 +79,13 @@ async function readSurface(bot, pace = makeExecutionPacer()) {
           biome[i] = bot.world.getBiome({ x, y, z });
           logs[i] = logCount;
           trunk[i] = v === LAND && prevLog ? 1 : 0;
-          if (v === WATER) { bed[i] = Y_BOTTOM; continue; }
+          if (v === WATER) { bed[i] = Y_BOTTOM; wet[i] = 1; continue; }
           bed[i] = y;
+          for (let d = 1; d <= WET_DEPTH; d++) {
+            const sb = reader.stateIdAt(x, y - d, z);
+            if (sb < 0) break;
+            if ((verdict.has(sb) ? verdict.get(sb) : classify(x, y - d, z, sb)) === WATER) { buried[i] = 1; break; }
+          }
           break;
         }
       }
@@ -80,9 +93,24 @@ async function readSurface(bot, pace = makeExecutionPacer()) {
   }
   reader.dispose();
   const biomeName = id => bot.registry.biomes[id]?.name || `biome#${id}`;
-  return { x0, z0, W, D, kind, height, bed, biome, state, stateName, logs, trunk, biomeName };
+  return { x0, z0, W, D, kind, height, bed, biome, state, stateName, logs, trunk, wet, buried, masked, biomeName };
 }
 
+
+// wetNear(g) → (minX, maxX, minZ, maxZ) → whether water can reach that box, in world cells: a column within
+// WATER_CLEARANCE of it is wet or lies outside the loaded area, or a column under the box itself holds buried water.
+// The one test every siting pass applies to a footprint.
+function wetNear(g) {
+  const { WATER_CLEARANCE: C } = require('@thinking/architect_config');
+  const wetIn = summedArea(g.W, g.D, i => g.wet[i]);
+  const buriedIn = summedArea(g.W, g.D, i => g.buried[i]);
+  return (minX, maxX, minZ, maxZ) => {
+    const x0 = minX - C - g.x0, x1 = maxX + C - g.x0, z0 = minZ - C - g.z0, z1 = maxZ + C - g.z0;
+    if (x0 < 0 || z0 < 0 || x1 >= g.W || z1 >= g.D) return true;
+    if (wetIn(x0, z0, x1 - x0 + 1, z1 - z0 + 1) > 0) return true;
+    return buriedIn(minX - g.x0, minZ - g.z0, maxX - minX + 1, maxZ - minZ + 1) > 0;
+  };
+}
 
 function summedArea(W, D, valueAt) {
   const S = new Float64Array((W + 1) * (D + 1));
@@ -111,7 +139,8 @@ async function footprintPass1(g, fw, fl, trunksIn, { ring: RING, below: BELOW },
   const tw = fw + 2 * RING, tl = fl + 2 * RING;
   const ringCols = tw * tl - fw * fl;
   const hist = new Uint32Array(H_BINS);
-  const sites = [], refused = { unloaded_or_lava: 0, water_in_footprint: 0, ring_not_land: 0 };
+  const sites = [], refused = { unloaded_or_lava: 0, water_in_footprint: 0, ring_not_land: 0, water_near: 0 };
+  const wet = wetNear(g);
   for (let oz = 0; oz + tl <= g.D; oz += FOOT_STRIDE) {
     for (let ox = 0; ox + tw <= g.W; ox += FOOT_STRIDE) {
       await pace();
@@ -128,6 +157,7 @@ async function footprintPass1(g, fw, fl, trunksIn, { ring: RING, below: BELOW },
       }
       if (blocked) { refused.unloaded_or_lava++; continue; }
       if (footWater) { refused.water_in_footprint++; continue; }
+      if (wet(g.x0 + ox + RING, g.x0 + ox + RING + fw - 1, g.z0 + oz + RING, g.z0 + oz + RING + fl - 1)) { refused.water_near++; continue; }
       if (ringLand < RING_LAND * ringCols) { refused.ring_not_land++; continue; }
       const h = percentileFromHist(hist, ringLand, 0.5, Y_BOTTOM);
       const bottom = h - BELOW;
@@ -164,8 +194,9 @@ async function footprintPass1(g, fw, fl, trunksIn, { ring: RING, below: BELOW },
 }
 
 
-// Pass 2 — every voxel of the pit (surface down to h - BELOW), its floor (one below) and the one-block shell around it.
-async function footprintPass2(g, reader, site, { ring: RING }, pace = makeExecutionPacer()) {
+// Pass 2 — every voxel of the pit (surface down to h - BELOW), its floor (one below), the rest of the basement where
+// its cells hang past the footprint (`over`, from its roof down to the same floor), and the one-block shell round all of it.
+async function footprintPass2(g, reader, site, { ring: RING, over }, pace = makeExecutionPacer()) {
   const cat = new Map();
   const categoryOf = (x, y, z) => {
     const s = reader.stateIdAt(x, y, z);
@@ -202,9 +233,20 @@ async function footprintPass2(g, reader, site, { ring: RING }, pace = makeExecut
       else if (f === 'air' || f === 'unloaded') r.floorOpen++;
     }
   }
-  for (let z = fz0 - 1; z <= fz0 + site.fl; z++) {
-    for (let x = fx0 - 1; x <= fx0 + site.fw; x++) {
+  const bx0 = fx0 - over.west, bx1 = fx0 + site.fw - 1 + over.east, bz0 = fz0 - over.north, bz1 = fz0 + site.fl - 1 + over.south;
+  for (let z = bz0; z <= bz1; z++) {
+    for (let x = bx0; x <= bx1; x++) {
       if (x >= fx0 && x < fx0 + site.fw && z >= fz0 && z < fz0 + site.fl) continue;
+      await pace();
+      for (let y = site.bottom + 3; y >= floorY; y--) {
+        const c = categoryOf(g.x0 + x, y, g.z0 + z);
+        if (c === 'water' || c === 'lava' || c === 'unloaded') r[c]++;
+      }
+    }
+  }
+  for (let z = bz0 - 1; z <= bz1 + 1; z++) {
+    for (let x = bx0 - 1; x <= bx1 + 1; x++) {
+      if (x >= bx0 && x <= bx1 && z >= bz0 && z <= bz1) continue;
       await pace();
       const i = z * g.W + x, wx = g.x0 + x, wz = g.z0 + z;
       for (let y = site.h + 1; y >= floorY; y--) {
@@ -224,12 +266,12 @@ async function footprintPass2(g, reader, site, { ring: RING }, pace = makeExecut
 
 
 // ── THE ONE CALL THE FOREMAN MAKES ─────────────────────────────────────────────────────────────────
-// await surveyFootprint(bot, { w, l, below, ring }, pace?) → { positions, refused, byTolerance:[{ tolerance, levelPositions,
+// await surveyFootprint(bot, { w, l, below, ring, over }, pace?) → { positions, refused, byTolerance:[{ tolerance, levelPositions,
 // plots, passingPlots, picks:[site] }] } where a site carries, in WORLD coordinates, `corner` (the footprint's
 // min x/z), `centre`, `h` (the ground floor), `bottom`, `fw`/`fl` (its orientation), `offLevel`, and `passes`
-// (no water, lava or unloaded ground in the pit, its floor or its shell). Picks are separate plots — no two share
+// (no water, lava or unloaded ground in the pit, its floor, the basement past it (`over`: blueprint_anchor_calculator.basementOver) or their shell). Picks are separate plots — no two share
 // a footprint column — nearest to level first. The blueprint is surveyed in its own orientation only.
-async function surveyFootprint(bot, { w, l, below, ring }, pace = makeExecutionPacer()) {
+async function surveyFootprint(bot, { w, l, below, ring, over }, pace = makeExecutionPacer()) {
   for (const [k, v] of Object.entries({ w, l, below, ring })) {
     if (!Number.isInteger(v) || v < 0) throw new Error(`[footprint_survey] CODING VIOLATION (Law 13): ${k} must be a whole number of blocks, got ${v}.`);
   }
@@ -240,7 +282,7 @@ async function surveyFootprint(bot, { w, l, below, ring }, pace = makeExecutionP
   // and suppress the as-authored plot overlapping it. The picks are a competition result, never a
   // census.
   const orientations = [[w, l]];
-  const all = [], refused = { unloaded_or_lava: 0, water_in_footprint: 0, ring_not_land: 0 };
+  const all = [], refused = { unloaded_or_lava: 0, water_in_footprint: 0, ring_not_land: 0, water_near: 0 };
   for (const [fw, fl] of orientations) {
     const p1 = await footprintPass1(g, fw, fl, trunksIn, { ring, below }, pace);
     all.push(...p1.sites);
@@ -253,7 +295,7 @@ async function surveyFootprint(bot, { w, l, below, ring }, pace = makeExecutionP
     const key = `${s.ox},${s.oz},${s.fw}`;
     if (!memo.has(key)) {
       memo.set(key, {
-        ...s, ...(await footprintPass2(g, reader, s, { ring }, pace)),
+        ...s, ...(await footprintPass2(g, reader, s, { ring, over }, pace)),
         corner: { x: g.x0 + s.ox + ring, z: g.z0 + s.oz + ring },
         centre: { x: g.x0 + s.ox + ring + Math.floor(s.fw / 2), z: g.z0 + s.oz + ring + Math.floor(s.fl / 2) },
       });
@@ -289,22 +331,29 @@ async function surveyFootprint(bot, { w, l, below, ring }, pace = makeExecutionP
 //   fillMax    ground up to this many layers under the floor is accepted (it is filled)
 //   searchTo   the farthest gap searched
 //   clearOf    optional [{ box, gap }]: other footprints the small building also keeps `gap` from
+//   admit      optional ({ x, z }) → boolean: the caller's own rule on the small building's transpose origin; a position
+//              it refuses is counted under refused.not_admitted
 //
 // THE NEAREST GAP WINS; within one block of it, the site nearest the big building's centre (the middle of a side,
 // the shortest trip on average to every part of the building), then the least ground moved. Every column under the footprint must
 // be land (no water, lava, unloaded cell or tree trunk) with its surface inside [floor - fillMax, floor + scrapeMax];
 // of the floors within ±rise that fit, the one with the fewest cells to fill is taken, then the fewest blocks to cut,
 // then the nearest to groundY.
+//   overTrees  optional: a column under a tree trunk is accepted; the site's trees are felled before its build.
+//   floorOf    optional (heights) → floor: a caller's own floor rule in place of the one above (utils/surface_site
+//              puts a structure on the surface); groundY and rise are then unused. The scrapeMax/fillMax test still applies.
 // Returns { found:true, center:{x,y,z}, gap, floor, scrape, fill, refused:{…} } (refused counts the nearer sites
 // passed over) or { found:false, refused:{…}, candidates }.
-async function siteBeside(g, { extent, avoid, groundY, minGap, rise, scrapeMax, fillMax, searchTo, clearOf = [] }, pace = makeExecutionPacer()) {
+async function siteBeside(g, { extent, avoid, groundY, minGap, rise, scrapeMax, fillMax, searchTo, clearOf = [], floorOf = null, overTrees = false, admit = null }, pace = makeExecutionPacer()) {
   const gapTo = (r, b) => Math.hypot(Math.max(0, b.minX - r.maxX - 1, r.minX - b.maxX - 1), Math.max(0, b.minZ - r.maxZ - 1, r.minZ - b.maxZ - 1));
-  for (const [k, v] of Object.entries({ groundY, minGap, rise, scrapeMax, fillMax, searchTo })) {
+  const whole = floorOf ? { minGap, scrapeMax, fillMax, searchTo } : { groundY, minGap, rise, scrapeMax, fillMax, searchTo };
+  for (const [k, v] of Object.entries(whole)) {
     if (!Number.isInteger(v)) throw new Error(`[footprint_survey] CODING VIOLATION (Law 13): siteBeside needs a whole-number ${k}, got ${v}.`);
   }
   const floors = [0];
-  for (let d = 1; d <= rise; d++) floors.push(-d, d);
-  const refused = { not_land: 0, trunk: 0, too_uneven: 0 };
+  for (let d = 1; d <= (floorOf ? 0 : rise); d++) floors.push(-d, d);
+  const refused = { not_land: 0, trunk: 0, too_uneven: 0, water_near: 0, not_admitted: 0 };
+  const wet = wetNear(g);
   const cands = [];
   for (let cz = g.z0 - extent.min_dz; cz + extent.max_dz < g.z0 + g.D; cz++) {
     for (let cx = g.x0 - extent.min_dx; cx + extent.max_dx < g.x0 + g.W; cx++) {
@@ -312,7 +361,9 @@ async function siteBeside(g, { extent, avoid, groundY, minGap, rise, scrapeMax, 
       const dx = Math.max(0, avoid.minX - r.maxX - 1, r.minX - avoid.maxX - 1);
       const dz = Math.max(0, avoid.minZ - r.maxZ - 1, r.minZ - avoid.maxZ - 1);
       const gap = Math.hypot(dx, dz);
-      if (gap >= minGap && gap <= searchTo && clearOf.every(c => gapTo(r, c.box) >= c.gap)) cands.push({ cx, cz, r, gap });
+      if (!(gap >= minGap && gap <= searchTo && clearOf.every(c => gapTo(r, c.box) >= c.gap))) continue;
+      if (admit && !admit({ x: cx, z: cz })) { refused.not_admitted++; continue; }
+      cands.push({ cx, cz, r, gap });
     }
   }
   cands.sort((a, b) => a.gap - b.gap);
@@ -321,13 +372,14 @@ async function siteBeside(g, { extent, avoid, groundY, minGap, rise, scrapeMax, 
   for (const c of cands) {
     if (best && c.gap > best.gap + 1) break;
     await pace();
+    if (wet(c.r.minX, c.r.maxX, c.r.minZ, c.r.maxZ)) { refused.water_near++; continue; }
     let ok = true, lo = Infinity, hi = -Infinity;
     const hs = [];
     for (let z = c.r.minZ; z <= c.r.maxZ && ok; z++) {
       for (let x = c.r.minX; x <= c.r.maxX; x++) {
         const i = (z - g.z0) * g.W + (x - g.x0);
         if (g.kind[i] !== LAND) { refused.not_land++; ok = false; break; }
-        if (g.trunk[i]) { refused.trunk++; ok = false; break; }
+        if (g.trunk[i] && !overTrees) { refused.trunk++; ok = false; break; }
         hs.push(g.height[i]); lo = Math.min(lo, g.height[i]); hi = Math.max(hi, g.height[i]);
       }
     }
@@ -336,13 +388,17 @@ async function siteBeside(g, { extent, avoid, groundY, minGap, rise, scrapeMax, 
     // a cut needs no material and a fill needs blocks the crew may not hold yet.
     const cutAt = F => hs.reduce((n, h) => n + Math.max(0, h - F), 0);
     const fillAt = F => hs.filter(h => h < F).length;
-    const floor = floors.map(d => groundY + d).filter(F => lo >= F - fillMax && hi <= F + scrapeMax)
-      .sort((a, b) => (fillAt(a) - fillAt(b)) || (cutAt(a) - cutAt(b)) || (Math.abs(a - groundY) - Math.abs(b - groundY)))[0];
+    const fits = F => lo >= F - fillMax && hi <= F + scrapeMax;
+    const floor = floorOf
+      ? [floorOf(hs)].filter(fits)[0]
+      : floors.map(d => groundY + d).filter(fits)
+        .sort((a, b) => (fillAt(a) - fillAt(b)) || (cutAt(a) - cutAt(b)) || (Math.abs(a - groundY) - Math.abs(b - groundY)))[0];
     if (floor === undefined) { refused.too_uneven++; continue; }
     const scrape = cutAt(floor);
     const fill = fillAt(floor);
     const mid = Math.round(Math.hypot(c.cx - midX, c.cz - midZ));
-    if (!best || mid < best.mid || (mid === best.mid && scrape + fill < best.scrape + best.fill)) {
+    const better = !best || mid < best.mid || (mid === best.mid && scrape + fill < best.scrape + best.fill);
+    if (better) {
       best = { gap: c.gap, mid, center: { x: c.cx, y: floor, z: c.cz }, floor, scrape, fill };
     }
   }
@@ -352,7 +408,7 @@ async function siteBeside(g, { extent, avoid, groundY, minGap, rise, scrapeMax, 
 }
 
 module.exports = {
-  readSurface, summedArea, percentileFromHist, footprintPass1, footprintPass2, surveyFootprint, siteBeside,
+  readSurface, summedArea, wetNear, percentileFromHist, footprintPass1, footprintPass2, surveyFootprint, siteBeside,
   Y_TOP, Y_BOTTOM, H_BINS, LAND, WATER, LAVA, COVER, WATER_SURFACE, FOOT_STRIDE, RING_LAND, TOLERANCES, LEVEL_SHARE,
   STONE_YIELD, DIRT_YIELD, FALLING,
 };

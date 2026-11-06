@@ -16,6 +16,18 @@ const FLUID_HAZARDS = new Set(['water', 'flowing_water', 'lava', 'flowing_lava',
 const MAX_COLUMN_WALK = 384;
 
 function isGravityBlock(name) { return GRAVITY_BLOCKS.has(name); }
+
+// Blocks that fall when the cell under them opens: the gravity blocks, and the ones no mine meets but a building
+// holds (an anvil, concrete powder, a dragon egg). A falling block is placed only on a standing block below, and
+// the block below it is dug only after it is lifted off (build_column_executor, place_authority).
+const FALLS_TOO = /^(anvil|chipped_anvil|damaged_anvil|dragon_egg|[a-z_]+_concrete_powder)$/;
+function fallsWithoutBelow(name) { return isGravityBlock(name) || FALLS_TOO.test(name || ''); }
+// holdsUp(below) → true when a falling block stays on `below`: anything but an open cell, a fluid, fire, or the
+// plant cover a placed block takes over (terrain_predicates.isReplaceable).
+function holdsUp(below) {
+  if (!below || isFluid(below.name) || below.name === 'fire' || below.name === 'soul_fire') return false;
+  return !require('@utils/movement/terrain_predicates').isReplaceable(below);
+}
 function isFluid(name) { return FLUID_HAZARDS.has(name); }
 
 // Reads a block's name; null for an unloaded column, the reading every caller here handles.
@@ -24,19 +36,22 @@ function blockName(bot, x, y, z) {
   return b ? b.name : null;
 }
 
-// True for a still water SOURCE block (safe farmland attach point), false for flowing water.
-// The "level" blockstate property is 0 only at a source; 1-15 is a flow tier.
-function isWaterSource(bot, x, y, z) {
+// waterLevel — the "level" blockstate of a water cell: 0 at a source, 1-7 a flow tier that thins away from
+// it, 8-15 water falling. null for a cell that is not water or is unloaded. Water runs toward a higher level.
+function waterLevel(bot, x, y, z) {
   const block = bot.blockAt(new Vec3(x, y, z));
-  if (!block || block.name !== 'water') return false;
+  if (!block || block.name !== 'water') return null;
   if (typeof block.getProperties === 'function') {
     const props = guardExternalSync('gravity_utils', 'block.getProperties() for water level', () => block.getProperties());
-    if (props.ok && props.value && props.value.level !== undefined) return parseInt(props.value.level, 10) === 0;
+    if (props.ok && props.value && props.value.level !== undefined) return parseInt(props.value.level, 10);
   }
   // A plain property read on an object we already hold — nothing to guard.
-  if (typeof block.metadata === 'number') return block.metadata === 0;
-  return false;
+  if (typeof block.metadata === 'number') return block.metadata;
+  return null;
 }
+
+// True for a still water SOURCE block (safe farmland attach point), false for flowing water.
+function isWaterSource(bot, x, y, z) { return waterLevel(bot, x, y, z) === 0; }
 
 // Walks up a gravity column from (x,y,z) to its top and checks whether a fluid reaches
 // the dug space by capping the column or touching a horizontal neighbor at any level.
@@ -64,7 +79,10 @@ module.exports = {
   GRAVITY_BLOCKS,
   FLUID_HAZARDS,
   isGravityBlock,
+  fallsWithoutBelow,
+  holdsUp,
   isFluid,
   isWaterSource,
+  waterLevel,
   followGravityColumn,
 };

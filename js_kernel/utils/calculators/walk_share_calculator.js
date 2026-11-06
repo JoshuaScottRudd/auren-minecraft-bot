@@ -1,6 +1,6 @@
 /*
 walk_share_calculator.js — how much of a job's time went to walking, and how much more working that walk
-has to be paid with. Computed once here because three readers ask it — the body at the end of each job,
+has to be paid with, and which jobs are judged by the ore they bring back instead. Computed once here because three readers ask it — the body at the end of each job,
 the foreman's run verdict, and the walking lens — and three copies of the arithmetic would let one run
 read as inside the limit and over it at once.
 */
@@ -10,6 +10,13 @@ read as inside the limit and over it at once.
 // The most of a job's time that may go to walking, in percent. At the limit a body works one second at
 // the end of a walk for every second it spent walking there and back.
 const WALK_LIMIT_PCT = 50;
+
+// ORE TRIPS ARE JUDGED BY ORE PER MINUTE, NOT BY THEIR WALKING. A strip-mine trip spends its walk finding ore, so
+// it does not count toward the walking share; it is judged by the ore it brings back for the time it held the body
+// (bot_minutes' ore_trip line, the walking lens' ore_per_minute).
+// Each is named as bot_minutes labels a job: `<type>/<what>`.
+const ORE_TRIPS = Object.freeze(['mine/dig_cell']);
+const isOreTrip = label => ORE_TRIPS.includes(label);
 
 // The share for one stretch of time a body held work.
 //   walkMs   milliseconds of it spent walking
@@ -52,4 +59,4 @@ function fleetShare(clocks) {
     return { bodies, ...walkShare(walk, held) };
 }
 
-module.exports = { WALK_LIMIT_PCT, walkShare, fleetShare };
+module.exports = { WALK_LIMIT_PCT, ORE_TRIPS, isOreTrip, walkShare, fleetShare };

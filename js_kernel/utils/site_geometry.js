@@ -350,7 +350,7 @@ function formatRejections(rejections) {
 }
 
 // ── where can one body stand, near here? ────────────────────────────────────────────────────────────
-// standingSpotNear — the desk's crew placement and the test harness's faux-person placement both need
+// standingSpotNear — the foreman's crew placement and the test harness's faux-person placement both need
 // this, so it is one function serving both (Law 16).
 //
 // It is `evaluateOpenBox` at body scale (size 1, height 2); flatness stays at default since one column

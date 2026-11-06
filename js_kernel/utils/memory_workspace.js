@@ -47,7 +47,8 @@ function budget() {
   return { ...sensed, growthBytes: Math.min(activeGrant.growthBytes, sensed.growthBytes), cacheCells: Math.min(activeGrant.cacheCells, sensed.cacheCells) };
 }
 
-// Abandoned computations never return, so their collections are cleared before their owner hands off control.
+// An abandoned computation's collections are cleared before its owner hands off control; one that resumes
+// afterwards finds them cleared and ends itself (pathfinding_utils' search).
 function leave() {
   for (const scope of scopes) for (const clear of scope) clear();
   scopes.clear();

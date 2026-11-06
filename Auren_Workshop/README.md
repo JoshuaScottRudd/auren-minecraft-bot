@@ -138,8 +138,7 @@ set a standpoint, build a shape with RCON — those are an operator's choices an
 It may never **compute an action's outcome** and call that a result. The moment a harness decides what the
 world would have done, it is grading its own paper (Law 26) and its verdict means nothing.
 
-**This is why the live probes in `tools/` are live.** `chat_probe`, `sign_probe`, `water_pillar_probe`,
-`stone_column_probe` and `ghost_probe` each exist because their question is a world-transformation — what
+**This is why the live probes in `tools/` are live.** `water_pillar_probe` and `ghost_probe` each exist because their question is a world-transformation — what
 does Minecraft DO — and the only honest answer to that is one read off a real server. Their headers used
 to cite the bench for this rule; they cite this section now.
 

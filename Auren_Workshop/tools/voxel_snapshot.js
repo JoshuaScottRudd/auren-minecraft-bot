@@ -5,8 +5,8 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/voxe
 //
 // WHAT A CAPTURE DOES, per area asked for:
 //   1. one creative body is /tp'd above the point asked for and falls to the surface;
-//   2. it waits until the server's whole view around it has arrived (wheat_plot_scanner.loadedAreaSettled);
-//   3. the PERSON SPOT is chosen by person_spot — the rule the harness stands its person on and the foreman's desk
+//   2. it waits until the server's whole view around it has arrived (loaded_area.loadedAreaSettled);
+//   3. the PERSON SPOT (the landing) is chosen by landing_spot — the rule the harness stands its person on and the foreman lands on
 //      accepts: an acceptable biome, not too high, a clear 3×3, and at least landingFloor from world spawn —
 //      nearest first outward from the point asked for;
 //   4. the body is moved onto that spot, the view settles again, and every column inside the server's view of
@@ -14,7 +14,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/voxe
 // The store refuses a capture that shares a chunk with a snapshot of the same seed, and keeps the newest 10
 // (voxel_snapshot_store). A view that never fully arrives is saved anyway and says how many chunks were missing.
 //
-// THE SERVER AND THE TERMINALS: as wheat_site_probe — refuses to start while any terminal a run opened is still open
+// THE SERVER AND THE TERMINALS: refuses to start while any terminal a run opened is still open
 // or a world answers; rolls the world back to run_config's hosting snapshot unless --continue; stops the server and
 // closes what it opened on the way out. Several areas are captured in one server session.
 //
@@ -34,12 +34,12 @@ for (const d of MODULE_DIRS) module.paths.unshift(d);
 
 const rcon = require('@utils/rcon_link');
 const { openWindows, closeWindows, describeWindows } = require('@utils/console_window');
-const { loadedAreaSettled, inServerView } = require('@utils/wheat_plot_scanner');
+const { loadedAreaSettled, inServerView } = require('@utils/loaded_area');
 const { makeVoxelReader } = require('@utils/voxel_reader');
 const { ringScan, formatRejections } = require('@utils/site_geometry');
 const { getBiomeName } = require('@perception/biome_scanner');
 const { SPAWN_PROTECTION_RADIUS, SERVER_MINECRAFT_VERSION } = require('@thinking/architect_config');
-const { personSpotTest, landingFloor } = require('@utils/person_spot');
+const { landingSpotTest, landingFloor } = require('@utils/landing_spot');
 const store = require('./voxel_snapshot_store');
 // The world a rollback start puts back, named by the foreman's one rule (foreman_plan.freshWorld).
 const HOSTING = require(paths.bot('foreman', 'foreman_plan.js')).freshWorld(require(paths.bot('js_kernel', 'utils', 'workstation.js')).needServerDir());
@@ -92,7 +92,7 @@ async function captureOne(bot, near, seed, label) {
   const floor = landingFloor(SPAWN_PROTECTION_RADIUS);
   const reader = makeVoxelReader(bot, { needs: ['type', 'water'] });
   const refY = Math.floor(bot.entity.position.y);
-  const isSpot = personSpotTest(reader, (x, y, z) => getBiomeName(bot, x, y, z), refY);
+  const isSpot = landingSpotTest(reader, (x, y, z) => getBiomeName(bot, x, y, z), refY);
   const sweep = await ringScan(reader, {
     origin: near, step: 1,
     accept: ({ x, z }) => Math.max(Math.abs(x - spawn.x), Math.abs(z - spawn.z)) >= floor,

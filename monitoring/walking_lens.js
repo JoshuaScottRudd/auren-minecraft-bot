@@ -6,7 +6,8 @@
 // process.argv, no process.exit.
 //
 // WALK_AGAINST_WORK leads: walking as a share of time on jobs against the limit, fleet and per job, from
-// the bot's own walk_share_calculator.
+// the bot's own walk_share_calculator; ore trips are left out of it. ORE_PER_MINUTE follows: each ore trip
+// kind's ore picked up per bot-minute held.
 //
 // Usage:  node Auren_Bot/monitoring/trace_monitor.js --walking [--bot=B] [--all]
 
@@ -14,6 +15,7 @@
 
 const out = require('./data_out');
 const { reduceBotMinutes } = require('./job_timeline_lens');
+const { relativeTime } = require('./report_formatting');
 
 const WALK_RE = /\[WALK_LEDGER\][^]*?walk verb=(\S+) category=(\S+) purpose=(\S+)(?: leg=(\S+))? held=([\d.]+)s outcome=(\w+)(?: from=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\) to=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\))?/;
 
@@ -38,15 +40,44 @@ function reduceWalking({ seg = [], bot: botFilter = null } = {}) {
     if (botFilter && l.bot !== botFilter) continue;
     const m = WALK_RE.exec(l.raw);
     if (!m) continue;
-    const w = { bot: l.bot, verb: m[1], category: m[2], purpose: m[3], leg: m[4] || 'travel', sec: +m[5], outcome: m[6], dist: null, to: null };
+    const w = { bot: l.bot, wallSec: l.wallSec, verb: m[1], category: m[2], purpose: m[3], leg: m[4] || 'travel', sec: +m[5], outcome: m[6], dist: null, from: null, to: null };
     if (m[7] !== undefined) {
       const f = [+m[7], +m[8], +m[9]], t = [+m[10], +m[11], +m[12]];
       w.dist = Math.hypot(t[0] - f[0], t[1] - f[1], t[2] - f[2]);
+      w.from = f;
       w.to = t;
     }
     walks.push(w);
   }
   return { walks };
+}
+
+// Every ore trip's line: { bot, job, sec, walk, ore, items: { item: count } }.
+const ORE_TRIP_RE = /ore_trip job=(\S+) held=([\d.]+)s walk=([\d.]+)s ore=(\d+) items=(\S+)/;
+function reduceOreTrips({ seg = [], bot: botFilter = null } = {}) {
+  const trips = [];
+  for (const l of seg) {
+    if (botFilter && l.bot !== botFilter) continue;
+    const m = ORE_TRIP_RE.exec(l.raw);
+    if (!m) continue;
+    const items = {};
+    if (m[5] !== 'none') for (const pair of m[5].split(',')) { const [i, n] = pair.split(':'); items[i] = +n; }
+    trips.push({ bot: l.bot, job: m[1], sec: +m[2], walk: +m[3], ore: +m[4], items });
+  }
+  return trips;
+}
+
+// Groups ore trips by a key into { key, trips, sec, walk, ore, empty }, most ore first.
+function _sumTrips(trips, keyOf) {
+  const by = new Map();
+  for (const t of trips) {
+    const k = keyOf(t);
+    const g = by.get(k) || { key: k, trips: 0, sec: 0, walk: 0, ore: 0, empty: 0 };
+    g.trips++; g.sec += t.sec; g.walk += t.walk || 0; g.ore += t.ore;
+    if (!(t.ore > 0)) g.empty++;
+    by.set(k, g);
+  }
+  return [...by.values()].sort((a, b) => b.ore - a.ore);
 }
 
 // Groups walks by a key into { key, walks, sec, arrived, failed, abandoned }, largest first.
@@ -76,12 +107,14 @@ function runWalking({ seg = [], traceName = '?', bot: botFilter = null, verbose 
   // THE NUMBER, FIRST: walking as a share of time on jobs, against the limit, from the bot's own
   // calculator. `work_owed_bot_min` is the working time the walking was short by; `stay_factor` is how
   // many times longer the working half of a job has to be for its walking to sit at the limit.
-  const { walkShare, WALK_LIMIT_PCT } = require('../js_kernel/utils/calculators/walk_share_calculator');
-  const jobTime = new Map(bm.byToken.map(t => [t.token, t.sec]));
+  const { walkShare, WALK_LIMIT_PCT, isOreTrip } = require('../js_kernel/utils/calculators/walk_share_calculator');
+  // Ore trips are judged by ore per minute (section ore_per_minute), so neither their walks nor their time count here.
+  const jobTime = new Map(bm.byToken.filter(t => !isOreTrip(t.token)).map(t => [t.token, t.sec]));
+  const oreTripSec = bm.byToken.filter(t => isOreTrip(t.token)).reduce((s, t) => s + t.sec, 0);
   // Travel only: a move made inside the work, once it has begun, is part of the work.
   const onJobs = walks.filter(w => jobTime.has(w.category) && w.leg === 'travel');
   const inWork = new Map(_group(walks.filter(w => w.leg === 'work'), w => w.category).map(g => [g.key, g.sec]));
-  const fleetShare = walkShare(onJobs.reduce((s, w) => s + w.sec, 0) * 1000, Math.max(bm.fleet.worked, onJobs.reduce((s, w) => s + w.sec, 0)) * 1000);
+  const fleetShare = walkShare(onJobs.reduce((s, w) => s + w.sec, 0) * 1000, Math.max(bm.fleet.worked - oreTripSec, onJobs.reduce((s, w) => s + w.sec, 0)) * 1000);
   out.section('walk_against_work');
   out.kv('limit_pct', WALK_LIMIT_PCT);
   out.kv('walk_pct', fleetShare.walk_pct);
@@ -96,6 +129,22 @@ function runWalking({ seg = [], traceName = '?', bot: botFilter = null, verbose 
       return [g.key, s.walk_pct, s.over, min(s.walk_ms / 1000), min(s.work_ms / 1000), min(s.work_owed_ms / 1000), s.stay_factor,
         g.walks, +(g.sec / g.walks).toFixed(1), min(inWork.get(g.key) || 0)];
     }).sort((a, b) => b[5] - a[5]));
+
+  // ORE PER MINUTE: each ore trip's ore picked up against the time it held the body (bot_minutes' ore_trip line),
+  // by trip kind, then by trip kind and item.
+  const trips = reduceOreTrips({ seg, bot: botFilter });
+  const perMin = (ore, sec) => (sec > 0 ? +((60 * ore) / sec).toFixed(2) : null);
+  out.section('ore_per_minute');
+  out.table(['job', 'trips', 'held_bot_min', 'walk_bot_min', 'ore', 'ore_per_bot_min', 'trips_with_no_ore'],
+    _sumTrips(trips, t => t.job).map(g => [g.key, g.trips, min(g.sec), min(g.walk), g.ore, perMin(g.ore, g.sec), g.empty]));
+  const byItem = [];
+  for (const t of trips) for (const [item, n] of Object.entries(t.items)) byItem.push({ ...t, item, ore: n });
+  out.table(['job', 'item', 'ore', 'ore_per_bot_min_of_all_trips'],
+    _sumTrips(byItem, t => `${t.job}|${t.item}`).map(g => {
+      const [job, item] = g.key.split('|');
+      const sec = trips.filter(t => t.job === job).reduce((s, t) => s + t.sec, 0);
+      return [job, item, g.ore, perMin(g.ore, sec)];
+    }));
 
   out.section('walking');
   out.kv('walks', walks.length);
@@ -156,6 +205,15 @@ function runWalking({ seg = [], traceName = '?', bot: botFilter = null, verbose 
       return [g.key, g.walks, min(g.sec), pct(g.sec, walkSec),
         +(here.reduce((s, w) => s + w.dist, 0) / here.length).toFixed(1), top.key, min(top.sec)];
     }));
+
+  // ONE BODY'S WALKS IN ORDER, with --bot: each walk's ends as the ledger wrote them, so where a body stood
+  // before and after each walk reads down one column.
+  if (botFilter) {
+    out.section('walks_in_order');
+    out.table(['at', 'category', 'purpose', 'leg', 'held_sec', 'outcome', 'from', 'to', 'blocks'],
+      walks.map(w => [Number.isFinite(w.wallSec) ? relativeTime(w.wallSec) : null, w.category, w.purpose, w.leg, w.sec, w.outcome,
+        w.from ? w.from.join(',') : null, w.to ? w.to.join(',') : null, w.dist == null ? null : +w.dist.toFixed(1)]));
+  }
 
   if (verbose) {
     out.section('walking_by_bot');

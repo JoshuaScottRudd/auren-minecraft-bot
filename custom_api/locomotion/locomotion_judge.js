@@ -145,7 +145,8 @@ module.exports = {
           verdict: 'success',
           invocation_id: capsule.invocation_id,
           attempt: capsule.attempt,
-          selected_target: capsule.selected_target || null
+          selected_target: capsule.selected_target || null,
+          step_budget_spent: capsule.step_budget_spent === true
         }
       };
       return signalBus.route(out.to, out);
@@ -180,7 +181,11 @@ module.exports = {
           required_side: capsule.required_side ?? null,
           min_y: capsule.min_y ?? null,
           max_y: capsule.max_y ?? null,
+          walk_only: capsule.walk_only === true,
+          leading: capsule.leading === true,
+          spare_builds: capsule.spare_builds === true,
           exact: capsule.exact ?? false,
+          max_steps: capsule.max_steps ?? null,
           candidates_ref: capsule.candidates_ref ?? null,
           candidates_count: capsule.candidates_count ?? 0,
           candidates_kind: capsule.candidates_kind ?? null

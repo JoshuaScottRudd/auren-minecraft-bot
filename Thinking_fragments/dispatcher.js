@@ -1,15 +1,13 @@
 // dispatcher.js
 // Thinking fragment: reads job_board_room, picks the lowest unmet need this species may take,
 // places the bot's magnet on the job, and dispatches to the correct manager.
-// Magnet: consulted before the claim (bot_mandate.magnetRefusal, SECTION 1) to filter the board by
-// species; written on claim, cleared when none remain. clearMagnet() also exported for disconnect
+// Magnet: written on claim, cleared when none remain. clearMagnet() also exported for disconnect
 // handlers (master_core).
 
 'use strict';
 
 const watcher = require('@kernel/watcher');
 const hq      = require('@kernel/corporate_headquarters');
-const botMandate = require('@kernel/bot_mandate');
 const { routeSignal } = require('@utils/signal_utils');
 const jobRanking = require('@thinking/job_ranking');
 const { BAND_POLICY } = require('@thinking/architect_config');
@@ -31,6 +29,8 @@ for (const [band, policy] of Object.entries(BAND_POLICY)) {
 const MANAGER_MAP = {
     // A manager: spawn then teleport are each verified by sensing (same shape as eat_manager).
     respawn: 'death_manager',
+    // TEMPORARY: the one job a body in running water holds (assessors/current).
+    current: 'current_manager',
     supply:  'supply_manager',
     build:   'building_manager',
     mine:    'mining_manager',
@@ -42,27 +42,38 @@ const MANAGER_MAP = {
     furnace:   'furnace_executor',
     // One-shot; the executor remembers a declined drop's id so it is not re-offered (Invariant D).
     ground_salvage: 'ground_salvage_executor',
+    // One-shot: a sector's scan, or one trip for stone open to the sky (assessors/survey).
+    survey: 'survey_executor',
     // One-shot: withdraw the banked compostables, feed the composter, bank the bone meal.
     compost:   'compost_executor',
+    // One-shot: withdraw a batch of banked farm saplings and plant them in the tree farm.
+    plant:     'sapling_plant_executor',
     // One pass: take trash and scattered part stacks out of the chests, pit the trash, bank the rest whole.
     housekeeping: 'chest_housekeeping_executor',
-    // One-shot: walk the dark cells, place torches, leave.
-    light:     'torch_executor',
-    // One-shot: fell one wild tree in a blueprint's clear ring (camera framing).
+    // One pass: walk to one anchor's stand in the standing home and register the fixtures it owns.
+    home_stations: 'home_stations_executor',
+    // A managed visit: carry torches, place the network's planned torches one at a time, re-planning after each.
+    light:     'lighting_manager',
+    // A managed hold: stand by a tandem worker through the night and take the mobs it declines.
+    guard:     'guard_manager',
+    // A managed herd: take one wheat, lead one animal into the crew's pen, leave it, bank the wheat.
+    herd:      'herd_manager',
+    // A managed hold: take one wheat, hold the penned flock at the long side while a tender works the pen, bank the wheat.
+    shepherd:  'shepherd_manager',
+    // A managed shearing: with a shepherd holding, shear the pen's woolly flock, leave, bank the wool.
+    shear:     'shear_manager',
+    // A managed cull: with a shepherd holding, slaughter a full meat pen's grown animals past its stock, leave, bank the produce.
+    cull:      'cull_manager',
+    // A managed feed: take two wheat, ask the server which penned animals can breed, feed one pair, bank the rest.
+    breed:     'breed_manager',
+    // A managed dyeing: take the dye and a wheat, dye the pen's white animals one color from outside the fence, bank the rest.
+    dye:       'dye_manager',
+    // One-shot: fell one wild tree on a structure's site before it is built.
     canopy:    'canopy_clear_executor',
-    // One-shot: dig the leaf debris and grass tufts in one tile of a building's grounds, then sweep the drops.
-    clear_ground: 'clear_ground_executor',
     // One-shot: work one anchor cube from beneath, dig/place/return. No manager — the board
     // re-senses every sweep. Goes through preparation (places only from the pocket) first.
     column:    'column_preparation',
-    // One-shot: scan the surface for logs, publish the most abundant species to the boardroom.
-    wood_preference: 'set_wood_preference',
 };
-
-// ── THE BOT DOES NOT NARRATE. IT ANNOUNCES WHETHER IT IS FREE. ───────────────
-// What a bot is doing is a pull (`foreman where` reads the magnet on request; words live in
-// foreman_vocabulary.js). Whether it is free is pushed to chat, through @kernel/bot_voice, which
-// floors how often either crossing becomes a line.
 
 function _getBotId() {
     return process.env.BOT_ID || 'default';
@@ -124,9 +135,19 @@ function _claimJob(botId, job, pledge) {
     const existing = hq.readBoardroomChair(botId, {});
     existing.magnet = {
         job_id:      job.id,
+        // When this claim was made: a claim's own budgets (sector_finder's scans) are counted against it.
+        claimed_at:  Date.now(),
         type:        job.type,
         what:        job.what,
         where:       job.where || null,
+        // The floor a deep seat digs nearest (assessors/mining, mining_manager).
+        deep_y:      job.deep_y ?? null,
+        // The crop a farm tend serves (assessors/farming ONE FARMER PER CROP).
+        crop:        job.crop ?? null,
+        // The other pens' animals a stranger cull kills, by entity id (assessors/ranching).
+        strangers:   Array.isArray(job.strangers) ? job.strangers : null,
+        // The three limits a breed round's pairs were the least of: half the pen, its room, the wheat (assessors/ranching).
+        pairs_by:    job.pairs_by ?? null,
         // A level and an amount never share a name — magnet is a field whitelist (add here too).
         hold_goal:      job.hold_goal ?? null,
         // `hold_goal` is the destination total; `need` is the shortfall the pledge math uses
@@ -136,10 +157,8 @@ function _claimJob(botId, job, pledge) {
         goal_parts:     Array.isArray(job.parts) ? job.parts : null,
         // What this body pledges to bring back; peers subtract it from `need` (`_readPeerClaims`).
         pledge:        pledge || null,
-        // Whether the fleet's stone is mined, captured live so a mid-flight flip reads as a moved
-        // classification (release and replan), not a Law 13 throw.
-        stone_is_mined: require('@utils/fragment_utils').stoneIsMined(),
-        // Usable crafting stations at the claim, same reason as `stone_is_mined` (Law 16).
+        // Usable crafting stations at the claim, captured live so a mid-flight change reads as a moved
+        // classification (release and replan), not a Law 13 throw (Law 16).
         stations_at_claim: require('@perception/station_registry').usableStationTypes(),
         at_destination: job.at_destination ?? null,
         batch_quantity: job.batch_quantity ?? null,
@@ -156,14 +175,12 @@ function _claimJob(botId, job, pledge) {
         tier:        job.tier || null,
         action:      job.action || null,
         anchor_index: job.anchor_index != null ? job.anchor_index : null,
-        // `structure` names the building. `radius`/`box` cover the same felling verb over different
-        // ground (Law 16). `line`/`column`+`anchor_index` are site-claim identities, read off the
-        // world by the claiming executor (Invariant B).
+        // A trip that only repairs its column's basement cell (assessors/downloaded_build.cellRepairs).
+        cell_only:   !!job.cell_only,
+        // `structure` names the building; `box` the site a felling clears. `line`/`column`+`anchor_index`
+        // are site-claim identities, read off the world by the claiming executor (Invariant B).
         structure:   job.structure || null,
-        radius:      Number.isFinite(job.radius) ? job.radius : null,
         box:         job.box || null,
-        // Ground inside `box` that is not the job's: a building's footprint cut out of its grounds.
-        hole:        job.hole || null,
         line:       job.line || null,
         column:      job.column != null ? job.column : null,
         // Which instance of a shared blueprint — farm_manager routes by it.
@@ -174,7 +191,7 @@ function _claimJob(botId, job, pledge) {
         asker:       job.asker || null,
         stage:       job.stage || null,
         // What the board said the fleet could not get, frozen at the claim (same reason as
-        // `stone_is_mined`) so a live re-read can't act on a list the board never saw.
+        // `stations_at_claim`) so a live re-read can't act on a list the board never saw.
         excluded:    job.excluded || null,
         chest_locks: [],
         // What this body has spoken for at a station (chest_ledger); clearMagnet() voids it with the
@@ -186,6 +203,19 @@ function _claimJob(botId, job, pledge) {
     };
     hq.writeBoardroomChair(botId, existing);
 }
+
+// ── A FIGHT HANDS THE JOB BACK, TWICE ───────────────────────────────────────────────────────────────
+// A job a fight took from this body is taken up again at its next planning pass, while the board still offers it. The
+// third fight in a row over one job replans, and so does a fight the body ran from or died in: its place is no longer safe or near.
+const RESUMES_PER_JOB = 2;
+let _fought = null;   // { id, times, armed }
+function noteFightTookJob() {
+    const id = hq.readBoardroomChair(_getBotId(), {}).magnet?.job_id;
+    if (!id) { _fought = null; return; }
+    const times = _fought && _fought.id === id ? _fought.times + 1 : 1;
+    _fought = { id, times, armed: times <= RESUMES_PER_JOB };
+}
+function noteFightFled() { if (_fought) _fought.armed = false; }
 
 function clearMagnet(botId) {
     if (!botId) botId = _getBotId();
@@ -237,9 +267,6 @@ function _goIdle(botId, reason, cause) {
     // One log decision for the whole pass — this runs about once a second (Law 5 noise otherwise).
     const post = require('@kernel/idle_scheduler').shouldLogIdlePhase();
     if (post) watcher.summary(TAG, `${reason} (idle pass ${post.passes})`);
-    // Says only that the bot is free, not why; detail is on the trace line and in `foreman where`.
-    // Floored to about once a minute by bot_voice, independent of the trace's `post` gate (Law 16).
-    require('@kernel/bot_voice').goneIdle();
     // Opens the idle span in the minute ledger (idempotent across the once-a-second idle exit); the
     // cause travels with it so the trace line and ledger cannot disagree (Invariant D).
     require('@kernel/bot_minutes').idle(cause);
@@ -266,27 +293,8 @@ function _run() {
         return;
     }
 
-    // ── THE MAGNET FILTER ───────────────────────────────────────────────────────────────────────
-    // The one place the species enters (`jobs` is the whole board). Runs before the peer-claim
-    // filter, which commutes. Passed-over jobs are counted by reason, not dropped (Law 6).
-    const attracted = [];
-    const passedOver = new Map();
-    for (const job of jobs) {
-        const refusal = botMandate.magnetRefusal(job);
-        if (!refusal) { attracted.push(job); continue; }
-        passedOver.set(refusal, (passedOver.get(refusal) || 0) + 1);
-    }
-    const passedOverCount = jobs.length - attracted.length;
-    const magnetNote = passedOverCount === 0 ? ''
-        : ` (magnet passed over ${passedOverCount}: ${[...passedOver].map(([why, n]) => `${n}× ${why}`).join('; ')})`;
-
-    if (attracted.length === 0) {
-        _goIdle(botId, `Nothing on the board this species may claim${magnetNote}`, 'none_for_species');
-        return;
-    }
-
     const { claimed, pledges, inbound } = _readPeerClaims(botId);
-    const unclaimed = attracted
+    const unclaimed = jobs
         .filter(j => j.scope === 'local' || !claimed.has(j.id));
 
     // ── AN ORDER ALREADY PLEDGED IN FULL IS NOT WORK ───────────────────────
@@ -300,8 +308,8 @@ function _run() {
     if (available.length === 0) {
         const allPledged = unclaimed.length > 0;
         _goIdle(botId, allPledged
-            ? `Every job this magnet attracts is already pledged in full by other bots — idle.${magnetNote}`
-            : `All jobs this magnet attracts are claimed by other bots — idle.${magnetNote}`,
+            ? `Every job this magnet attracts is already pledged in full by other bots — idle.`
+            : `All jobs this magnet attracts are claimed by other bots — idle.`,
             allPledged ? 'pledged_by_peers' : 'claimed_by_peers');
         return;
     }
@@ -346,7 +354,11 @@ function _run() {
     const seats = leanest.map(seatsOpen);
     const leanestSeats = seats.reduce((n, s) => n + s, 0);
     let draw = Math.random() * leanestSeats;
-    const job = leanest[seats.findIndex(s => (draw -= s) < 0)];
+    // A body's own survival, the preconditions band, comes before the job a fight took.
+    const resumed = _fought && _fought.armed && equals[0].asker !== 'preconditions' ? available.find(j => j.id === _fought.id) : null;
+    const job = resumed || leanest[seats.findIndex(s => (draw -= s) < 0)];
+    if (resumed) watcher.summary(TAG, `FIGHT_RESUME job=${resumed.id} time=${_fought.times} of ${RESUMES_PER_JOB}`);
+    if (_fought) { if (job.id === _fought.id) _fought.armed = false; else if (equals[0].asker !== 'preconditions') _fought = null; }
     const managerName = MANAGER_MAP[job.type];
 
     if (!managerName) {
@@ -381,8 +393,6 @@ function _run() {
     const qty    = job.need != null ? ` (need: ${job.need}, hold ${job.hold_goal}${breakdown})`
                  : job.batch_quantity != null ? ` (batch: ${job.batch_quantity})`
                  : '';
-    // Passed-over count rides the dispatch line (Law 6); the per-reason breakdown does not.
-    const skipped = passedOverCount ? ` · magnet passed over ${passedOverCount}` : '';
     // A random pick is inspectable only if the set it was made from is on the record (Law 6).
     const among = equals.length > 1
         ? ` · 1 of ${leanest.length} leanest (${levelPool} holds ${lowest}) of ${equals.length} equal · ${leanestSeats} seat(s) drawn from`
@@ -394,11 +404,7 @@ function _run() {
         : '';
     // Quotes the job's coordinates, matching the board line it was chosen from.
     watcher.summary(TAG,
-        `Claimed [${jobRanking.describeBand(job)}] ${job.type}/${job.what}${act}${dest}${src}${qty} — dispatching to ${managerName}.${pledged}${among}${skipped}`);
-
-    // What the claim IS stands in the boardroom for `foreman where` (Law 3); only that there is one
-    // crosses into chat, silent on every claim but the first after an idle phase.
-    require('@kernel/bot_voice').backToWork();
+        `Claimed [${jobRanking.describeBand(job)}] ${job.type}/${job.what}${act}${dest}${src}${qty} — dispatching to ${managerName}.${pledged}${among}`);
 
     // Real boundary — crosses a socket to the foreman, so a failure is the network's, not ours.
     require('@utils/external_library_guard')
@@ -415,6 +421,8 @@ function _run() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
+    noteFightTookJob,
+    noteFightFled,
     // Releases the planning token on every exit path, only after _run() returns, so a claimed magnet
     // is rebroadcast before the token passes on (per-socket message order). Never reorder.
     receive(signalType, payload) {

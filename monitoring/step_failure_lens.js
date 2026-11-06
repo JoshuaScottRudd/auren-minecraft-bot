@@ -16,7 +16,7 @@ const out = require('./data_out');
 // Read from the run's server console so a set-back carries the server's word for it.
 const SERVER_SAID_RE = /(\w+)(?: \(vehicle of \w+\))? (moved wrongly|moved too quickly|was kicked for floating too long)/;
 function serverRefusals(botFilter) {
-  const file = require('./lens_paths').bot('fleet_logs', 'console_server.log');
+  const file = require('path').join(require(require('./lens_paths').bot('js_kernel/utils/record_homes')).RECORDS_DIR, 'console_server.log');
   if (!fs.existsSync(file)) return null;
   const rows = [];
   for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {

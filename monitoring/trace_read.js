@@ -164,7 +164,7 @@ function readCameraView(dir) {
   return mergeStreams(streamFiles(dir || path.dirname(DEFAULT_TRACE_FILE), { view: STREAM_VIEW.CAMERA }));
 }
 
-// readForemanView(dir) — the desk's own record and nothing else (FOREMAN_STREAM_RE names its file, Law 16).
+// readForemanView(dir) — the foreman's own record and nothing else (FOREMAN_STREAM_RE names its file, Law 16).
 function readForemanView(dir) {
   return mergeStreams(streamFiles(dir || path.dirname(DEFAULT_TRACE_FILE), { view: STREAM_VIEW.FOREMAN }));
 }
@@ -226,6 +226,23 @@ const STORY_KILL = /stopped an (?:infinite loop|AB)|CODING VIOLATION/;
 // The judge routing to job_board IS the release of the seat, closing an episode for one-shot executor
 // jobs that have no manager. `ok` stays null: the judge asserts the seat is free, not that work is done.
 const STORY_JOB_RELEASED = /\[RECURSIVE_JUDGE\].*Routing to job_board/;
+// The release's reason as the judge wrote it: a manager's readable, a loop's repeated readable, or the
+// portable judge's stall reason. Carried as `why` beside the code; null when the line names none.
+const RELEASE_WHY = [
+  [/Manager "(\w+)" reporting: "(.*)"\. Routing to job_board/, m => `${m[1]}: ${m[2]}`],
+  [/Loop detected after .*? from "(\w+)": "(.*)"\. /, m => `loop|${m[1]}: ${m[2]}`],
+  [/Portable judge reported (.+?) in "(\w+)"/, m => `portable_judge|${m[2]}: ${m[1]}`],
+];
+function releaseWhy(raw) {
+  const plain = raw.replace(/\x1b\[[0-9;]*m/g, '');
+  for (const [re, fmt] of RELEASE_WHY) {
+    const m = plain.match(re);
+    if (m) return fmt(m);
+  }
+  return null;
+}
+// battle_stations' night recall ends the claim by sending the body home; no judge release follows it.
+const STORY_NIGHT_RECALL = /NIGHT_RECALL job=(\S+) why=(.+?) source=/;
 
 // "[bot/craft] supply/logs (need: 64)" → "supply/logs": strips both the current and the older `P<n>`
 // prefix shape (Law 25).
@@ -300,11 +317,12 @@ function buildEpisodes(seg) {
       // A manager can log several verbs on one line; read by priority so COMPLETE wins over RELEASE.
       close(bot, /\bCOMPLETE\b/.test(l.raw) ? { ok: true, code: 'complete', text: 'COMPLETE' }
         : /\bSTUCK\b/.test(l.raw) ? { ok: false, code: 'stuck', text: 'STUCK' }
-        : { ok: null, code: 'released', text: 'released' });
+        : { ok: null, code: 'released', text: 'released', why: afterMarker(l.raw) });
       continue;
     }
     if ((m = l.raw.match(/JOB_RESULT produced=(true|false)/))) { ep.produced = m[1] === 'true'; continue; }
-    if (STORY_JOB_RELEASED.test(l.raw)) { close(bot, { ok: null, code: 'released', text: 'released' }); continue; }
+    if (STORY_JOB_RELEASED.test(l.raw)) { close(bot, { ok: null, code: 'released', text: 'released', why: releaseWhy(l.raw) }); continue; }
+    if ((m = l.raw.match(STORY_NIGHT_RECALL))) { close(bot, { ok: null, code: 'night_recall', text: 'night_recall', why: m[2] }); continue; }
     if (!ep.managerPlan && (m = l.raw.match(STORY_MGR_PLAN))) { ep.managerPlan = m[2].trim(); continue; }
     if ((m = l.raw.match(STORY_JUDGE_FRAG))) {
       // Three states, not two: 'not stated' is a progress report carrying no verdict, distinct from

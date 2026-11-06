@@ -47,11 +47,8 @@ function start(label, script, env = {}) {
 // already stops when it closes, so one of them claims the report and stays on screen in the window it
 // already had (`js_kernel/utils/foreman_gone.js`). This door has no part in it, so it says nothing
 // (Law 16).
-//
-// `carriesOn(code, signal)` is asked when the child has left: true means the launcher has more to do (it
-// raises the child again after the machine's hour) and this door stays open for it.
 let _saysWait = false;
-function followOwner(child, _onExit, carriesOn) {
+function followOwner(child, _onExit) {
   if (!_saysWait) {
     _saysWait = true;
     const wait = () => console.log('\n  the foreman is shutting down — the bots first, then the world it started. This window closes when it has.');
@@ -60,7 +57,6 @@ function followOwner(child, _onExit, carriesOn) {
     process.on('SIGBREAK', wait);
   }
   child.on('exit', (code, signal) => {
-    if (carriesOn && carriesOn(code, signal)) return;
     process.exit(signal ? 1 : (code === null ? 1 : code));
   });
 }

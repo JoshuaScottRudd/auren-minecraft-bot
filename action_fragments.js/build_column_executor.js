@@ -8,8 +8,7 @@
 // A downloaded building's box is solid to navigation once its trees are down (downloaded_plan_registry
 // .closedBox): no door, no window, no opening is an entrance, and no route may pass through it. A body is
 // sent to the cell directly beneath the column's stand; navigation reaches it by its own route, a stair
-// from the surface and a tunnel under the box. What that leaves under the building IS the basement;
-// nothing here draws one.
+// from the surface and whatever it digs under the box.
 //
 // ── ONE CUBE, THEN DOWN AND OUT ─────────────────────────────────────────────────────────────────────
 // The body rises on trash filler (utils/trash) through the stand shaft, works the one cube it was given from
@@ -28,6 +27,12 @@
 // this cube places each shaft block above the body's head as it digs the filler out from under its feet, top
 // down, so the block placed last is the attach face for the next.
 //
+// ── THE BASEMENT IS THE MINE'S OLD CELL, ONE UNDER EVERY COLUMN ─────────────────────────────────────
+// The body standing under its column digs that column's cell (downloaded_plan_registry.basementCell) from where it
+// stands and hangs the cell's torch. It is an implicit blueprint the keeper keeps whole
+// (foreman/mansion_keeper) and a support structure: any cell the keeper reads wrong gets a trip of its own
+// (magnet.cell_only, assessors/downloaded_build.cellJobs), ahead of the build, which also fills what a route cut. The climb cuts the roof over the stand; the column's last descent closes it.
+//
 // ── AN INTERRUPTED TRIP IS RESUMED, NOT REPAIRED ────────────────────────────────────────────────────
 // A body that drops out mid-cube leaves filler in the shaft and a half-worked cube. The next dispatch reads both
 // off the world: it climbs the existing filler, skips every cell already right, and carries on (Invariant B).
@@ -43,12 +48,13 @@ const planRegistry = require('@kernel/downloaded_plan_registry');
 const { trashPath, keyOf } = require('@kernel/cube_trash_path');
 const trash = require('@utils/trash');
 const { repairAtAnchor, findAttachable, reachFromStand } = require('@api/anchored_repair');
-const { findAim, clickCells } = require('@utils/movement/facing_aim');
+const { findAim, clickCells, familyOf } = require('@utils/movement/facing_aim');
 const { BLOCK_REACH } = require('@utils/fragment_utils');
 const { performDig } = require('@utils/movement/dig_authority');
 const { performPlace } = require('@utils/movement/place_authority');
 const { pillarStep } = require('@utils/movement/scaffold_movement');
 const { isAir } = require('@utils/movement/terrain_predicates');
+const { fallsWithoutBelow } = require('@utils/gravity_utils');
 const { itemsFor } = require('@kernel/blueprint_importer');
 const { combatCheckpoint } = require('@api/battle_stations');
 const { collectNearby } = require('@api/drop_collector');
@@ -56,6 +62,15 @@ const { routeToJudge, routeSignal } = require('@utils/signal_utils');
 const { claimFirst, releaseTarget } = require('@utils/target_claims');
 
 const TAG = 'build_column_executor';
+
+// placeState(block, planState) -> the state a place is aimed by: the plan's, or {} for a block whose family clicks
+// one face whatever its state (a standing torch, on the block below). Aimed by findAim, it is never clicked onto a
+// solid face beside it, which stands a wall torch where the plan has a candle's torch.
+function placeState(block, planState) {
+  if (planState) return planState;
+  const fam = familyOf(block);
+  return fam && fam.controls.length === 0 ? {} : null;
+}
 
 // A CLIMB THAT FAILS ON THE SAME CUBE, TRIP AFTER TRIP, IS AN ERROR. Each failed climb spends the next of
 // the foreman's once-only 'climb_stall:' keys for that cube, so the key a body is granted is the crew's count
@@ -118,7 +133,10 @@ function itemFor(bot, block, state) {
   const items = itemsFor(block, state, mc);
   if (!items.length) return null;                      // the other half of a two-cell piece — comes free
   const name = items[0][0];
-  return name.includes(' ') ? null : name;
+  if (name.includes(' ')) return null;
+  // Any form of a copper block in the pocket is that block; a form with none held still names the fresh one.
+  const held = bot.inventory.items();
+  return require('@utils/fragment_utils').agedForms(name).find(form => held.some(i => i.name === form)) || name;
 }
 
 // correctAlready — does this cell already hold its target, state and all? Null target = air. The cheap test
@@ -134,7 +152,8 @@ function correctAlready(bot, frame, pos, v) {
 // the two cells over the head before each jump, so the climb goes through whatever stands in the shaft — natural
 // ground below the building, trash a previous trip left — and the shaft needs no clearing of its own.
 // THE CLIMB'S TRASH IS IN THE CUBE'S PRICE (assessors/downloaded_build.trashOf) and column_preparation leaves
-// only with it whole, so a body with no block for its next step was stocked wrong: that stops the run (Law 13).
+// only with it whole, so a body with no block for its next step was priced too low: it says so loudly and the trip
+// ends unbuilt.
 // ── WHAT THE TRIP STILL OWES IS NOT TRASH ───────────────────────────────────────────────────────────
 // A trip carries its cube's blocks and its trash in one pocket, and where the cube is built of the wood the
 // trash is made of they are the same items. `_owed` answers, off the world, what the trip's own cells still
@@ -181,13 +200,107 @@ async function riseTo(bot, standX, standZ, feetY, wood) {
       // the climb stops here and the trip ends unbuilt, to be stocked again.
       const left = tripTrash(bot, wood);
       if (left.logs > 0) return { ok: false, y: feet.y, reason: `the trip's trash is still ${left.logs} log(s); its planks are made at the yard` };
-      throw new Error(`[${TAG}] CODING VIOLATION (Law 13): no trash block in the pocket for the climb at y${feet.y} toward y${feetY} in the shaft at (${standX},${standZ}). `
-        + `The cube's price carries the climb (downloaded_build.trashOf) and column_preparation gates the trip on it; a body that reaches its shaft short was priced or stocked wrong.`);
+      // RAN OUT OF TRASH: said loudly, because the cube's price carries the climb with a margin (downloaded_build.trashOf)
+      // and a body short here means that price is too low. The climb stops and the trip ends unbuilt, to be stocked again.
+      watcher.warn(TAG, `🚨 OUT OF TRASH 🚨 no trash block in the pocket for the climb at y${feet.y} toward y${feetY} in the shaft at (${standX},${standZ}) — `
+        + `the cube's price (downloaded_build.trashOf) was too low for this climb; the trip ends here unbuilt.`);
+      return { ok: false, y: feet.y, reason: 'out of trash on the climb' };
     }
     const up = await pillarStep(bot, { candidateItemNames: [block], ownShaft: true });
     if (!up.success) return { ok: false, y: bot.entity.position.floored().y, reason: `pillar stalled: ${up.reason}` };
   }
   return { ok: false, y: bot.entity.position.floored().y, reason: `did not reach ${feetY} in ${MAX_RISE_STEPS} steps` };
+}
+
+// ── A FALLING BLOCK COMES OFF BEFORE THE BLOCK UNDER IT IS DUG ──────────────────────────────────────
+// liftFalling — for every cell the trip digs, the falling blocks standing on it (an anvil, sand:
+// gravity_utils.fallsWithoutBelow), read up the column off the world, are dug first: repairAtAnchor digs top-down,
+// so each comes off before the cell under it opens. One that is the plan's own block in its cell is put back: the
+// places run bottom-up, so the block under it stands first, and place_authority places a falling block only on a
+// block that holds it up. A falling block in a stand shaft (blueprint_anchor_calculator
+// .restorableOverhead names it) stands on the cell straight under it, so the descent places that cell first (descentOrder).
+// Adds the steps to `steps` and returns how many blocks it lifts.
+function liftFalling(bot, frame, anchor, steps) {
+  const digs = new Set(steps.filter(s => s.action === 'dig').map(s => keyOf(s.place)));
+  const places = new Set(steps.filter(s => s.action === 'place').map(s => keyOf(s.place)));
+  const origin = frame.worldOf(0, 0, 0);
+  const plan = planVoxels();
+  const lifted = [];
+  for (const s of steps.filter(st => st.action === 'dig')) {
+    for (let y = s.place.y + 1; ; y++) {
+      const at = { x: s.place.x, y, z: s.place.z };
+      const here = bot.blockAt(new Vec3(at.x, at.y, at.z));
+      if (!here || !fallsWithoutBelow(here.name)) break;
+      if (digs.has(keyOf(at))) continue;               // the trip digs it already, as a wrong block
+      const b = [at.x - origin.x, at.y - origin.y, at.z - origin.z];
+      const v = plan.get(b.join(','));
+      const block = v ? frame.voxelBlock(v) : 'air';
+      steps.push({ action: 'dig', place: at, type: block, lift: true });
+      digs.add(keyOf(at));
+      lifted.push(`${here.name}@(${at.x},${at.y},${at.z})`);
+      if (v && block === here.name && !places.has(keyOf(at))) {
+        steps.push({ action: 'place', place: at, type: block, state: placeState(block, frame.voxelState(v)), block, v, b });
+        places.add(keyOf(at));
+      }
+    }
+  }
+  if (lifted.length) watcher.summary(TAG, `FALLING_LIFT cube=${anchor.index} n=${lifted.length} blocks=${lifted.slice(0, 8).join(',')}`);
+  return lifted.length;
+}
+
+// liftOne — dig one falling block off the cell under it with a tool it drops for (dig_authority mustDrop), then
+// wait for its item to reach the pocket. True when the cell opened; said with whether the item came back.
+const LIFT_PICKUP_MS = 1500;
+async function liftOne(bot, at, block, anchor) {
+  const held = () => bot.inventory.items().filter(i => i.name === block.name).reduce((n, i) => n + i.count, 0);
+  const before = held();
+  if (!(await performDig(bot, at, block, TAG, { liftFalling: true, mustDrop: true }))) return false;
+  for (const until = Date.now() + LIFT_PICKUP_MS; held() <= before && Date.now() < until;) await new Promise(res => setTimeout(res, 100));
+  watcher.summary(TAG, `FALLING_LIFTED cube=${anchor.index} block=${block.name} at=(${at.x},${at.y},${at.z}) picked_up=${held() > before}`);
+  return true;
+}
+
+// digBasementCell — the column's basement cell, from the body's stand at its centre: its room dug and its torch
+// hung. A repair trip (`repair`) also stands kept trash wherever a wall, floor or roof is gone; a
+// build trip leaves that to the keeper's repair, since its trash is the climb's. Returns the blocks moved.
+async function digBasementCell(bot, frame, column, stand, repair) {
+  const { basementCell } = require('@kernel/downloaded_plan_registry');
+  const cell = basementCell(column);
+  // The room's cells are dug, its torch's own cell too; a torch already standing there is left standing.
+  const standingTorch = (b) => {
+    const p = frame.worldOf(b[0], b[1], b[2]);
+    return /torch$/.test(bot.blockAt(new Vec3(p.x, p.y, p.z))?.name || '');
+  };
+  const targets = cell.open.filter(b => !standingTorch(b)).map(b => ({ b, v: null }));
+  const dug = await workCube(bot, frame, { index: `basement${column.column}`, layer: -1 }, stand, targets);
+  let moved = dug.dug, failed = dug.failed;
+  if (repair) {
+    // The roof over the stand is the climb's to cut until the column stands, so an unfinished column's stays cut: the
+    // next climb would only cut it again (mansion_keeper reads it the same way).
+    const { targetsOf, shaftTargets } = require('@thinking/assessors/downloaded_build');
+    const { anchors } = require('@kernel/downloaded_plan_registry');
+    const stands = [...column.anchors.flatMap(i => targetsOf(anchors()[i])), ...shaftTargets(column)]
+      .every(t => correctAlready(bot, frame, frame.worldOf(t.b[0], t.b[1], t.b[2]), t.v));
+    const roof = new Set(cell.roof.map(b => b.join()));
+    for (const b of cell.fill) {
+      if (!stands && roof.has(b.join())) continue;
+      const p = frame.worldOf(b[0], b[1], b[2]);
+      const at = new Vec3(p.x, p.y, p.z);
+      const here = bot.blockAt(at);
+      if (!here || (!isAir(here.name) && here.name !== 'water' && here.name !== 'lava')) continue;
+      const item = keptInHand(bot, frame.wood);
+      const face = findAttachable(bot, at);
+      const res = item && face ? await performPlace(bot, at, face.anchor, face.face, item, TAG, {}) : { ok: false };
+      if (res.ok) moved++; else failed++;
+    }
+  }
+  if (failed) watcher.summary(TAG, `BASEMENT_CELL column=${column.column} moved=${moved} failed=${failed}`);
+  const world = (p) => frame.worldOf(p.x, p.y, p.z);
+  const lamps = cell.lamps.map(l => ({ source: world(l.source), attach: world(l.attach) }))
+    .filter(l => !/torch$/.test(bot.blockAt(new Vec3(l.source.x, l.source.y, l.source.z))?.name || ''))
+    .map(l => ({ ...l, x: l.source.x, y: l.source.y - 1, z: l.source.z, paint: 'basement', mount: 'wall', part: 'basement' }));
+  await require('@action/lighting_manager').lightCell(bot, lamps, _owed().torch || 0);
+  return moved;
 }
 
 // workCube — clear and place one anchor cube from its stand, through the SAME stationary primitive
@@ -205,10 +318,10 @@ async function workCube(bot, frame, anchor, stand, targets) {
     const pos = frame.worldOf(t.b[0], t.b[1], t.b[2]);
     if (correctAlready(bot, frame, pos, t.v)) continue;
     const at = bot.blockAt(new Vec3(pos.x, pos.y, pos.z));
-    const block = t.v ? frame.blockOf(t.v[3], t.v[1]) : 'air';
+    const block = t.v ? frame.voxelBlock(t.v) : 'air';
     // A block of the right name in the wrong state is said with the state it shows and the state asked.
     const shows = (at && t.v && at.name === block)
-      ? `[${Object.entries(frame.stateOf(t.v[4]) || {}).map(([k, v]) => `${k}=${at.getProperties()[k]}/${v}`).join(' ')}]` : '';
+      ? `[${Object.entries(frame.voxelState(t.v) || {}).map(([k, v]) => `${k}=${at.getProperties()[k]}/${v}`).join(' ')}]` : '';
     const pair = `${at?.name || 'unseen'}${shows}>${block}`;
     wrong[pair] = (wrong[pair] || 0) + 1;
     wrongCells.push(`${pos.x}|${pos.y}|${pos.z}`);
@@ -216,11 +329,12 @@ async function workCube(bot, frame, anchor, stand, targets) {
     // A block that hangs on a block no cube has placed yet is left for the trip after that block stands.
     if (await waitsOnSupport(bot, frame, anchor, t)) { hanging.push(`${block}@(${pos.x},${pos.y},${pos.z})`); continue; }
     if (t.v) {
-      const state = frame.stateOf(t.v[4]);
+      const state = placeState(block, frame.voxelState(t.v));
       steps.push({ action: 'place', place: pos, type: block, state, block, v: t.v, b: t.b });
     }
   }
   if (hanging.length) watcher.summary(TAG, `CUBE_HANGING_WAIT cube=${anchor.index} n=${hanging.length} blocks=${hanging.slice(0, 8).join(',')}`);
+  dig += liftFalling(bot, frame, anchor, steps);
   if (!steps.length) {
     watcher.summary(TAG, `CUBE_FOUND cube=${anchor.index} layer=${anchor.layer} wrong=${hanging.length ? 'hanging_only' : 'none'}`);
     return { dug: 0, placed: 0, failed: 0 };
@@ -240,7 +354,18 @@ async function workCube(bot, frame, anchor, stand, targets) {
       const block = bot.blockAt(at);
       // A cell already empty (gravel fell away, a peer dug it) is what the dig was for.
       if (block && block.boundingBox === 'empty' && (block.name === 'air' || block.name === 'cave_air')) return true;
-      return performDig(bot, at, block, TAG);
+      // A falling block is lifted only with a tool it drops for, and the pocket is watched for it to come back.
+      if (s.lift) return liftOne(bot, at, block, anchor);
+      // Nothing is dug out from under a falling block still standing on it (liftFalling ordered it off first).
+      const above = bot.blockAt(at.offset(0, 1, 0));
+      if (above && fallsWithoutBelow(above.name)) {
+        watcher.warn(TAG, `FALLING_NOT_LIFTED cube=${anchor.index} block=${above.name} at=(${at.x},${at.y + 1},${at.z}) on=${block?.name || 'unseen'} — it still stands on the cell to be dug, so that cell is left standing.`);
+        return false;
+      }
+      // A station standing in a cell its plan gives another block is not that station's voxel (an anvil fallen
+      // into the cell under it when that cell was dug), so it comes out like any wrong block.
+      const misplaced = !!block && block.name !== s.type;
+      return performDig(bot, at, block, TAG, misplaced ? { misplacedStation: true } : {});
     },
     placeOne: async (s, ev) => {
       // A block a neighbouring cube's trip placed early as its own block's face is already right.
@@ -295,8 +420,8 @@ async function workCube(bot, frame, anchor, stand, targets) {
 // goes (support_plan.hangs) is never stood on trash that comes back out: it is placed when its real support
 // stands, and where that support is a cell no plan owns (outside the box) and nothing stands there, trash is
 // stood there and STAYS — cobblestone when the pocket holds one, the trash block otherwise (utils/trash.keptInHand).
-// THE TRIP'S TRASH IS IN THE CUBE'S PRICE, sized for every empty cell of the cube (downloaded_build.trashOf),
-// so a path the pocket cannot pay for is a trip priced or stocked wrong, and stops the run (Law 13).
+// THE TRIP'S TRASH IS IN THE CUBE'S PRICE: the plan's figure for the cube (cube_trash_need) with a margin
+// (downloaded_build.trashOf). A path the pocket cannot pay for is said loudly and its block is left open.
 // Returns { placed, left } — left counts blocks still not standing, each said by name.
 async function escalate(bot, frame, anchor, stand, places, targets) {
   const { hangs } = require('@kernel/support_plan');
@@ -345,8 +470,8 @@ async function escalate(bot, frame, anchor, stand, places, targets) {
   const neighbourBlock = (cell) => {
     const v = planAt.get(`${cell.x - origin.x},${cell.y - origin.y},${cell.z - origin.z}`);
     if (!v) return null;
-    const block = frame.blockOf(v[3], v[1]);
-    const state = frame.stateOf(v[4]);
+    const block = frame.voxelBlock(v);
+    const state = frame.voxelState(v);
     if ((state && Object.keys(state).length) || hangs(block, state)) return null;
     const data = bot.registry.blocksByName[block];
     if (!data || data.boundingBox !== 'block') return null;
@@ -445,10 +570,13 @@ async function escalate(bot, frame, anchor, stand, places, targets) {
     const walk = path.cells.filter(cell => st.state || !cell.equals(own));
     const needed = walk.filter(cell => ![PRICE_PLAN_BLOCK, PRICE_NEIGHBOUR_BLOCK].includes(priceOf(cell))).length;
     const have = trashHeld();
+    // RAN OUT OF TRASH: said loudly, because the cube's price carries its plan figure with a margin
+    // (downloaded_build.trashOf) and a body short here means that figure is too low. The block is left for a
+    // better-stocked trip: the cube ends with it open and is offered again.
     if (needed > have) {
-      throw new Error(`[${TAG}] CODING VIOLATION (Law 13): cube ${anchor.index} needs ${needed} more trash block(s) to give ${st.block} at (${own.x},${own.y},${own.z}) a face, `
-        + `and the pocket holds ${have} with ${temps.length} already standing. The cube's price carries a trash block for every empty cell (downloaded_build.trashOf) and `
-        + `column_preparation gates the trip on it; a body short at the cube was priced or stocked wrong.`);
+      watcher.warn(TAG, `🚨 OUT OF TRASH 🚨 cube ${anchor.index} needs ${needed} trash block(s) to give ${st.block} at (${own.x},${own.y},${own.z}) a face, `
+        + `the pocket holds ${have} with ${temps.length} already standing (plan figure ${anchor.trash}) — the cube's price was too low; this block is left open.`);
+      return { why: `out of trash: needs ${needed}, holds ${have}` };
     }
     return { path, walk, trash: needed };
   };
@@ -575,24 +703,29 @@ function planVoxels() {
 // shaftSupport — a shaft block that must be clicked onto a particular neighbour (a trapdoor, a stair) when that
 // neighbour is air: a trash block is stood in an empty cell beside it until the click that gives the wanted
 // state exists, and its position is returned so the caller digs it back out once the block is placed. The
-// cell below is left alone: it is the shaft's own next cell. Returns the temp position, or null.
+// cell below is left alone: it is the shaft's own next cell. The cell above with nothing to click on (an upright log
+// under an air target, air on every side) is first given a prop beside it (shaftProp), dug out with the temp.
+// Returns { temp, props } (props bottom first), or null.
 async function shaftSupport(bot, at, block, state, wood) {
   if (!state || findAim(bot, at, block, state).ok) return null;
   for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]]) {
     const cell = at.offset(dx, dy, dz);
     const here = bot.blockAt(cell);
     if (!here || !isAir(here.name)) continue;
+    const props = !findAttachable(bot, cell) && dy === 1 ? await shaftProp(bot, cell, wood) : [];
     const face = findAttachable(bot, cell);
-    if (!face) continue;
+    const undo = async () => { for (const p of [...props].reverse()) await performDig(bot, p, bot.blockAt(p), TAG); };
+    if (!face) { await undo(); continue; }
     const item = await trashInHand(bot, wood);
-    if (!item) return null;
+    if (!item) { await undo(); return null; }
     const put = await performPlace(bot, cell, face.anchor, face.face, item, TAG, {});
-    if (!put.ok) continue;
+    if (!put.ok) { await undo(); continue; }
     if (findAim(bot, at, block, state).ok) {
-      watcher.summary(TAG, `SHAFT SUPPORT temp ${item} at (${cell.x},${cell.y},${cell.z}) for ${block} at (${at.x},${at.y},${at.z})`);
-      return cell;
+      watcher.summary(TAG, `SHAFT SUPPORT temp ${item} at (${cell.x},${cell.y},${cell.z}) for ${block} at (${at.x},${at.y},${at.z})${props.length ? ` on a prop of ${props.length}` : ''}`);
+      return { temp: cell, props };
     }
     await performDig(bot, cell, bot.blockAt(cell), TAG);
+    await undo();
   }
   return null;
 }
@@ -628,18 +761,34 @@ async function shaftProp(bot, at, wood) {
   return [];
 }
 
-// restoreShaft — the column's last descent, top down over the whole shaft: bring the feet two below the
-// cell, dig whatever stands in it that is not its target, place the plan's block if it has one. The cell
-// is always at least two above the feet, so the body is never in it, and the block placed last is the
-// attach face for the next.
+// descentOrder(shaft, frame) → the shaft's cells in the order they are placed: top first, except that a block that
+// needs a block below comes after its support, so the body goes under the support, places it, and places the block on
+// it through it (a place needs no line of sight).
+function descentOrder(shaft, frame) {
+  const { restorableOverhead } = require('@kernel/blueprint_anchor_calculator');
+  const needs = (t) => !!t.v && !restorableOverhead(frame.voxelBlock(t.v), frame.voxelState(t.v));
+  const out = [];
+  for (let i = 0; i < shaft.length;) {
+    const run = [shaft[i++]];
+    while (needs(run[run.length - 1]) && i < shaft.length && shaft[i].b[1] === run[run.length - 1].b[1] - 1) run.push(shaft[i++]);
+    out.push(...run.reverse());
+  }
+  return out;
+}
+
+// restoreShaft — the column's last descent over the whole shaft (descentOrder): bring the feet two below the
+// cell, dig whatever stands in it that is not its target, place the plan's block if it has one, or kept trash in a cell
+// marked `fill` (the roof over the stand) or `support`. The cell is always at least two above the feet, so the body is
+// never in it, and the block placed last is the attach face for the next.
 async function restoreShaft(bot, frame, shaft, standX, standZ, waiters = []) {
   let placed = 0, failed = 0;
-  for (const t of shaft) {                             // top first (assessor's shaftTargets)
+  for (const t of descentOrder(shaft, frame)) {
     await combatCheckpoint(bot, 'column');
     const pos = frame.worldOf(t.b[0], t.b[1], t.b[2]);
+    const kept = t.fill || t.support;
     // Every shaft cell under the feet holds the filler the body climbed on, and the descent digs it out: a
     // cell there is never standing already, whatever the filler happens to match.
-    if (pos.y >= bot.entity.position.floored().y && correctAlready(bot, frame, pos, t.v)) continue;
+    if (pos.y >= bot.entity.position.floored().y && (kept ? !isAir(bot.blockAt(new Vec3(pos.x, pos.y, pos.z))?.name || 'air') : correctAlready(bot, frame, pos, t.v))) continue;
 
     if (bot.entity.position.floored().y > pos.y - 2) {
       const down = await locomotion.descendColumn({ x: standX, z: standZ, toFeetY: pos.y - 2 });
@@ -651,15 +800,24 @@ async function restoreShaft(bot, frame, shaft, standX, standZ, waiters = []) {
     }
     const at = new Vec3(pos.x, pos.y, pos.z);
     const standing = bot.blockAt(at);
-    if (standing && standing.name && !isAir(standing.name) && !await performDig(bot, at, standing, TAG, { ownShaft: true })) {
+    if (!kept && standing && standing.name && !isAir(standing.name) && !await performDig(bot, at, standing, TAG, { ownShaft: true })) {
       failed++;
       watcher.warn(TAG, `Descent dig refused at (${at.x},${at.y},${at.z}) ${standing.name} — the shaft cell keeps what stands in it.`);
       continue;
     }
+    if (kept) {
+      if (standing && standing.name && !isAir(standing.name)) continue;
+      const item = keptInHand(bot, frame.wood);
+      const face = findAttachable(bot, at);
+      const res = item && face ? await performPlace(bot, at, face.anchor, face.face, item, TAG, {}) : { ok: false, reason: item ? 'no face' : 'no trash' };
+      if (res.ok) placed++;
+      else { failed++; watcher.warn(TAG, `Descent could not stand a kept block at (${at.x},${at.y},${at.z}): ${res.reason || 'no reason given'}`); }
+      continue;
+    }
     if (!t.v) continue;                                 // an air target: clearing it was the whole job
 
-    const block = frame.blockOf(t.v[3], t.v[1]);
-    const state = frame.stateOf(t.v[4]);
+    const block = frame.voxelBlock(t.v);
+    const state = frame.voxelState(t.v);
     const item = itemFor(bot, block, state);
     if (!item) continue;                                // free half of a two-cell piece
     const temp = await shaftSupport(bot, at, block, state, frame.wood);
@@ -675,8 +833,9 @@ async function restoreShaft(bot, frame, shaft, standX, standZ, waiters = []) {
     const res = await performPlace(bot, at, attach.anchor, attach.face, item, TAG, state ? { state, block } : {});
     for (const cell of prop.reverse()) await performDig(bot, cell, bot.blockAt(cell), TAG);
     if (temp) {
-      const out = await performDig(bot, temp, bot.blockAt(temp), TAG);
-      watcher.summary(TAG, `SHAFT SUPPORT temp removed at (${temp.x},${temp.y},${temp.z}) ok=${!!out}`);
+      const out = await performDig(bot, temp.temp, bot.blockAt(temp.temp), TAG);
+      for (const p of [...temp.props].reverse()) await performDig(bot, p, bot.blockAt(p), TAG);
+      watcher.summary(TAG, `SHAFT SUPPORT temp removed at (${temp.temp.x},${temp.temp.y},${temp.temp.z}) ok=${!!out}${temp.props.length ? `, prop of ${temp.props.length} dug` : ''}`);
     }
     if (res.ok && !(res.state && res.state.ok === false)) placed++;
     else { failed++; watcher.warn(TAG, `Descent place refused at (${at.x},${at.y},${at.z}) ${block}: ${res.reason || 'wrong state'}`); continue; }
@@ -698,8 +857,8 @@ async function placeOnShaft(bot, frame, waiters, shaftCell) {
     const at = new Vec3(pos.x, pos.y, pos.z);
     const here = bot.blockAt(at);
     if (!here || !isAir(here.name)) continue;
-    const block = frame.blockOf(t.v[3], t.v[1]);
-    const state = frame.stateOf(t.v[4]);
+    const block = frame.voxelBlock(t.v);
+    const state = frame.voxelState(t.v);
     const item = itemFor(bot, block, state);
     if (!item) continue;
     const res = await performPlace(bot, at, anchor, at.minus(shaftCell), item, TAG, state ? { state, block } : {});
@@ -752,7 +911,7 @@ module.exports = {
       }
     }
 
-    // UNDER THE COLUMN, at its own x,z, feet two below the box. The route is navigation's: the box is
+    // UNDER THE COLUMN, at its own x,z, feet on its basement cell's floor. The route is navigation's: the box is
     // closed to it, and `max_y` keeps the feet at the under-level, so the walk runs beneath the box from the
     // mouth. `exact`, because every later position in this pass is measured from the shaft.
     const entered = await locomotion.goTo({ x: standX, y: foot.y, z: standZ, exact: true, leg: 'work', max_y: foot.y });
@@ -764,12 +923,14 @@ module.exports = {
 
     // THE STAND SHAFT IS THIS BODY'S ALONE FOR THE TRIP. The filler it climbs on stands in the entry cell
     // of the under-level, so the shaft is claimed and closed to every peer's route and dig, from the
-    // entry cell to the head of the stand, until the body is back down.
+    // block the entry cell stands on to the head of the stand, until the body is back down. The floor is in the
+    // box because the descent lands on it: a peer's route ducking under the shaft would dig it out, and the
+    // descent's last step would then refuse a two-block drop.
     const columnKey = `column:${structure}:${index}`;
     const taken = await claimFirst([column], { keyOf: () => columnKey });
     if (!taken.pick) return routeIdle(`column ${index} is held by a peer working its stand shaft`);
     require('@kernel/foreman_link').closeClaimedArea(columnKey, {
-      min: { x: standX, y: foot.y, z: standZ },
+      min: { x: standX, y: foot.y - 1, z: standZ },
       max: { x: standX, y: standWorld.y + 1, z: standZ },
     });
 
@@ -779,8 +940,9 @@ module.exports = {
     for (const i of column.anchors) if (await sealable(bot, frame, column, i)) sealed.add(i);
     const stoodBefore = shaftTargets(column).filter(t => t.v && correctAlready(bot, frame, frame.worldOf(t.b[0], t.b[1], t.b[2]), t.v));
     // The same question column_preparation stocked this pocket on, asked of the world as the trip finds it.
-    tripOwes(bot, frame, await tripCells(bot, frame, column, anchor, await endsColumn(bot, frame, column, { anchor, seal: false })));
-    const rise = await riseTo(bot, standX, standZ, standWorld.y, frame.wood);
+    tripOwes(bot, frame, magnet.cell_only ? [] : await tripCells(bot, frame, column, anchor, await endsColumn(bot, frame, column, { anchor, seal: false })));
+    const cellMoved = await digBasementCell(bot, frame, column, { x: standX, y: foot.y, z: standZ }, !!magnet.cell_only);
+    const rise = magnet.cell_only ? { ok: true, y: foot.y, reason: null } : await riseTo(bot, standX, standZ, standWorld.y, frame.wood);
     let work = { dug: 0, placed: 0, failed: 0 };
     let shaftDone = { placed: 0, failed: 0 };
     let columnDone = false;
@@ -794,7 +956,7 @@ module.exports = {
           + `the last climb stopped at y${rise.y} (${rise.reason}) at (${standX},${rise.y},${standZ}). The crew has failed this climb `
           + `${STALL_LIMIT} times without building the cube, so the build cannot finish on its own.`);
       }
-    } else {
+    } else if (!magnet.cell_only) {
       work = await workCube(bot, frame, anchor, { x: standX, y: standWorld.y, z: standZ }, targetsOf(anchor));
       // EVERY OTHER CUBE OF THE COLUMN IS READ FROM HERE, AND ONE THAT DOES NOT STAND IS THIS BODY'S TO FORGET.
       // The board offers a cube off this body's memory of the finished ones; the body is now in the column and
@@ -852,7 +1014,8 @@ module.exports = {
             watcher.summary(TAG, `SHAFT_REACH column=${index} from_y=${feetY} to_y=${under} ok=false reason=filler ${filler} of ${under - feetY}`);
           }
         }
-        shaftDone = await restoreShaft(bot, frame, shaftTargets(column), standX, standZ, waiters);
+        const roof = planRegistry.basementCell(column).roof.map(b => ({ b, v: null, fill: true }));
+        shaftDone = await restoreShaft(bot, frame, [...shaftTargets(column), ...roof], standX, standZ, waiters);
       }
       // A TRIP THAT MOVED NO BLOCK LEAVES THE SHAFT AS IT FOUND IT. The climb dug every shaft cell it passed;
       // the ones that stood as the plan asks before it are set back on the way down, from the blocks the dig
@@ -882,7 +1045,7 @@ module.exports = {
       + `failed ${work.failed}${columnDone ? `, shaft ${shaftDone.placed} placed ${shaftDone.failed} failed` : ''}`
       + `${rise.ok ? '' : `, climb stopped at y${rise.y}`}`;
 
-    if (work.dug === 0 && work.placed === 0 && shaftDone.placed === 0) return routeIdle(`${readable} — nothing done`);
+    if (work.dug === 0 && work.placed === 0 && shaftDone.placed === 0 && cellMoved === 0) return routeIdle(`${readable} — nothing done`);
 
     portableJudge.done(TAG);
     watcher.summary(TAG, readable);

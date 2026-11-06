@@ -5,7 +5,7 @@
 
 const watcher = require('@kernel/watcher');
 const { isFluid } = require('@utils/gravity_utils');
-const { sleep, equipBestToolForBlock, STATION_TYPES } = require('@utils/fragment_utils');
+const { sleep, equipBestToolForBlock, canHarvest, STATION_TYPES } = require('@utils/fragment_utils');
 const { isAir, belowDepthFloor } = require('@utils/movement/terrain_predicates');
 const { WORLD_DEPTH_FLOOR_Y } = require('@thinking/architect_config');
 const { guardExternal, guardExternalSync } = require('@utils/external_library_guard');
@@ -119,6 +119,11 @@ async function digBounded(bot, block, tag = 'dig_authority') {
 // drops depend on the held item.
 const LOCOMOTION_DIG_TAGS = new Set(['navigator', 'drive', 'scaffold_movement']);
 const LEAF_REFLEX_TAG = 'leaf_authority';
+// The emergency way out of water (water_escape) digs afloat and onto water, and only after proving the body is
+// trapped there; it is admitted by its tag alone, as the leaf reflex is.
+const WATER_ESCAPE_TAG = 'water_escape';
+// A body standing on leaves breaks the leaf under it and falls (canopy_descent); admitted by its tag alone.
+const CANOPY_DESCENT_TAG = 'canopy_descent';
 
 // bobbing — the body is afloat: in water with nothing solid under its feet, or with water over its head
 // cell. A body standing on a floor in water one deep is STANDING, whether that water is still or running,
@@ -333,14 +338,21 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
   }
   // A station is never dug (isUnbreakable, above) — enforced here so nothing can route around it (Law 16/27).
   // opts.ownShaft: the caller is a column trip clearing its own stand shaft, which holds nothing but what the
-  // last descent sets, so whatever stands in it comes out.
-  if (isUnbreakable(block.name) && opts.ownShaft !== true) {
+  // last descent sets, so whatever stands in it comes out. opts.misplacedStation: the caller is a column trip whose
+  // plan gives this cell another block, so the station in it is no blueprint voxel (a fallen anvil). opts.liftFalling:
+  // the caller lifts a falling station (an anvil) off the block it is about to dig, and puts it back after.
+  if (isUnbreakable(block.name) && opts.ownShaft !== true && opts.misplacedStation !== true && opts.liftFalling !== true) {
     watcher.warn(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} is a station and stations are never dug: a station is always a blueprint voxel. Whatever wanted this cell must route around it, not through it.`);
     return false;
   }
   // A dig never opens a face onto water: water beside or above the block pours into the hole and makes
-  // a flow trap. The same predicate A* reads, so a route never plans a dig this refuses (Law 16).
-  if (require('@utils/pathfinding_utils').opensOntoWater(bot, pos.x, pos.y, pos.z)) {
+  // a flow trap. The same predicate A* reads, so a route never plans a dig this refuses (Law 16): the water the body
+  // already stands in is passed over (bodyWater), since it lets in nothing new. The water escape (WATER_ESCAPE_TAG)
+  // opens onto any water. opts.waterCell: the caller's plan gives this cell water (a field's channel), so the water that
+  // pours in fills the cell the plan wants filled; a foreign block standing in it comes out.
+  const pfu = require('@utils/pathfinding_utils');
+  const bf = bot.entity.position.floored();
+  if (tag !== WATER_ESCAPE_TAG && opts.waterCell !== true && pfu.opensOntoWater(bot, pos.x, pos.y, pos.z, pfu.bodyWater(bot, bf.x, bf.y, bf.z))) {
     watcher.summary(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} has water beside or above it, or beside the loose column that would fall when it breaks; breaking it would let the water flow.`);
     return false;
   }
@@ -355,13 +367,16 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
   // down the column it climbed — onto a solid block directly beneath; a peer's is refused to every caller.
   const held = bodyHeldBy(bot, pos);
   if (held) {
-    const lowering = held === 'the body' && (LOCOMOTION_DIG_TAGS.has(tag) || opts.lowerSelf === true);
+    // A BODY ON A CANOPY DROPS (canopy_descent, its tag alone): a leaf is never a floor, so the body breaks the
+    // leaf it stands on and falls to whatever is beneath, fall damage and all.
+    const canopy = held === 'the body' && tag === CANOPY_DESCENT_TAG && require('@utils/movement/leaf_authority').isPhantom(bot, block);
+    const lowering = held === 'the body' && (LOCOMOTION_DIG_TAGS.has(tag) || opts.lowerSelf === true || canopy);
     const landing = lowering ? bot.blockAt(pos.offset(0, -1, 0)) : null;
     if (!lowering) {
       watcher.summary(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} is the last block holding ${held} up; breaking it would drop ${held === 'the body' ? 'it' : 'them'}.`);
       return false;
     }
-    if (!landing || landing.boundingBox !== 'block') {
+    if (!canopy && (!landing || landing.boundingBox !== 'block')) {
       watcher.warn(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} holds the body up and ${landing ? landing.name : 'an unloaded cell'} is beneath it; the body would drop more than one block.`);
       return false;
     }
@@ -374,15 +389,18 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
   // Spawn protection has no separate check: protected cells already read as bedrock fleet-wide
   // (spawn_protection.maskWorldReads), so they're refused above.
   //
-  // NO DIG WHILE BOBBING, FOR ANY CALLER. A body afloat was not meant to be digging: a plan that put it
-  // there has already failed, or something knocked it in. The signal is dropped and the brain plans again
-  // from where the body is; getting out of the water is the pathfinder's work (water_exit, then
-  // water_bank_out), never this primitive's.
+  // NO DIG WHILE BOBBING, EXCEPT THE ROUTE'S OWN. A body afloat digs only where its route priced the dig at
+  // WATER_DIG_AFLOAT (pathfinding_utils), as the last way out of the water: the locomotion tags. Any other caller
+  // afloat was not meant to be digging: a plan that put it there has already failed, or something knocked it in.
+  // The signal is dropped and the brain plans again from where the body is.
   //
   // THE LEAF REFLEX IS THE ONE DIG MADE AFLOAT. The pathfinder reads a loose leaf as air, so a route runs
   // straight through one; the reflex takes it out of the body's way in a moment and the body is where it
   // was. Its tag names it, and it can only ever be handed a loose leaf (leaf_authority.isPhantom).
-  if (tag !== LEAF_REFLEX_TAG && bobbing(bot)) {
+  //
+  // THE WATER ESCAPE IS THE OTHER: a body proved trapped in water (water_escape.prove) digs its fewest-dig
+  // way out, afloat and onto water both, and says every dig as a warning.
+  if (tag !== LEAF_REFLEX_TAG && tag !== WATER_ESCAPE_TAG && !LOCOMOTION_DIG_TAGS.has(tag) && bobbing(bot)) {
     const at = bot.entity.position.floored();
     watcher.warn(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — the body is bobbing in water at (${at.x},${at.y},${at.z}); no dig is made afloat. Signal dropped, replanning.`);
     require('@utils/signal_utils').routeToJudge('dig_authority', { readable: `dig_authority: ${tag} asked to dig while bobbing — replanning` });
@@ -400,6 +418,12 @@ async function performDig(bot, pos, block, tag = 'dig_authority', opts = {}) {
 
   // Unguarded on purpose: equipBestToolForBlock already boundaries its own calls, so a throw here is a real defect, not one to swallow (Law 13).
   if (opts.equip !== 'none') await equipBestToolForBlock(bot, block, tag);
+  // opts.mustDrop: the block is to come back as an item (a falling block lifted to be put back), so it is swung at
+  // only with a held tool that harvests it; a swing that would break it to nothing is refused.
+  if (opts.mustDrop === true && !canHarvest(block, bot.heldItem)) {
+    watcher.warn(tag, `dig refused at (${pos.x},${pos.y},${pos.z}) — ${block.name} must drop as an item and the body holds no tool that harvests it (held: ${bot.heldItem?.name || 'nothing'}).`);
+    return false;
+  }
 
   // Only the aim is boundary-guarded; the verdict below comes from re-sensing, not from the dig call.
   if (!(await guardExternal(tag, `lookAt dig target (${pos.x},${pos.y},${pos.z})`, () => bot.lookAt(pos.offset(0.5, 0.5, 0.5)))).ok) return false;
@@ -439,5 +463,8 @@ module.exports = {
   ensureNoOpenWindow,
   performDig,
   bobbing,
+  WATER_ESCAPE_TAG,
+  CANOPY_DESCENT_TAG,
   isUnbreakable,
+  bodyHeldBy,
 };

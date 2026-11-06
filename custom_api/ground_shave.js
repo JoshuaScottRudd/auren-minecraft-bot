@@ -11,8 +11,10 @@
 // the ground above that layer, and walks on when the layer within reach is spent.
 //
 // ── THE CLAIM ─────────────────────────────────────────────────────────────────────────────────────────
-// Ground is held by the TILE — `dirt:tx,tz`, a DIRT_TILE square of columns — taken before the walk
-// through target_claims, so each patch has one digger (Invariant A). The tile stays open to every
+// Ground is held by the TILE — `dirt:tx,tz`, a DIRT_TILE square of columns at every height — taken before
+// the walk through target_claims, so each patch has one digger (Invariant A). The tile is a resource claim
+// (@utils/resource_footprint): no tile is offered or granted while any peer's resource claim, of any kind,
+// touches its ground. The tile stays open to every
 // body's route, since shaved ground is walkable ground. A tile touching a base keep-out box is never
 // offered.
 
@@ -25,7 +27,7 @@ const { claimFirst, releaseTarget } = require('@utils/target_claims');
 
 const TAG = 'ground_shave';
 
-const DIRT_TILE = 8;                 // columns per side of one claimed tile
+const { DIRT_TILE, boxOfKey, overlaps, peerBoxes } = require('@utils/resource_footprint');
 const KEY_PREFIX = 'dirt:';
 const AREA_BELOW = 4;                // how far under the holder's feet a tile is searched for ground
 const AREA_ABOVE = 6;                // and how far over them
@@ -73,19 +75,8 @@ function touchesKeepout(t, keepout) {
   return (keepout || []).some(b => c.x <= b.maxX && maxX >= b.minX && c.z <= b.maxZ && maxZ >= b.minZ);
 }
 
-// The tiles peers hold, read from the broadcast boardroom the way the tree census reads `tree:` claims.
-function peerTileKeys() {
-  const hq = require('@kernel/corporate_headquarters');
-  const selfId = process.env.BOT_ID || 'default';
-  const keys = new Set();
-  for (const [botId, chair] of Object.entries(hq.getFullBoardroom({}) || {})) {
-    if (botId === selfId || !chair || !chair.magnet) continue;
-    for (const key of Object.keys(chair.active_claims || {})) {
-      if (key.startsWith(KEY_PREFIX)) keys.add(key);
-    }
-  }
-  return keys;
-}
+// Whether any peer's resource claim, of any kind, touches a tile's ground (the box the foreman grants by).
+const peerTouches = (peers, t) => { const box = boxOfKey(keyOfTile(t)); return peers.some(b => overlaps(b.box, box)); };
 
 // standBeside — the feet cell a body digs `target` from: a standable neighbour level with the block or
 // one step under it, the nearest to the body. The block's own top when no neighbour stands.
@@ -109,13 +100,13 @@ function standBeside(bot, target) {
 function open(bot, { keepout, blocks }) {
   const held = new Map();        // claim key → tile, every tile this errand holds
   const refused = new Set();     // claim keys a peer answered for during this errand
-  let peers = peerTileKeys();
+  let peers = peerBoxes();
   let moves = 0;
 
   const free = (t) => {
     const key = keyOfTile(t);
     if (held.has(key)) return true;
-    return !touchesKeepout(t, keepout) && !refused.has(key) && !peers.has(key);
+    return !touchesKeepout(t, keepout) && !refused.has(key) && !peerTouches(peers, t);
   };
 
   // offers — true for a block this errand may take: shaveable, under no body, in a tile it holds or may claim.
@@ -194,7 +185,7 @@ function open(bot, { keepout, blocks }) {
   async function moveOn(skip) {
     if (moves >= MAX_MOVES) return false;
     moves++;
-    peers = peerTileKeys();
+    peers = peerBoxes();
     const from = bot.entity.position;
     const highestThenNearest = (a, b) => (b.y - a.y)
       || (((a.x - from.x) ** 2 + (a.z - from.z) ** 2) - ((b.x - from.x) ** 2 + (b.z - from.z) ** 2));

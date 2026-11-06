@@ -18,9 +18,11 @@
 //         released, so the token cannot cover them. Both bots may run the
 //         same job type; they must not touch the same block. The key names a
 //         block, but what it EXCLUDES is per-prefix: 'cell:'/'anchor:' exclude
-//         that block, 'tree:' excludes a 5x5 column around it at every height
-//         (see @utils/tree_footprint — a felling bot occupies more than the
-//         one voxel it named, so a block-exact hold does not de-conflict it).
+//         that block; a resource key (tree, dirt, grass, dig) excludes the box
+//         around it against every resource of any kind (see
+//         @utils/resource_footprint — a body taking a resource occupies more
+//         than the one voxel it named, so a block-exact hold does not
+//         de-conflict it).
 //     (b) CRITICAL SECTION — one token for planning and temporary computation.
 //         The plan phase covers job_board sweep → dispatcher magnet claim → HQ
 //         sync; execution searches borrow that same gate. Planners see fresh peer
@@ -48,13 +50,16 @@
 // refused every time, so its object reads at the executor as held by every peer and drives a
 // concede-reclaim loop; the rejection carries `fault: 'claimant'` and foreman_link throws on it, so it
 // arrives as the coding violation it is, not as a world condition (Law 13).
-// 'stone_column:' — stone_prospect_executor, one key per surface column it opens.
-// 'grass:' — seed_picker, one key per tuft, held for a single punch. Exact-block:
-// peers punch neighbouring tufts of one patch without interfering, so no footprint.
-// tree/stone_column/grass are taken through js_kernel/utils/target_claims, the one claim-reach-release walk.
+// 'grass:' — seed_picker, one key per tuft, held for a single punch.
+// 'dig:' — survey_executor, one key per block a surface-stone trip digs.
+// 'sector:' — survey_executor, one key per survey sector a body is scanning.
+// 'stone_column:' — stone_pierce, one key per column a body opens and its 3x3 ground.
+// tree/dirt/grass/dig are RESOURCE keys (@utils/resource_footprint): each holds a box, and no resource of any
+// kind is granted to a second body inside a box a body is working. They are taken through
+// js_kernel/utils/target_claims, the one claim-reach-release walk.
 // 'prep:' — preconstruction, one key per unit of a crafted block a pledge-approved anchor still needs, so
 // each unit is crafted by one body.
-// 'dirt:' — harvest_executor, one key per ground tile it shaves, so each patch of ground has one digger.
+// 'dirt:' — ground_shave, one key per ground tile it shaves, so each patch of ground has one digger.
 // 'column:' — build_column_executor, one key per building column, held for one trip up its stand shaft.
 // 'line:' — mining_manager, one key per strip tunnel (its origin segment, kind and direction), held for a whole trip
 // down it, so one body digs one tunnel and no peer is handed the segment beyond a body still working it.
@@ -67,9 +72,13 @@
 // 'sapling:' — sapling_planter, one key per tree-farm grid cell, held from before the walk to the cell until it is planted.
 // 'climb_stall:' — build_column_executor, one key per failed climb toward one cube (structure, column, cube, count),
 // SPENT, so the count a body is granted is the crew's count of failed climbs on that cube.
-const OBJECT_KEY_PREFIXES = ['anchor:', 'tree:', 'cell:', 'stone_column:', 'grass:', 'prep:', 'dirt:', 'column:', 'line:', 'bill:', 'chest_forgiveness:', 'sapling:', 'pit_report:', 'climb_stall:'];
-// The tree key and its footprint are `@utils/tree_footprint`, which a body choosing a trunk reads too (Law 16).
-const { TREE_KEY_PREFIX, parseTreeFootprint, inFootprint } = require('@utils/tree_footprint');
+// 'gate:' — pen_gate, one key per pen gate, held by the one body crossing it (in behind a led animal, or out).
+// 'park:' — pen_gate, one key per pen gate's standby cell, held by the tender (bringer, shearer) from its claim until it is out with the gate shut.
+// 'shepherd:' — pen_gate, one key per pen's shepherd post, held by the shepherd while it holds the penned flock away from the gate.
+// 'shears_seat:' — harvest_executor, one leaf-cutting shears seat per leaf pair ('shears_seat:leaves:<i>', architect_config.LEAF_PAIRS), held from the borrow of the pair to its return.
+const OBJECT_KEY_PREFIXES = ['anchor:', 'tree:', 'cell:', 'grass:', 'dig:', 'prep:', 'dirt:', 'column:', 'line:', 'bill:', 'chest_forgiveness:', 'sapling:', 'pit_report:', 'climb_stall:', 'sector:', 'stone_column:', 'gate:', 'park:', 'shepherd:', 'shears_seat:'];
+// The resource keys and their boxes are `@utils/resource_footprint`, which a body choosing a target reads too (Law 16).
+const { isResourceKey, boxOfKey, overlaps } = require('@utils/resource_footprint');
 
 // ── KEYS GRANTED ONCE PER RUN, AND THIS IS WHERE EACH ONE IS COUNTED ──────────────────────────────────
 // A run can end while a body has a chest open, so the next run's picture of that chest and the world's
@@ -80,42 +89,32 @@ const { TREE_KEY_PREFIX, parseTreeFootprint, inFootprint } = require('@utils/tre
 const ONCE_KEY_PREFIXES = ['chest_forgiveness:', 'pit_report:', 'climb_stall:'];
 const _spentOnce = new Map();   // key → { bot_id, spent_at }
 
-// Object claims: object key → { bot_id, claimed_at, footprint }
-// footprint is { x, z } for tree keys (see below) and null for every other key.
+// Object claims: object key → { bot_id, claimed_at, box }
+// box is the ground a resource key holds (see below) and null for every other key.
 const _objectClaims = new Map();
 
 const STALE_CLAIM_MS = 5 * 60 * 1000;
 
-// ── A tree claim excludes a COLUMN, not a block (Invariant A: one occupant per scope) ──
-// A tree key names one base block, but the scope a feller actually occupies is the column
-// around that base: it stands on a skirt cell beside the trunk, pillars up through that cell,
-// and mines the base out from under the logs above. Block-exact exclusivity leaves three holes
-// a peer walks straight through, and all three widen as the fleet grows:
-//   1. ONE TREE, SEVERAL BASES — the tree scan collapses logs per XZ COLUMN and keeps every
-//      column bottoming out on solid ground, so a multi-column trunk yields more than one base
-//      coordinate. A different coordinate is a different key, hence a second grant on one tree.
-//   2. THE PILLAR READS AS A TREE — pillaring stock is timber-first, so a climbing feller leaves
-//      a log column standing on solid ground, which the scan cannot tell from a trunk. A peer
-//      claims it and mines the scaffold out from under the climber.
-//   3. Y DRIFT — clearing the lower logs re-exposes the residual trunk as a fresh base at a
-//      higher y, which is again a key nobody holds.
-// Comparing X/Z only, at Chebyshev radius 2, closes all three: a 5x5 footprint unbounded in Y,
-// so no coordinate anywhere in that column can be granted to a second bot while the feller works.
-// Scoped to tree keys alone — 'cell:' and 'anchor:' name blocks peers work beside without
-// interference, and a blanket radius would freeze mining cells against a fault never seen there.
+// ── A RESOURCE CLAIM EXCLUDES GROUND, NOT A BLOCK (Invariant A: one occupant per scope) ──
+// A resource key names one objective, but a body taking it occupies the ground around it: it stands beside
+// it, digs about it, pillars up a trunk, and its drops land around it. Block-exact exclusivity lets a second
+// body work the same ground under another key — a tree beside a dirt patch, a second base of one trunk, a
+// stone beside a stone — and each undermines or robs the other. So every resource key holds a box
+// (@utils/resource_footprint: a 5x5x5 cube around the objective; a tree's 5x5 column up to its top; a dirt
+// tile at every height), and no resource of any kind is granted inside a box another body holds.
+// Scoped to resource keys alone — 'cell:' and 'anchor:' name blocks peers work beside without interference.
 function isObjectKey(key) {
   return typeof key === 'string' && OBJECT_KEY_PREFIXES.some(p => key.startsWith(p));
 }
 
-// The peer whose tree column contains this base, or null if the footprint is free. Stale holds
-// are skipped on the same TTL as an exact key, so a dead feller's column decays instead of
-// freezing a 5x5 of forest for good (Law 13: default = available).
-function treeFootprintHolder(botId, footprint) {
+// The peer whose resource box touches this one, or null if the ground is free. Stale holds are skipped on
+// the same TTL as an exact key, so a dead body's ground decays instead of freezing for good.
+function resourceBoxHolder(botId, box) {
   const now = Date.now();
   for (const claim of _objectClaims.values()) {
-    if (!claim.footprint || claim.bot_id === botId) continue;
+    if (!claim.box || claim.bot_id === botId) continue;
     if (now - claim.claimed_at > STALE_CLAIM_MS) continue;
-    if (inFootprint(claim.footprint, footprint)) return claim.bot_id;
+    if (overlaps(claim.box, box)) return claim.bot_id;
   }
   return null;
 }
@@ -139,21 +138,20 @@ function handleClaimRequest(botId, key) {
     return { granted: true };
   }
 
-  // A tree key is admitted by FOOTPRINT; every other prefix stays exact-block. The exact-key
-  // test below still runs for trees, but the column test above it always answers first for a
-  // peer holding the same coordinate, since that coordinate has spread 0.
-  let footprint = null;
-  if (key.startsWith(TREE_KEY_PREFIX)) {
-    footprint = parseTreeFootprint(key);
-    if (!footprint) {
+  // A resource key is admitted by its BOX; every other prefix stays exact-block. The exact-key test below
+  // still runs for resources, but the box test always answers first for a peer holding the same key.
+  let box = null;
+  if (isResourceKey(key)) {
+    box = boxOfKey(key);
+    if (!box) {
       // Same class as an unknown prefix: a claimant-side coding violation, rejected loudly (Law 13).
-      log(`Claim rejected for '${botId}': malformed tree key '${key}' (expected 'tree:x,y,z').`);
-      return { granted: false, fault: 'claimant', reason: `malformed tree key '${key}'` };
+      log(`Claim rejected for '${botId}': malformed resource key '${key}' (see @utils/resource_footprint).`);
+      return { granted: false, fault: 'claimant', reason: `malformed resource key '${key}'` };
     }
-    const columnHolder = treeFootprintHolder(botId, footprint);
-    if (columnHolder) {
-      log(`Tree claim rejected for '${botId}': '${key}' falls inside the column held by '${columnHolder}'.`);
-      return { granted: false, reason: `'${key}' inside tree column held by '${columnHolder}'` };
+    const groundHolder = resourceBoxHolder(botId, box);
+    if (groundHolder) {
+      log(`Resource claim rejected for '${botId}': '${key}' touches ground held by '${groundHolder}'.`);
+      return { granted: false, reason: `'${key}' touches ground held by '${groundHolder}'` };
     }
   }
 
@@ -170,7 +168,7 @@ function handleClaimRequest(botId, key) {
   if (current && current.bot_id !== botId) {
     log(`Stale object claim on '${key}' by '${current.bot_id}' expired — granting to '${botId}'.`);
   }
-  _objectClaims.set(key, { bot_id: botId, claimed_at: Date.now(), footprint });
+  _objectClaims.set(key, { bot_id: botId, claimed_at: Date.now(), box });
   return { granted: true };
 }
 
@@ -218,6 +216,9 @@ function handleClaimRelease(botId, key) {
 
 const timeoutCrash = require('../js_kernel/utils/timeout_crash');
 const GATE = 'planning_gate';
+// A plan that holds the gate past slow_ms, or a line longer than line_max bodies, is said as a warning: either
+// one means every body behind it is standing still and answering nothing.
+const PLANNING_WARN = Object.freeze({ slow_ms: 1000, line_max: 5 });
 const memoryWorkspace = require('../js_kernel/utils/memory_workspace');
 const _requestedPhases = new Map();
 
@@ -313,6 +314,9 @@ function requestPlanningToken(botId, phase = 'planning', requestId) {
 
   _requestedPhases.set(botId, { phase, requestId });
   _planningQueue.push(botId);
+  if (_planningQueue.length === PLANNING_WARN.line_max + 1) {
+    _said(`⚠️ PLANNING LINE: ${_planningQueue.length} bodies waiting (more than ${PLANNING_WARN.line_max}) — ${_planningQueue.join(', ')}.`);
+  }
   _serveLine();
   const place = _planningQueue.indexOf(botId);
   if (place < 0) return;
@@ -351,6 +355,9 @@ function releasePlanningToken(botId, entry) {
     return;
   }
   _said(`EXIT #${entry} from '${botId}' after ${_heldMs(holder)} ms.`);
+  if (holder.phase === 'planning' && _heldMs(holder) > PLANNING_WARN.slow_ms) {
+    _said(`⚠️ PLANNING SLOW: '${botId}' planned for ${_heldMs(holder)} ms on entry #${entry} (more than ${PLANNING_WARN.slow_ms} ms).`);
+  }
   _closeEntry(botId);
   _serveLine();
 }

@@ -2,13 +2,12 @@
 // THE CAMERA WARDEN — a camera per bot on a run where the bots do not exist yet.
 //
 // ── WHY THIS EXISTS ─────────────────────────────────────────────────────────────────────────────────
-// Every other filming route is built for a crew whose size is known before the world starts. A
-// CONTRACTOR run inverts that: the world comes up with zero bots, and a hire in game can bring bodies
-// into being that nothing had heard of a minute earlier. A camera per bot has to be raisable DURING the
-// take, or a let's-play run is the one run type that cannot be filmed.
+// Every other filming route is built for a crew whose size is known before the world starts. A body that
+// stands up later — a hand `bot-start`, a revive, a crew raised after the cameras — was unknown when the
+// cameras came up, so a camera per bot has to be raisable DURING the take.
 //
 // ── IT WATCHES THE WORLD, NOT THE LAUNCHER ──────────────────────────────────────────────────────────
-// A hook in `foreman get` or `fleet_control botStart` is the wrong joint twice over. First, `bot-start`
+// A hook in the foreman's crew raise or `fleet_control botStart` is the wrong joint twice over. First, `bot-start`
 // returns when the PROCESS is launched — a body enters the foreman's registry only after it connects,
 // spawns and master_core initialises, seconds later — so a camera raised on the launcher's return aims
 // at a bot not yet in the world (Law 26: the launcher's fact and the world's fact are different facts).
@@ -16,12 +15,12 @@
 // whether it is being filmed (Law 19 — the film crew observes, it does not act).
 //
 // So the warden SENSES instead: it asks the foreman's registry who is standing, every few seconds, and
-// gives a camera to anyone who has none. That covers `foreman get`, a hand `bot-start`, a revive, and
+// gives a camera to anyone who has none. That covers the foreman's raise, a hand `bot-start`, a revive, and
 // anything not yet written, since none of them is what it is watching (Invariant B — re-sense the
 // world, never track it from remembered events).
 //
 // ── ATTACH ONLY. A CAMERA IS NEVER TAKEN DOWN MID-TAKE ────────────────────────────────────────────────
-// A dismissed contractor leaves the registry, and its camera keeps filming an empty spectator vantage
+// A body that leaves the registry keeps its camera, which keeps filming an empty spectator vantage
 // until the take ends, costing disk and nothing else. Reaping it would mean removing a live OBS source
 // and killing a client whose Source Record filter is mid-file — a file no muxer closed is the expensive
 // failure this whole stack exists to avoid. The whole crew comes down together, in order, at teardown,
@@ -41,7 +40,7 @@
 //
 // THE MID-TAKE ATTACH IS MEASURED: a Source Record filter created after StartRecord began wrote
 // immediately, alongside the already-running capture, so a running recording does not need to be
-// stopped and restarted for a new contractor.
+// stopped and restarted for a new bot.
 //
 // ── WHAT IT REFUSES ─────────────────────────────────────────────────────────────────────────────────
 // A ceiling on cameras, since this raises GAME CLIENTS and nothing else in the loop is counting — an
@@ -75,7 +74,7 @@ paths.registerAliases();
 const door = require(path.join(BOT_DIR, 'foreman', 'foreman_door.js'));
 
 // How often the registry is asked. Six seconds is well under how long a body takes to join (the
-// foreman allows ninety), so a contractor is filmed within a few seconds of standing up, and the cost
+// foreman allows ninety), so a bot is filmed within a few seconds of standing up, and the cost
 // of asking is one short-lived socket to a process on this machine.
 const POLL_MS = 6000;
 // The ceiling counts GAME CLIENTS, not bots: the host seat and the operator's eye are windows on the
@@ -95,6 +94,8 @@ const onOff = (name) => /^(on|true|1|yes)$/i.test(String(opt(name, 'off')));
 const OVERLAY = opt('overlay', 'watch');          // 'record' | 'watch' — decides only whether files are proved
 const HOST_ON = onOff('host');
 const ARCHITECT_ON = onOff('architect');
+// The scout seat: one more window, and the director it restarts must be told of it again on every converge.
+const SCOUT_ON = onOff('scout');
 const MAX_CAMERAS = parseInt(opt('max-cameras', String(DEFAULT_MAX_CAMERAS)), 10);
 // Bots already filmed when the warden was raised — a run that started with a standing crew. The warden
 // must not re-launch a client that is already up, and -Add would find it running anyway; seeding is
@@ -132,7 +133,7 @@ function runScript(name, args, label) {
 // How many windows this run has standing, counting the seats that are not bots. The ceiling is about
 // the GPU, and the GPU does not care which of them a director is driving.
 function windowsFor(botCount) {
-  return botCount + (HOST_ON ? 1 : 0)
+  return botCount + (HOST_ON ? 1 : 0) + (SCOUT_ON ? 1 : 0)
     + (ARCHITECT_ON ? require(paths.workshop('camera', 'camera_configure.js')).architect.camNames.length : 0);
 }
 
@@ -157,7 +158,7 @@ async function attach(all, added) {
   try { if (fs.existsSync(CREW_READY_FILE)) fs.unlinkSync(CREW_READY_FILE); } catch (e) { /* nothing to clear */ }
 
   const camArgs = ['-Bots', all.join(','), '-Add', '-Framing',
-    ...(HOST_ON ? ['-HostSeat'] : []), ...(ARCHITECT_ON ? ['-Architect'] : [])];
+    ...(HOST_ON ? ['-HostSeat'] : []), ...(ARCHITECT_ON ? ['-Architect'] : []), ...(SCOUT_ON ? ['-Scout'] : [])];
   if (!runScript('start_cameras.ps1', camArgs, `camera crew converge on ${all.join(', ')}`)) {
     say(`✗ the camera crew did not converge — ${added.join(', ')} ${added.length === 1 ? 'is' : 'are'} NOT being filmed.`);
     return false;
@@ -175,7 +176,7 @@ async function attach(all, added) {
   // it, which is the whole of watching. On a recorded run the recorder binds the new capture and proves
   // every file is putting real bytes on disk — the only moment a mid-take attach can be proved.
   if (RECORDER) {
-    const obsArgs = [`--bots=${all.join(',')}`, `--host=${HOST_ON ? 'on' : 'off'}`, `--architect=${ARCHITECT_ON ? 'on' : 'off'}`];
+    const obsArgs = [`--bots=${all.join(',')}`, `--host=${HOST_ON ? 'on' : 'off'}`, `--architect=${ARCHITECT_ON ? 'on' : 'off'}`, `--scout=${SCOUT_ON ? 'on' : 'off'}`];
     if (!RECORDER.bindLate(obsArgs)) {
       say('✗ the new camera is not recording — read the lines above for which step. The rest of the take is unaffected.');
       return false;
@@ -219,16 +220,16 @@ async function main() {
   // because a process killed hard leaves it behind.
   try {
     fs.writeFileSync(PID_FILE, JSON.stringify({
-      pid: process.pid, overlay: OVERLAY, host: HOST_ON, architect: ARCHITECT_ON,
+      pid: process.pid, overlay: OVERLAY, host: HOST_ON, architect: ARCHITECT_ON, scout: SCOUT_ON,
       max_cameras: MAX_CAMERAS, raised_at: Date.now(),
     }, null, 2));
   } catch (e) { say(`⚠ could not record my own pid (${e.message}) — teardown still finds me by command line.`); }
 
   const filmed = new Set(SEED);
   say(`up. Watching the foreman's registry every ${POLL_MS / 1000}s for bots with no camera.`);
-  say(`overlay '${OVERLAY}'${HOST_ON ? ', host seat on' : ''}${ARCHITECT_ON ? ", Architect's eye on" : ''}` +
+  say(`overlay '${OVERLAY}'${HOST_ON ? ', host seat on' : ''}${ARCHITECT_ON ? ", Architect's eye on" : ''}${SCOUT_ON ? ', scout seat on' : ''}` +
     `, ceiling ${MAX_CAMERAS} window(s).` +
-    (filmed.size ? ` Already filmed: ${[...filmed].join(', ')}.` : ' No crew yet — say "foreman get" in game.'));
+    (filmed.size ? ` Already filmed: ${[...filmed].join(', ')}.` : ' No crew yet.'));
 
   let refusedAnnounced = new Set();
   for (;;) {

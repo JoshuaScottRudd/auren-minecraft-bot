@@ -36,6 +36,8 @@
 #   .\start_cameras.ps1 -Bots A,B -Add -HostSeat
 #                                    -> CONVERGE on that set: launch only what is missing, restart
 #                                       the director and titler over all of it. Safe to repeat.
+#   .\start_cameras.ps1 -Scout       -> add the scout seat (Cam_Scout): one directed camera that films whichever
+#                                       bot is doing the activity ranked highest on the scout focus
 #   .\start_cameras.ps1 -Down        -> stop the camera clients and the director this script started
 #
 # NOTE the switch is -HostSeat and not -Host: $Host is a PowerShell automatic variable (the host UI
@@ -58,6 +60,7 @@ param(
     [switch]$Framing,             # launch the director with framing ON regardless of camera_configure
     [switch]$Architect,           # add the seat a human flies (OFF by default - see the eye section)
     [switch]$HostSeat,            # add the seat a human PLAYS (OFF by default - see the host section)
+    [switch]$Scout,               # add the scout seat: one directed camera, its bot picked by the scout focus
     [switch]$Add,                 # CONVERGE: launch only what is missing, restart director + titler
     [switch]$Down                 # reap the crew this script raises (Law 8) - see the -Down section
 )
@@ -155,6 +158,11 @@ if ($Down) {
 $node = Get-AurenNode
 # The server folder whose latest.log is read below - the workstation resolver's answer (Law 16).
 $serverDir = & $node (Join-Path $botRoot 'js_kernel\utils\workstation.js') server
+# The port the cameras join is that server's own server-port, read by the one server.properties parser
+# (rcon_link.parseServerProperties), so a camera raised for a second seat joins that seat's world.
+$rconJs = (Join-Path $botRoot 'js_kernel\utils\rcon_link.js') -replace '\\', '/'
+$propsJs = (Join-Path "$serverDir" 'server.properties') -replace '\\', '/'
+$gamePort = (& $node -p "require('$rconJs').parseServerProperties(require('fs').readFileSync('$propsJs', 'utf8'))['server-port'] || 25565").Trim()
 
 # The major version of a java.exe, read from the `release` file the runtime ships beside its bin folder:
 # a file read, so it costs nothing per camera and answers for a runtime this script will not run.
@@ -230,15 +238,21 @@ if (-not $HostCam -or -not $HostPlayer) {
 }
 $HostOn = $HostSeat.IsPresent -or ((& $node -p "!!require('$cfgPath').host.enable").Trim() -eq 'true')
 
+# ---- The SCOUT SEAT: one more directed window, its subject chosen by the director -------------
+# Built and titled like a bot camera, and passed to the director on --scoutcam rather than --bots, because
+# its bot is not fixed: the director picks it from the bots' ACTIVITY lines and the operator's ranked focus
+# (camera/scout_focus.js). The overlay decides when a run raises it and passes -Scout here.
+$ScoutCam = (& $node -p "require('$cfgPath').scoutSeat.camName").Trim()
+if ($Scout -and -not $ScoutCam) { Write-Host 'Could not read scoutSeat.camName from camera/camera_configure.js.'; exit 1 }
+
 $CamList = @($BotCams)
 if ($ArchitectOn) { $CamList += $ArchitectCams }
 if ($HostOn)      { $CamList += $HostCam }
+if ($Scout)       { $CamList += $ScoutCam }
 
 # The player name each window joins under. Every camera wears its own cam name - they are invented
 # names on an offline-mode server and nothing depends on them beyond being unique. The host wears a
-# REAL one, and that is load-bearing rather than cosmetic: `foreman get` stamps the asker's name onto
-# every contractor it launches, so a presenter joined under an invented name would hire a crew that
-# answers to somebody who is not him, and could not run a command from inside his own window either.
+# REAL one, opped on the server, so a presenter can run a command from inside his own window.
 function Get-PlayerName([string]$cam) { if ($cam -eq $HostCam) { return $HostPlayer } return $cam }
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -561,7 +575,8 @@ foreach ($cam in $CamList) {
     # get" has to be typed by somebody holding a player slot. Hidden chat on this seat would leave the
     # presenter unable to hire the crew the episode is about, and the desk's replies - which are the
     # thing the audience is watching him read - would not be on the tape either.
-    Set-OptionLine $optFile 'chatVisibility' $(if ($ArchitectCams -contains $cam -or $cam -eq $HostCam) { '0' } else { '2' })
+    # A numbered camera holds a saved angle and nobody types in it, so it is a lens too.
+    Set-OptionLine $optFile 'chatVisibility' $(if ($cam -match '^Cam_\d+$') { '2' } elseif ($ArchitectCams -contains $cam -or $cam -eq $HostCam) { '0' } else { '2' })
 
     # renderDistance belongs to the game, which selects it from the machine's available resources.
     # Removing the launcher override on every run leaves that decision with the game.
@@ -614,9 +629,9 @@ if ($SetupOnly) { Write-Host 'Setup complete - run without -SetupOnly to film.';
 # multiplayer screen until it is.
 $serverUp = $false
 $probe = New-Object System.Net.Sockets.TcpClient
-try { $probe.Connect('127.0.0.1', 25565); $serverUp = $true } catch {} finally { $probe.Close() }
+try { $probe.Connect('127.0.0.1', [int]$gamePort); $serverUp = $true } catch {} finally { $probe.Close() }
 if (-not $serverUp) {
-    Write-Host 'NOTE: no Minecraft server on 127.0.0.1:25565 yet - start the world first if the'
+    Write-Host "NOTE: no Minecraft server on 127.0.0.1:$gamePort yet - start the world first if the"
     Write-Host 'camera windows sit at the connect screen.'
 }
 
@@ -658,7 +673,7 @@ for ($i = 0; $i -lt $toLaunch.Count; $i++) {
     # "-o, --offline <offline>  Launch offline, with given player name"). Instance name and player
     # name are the same string for every camera and DIFFERENT for the host, which is the whole reason
     # they are two variables here rather than one used twice.
-    Start-Process $prismExe -ArgumentList '--launch', $cam, '--offline', $player, '--server', '127.0.0.1:25565' `
+    Start-Process $prismExe -ArgumentList '--launch', $cam, '--offline', $player, '--server', "127.0.0.1:$gamePort" `
         -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     # First-ever launch downloads the game once; stagger so the two instances don't fight
     # over the shared download cache.
@@ -698,6 +713,7 @@ if ($ArchitectOn) { $rigArgs += " --freecams=$($ArchitectCams -join ',')" }
 # silent: the seat is standing in the world the whole time, so the run waits out its full ceiling and
 # reports a crew that never arrived, with OBS never reached and the take unrecorded.
 if ($HostOn) { $rigArgs += " --presentplayers=$HostPlayer" }
+if ($Scout) { $rigArgs += " --scoutcam=$ScoutCam" }
 if ($Framing) { $rigArgs += ' --framing=on' }
 Write-Host "Starting camera director (camera_rig.js, new window) over: $($BotNames -join ', ')"
 Start-Process powershell -ArgumentList '-NoExit', '-Command', "& '$node' '$rig' $rigArgs"

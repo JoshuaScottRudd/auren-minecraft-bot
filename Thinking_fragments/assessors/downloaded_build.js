@@ -5,7 +5,7 @@
 // every cell of the blueprint's box (blueprint_anchor_calculator's header); a cell the download leaves
 // empty is an air target, so the ground standing inside the box is cleared by the same pass that builds
 // the walls — bottom-up, one cube at a time. The way down to a column's foot is navigation's to find (a
-// straight diagonal stair and a tunnel under the box), and whatever that leaves is the basement.
+// straight diagonal stair and what it digs under the box) into the column's basement cell (downloaded_plan_registry.basementCell).
 //
 // The two phases are one ladder with one owner (Invariant D) — `assessors/building` owns the
 // headframe's for the same reason — and exactly one is live at a time.
@@ -37,18 +37,18 @@ const Vec3 = require('vec3');
 const pace = require('@utils/execution_yield').makeExecutionPacer();
 const hq = require('@kernel/corporate_headquarters');
 const planRegistry = require('@kernel/downloaded_plan_registry');
-const { cubeCells, ENTRY_FEET_BELOW, CUBE } = require('@kernel/blueprint_anchor_calculator');
+const { ENTRY_FEET_BELOW, CUBE } = require('@kernel/blueprint_anchor_calculator');
 const { currentMode } = require('@kernel/bot_mandate');
 const { isAir } = require('@utils/movement/terrain_predicates');
 
 const inventoryLens = require('@kernel/inventory_lens');
 const watcher = require('@kernel/watcher');
 const { itemsFor } = require('@kernel/blueprint_importer');
-const { remainingRawInSpecies, familyBalance, familyRoot, isChainOwned, isGatherable } = require('@utils/calculators/build_material_calculator');
+const { remainingRawInSpecies, familyBalance, billThrough, familyRoot, isChainOwned, isGatherable } = require('@utils/calculators/build_material_calculator');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const { getBotInventory, homeChest, isUnderground, group_to_item } = require('@utils/fragment_utils');
 
-const { JOB_TYPE, BOT_MODES } = require('@thinking/architect_config');
+const { JOB_TYPE, STAND_INS } = require('@thinking/architect_config');
 const { TAG, deliverScope, supplyJob, planTreeBox, siteTreePhaseDone, siteTreesJob, furnaceInput } = require('@thinking/assessors/shared');
 
 const trash = require('@utils/trash');
@@ -59,11 +59,10 @@ const PRICED_PER_SWEEP = 32;
 // How many remembered-finished cubes are re-read each sweep, oldest first (see the header).
 const REVERIFIED_PER_SWEEP = 8;
 
-// The one place the run's build name comes from. A crew that is not a builder has none, and every
-// question below answers "nothing to do" for it, never a guessed structure.
+// The one place the run's build name comes from (architect_config.CREW_BUILD). A crew with none answers
+// "nothing to do" to every question below, never a guessed structure.
 function buildName() {
-    if (currentMode() !== BOT_MODES.BUILDER) return null;
-    return require('../../foreman_config').builder?.build || null;
+    return require('@thinking/architect_config').CREW_BUILD[currentMode()] || null;
 }
 
 // The locked row the foreman wrote when it sited the building, or null while it has not.
@@ -105,13 +104,7 @@ function targetsOf(anchor) {
     const key = `cube:${anchor.index}`;
     let t = cachedTargets(key);
     if (t) return t;
-    const dims = planRegistry.dimensions();
-    const byCell = new Map(anchor.voxels.map(v => [`${v[0]},${v[1]},${v[2]}`, v]));
-    t = [];
-    for (const [x, y, z] of cubeCells(anchor, dims)) {
-        if (x === anchor.stand[0] && z === anchor.stand[2]) continue;   // restored on the column's last descent
-        t.push({ b: [x, y, z], v: byCell.get(`${x},${y},${z}`) || null });
-    }
+    t = planRegistry.cubeTargets(anchor);
     keepTargets(key, t);
     return t;
 }
@@ -122,10 +115,7 @@ function shaftTargets(column) {
     const key = `shaft:${column.column}`;
     let t = cachedTargets(key);
     if (t) return t;
-    const dims = planRegistry.dimensions();
-    const byY = new Map(column.descent.map(v => [v[1], v]));
-    t = [];
-    for (let y = dims.h - 1; y >= 0; y--) t.push({ b: [column.stand[0], y, column.stand[1]], v: byY.get(y) || null });
+    t = planRegistry.shaftTargets(column);
     keepTargets(key, t);
     return t;
 }
@@ -133,12 +123,36 @@ function shaftTargets(column) {
 // cellState — one owned cell against its target: 'ok' | 'wrong' | 'unseen'. An unloaded cell is UNSEEN, never
 // ok: calling it finished would remember a cube nobody has looked at (and the memory is the one thing here that
 // is not re-derived every sweep).
+// worldName(bot, frame, t) → the name of the block standing in cell t now, or null where this body has not loaded it.
+function worldName(bot, frame, t) {
+    const p = frame.worldOf(t.b[0], t.b[1], t.b[2]);
+    const at = bot.blockAt(new Vec3(p.x, p.y, p.z));
+    return at && at.name ? at.name : null;
+}
 function cellState(bot, frame, t) {
     const p = frame.worldOf(t.b[0], t.b[1], t.b[2]);
     const at = bot.blockAt(new Vec3(p.x, p.y, p.z));
-    if (!at || !at.name) return 'unseen';
-    if (!t.v) return isAir(at.name) ? 'ok' : 'wrong';
+    if (!at || !at.name) return keptCell(t);
+    if (!t.v) return isAir(at.name) === !t.support ? 'ok' : 'wrong';
     return frame.holds(t.v, at) ? 'ok' : 'wrong';
+}
+
+// A CELL THIS BODY HAS NOT LOADED IS ASKED OF THE KEEPER (foreman/mansion_keeper, subject `mansion`): it reads 'ok' when
+// the keeper holds every cell of its cube, or of its stand shaft, as the plan asks. A cube the keeper reads open, or
+// does not hold, stays unseen: only a trip there can say which cell. A crew with no keeper reads only its own world.
+let _ownerOf = null;   // cell "x,y,z" → ['cube', anchor index] | ['shaft', column]
+function keptCell(t) {
+    const verdicts = require('@kernel/keeper_verdicts');
+    const kept = verdicts.required() ? verdicts.get('mansion') : null;
+    if (!kept || !kept.plan) return 'unseen';
+    if (!_ownerOf) {
+        _ownerOf = new Map();
+        for (const a of planRegistry.anchors()) for (const c of targetsOf(a)) _ownerOf.set(c.b.join(','), ['cube', a.index]);
+        for (const col of planRegistry.columns()) for (const c of shaftTargets(col)) _ownerOf.set(c.b.join(','), ['shaft', col.column]);
+    }
+    const o = _ownerOf.get(t.b.join(','));
+    if (!o) return 'unseen';
+    return (o[0] === 'cube' ? kept.cubes : kept.shafts)[o[1]] === 'ok' ? 'ok' : 'unseen';
 }
 
 // allCorrect — early exit on the first cell that is not ok.
@@ -164,7 +178,7 @@ async function workable(bot, frame, anchor) {
         const p = frame.worldOf(t.b[0], t.b[1], t.b[2]);
         if (!isAir(bot.blockAt(new Vec3(p.x, p.y, p.z)).name)) return true;   // something to dig
         if (await waitsOnSupport(bot, frame, anchor, t)) continue;
-        const block = frame.blockOf(t.v[3], t.v[1]), plan = frame.stateOf(t.v[4]);
+        const block = frame.voxelBlock(t.v), plan = frame.voxelState(t.v);
         if (!itemsFor(block, plan, mc).length) continue;
         if (!plan) return true;
         // A click cell serves when it stands now, or when trash can stand in it: any cell off the shaft.
@@ -183,7 +197,7 @@ async function workable(bot, frame, anchor) {
 
 // ── A BLOCK THAT HANGS WAITS FOR THE BLOCK IT HANGS ON ────────────────────────────────────────────────
 // waitsOnSupport(bot, frame, anchor, t) → true when the cell's block drops without its support (a lantern, a
-// torch, a sign, a ladder, a button: support_plan.hangs) and no cell it may hang on will hold the plan's block by
+// torch, a sign, a ladder, a button, an anvil: support_plan.hangs) and no cell it may hang on will hold the plan's block by
 // the time this trip places it. Such a block is left out of the trip whole: not ordered, not tried, not counted
 // as a failure. It is read again on every sweep and at the start of every trip, so it goes in on the first trip
 // after the cube that owns its support has placed it.
@@ -197,20 +211,22 @@ async function workable(bot, frame, anchor) {
 async function waitsOnSupport(bot, frame, anchor, t) {
     if (!t.v) return false;
     const { hangs, supportCells } = require('@kernel/support_plan');
-    const block = frame.blockOf(t.v[3], t.v[1]);
-    const state = frame.stateOf(t.v[4]);
+    const block = frame.voxelBlock(t.v);
+    const state = frame.voxelState(t.v);
     if (!hangs(block, state)) return false;
     const cells = supportCells(t.b, block, state);
     if (!cells) return false;
     const mc = require('minecraft-data')(bot.version);
     const full = (name) => { const b = mc.blocksByName[name]; return !!b && b.boundingBox === 'block'; };
+    // A falling block (an anvil) stands on whatever plan block is under it, a slab as much as a full block.
+    const falls = require('@utils/gravity_utils').fallsWithoutBelow(block);
     const { cube, shaft } = await owners();
     for (const c of cells) {
         const key = c.join(',');
         if (shaft.has(key)) continue;
         const o = cube.get(key);
         if (!o) return false;   // outside the box: ground, or trash that stays where the ground is gone
-        if (!o.t.v || !full(frame.blockOf(o.t.v[3], o.t.v[1]))) continue;
+        if (!o.t.v || (!falls && !full(frame.voxelBlock(o.t.v)))) continue;
         if (o.index === anchor.index || cellState(bot, frame, o.t) !== 'wrong') return false;
     }
     return true;
@@ -264,9 +280,9 @@ async function waitsOf(bot, frame, anchor, statusOf) {
     let cells = 0;
     for (const t of targetsOf(anchor)) {
         if (!t.v || cellState(bot, frame, t) === 'ok') continue;
-        if (!itemsFor(frame.blockOf(t.v[3], t.v[1]), frame.stateOf(t.v[4]), mc).length) continue;
+        if (!itemsFor(frame.voxelBlock(t.v), frame.voxelState(t.v), mc).length) continue;
         cells++;
-        named.push(`${t.b.join(',')}:${frame.blockOf(t.v[3], t.v[1])}`);
+        named.push(`${t.b.join(',')}:${frame.voxelBlock(t.v)}`);
         const reasons = new Set();
         let planNeighbours = 0, own = false;
         for (const [dx, dy, dz] of SIX) {
@@ -469,7 +485,7 @@ async function noteFinished(bot, frame, finished) {
 // building's orders is chosen by are read from this one figure.
 const BILL_EVERY_MS = 30000;
 const BALANCE_EVERY_MS = 5000;
-let _bill = null, _billAt = 0;
+let _bill = null, _billAt = 0, _through = {};
 let _balance = null, _balanceAt = 0, _balanceSaid = null;
 function castleBalance() { return _balance; }
 async function readBalance(bot, frame, finished) {
@@ -485,7 +501,8 @@ async function readBalance(bot, frame, finished) {
             if (!t.v || unseen) return;
             const state = cellState(bot, frame, t);
             if (state === 'unseen') { unseen = true; return; }
-            if (state === 'ok') return;
+            // A cell standing as its planks (architect_config.STAND_INS) still owes the real block, so the bill keeps it.
+            if (state === 'ok' && !(STAND_INS[t.v[3]] && worldName(bot, frame, t) === `${frame.wood}_planks`)) return;
             for (const [item, n] of itemsFor(frame.blockOf(t.v[3], t.v[1]), frame.stateOf(t.v[4]), mc)) {
                 if (!item.includes(' ')) bill[item] = (bill[item] || 0) + n;
             }
@@ -498,7 +515,7 @@ async function readBalance(bot, frame, finished) {
             await pace();
             for (const t of shaftTargets(column)) add(t);
         }
-        if (!unseen) _bill = bill;
+        if (!unseen) { _bill = bill; _through = billThrough(bill); }
     }
     if (_balance && now - _balanceAt < BALANCE_EVERY_MS) return _balance;
     _balanceAt = now;
@@ -558,8 +575,8 @@ function materialsOf(bot, frame, cells) {
     const mc = require('minecraft-data')(bot.version);
     const need = {};
     for (const { v } of cells) {
-        const block = frame.blockOf(v[3], v[1]);
-        for (const [item, n] of itemsFor(block, frame.stateOf(v[4]), mc)) {
+        const block = frame.voxelBlock(v);
+        for (const [item, n] of itemsFor(block, frame.voxelState(v), mc)) {
             if (item.includes(' ')) continue;     // a block with no item — the plan's own report names it
             need[item] = (need[item] || 0) + n;
         }
@@ -615,23 +632,45 @@ async function tripCells(bot, frame, column, anchor, withDescent, withWaiters = 
     return cells;
 }
 
-// trashOf — the trash blocks ONE trip to this cube is sent with (utils/trash), sized so the trip cannot run
-// short whatever the cube asks of it: the climb to its stand, one helper, one block for every cell of the
-// cube that does not already hold a block of the plan — the most a trash path can ever stand at once — and
-// the walking reserve the pocket's planks row names, for the pillars and bridges of the walk there. It all
-// comes back out, so it is carried by a body and never consumed by the building.
+// trashOf — the trash blocks ONE trip to this cube is sent with (utils/trash), sized so the trip does not run short:
+//   the climb     fillerOf: the stand shaft from under the box to the cube, stood a block at a time and dug back out
+//                 on the way down, plus CLIMB_MARGIN for steps a pillar stands twice (a refused or slipped step);
+//   the cube      the plan's own figure for it (anchor.trash, cube_trash_need): the most trash its trip ever has
+//                 standing at once when it places the cube by its trash paths, plus CUBE_TRASH_MARGIN for the paths a
+//                 refused placement makes it walk again, and one helper;
+//   the walk      the walking reserve the pocket's planks row names, for the pillars and bridges of the walk there.
+// It all comes back out, so it is carried by a body and never consumed by the building. A trip that still runs short
+// says so loudly and leaves the cube for a better-stocked trip (build_column_executor).
 const TRASH_FOR_A_HELPER = 1;
+const CLIMB_MARGIN = CUBE;
+const CUBE_TRASH_MARGIN = 10;
 const TRASH_FOR_THE_WALK = require('@thinking/architect_config').STOCK_THRESHOLDS
     .find(r => r.item === 'planks' && r.holder === 'bot').deficit_below;
 function trashOf(bot, frame, anchor) {
-    const empty = targetsOf(anchor).filter(t => !(t.v && cellState(bot, frame, t) === 'ok')).length;
-    return fillerOf(anchor) + TRASH_FOR_A_HELPER + empty + TRASH_FOR_THE_WALK;
+    return fillerOf(anchor) + CLIMB_MARGIN + anchor.trash + CUBE_TRASH_MARGIN + TRASH_FOR_A_HELPER + TRASH_FOR_THE_WALK;
 }
 
 // stillOrdered — how much of one item the building's last whole reading still asks for, or null before any
 // reading: an unread building is not a building that needs nothing (Law 25).
 function stillOrdered(item) {
     return _buildNeed ? (_buildNeed[item] || 0) : null;
+}
+
+// reservedFor — how much of one item the building's order holds back from the waste pit, or null before a whole reading
+// (Law 25). A root of the bill is held as what is still owed in it past what is already smelted or crafted from it; any
+// other item as what the bill passes through it or its group; never less than what the cubes still ask of it directly.
+function reservedFor(item) {
+    if (!_buildNeed || !_balance) return null;
+    const row = _balance[familyRoot(item)];
+    let through = 0;
+    if (row) through = Math.max(0, row.need - (row.have - row.raw));
+    else {
+        through = _through[item] || 0;
+        for (const [group, members] of Object.entries(require('@utils/fragment_utils').group_to_item)) {
+            if (members.includes(item)) through += _through[group] || 0;
+        }
+    }
+    return Math.max(_buildNeed[item] || 0, through);
 }
 
 // buildNeed — the material of every cube of the plan that does not stand yet, each open stand column's own
@@ -761,7 +800,8 @@ function smeltPlanOf(offered, held, pool, wood, homeStands = true) {
         through = { ...stocked };
         for (const [item, n] of Object.entries(byLayer.get(l))) through[item] = (through[item] || 0) + n;
         layer = l;
-        if (Object.keys(remainingRawInSpecies(through, pool, wood)).length) break;
+        // A LAYER WAITS ONLY ON WHAT A FURNACE MAKES: wool short on a lower layer kept 32 glass uncooked beside banked sand for a whole run.
+        if (Object.keys(remainingRawInSpecies(through, pool, wood)).some(item => furnaceInput(item))) break;
         stocked = through;
         stockedLayer = l;
     }
@@ -795,6 +835,34 @@ function noteHomeFirst(home, waiting) {
     if (waiting === _homeFirstSaid) return;
     _homeFirstSaid = waiting;
     watcher.summary(TAG, `HOME_FIRST home=${home} cubes_wait=${waiting}`);
+}
+
+// The job every peer holds. This body's own chair is left out: a cube it held and could not stage is priced like any other.
+function jobsPeersHold() {
+    const selfId = process.env.BOT_ID || 'default';
+    return new Set(Object.entries(hq.getFullBoardroom({}))
+        .filter(([botId]) => botId !== selfId).map(([, chair]) => chair?.magnet?.job_id).filter(Boolean));
+}
+
+// One shaft takes one body, on a cube's trip or a cell's alike (build_column_executor's column claim).
+function columnHeld(peers, structure, column) {
+    return peers.has(`site_column_${structure}_${column}`) || peers.has(`site_cell_${structure}_${column}`);
+}
+
+// cellJobs — THE BASEMENT IS A SUPPORT STRUCTURE (job_ranking.measureSiteRank): a trip for every column whose cell the
+// keeper reads open, dug or damaged alike. It is posted once the site's trees are down, ahead of the build's own
+// gates: it waits on no home, no paid layer and no material, since it spends none and pays stone. Unpriced.
+// A column a peer holds is that peer's: its trip stands filler in the cell and closes the shaft, and digs the cell itself.
+function cellJobs(structure, frame) {
+    const verdicts = require('@kernel/keeper_verdicts');
+    const kept = verdicts.required() ? verdicts.get('mansion') : null;
+    if (!kept || !kept.plan) return [];
+    const peers = jobsPeersHold();
+    return planRegistry.columns().filter(c => kept.cells[c.column] === 'open' && !columnHeld(peers, structure, c.column)).slice(0, PRICED_PER_SWEEP).map(c => ({
+        id: `site_cell_${structure}_${c.column}`, type: 'column', what: 'build_column',
+        where: entryFoot(frame, c), structure, column: c.column, anchor_index: c.anchors[0], cell_only: true, support_structure: true,
+        build_order: c.column, job_type: JOB_TYPE.site_column, scope: 'shared', claimed_by: null,
+    }));
 }
 
 async function assess({ built = {} } = {}) {
@@ -838,13 +906,10 @@ async function assess({ built = {} } = {}) {
 
     // PHASE 2 — the anchors, bottom-up, and the material order that makes the next one workable.
     //
-    // NO CUBE BEFORE THE WOOD IS DECIDED. The building's one species is the site's (siteWood in the plan
-    // registry says why), and until the fleet has counted the trees around the base there is no answer
-    // for what a finished oak-or-birch stair looks like here. Building a first cube in the plan's wood
-    // and the rest in the site's would mix two woods in one structure, which the material rule exists
-    // to prevent.
+    // NO CUBE WITHOUT A WOOD. The building's one species is the plan's own (siteWood in the plan registry);
+    // a frame with none has no answer for what a finished stair looks like.
     if (!frame.wood) {
-        watcher.summary(TAG, `↳ "${structure}" anchors wait on the fleet's wood preference — the building is made of the wood that grows here`);
+        watcher.summary(TAG, `↳ "${structure}" anchors wait: the plan names no wood`);
         return { jobs, built: { [structure]: false } };
     }
 
@@ -857,9 +922,11 @@ async function assess({ built = {} } = {}) {
         if (next) waiting.push(...next.passed);
         if (next && !next.waiting) offered.push({ column, ...next, order: next.anchor.layer * 1000 + column.column });
     }
+    jobs.push(...cellJobs(structure, frame));
     const waitingCubes = waiting.length;
     // BUILT MEANS EVERY CUBE AND EVERY STAND COLUMN STANDS AS THE PLAN ASKS.
     noteWaiting(waitingCubes);
+    require('@kernel/downloaded_plan_registry').noteStanding(!offered.length && waitingCubes === 0);
     await noteFinished(bot, frame, finished);
     await readBalance(bot, frame, finished);
     if (!offered.length) {
@@ -888,50 +955,50 @@ async function assess({ built = {} } = {}) {
     let postedCubes = 0;
     let paidNeed = {};
     let paidTrash = 0;
-    // This body's own chair is left out: a cube it held and could not stage is priced like any other.
-    const selfId = process.env.BOT_ID || 'default';
-    const heldByPeer = new Set(Object.entries(hq.getFullBoardroom({}))
-        .filter(([botId]) => botId !== selfId).map(([, chair]) => chair?.magnet?.job_id).filter(Boolean));
-    // A LAYER IS BUILT WHEN THE POOL HOLDS THE WHOLE OF IT, AND THE NEXT OPENS WHEN EVERY CUBE OF IT IS CLAIMED.
-    // The layers are taken lowest first. A layer's cubes are posted together, lowest column first, once the pool
-    // covers every cube of it no peer holds; a layer the pool does not cover posts nothing and no layer above it
-    // is priced. `unclaimed` counts the cubes posted on a layer that no peer holds, and the layer above is priced
-    // only while that count is zero. A body with no cube to take gathers for the whole building.
+    const heldByPeer = jobsPeersHold();
+    // A CUBE IS POSTED WHEN THE POOL HOLDS ITS OWN MATERIAL, AND THE NEXT LAYER OPENS WHEN EVERY POSTED CUBE OF THIS ONE
+    // IS CLAIMED.
+    // The layers are taken lowest first. A layer's cubes are priced in build order, lowest column first, each on top
+    // of the cubes already paid this sweep: one the pool covers is posted, one it does not is held on its own short,
+    // so a cube waiting on wool does not hold back the stone cubes beside it. No layer above is priced while a cube
+    // of this one is posted unclaimed (`unclaimed` counts the cubes posted on a layer that no peer holds). A cube held
+    // for its material does not close the layer above: its column stays where it is, and every other column goes up
+    // (`offered` is each column's next cube, so a column is never priced above its own unfinished cube).
+    // A body with no cube to take gathers for the whole building.
     const bodies = Object.keys(hq.getFullBoardroom({})).length;
-    const held = o => heldByPeer.has(`site_column_${structure}_${o.column.column}`);
+    const held = o => columnHeld(heldByPeer, structure, o.column.column);
     let unclaimed = 0;
-    let layerShort = false;
     for (const layer of [...new Set(offered.map(o => o.anchor.layer))]) {
         const cubes = offered.filter(o => o.anchor.layer === layer);
-        if (unclaimed > 0 || layerShort) { for (const o of cubes) o.layerClosed = true; continue; }
+        if (unclaimed > 0) { for (const o of cubes) o.layerClosed = true; continue; }
         // SPECIES-TRUE: only the site's own logs and planks count toward this building (see
         // remainingRawInSpecies), so the order names `<wood>_log` and the gate and the prep agree on it.
         // ONE POOL PAYS FOR THE LAYER TOGETHER, on top of every layer paid before it this sweep. A cube a peer
         // holds took its material out of the pool with that body, so it is not counted again. The layer's trash
         // is what the bodies building it at once carry: each trip takes its trash back out.
-        const together = { ...paidNeed };
-        let layerTrash = 0, open = 0;
+        let together = { ...paidNeed };
+        let layerTrash = 0, paid = 0;
         for (const o of cubes) {
             const need = await cubeMaterials(bot, frame, o.column, o.anchor, await endsColumn(bot, frame, o.column, o));
             const cubeTrash = trashOf(bot, frame, o.anchor);
             maxTrash = Math.max(maxTrash, cubeTrash);
-            if (held(o)) continue;
-            for (const [item, n] of Object.entries(need)) together[item] = (together[item] || 0) + n;
-            layerTrash = Math.max(layerTrash, cubeTrash);
-            open++;
-        }
-        const tripsTrash = layerTrash * Math.min(open, bodies);
-        const short = Object.keys(trash.shortWith(together, paidTrash + tripsTrash, pool, frame.wood));
-        layerShort = short.length > 0;
-        for (const o of cubes) {
             // A CUBE A PEER HOLDS IS THAT PEER'S: it counts as posted for the layer and the waits, it was not priced
             // against this body's pool, and it is no job on this body's board.
             if (held(o)) { o.posted = true; postedCubes++; continue; }
-            if (layerShort) {
+            // Priced on top of the cubes paid before it: its trips' trash is what the bodies building the paid
+            // cubes and this one at once carry.
+            const withCube = { ...together };
+            for (const [item, n] of Object.entries(need)) withCube[item] = (withCube[item] || 0) + n;
+            const cubeLayerTrash = Math.max(layerTrash, cubeTrash);
+            const short = Object.keys(trash.shortWith(withCube, paidTrash + cubeLayerTrash * Math.min(paid + 1, bodies), pool, frame.wood));
+            if (short.length) {
                 if (short.some(raw => IRON_RAW.test(raw))) ironHeld.push(o.anchor.index);
                 o.short = short;
                 continue;
             }
+            together = withCube;
+            layerTrash = cubeLayerTrash;
+            paid++;
             if (postedCubes >= PRICED_PER_SWEEP) continue;
             o.posted = true;
             postedCubes++;
@@ -944,7 +1011,8 @@ async function assess({ built = {} } = {}) {
                 job_type: JOB_TYPE.site_column, scope: 'shared', claimed_by: null,
             });
         }
-        if (!layerShort) { paidNeed = together; paidTrash += tripsTrash; }
+        paidNeed = together;
+        paidTrash += layerTrash * Math.min(paid, bodies);
     }
     _smeltPlan = smeltPlanOf(offered, held, pool, frame.wood, !homeWaits);
     for (const o of offered) if (o.posted && o.anchor.layer > (_releasedLayer ?? -Infinity)) _releasedLayer = o.anchor.layer;
@@ -992,6 +1060,13 @@ async function assess({ built = {} } = {}) {
             if (gap <= 0) continue;
             // A gather the whole loaded world just came back empty for is not offered again until its note expires.
             if (absentNearby(raw)) continue;
+            // A crop the crew's fields grow (sugar cane) is never gathered for the building: the fields are sized to its
+            // need (calculators/cane_critical_mass) and grow it, and the one wild trip is the first field's
+            // (assessors/farming WILD CANE).
+            if (Object.values(require('@perception/farmland_site').CROPS).some(c => c.block === raw)) continue;
+            // ONE LEAF PAIR, ONE CUTTER: leaves are cut only with the fleet's leaf pairs, each borrowed by one body at a
+            // time (harvest_executor's leaf seats), so a leaf order is LEAF_PAIRS seats — each claimant pledges its share.
+            const oneSeat = raw.endsWith('_leaves') ? { pledge_unit: Math.ceil(gap / require('@thinking/architect_config').LEAF_PAIRS) } : {};
             // Into the base chest when one stands, into the pocket before it does — the same two
             // routes `assessors/building` takes, and the same reason: a build cannot gate on a chest
             // it has not built yet. `deliverScope` decides the scope dynamically, so a craftable
@@ -1006,7 +1081,7 @@ async function assess({ built = {} } = {}) {
                     // One asker: the site being built. Delivered to a chest, so no pocket term.
                     parts: [{ who: `blueprint:${structure}`, amount: gap }],
                     category: 'resource', action: 'deliver', scope: deliverScope(raw),
-                    level: levelOf(raw, gap, pool), ...levelShelf(raw, gap, pool),
+                    level: levelOf(raw, gap, pool), ...levelShelf(raw, gap, pool), ...oneSeat,
                 })
                 : supplyJob({
                     id: `site_supply_${raw}`, what: raw, need: gap, net_of_pool: true, where: null, structure,
@@ -1021,28 +1096,13 @@ async function assess({ built = {} } = {}) {
                         { who: `blueprint:${structure}`, amount: gap },
                     ],
                     category: 'resource', scope: 'local',
-                    level: levelOf(raw, gap, pool), ...levelShelf(raw, gap, pool),
+                    level: levelOf(raw, gap, pool), ...levelShelf(raw, gap, pool), ...oneSeat,
                 }));
             posted.push(`${raw}:${gap}`);
         }
-        // LEAVES ARE ONLY EVER CUT, AND ONLY SHEARS CUT THEM WHOLE. A bare hand or any other tool breaks a
-        // leaf block into a sapling or nothing, so a leaf order in a shearless pocket is a gather that
-        // comes back empty every time. job_gates.toolGate holds the leaf order from a bot without shears;
-        // this is the other half — the pair of shears that releases it, made from two of the iron the
-        // castle already draws on. ONE PAIR FOR THE WHOLE FLEET: posted only while a leaf order stands and no
-        // body or chest holds a pair, as one shared seat, so one body makes it and that body cuts the leaves.
-        const leafOrdered = Object.keys(surfaceNeeded).some(raw => raw.endsWith('_leaves') && surfaceNeeded[raw] > 0);
-        if (leafOrdered && inventoryLens.reachableByFleet('shears') === 0) {
-            jobs.push(supplyJob({
-                id: 'site_supply_shears', what: 'shears', need: 1, where: null, structure,
-                job_type: JOB_TYPE.site_supply, claimed_by: null,
-                hold_goal: 1, at_destination: 0,
-                // One asker, one pair: the site's leaf order is what makes shears necessary.
-                parts: [{ who: `blueprint:${structure}_leaf_tool`, amount: 1 }],
-                category: 'crafting', scope: 'shared',
-            }));
-            posted.push('shears:1');
-        }
+        // LEAVES ARE ONLY EVER CUT, AND ONLY SHEARS CUT THEM WHOLE: job_gates.toolGate holds the leaf order from a bot
+        // without shears, and the pairs that release it are the kit's (STOCK_THRESHOLDS shears row), made from the
+        // iron right after the bucket.
         if (posted.length) watcher.summary(TAG, `↳ "${structure}" window of ${offered.length} column(s), layers ${offered[0].anchor.layer}..${offered[offered.length - 1].anchor.layer}, ${postedCubes} cube(s) paid — order: ${posted.join(', ')}`);
     }
 
@@ -1060,4 +1120,4 @@ async function assess({ built = {} } = {}) {
 // cubeMaterials, targetsOf, shaftTargets and endsColumn are exported for column_preparation and the executor,
 // which must ask the SAME questions this gate asked before it posted the cube (Law 16) — two copies of "what
 // does this cube own" or "what does this trip need" could disagree.
-module.exports = { name: 'downloaded_build', assess, smeltPlan, buildName, sitedRow, castleBalance, finishedCount, releasedLayer, familyLevel,cubeMaterials, tripCells, materialsOf, trashOf, stillOrdered, targetsOf, shaftTargets, endsColumn, entryFoot, entryMouth, waitsOnSupport, sealable, forgetFinished };
+module.exports = { name: 'downloaded_build', assess, smeltPlan, buildName, sitedRow, castleBalance, finishedCount, releasedLayer, familyLevel,cubeMaterials, tripCells, materialsOf, trashOf, stillOrdered, reservedFor, targetsOf, shaftTargets, endsColumn, entryFoot, entryMouth, waitsOnSupport, sealable, forgetFinished };

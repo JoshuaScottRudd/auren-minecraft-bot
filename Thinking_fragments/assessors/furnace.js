@@ -7,7 +7,8 @@ const hq = require('@kernel/corporate_headquarters');
 const stationRegistry = require('@perception/station_registry');
 const watcher = require('@kernel/watcher');
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
-const { isSmeltComplete } = require('@utils/calculators/smelt_calculator');
+const { smeltCookedBy } = require('@utils/calculators/smelt_calculator');
+const { charcoalFor } = require('@utils/calculators/fuel_calculator');
 const {
     underground_items: UNDERGROUND_ITEMS,
     group_to_item: GROUP_TO_ITEM,
@@ -45,13 +46,11 @@ function _inFlightSmelt(item, allStations) {
     return n;
 }
 
-// A furnace batch is all-or-nothing: a partial smelt still pays the full station cycle (walk, load,
-// wait, collect, bank), so a short input converts to a pull (underground) or a dynamic request
-// (surface), never a fractional smelt — every shortfall leaves this function as an order, a pull,
-// or a request (Law 25).
+// A short input is cooked as far as it goes, and the rest converts to a pull (underground) or a dynamic
+// request (surface) — every shortfall leaves this function as an order, a pull, or a request (Law 25).
 // ── A LIVE ORDER IS A SMELT REQUEST, EXACTLY AS A STOCK ROW IS ──
 // Shapes each fleet-wanted token into a row like a stock row (item, deficit_below, holder) so in-flight
-// credit, whole-batch-or-none, and pull-vs-request apply identically below (Law 16); `have` nets fleet
+// credit, the batch on hand, and pull-vs-request apply identically below (Law 16); `have` nets fleet
 // stock of the item and its substitutes against the raw (gross) want.
 function _demandRows(wanted, owedInFull = {}) {
     const rows = [];
@@ -118,18 +117,20 @@ function _byLayer(wanted, owed, plan) {
 }
 
 // ── WHAT A SMELT LEAVES IN THE CHESTS ───────────────────────────────────────────────────────────────
-// keep(input) → the units of one furnace input no smelt may take: what the building's stocked layers are counted
+// keep(inputs) → the units of a furnace input no smelt may take: what the building's stocked layers are counted
 // on (smeltPlan.reserve), the stack kept for tools and furnaces (smeltPlan.floor), and what a stone tool would
-// cost every body that has none (supply.stoneToolBill), a
-// group token counted for each of its members.
+// cost every body that has none (supply.stoneToolBill). `inputs` is one name or the input's every member; a tool
+// token speaking for any of them is kept once, never once per member (charcoal takes 27 woods, so a group token
+// counted per member holds back many times its own figure).
 function _keeper(plan) {
     const tools = _fleetSummed('materials_wanted_tools');
     const reserve = plan ? plan.reserve : {};
     const floor = (plan && plan.floor) || {};
-    return (input) => {
-        let n = (reserve[input] || 0) + (floor[input] || 0);
+    return (inputs) => {
+        const names = Array.isArray(inputs) ? inputs : [inputs];
+        let n = names.reduce((k, name) => k + (reserve[name] || 0) + (floor[name] || 0), 0);
         for (const [token, count] of Object.entries(tools)) {
-            if (token === input || (GROUP_TO_ITEM[token] || []).includes(input)) n += count;
+            if (names.some(name => token === name || (GROUP_TO_ITEM[token] || []).includes(name))) n += count;
         }
         return n;
     };
@@ -153,25 +154,35 @@ function _smeltableInput(output, keep) {
     const inputs = require('@kernel/crafting_blueprint_registry').smeltInputsFor(output);
     const ledger = require('@perception/chest_ledger');
     const names = Array.isArray(inputs) ? inputs : [inputs];
-    const claimed = names.reduce((n, name) => n + ledger.claimedByOthers(name) + keep(name), 0);
+    const claimed = ledger.claimedByOthers(names) + keep(names);
     return Math.max(0, inventoryLens.reachableByFleet(inputs) - claimed);
 }
 
-// ── STONE IS SMELTED IN WHOLE STACKS ────────────────────────────────────────────────────────────────
-// batchOf(item, order, input, stack) → how much of an order the furnaces take now. A stone order of a stack or
-// more is loaded a whole stack to a furnace and waits for a stack of input; the part under a stack is a smaller
-// order once the stacks are cooking (their batches are credited as had), and an order under a stack is smelted
-// whole. Every other smelt takes what input there is: an ingot order is a layer's few, and waiting on a stack of
-// ore would hold the layer.
-const WHOLE_STACKS = new Set(['stone', 'smooth_stone']);
-function batchOf(item, order, input, stack) {
-    const n = Math.min(order, input);
-    return WHOLE_STACKS.has(item) && order >= stack ? Math.floor(n / stack) * stack : n;
+// ── A FURNACE NEVER WAITS FOR A FULL STACK ──────────────────────────────────────────────────────────
+// batchOf(order, input) → how much of an order the furnaces take now: all of it the input on hand covers. A small
+// batch costs a station cycle for few items, but a cold furnace beside input it could cook makes nothing at all,
+// and everything downstream (charcoal, torches, the mine) waits on it; the rest is cooked as its input arrives.
+function batchOf(order, input) {
+    return Math.min(order, input);
+}
+
+// ── THE CHARCOAL ROW CARRIES THE BUILDING'S FUEL ────────────────────────────────────────────────────
+// _buildingSmelts(wanted, owed) → the items the fleet's orders still need out of a furnace, every one: the whole
+// building (stone, smooth stone, iron for bars and trapdoors, glass), not the layer the furnaces work on now, each
+// step of a chain counted (smooth stone wants its stone smelted first). Fuel orders are left out: charcoalFor
+// already pays for the charcoal's own cooking. Each item counted once, at the larger of its two orders.
+function _buildingSmelts(wanted, owed) {
+    const left = {};
+    for (const row of _demandRows(wanted, owed)) {
+        if (FUEL_PREFERENCES.includes(row.item)) continue;
+        left[row.item] = Math.max(left[row.item] || 0, row.deficit_below - row._have);
+    }
+    return Object.values(left).reduce((n, k) => n + Math.max(0, k), 0);
 }
 
 const BASE_STOCKED_INGOTS = ['iron_ingot', 'copper_ingot', 'gold_ingot'];
 const INGOT_BASE_STACKS = 2;
-function _smeltDemand(inventory, allStations, buildClaim, wanted, owed, keep) {
+function _smeltDemand(inventory, allStations, buildClaim, wanted, owed, keep, homeStands, buildingFuel = 0) {
     const stackSizes = require('minecraft-data')(require('@thinking/architect_config').SERVER_MINECRAFT_VERSION).itemsByName;
     const stackOf = item => stackSizes[item]?.stackSize || 64;
     const pulls = {};
@@ -185,24 +196,28 @@ function _smeltDemand(inventory, allStations, buildClaim, wanted, owed, keep) {
         if (stock.deficit_below == null || ordered.has(stock.item)) continue;
         const input = furnaceInput(stock.item);
         if (!input) continue;                                   // not furnace-produced
+        if (input === 'cobblestone' && !homeStands) continue;   // no stone is smelted before the crew's home stands: every block is the home's
         // storage rows measure fleet-wide chest stock (nets layers beneath, forChestRequest); bot rows
         // measure the pocket, the bottom layer. A demand row skips both — it already carries its own
         // fleet-wide figure (Law 7). Either way, in-flight batches (_inFlightSmelt) credit on top.
+        // A storage row counts its substitutes in the chests as its own (coal on the charcoal row).
         const isStorage = stock.holder === 'storage';
         const have = (stock._fromDemand
             ? stock._have
             : isStorage
-                ? inventoryLens.forChestRequest(stock.item, buildClaim)
+                ? [stock.item, ...(SUBSTITUTES_FOR[stock.item] || [])].reduce((n, i) => n + inventoryLens.forChestRequest(i, buildClaim), 0)
                 : countInInventory(stock.item, inventory))
             + _inFlightSmelt(stock.item, allStations);
-        if (have >= stock.deficit_below) continue;
-        const deficit = stock.deficit_below - have;
+        // The chests' charcoal row stands on top of the building's fuel (_buildingSmelts): its level is the standing
+        // shelf plus the charcoal every smelt still owed burns. Coal the mine turns up counts toward it as charcoal.
+        const level = stock.item === 'charcoal' && !stock._fromDemand ? stock.deficit_below + buildingFuel : stock.deficit_below;
+        if (have >= level) continue;
+        const deficit = level - have;
         const inputAvail = _smeltableInput(stock.item, keep);
-        const qty = batchOf(stock.item, deficit, inputAvail, stackOf(stock.item));
-        // ── A SHORT INPUT SPLITS ACROSS FEWER FURNACES, NEVER STALLS THE ORDER ──
-        // A partial input fills fewer furnaces fully, never one partially (the pledge rule, Law 25);
-        // the shortfall still posts as a pull or request. furnace_executor re-bounds qty against what's
-        // actually on hand, so a short batch is already a legal outcome there.
+        const qty = batchOf(deficit, inputAvail);
+        // ── A SHORT INPUT COOKS WHAT IT HAS, NEVER STALLS THE ORDER ──
+        // What is on hand is loaded now and the shortfall posts as a pull or request. furnace_executor
+        // re-bounds qty against what's actually on hand, so a short batch is already a legal outcome there.
         if (inputAvail < deficit) {
             if (require('@utils/fragment_utils').isUnderground(input)) {
                 // The mine is asked for the shortfall only, and what is already up cooks now.
@@ -223,10 +238,22 @@ function _smeltDemand(inventory, allStations, buildClaim, wanted, owed, keep) {
             }
             continue;
         }
-        // The whole deficit, in whole stacks where it is a stack or more (batchOf). The executor still
+        // The whole deficit. The executor still
         // re-bounds this against what it ends up holding, so this stays an upper bound, not a guarantee.
-        whole.push({ item: stock.item, input, qty });
-        ordered.add(stock.item);
+        if (qty > 0) { whole.push({ item: stock.item, input, qty }); ordered.add(stock.item); }
+    }
+    // ── A COLD FURNACE COOKS CHARCOAL WITH NOBODY ASKING ──
+    // With logs to spare and the chests under the row's fill_to, charcoal is made ahead of any order, however few.
+    // A large load holds nothing back from the torches: a furnace is emptied mid-cook for a body waiting on fuel.
+    // It asks for no logs and comes after every asked order.
+    const charcoalRow = require('@thinking/requested_work').activeStockRows().find(r => r.item === 'charcoal');
+    if (charcoalRow && !ordered.has('charcoal')) {
+        const spare = _smeltableInput('charcoal', keep);
+        const have = ['charcoal', ...(SUBSTITUTES_FOR.charcoal || [])].reduce((n, i) => n + inventoryLens.forChestRequest(i, buildClaim), 0) + _inFlightSmelt('charcoal', allStations);
+        const room = charcoalRow.fill_to - have;
+        if (room > 0 && spare > 0) {
+            whole.push({ item: 'charcoal', input: furnaceInput('charcoal'), qty: batchOf(room, spare), standing: true });
+        }
     }
     // ── EVERY INGOT HAS A STANDING BASE OF INGOT_BASE_STACKS ──
     // With nothing asking, ore is smelted until the fleet holds that base of the ingot, cooking batches
@@ -237,49 +264,101 @@ function _smeltDemand(inventory, allStations, buildClaim, wanted, owed, keep) {
         const avail = input ? _smeltableInput(ingot, keep) : 0;
         if (!(avail > 0)) continue;
         const base = INGOT_BASE_STACKS * stackOf(ingot);
-        const toBase = batchOf(ingot, base - inventoryLens.reachableByFleet(ingot) - _inFlightSmelt(ingot, allStations), avail, stackOf(ingot));
+        const toBase = batchOf(base - inventoryLens.reachableByFleet(ingot) - _inFlightSmelt(ingot, allStations), avail);
         if (!(toBase > 0)) continue;
         const made = [...whole, ...partials].find(o => o.item === ingot);
         if (made) made.qty = Math.max(made.qty, toBase);
-        else whole.push({ item: ingot, input, qty: toBase });
+        else whole.push({ item: ingot, input, qty: toBase, standing: true });
     }
     return { orders: [...whole, ...partials], pulls, inputShort };
 }
 
-// _assignFurnaces(orders, free, stackOf) → [{ order, stations, share }]. Every order gets the furnaces its whole
-// stacks need, smallest order first, and each of those furnaces is loaded with a full stack: a furnace pays
-// the same walk, load and collect for five items as for sixty-four. An order under one stack takes one furnace
-// and its own figure. A furnace no order has a stack for stays cold.
+// _assignFurnaces(orders, free, stackOf) → [{ order, stations, share }]. Every order gets one furnace per stack
+// it holds, smallest order first, each loaded with up to a stack: a furnace pays the same walk, load and collect
+// for five items as for sixty-four, so an order is not split thinner than it must be. An order under one stack
+// takes one furnace and its own figure, however few.
 function _assignFurnaces(orders, free, stackOf) {
     // FUEL FIRST: an order for a fuel takes its furnaces before any other, since every other load burns it.
     // THEN SMALLEST ORDER FIRST: a few ingots are cooked and out, where a standing stone order would take
     // every furnace that frees, sweep after sweep.
     const fuelFirst = o => (FUEL_PREFERENCES.includes(o.item) ? 0 : 1);
-    const plan = [...orders].sort((a, b) => fuelFirst(a) - fuelFirst(b) || a.qty - b.qty).map(order => ({ order, stations: 0 }));
+    // EVERY ORDER GETS A FURNACE BEFORE ANY ORDER GETS A SECOND. A standing base (`standing`, nothing asked for it) comes
+    // after every asked order.
+    const plan = [...orders].sort((a, b) => (a.standing ? 1 : 0) - (b.standing ? 1 : 0) || fuelFirst(a) - fuelFirst(b) || a.qty - b.qty).map(order => ({ order, stations: 0, share: 0 }));
     let left = free;
+    for (const p of plan) if (left > 0) { p.stations = 1; left--; }
     for (const p of plan) {
-        const take = Math.min(left, Math.ceil(p.order.qty / stackOf(p.order.item)));
-        p.stations += take;
-        left -= take;
+        if (!p.stations) continue;
+        p.share = Math.min(stackOf(p.order.item), p.order.qty);
+        p.stations += Math.min(left, Math.ceil(p.order.qty / p.share) - 1);
+        left -= p.stations - 1;
     }
-    return plan.filter(p => p.stations > 0)
-        .map(p => ({ ...p, share: Math.min(stackOf(p.order.item), p.order.qty) }));
+    return plan.filter(p => p.stations > 0);
 }
 
-function assess({ inventory, buildClaim }) {
+// ── A COOKING FURNACE IS TOPPED UP BEFORE A COLD ONE IS LIT ─────────────────────────────────────────
+// _topUps(orders, furnaces, collecting, stackOf, fuel, jobs) → the orders' remainder. Input that arrives while its order cooks goes into
+// that furnace with its fuel, up to a stack counting all its uncollected output, so an order keeps one furnace. No batch waits
+// to qualify: with nothing of the order cooking, or no room, the remainder lights a cold furnace at once. A furnace up for
+// collecting has its one job already, and a load of another input cannot share its slot. A top-up is posted to a body that can
+// reach both what goes in: the slot's input, and the slot's kind of fuel, planks being reached through logs.
+function _topUps(orders, furnaces, collecting, stackOf, fuel, inventory, jobs) {
+    const ledger = require('@perception/chest_ledger');
+    const reach = name => countInInventory(name, inventory) + ledger.unclaimedOf([name]);
+    const left = [];
+    for (const order of orders) {
+        let qty = order.qty;
+        for (const [id, e] of furnaces) {
+            const st = e.smelt;
+            if (qty <= 0 || !st || !st.started_at || st.order !== order.item || collecting.has(id)) continue;
+            const slotFuel = st.fuel || fuel;
+            if (!(reach(st.input) > 0) || !(reach(slotFuel) + (/_planks$/.test(slotFuel) ? reach(slotFuel.replace(/_planks$/, '_log')) : 0) > 0)) continue;
+            const room = stackOf(order.item) - (st.qty || 1);
+            if (room <= 0) continue;
+            const add = Math.min(qty, room);
+            jobs.push({
+                id: `furnace_${id}`, type: 'furnace', what: order.item,
+                where: e.pos, station_id: id,
+                order: order.item, input: st.input, fuel: slotFuel,
+                batch_quantity: add,
+                job_type: JOB_TYPE.furnace_load,
+                claimed_by: null, action: 'topup', scope: 'shared',
+            });
+            watcher.summary(TAG, `↳ ${add}x ${order.item} tops up furnace ${id}`);
+            qty -= add;
+        }
+        if (qty > 0) left.push({ ...order, qty });
+    }
+    return left;
+}
+
+function assess({ inventory, buildClaim, built }) {
     const jobs = [];
     const pullNeeded = {};
     const allStations = stationRegistry.getStations();
     const furnaces = Object.entries(allStations).filter(([, e]) => e && e.type === 'furnace');
 
-    // COLLECT — any furnace whose recorded batch is cooked (calculator over the on-disk start).
+    // ── ONE CLAIM ON A FURNACE, ONE ACT AT A TIME ──
+    // Every furnace posts at most one job, under one id (`furnace_<id>`): the id is the lock, so a claimed furnace is invisible to
+    // every other body until its holder is done. Its state names the act: no batch, load; cooking, top up; fully cooked, empty.
+    // Collect takes all the output and banks what its holder has no use for; the executor restarts the clock on what is
+    // still cooking, and the next body may claim it when the clock says so.
+    // COLLECT posts when the whole batch is cooked, or for a body held back for torch fuel (lighting_manager.noteFuelWait) when
+    // this one furnace's clock and the chests cover all that body waits on. Under that, nobody walks.
+    const wantedFuel = require('@action/lighting_manager').fuelWaited();
+    const bankedFuel = wantedFuel ? require('@perception/chest_ledger').unclaimedOf(['coal', 'charcoal']) + ['coal', 'charcoal'].reduce((n, f) => n + countInInventory(f, inventory), 0) : 0;
+    const collecting = new Set();
     for (const [id, entry] of furnaces) {
         const st = entry.smelt;
         if (!st || !st.started_at || !st.order) continue;
-        if (isSmeltComplete(st.started_at, st.order, st.qty || 1)) {
+        const qty = st.qty || 1;
+        const cooked = smeltCookedBy(st.started_at, st.order, qty);
+        const coversWaiter = wantedFuel > 0 && FUEL_PREFERENCES.includes(st.order) && cooked > 0 && bankedFuel + cooked >= wantedFuel;
+        if (cooked >= qty || coversWaiter) {
+            collecting.add(id);
             jobs.push({
-                id: `furnace_collect_${id}`, type: 'furnace', what: st.order,
-                where: entry.pos, station_id: id, order: st.order, batch_quantity: st.qty || 1,
+                id: `furnace_${id}`, type: 'furnace', what: st.order,
+                where: entry.pos, station_id: id, order: st.order, batch_quantity: cooked,
                 job_type: JOB_TYPE.furnace_collect,
                 claimed_by: null, action: 'collect', scope: 'shared',
             });
@@ -287,7 +366,7 @@ function assess({ inventory, buildClaim }) {
     }
 
     // ── EVERY COLD FURNACE IS A SEAT ──
-    // One job per cold furnace, id'd by the furnace itself (`furnace_load_<id>`) with `scope: 'shared'`
+    // One job per cold furnace, id'd by the furnace itself (`furnace_<id>`) with `scope: 'shared'`
     // giving each exactly one owner — the lane/tree-seat model (Law 16: where the work is already named,
     // the name is the lock).
     const freeFurnaces = furnaces.filter(([, e]) => !e.smelt || !e.smelt.started_at);
@@ -301,8 +380,10 @@ function assess({ inventory, buildClaim }) {
     // logs-short bot can still be asked to fetch its own fuel. Reads last sweep's want (the board
     // publishes after the gates), checked against fleet stock measured fresh here (Invariant B).
     const smeltPlan = require('@thinking/assessors/downloaded_build').smeltPlan();
-    const { wanted, owed } = _byLayer(_fleetWanted(), _fleetWanted('materials_wanted_net'), smeltPlan);
-    const demand = _smeltDemand(inventory, allStations, buildClaim, wanted, owed, _keeper(smeltPlan));
+    const whole = { wanted: _fleetWanted(), owed: _fleetWanted('materials_wanted_net') };
+    const { wanted, owed } = _byLayer(whole.wanted, whole.owed, smeltPlan);
+    const demand = _smeltDemand(inventory, allStations, buildClaim, wanted, owed, _keeper(smeltPlan),
+        built[require('@kernel/bot_mandate').homeBlueprint()] === true, charcoalFor(_buildingSmelts(whole.wanted, whole.owed)));
     Object.assign(pullNeeded, demand.pulls);
 
     // ── THE DYNAMIC INPUT REQUEST — THE BUILDING'S LOGS, NOT THE BODY'S ──
@@ -334,7 +415,9 @@ function assess({ inventory, buildClaim }) {
         const structure = (demandSite && demandItems.has(short.for)) ? demandSite : undefined;
         if (poolChest) {
             jobs.push(supplyJob({
-                id: `smelt_supply_${item}`, what: item, need: gap, structure,
+                // The gap is already short of the input the fleet can spare (_smeltableInput), so the order says it
+                // is net of the pool: job_ranking stamps it a gather, never a build measured against that stock.
+                id: `smelt_supply_${item}`, what: item, need: gap, structure, net_of_pool: true,
                 where: poolChest.station.pos,
                 station_id: poolChest.id,
                 destination: 'storage',
@@ -352,7 +435,7 @@ function assess({ inventory, buildClaim }) {
         } else {
             const held = countInInventory(item, inventory);
             jobs.push(supplyJob({
-                id: `smelt_supply_${item}`, what: item, need: gap,
+                id: `smelt_supply_${item}`, what: item, need: gap, net_of_pool: true,
                 where: null,
                 job_type: JOB_TYPE.smelt_input_supply,
                 claimed_by: null,
@@ -370,24 +453,24 @@ function assess({ inventory, buildClaim }) {
     }
     if (postedInput.length) {
         watcher.summary(TAG, `↳ dynamic smelt-input request posted: ${postedInput.join(' | ')}`
-            + ' — a partial furnace batch costs a whole station cycle, so the batch waits for its input');
+            + ' — what input is on hand cooks now; this is the rest');
     }
     if (absent.length) {
         watcher.summary(TAG, `↳ smelt input not ordered: ${absent.join(', ')} — the loaded world held none on the last deep scan`);
     }
 
     if (fuelPref) {
-        if (demand.orders.length && freeFurnaces.length > 0) {
+        if (demand.orders.length && (freeFurnaces.length > 0 || furnaces.some(([id, e]) => e.smelt?.started_at && !collecting.has(id)))) {
             // Each order takes the furnaces _assignFurnaces gives it, one stack at most per load — an upper bound
             // the executor re-bounds against what the body actually carries. `_inFlightSmelt` shrinks next
             // sweep's orders as furnaces catch, so nothing tracks what was handed out.
             const itemsByName = require('minecraft-data')(require('@thinking/architect_config').SERVER_MINECRAFT_VERSION).itemsByName;
             const stackOf = item => itemsByName[item]?.stackSize || 64;
             let next = 0;
-            for (const { order, stations, share } of _assignFurnaces(demand.orders, freeFurnaces.length, stackOf)) {
+            for (const { order, stations, share } of _assignFurnaces(_topUps(demand.orders, furnaces, collecting, stackOf, fuelPref, inventory, jobs), freeFurnaces.length, stackOf)) {
                 for (const [freeId, freeEntry] of freeFurnaces.slice(next, next + stations)) {
                     jobs.push({
-                        id: `furnace_load_${freeId}`, type: 'furnace', what: order.item,
+                        id: `furnace_${freeId}`, type: 'furnace', what: order.item,
                         where: freeEntry.pos, station_id: freeId,
                         order: order.item, input: order.input, fuel: fuelPref,
                         batch_quantity: share,

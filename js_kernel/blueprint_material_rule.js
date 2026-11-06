@@ -7,9 +7,11 @@
 // A block is BUILT only when it belongs to one of the families below; a block outside every family is left
 // out and its cell stays air. There is no list of forbidden blocks — absence from these families is the
 // exclusion (Law 29).
-//   WOOD    — the one chosen species, every shape (planks, log, wood, stairs, slab, fence, gate, door,
-//             trapdoor, sign, button, plate). Another species' block becomes the chosen species' same shape.
-//   LEAVES  — the chosen species' leaves, gathered with shears. BUILT (*"I want to make
+//   WOOD    — two tones, every shape (planks, log, wood, stairs, slab, fence, gate, door, trapdoor, sign, button,
+//             plate). The species the download uses most is built as the PRIMARY wood; every other species is
+//             built as the ACCENT wood, in its same shape, so the download's contrast survives in the two woods
+//             the fleet's forest gives most (architect_config.BUILD_WOOD).
+//   LEAVES  — the primary wood's leaves, gathered with shears. BUILT (*"I want to make
 //             the whole thing"*). The castle asks 702 of them, and a leaf only comes off a standing tree, so
 //             at that scale they need A SYSTEM THAT HANDLES THE SHEER NUMBER OF TREES — a tree farm, not yet
 //             built, and owed as well for the castle's ~4,000 logs and the charcoal behind its smelting. It is
@@ -23,6 +25,10 @@
 //             priced in IRON_PER_BLOCK.
 //   DIRT    — dirt. Grass and the other soils are placed as dirt ("dirt=grass": grass spreads onto it),
 //             and gravel resolves to dirt or stone from its neighbours.
+//   AWAITING — a block a producer makes beyond the bases (producer_hooks: wool, wheat, concrete, flowers,
+//             books). A candle is not awaited: it is built as a standing torch (SUBSTITUTIONS). Kept in the plan as downloaded and reported under its own heading; the run sets it aside
+//             while its producer is not ready (downloaded_plan_registry). Only a block no family and no producer
+//             makes is left out: an extreme rarity.
 //
 // ── WHY THE STONE FAMILY COLLAPSES TO THREE LINEAGES ────────────────────────────────────────────────
 // The fleet's only rock producer is a prospect dig that yields COBBLESTONE. Everything else the fleet lays is
@@ -35,7 +41,7 @@
 // with something done to it that the fleet has no job to reproduce, so each collapses to its plain lineage.
 //
 // ── SUBSTITUTIONS NAMED AT THE TABLE ────────────────────────────────────────────────────────────────
-// Brick becomes stone brick shape for shape, a bookshelf becomes the chosen planks, moss becomes dirt, and
+// Brick becomes stone brick shape for shape, a candle becomes a standing torch, an enchanting table becomes the chosen planks, moss becomes dirt, and
 // gravel becomes whichever of stone or dirt most of its six converted neighbours are (a tie is stone) —
 // "stone or dirt" left the choice to the place the gravel sits, and its neighbours are that place.
 // A STRIPPED LOG IS BUILT AS A PLAIN LOG, and the reason is that stripping is not a recipe: it is an axe used
@@ -94,10 +100,11 @@ function stoneCut(name) {
 
 // Iron ingots per block, from the crafting recipes: lantern 8 nuggets; chain (iron_chain from 1.21.9) 1 ingot + 2 nuggets; 6 ingots → 16 bars;
 // anvil 3 blocks + 4 ingots; plate 2; 6 ingots → 16 rails; 1 ingot → 2 hooks; blast furnace 5; stonecutter 1;
-// hopper 5; cauldron 7; 6 ingots → 3 iron doors (the upper half costs nothing); 4 ingots → 1 iron trapdoor.
+// hopper 5; cauldron 7; 6 ingots → 3 iron doors (the upper half costs nothing); 4 ingots → 1 iron trapdoor;
+// smithing table 2.
 const IRON_PER_BLOCK = {
   lantern: 8 / 9, chain: 11 / 9, iron_chain: 11 / 9, iron_bars: 6 / 16, anvil: 31, heavy_weighted_pressure_plate: 2, rail: 6 / 16, tripwire_hook: 0.5,
-  blast_furnace: 5, stonecutter: 1, hopper: 5, cauldron: 7, iron_door: 2, iron_trapdoor: 4,
+  blast_furnace: 5, stonecutter: 1, hopper: 5, cauldron: 7, iron_door: 2, iron_trapdoor: 4, smithing_table: 2,
 };
 // Cobblestone per block, the stone side of the iron-to-stone ratio. A stone-lineage shape costs what its recipe
 // costs (6 → 4 stairs, 3 → 6 slabs, 2 → 1 plate); smelting and cutting cost no stone. The crafts are their recipes.
@@ -112,9 +119,29 @@ const CRAFTS = new Set(['chest', 'trapped_chest', 'barrel', 'crafting_table', 'f
   'torch', 'wall_torch', 'campfire', ...Object.keys(IRON_PER_BLOCK)]);
 const SOILS = new Set(['grass_block', 'coarse_dirt', 'podzol', 'rooted_dirt', 'dirt_path', 'mycelium', 'moss_block']);
 
+// speciesOf — the wood species a block name is made of, or null; stripped and leaf names included.
+function speciesOf(name) {
+  const bare = name.replace(/^stripped_/, '');
+  for (const sp of SPECIES) if (bare.startsWith(`${sp}_`)) return sp;
+  return null;
+}
+
+// woodTones(voxels) → { [source species]: built species }: the species most voxels are made of becomes the
+// primary, every other the accent. Leaves are not counted: they are the canopy, not the building's wood.
+function woodTones(voxels, primary, accent) {
+  const counts = {};
+  for (const v of voxels) {
+    const sp = /_leaves$/.test(v[3]) ? null : speciesOf(v[3]);
+    if (sp) counts[sp] = (counts[sp] || 0) + 1;
+  }
+  const most = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+  return Object.fromEntries(SPECIES.map(sp => [sp, most && sp === most[0] ? primary : accent]));
+}
+
 // judge — one block name → { family, to } for a block that is built, or null for a block the rule leaves out.
-// `to` is the block actually placed; 'gravel' is resolved later from its neighbours.
-function judge(name, wood, leaves) {
+// `to` is the block actually placed; 'gravel' is resolved later from its neighbours. `tones` maps each source
+// species to the wood it is built in; `wood` is the primary.
+function judge(name, wood, leaves, tones) {
   for (const sp of SPECIES) {
     for (const stripped of [false, true]) {
       const head = stripped ? `stripped_${sp}` : sp;
@@ -125,7 +152,7 @@ function judge(name, wood, leaves) {
       if (stripped && !['_log', '_wood', '_stem', '_hyphae'].includes(shape)) continue;
       const own = shape === '_stem' ? '_log' : shape === '_hyphae' ? '_wood' : shape;
       // The stripped prefix is dropped: stripping is an axe verb, not a recipe (see the header).
-      return { family: 'wood', to: `${wood}${own}` };
+      return { family: 'wood', to: `${tones[sp]}${own}` };
     }
   }
   if (name === 'azalea_leaves' || name === 'flowering_azalea_leaves') return leaves ? { family: 'leaves', to: `${wood}_leaves` } : null;
@@ -139,28 +166,67 @@ function judge(name, wood, leaves) {
     if (to) return { family: 'stone', to };
   }
   if (CRAFTS.has(name)) return { family: 'craft', to: name };
-  if (name === 'bookshelf') return { family: 'wood', to: `${wood}_planks` };
+  // The enchanting table's diamond and obsidian have no job that seeks them: it is built as planks.
+  if (name === 'enchanting_table') return { family: 'wood', to: `${wood}_planks` };
   if (name === 'dirt' || SOILS.has(name)) return { family: 'dirt', to: 'dirt' };
+  // A candle is built as a standing torch: its wax is honeycomb, which no job gathers, and a torch stands where a
+  // candle stood (on the block below) for charcoal and a stick. The candle's own state (count, lit) is dropped.
+  if (/^(\w+_)?candle$/.test(name)) return { family: 'craft', to: 'torch', stateless: true };
   if (name === 'gravel') return { family: 'gravel', to: null };
+  const producer = require('@kernel/producer_hooks').producerOf(name);
+  if (producer) return { family: 'awaiting', to: name, producer };
   return null;
 }
 
-// applyMaterialRule(voxels, { wood, leaves, serverVersion }) → { voxels, report }
-//   voxels  [x,y,z,block,state?] as blueprint_importer writes them
-//   wood    the one species every wood block is built from ('spruce')
-//   leaves  true to build leaves from shears, false to leave them out
-function applyMaterialRule(voxels, { wood, leaves, serverVersion }) {
-  if (!SPECIES.includes(wood)) throw new Error(`[blueprint_material_rule] CODING VIOLATION: wood "${wood}" is not a species. Species: ${SPECIES.join(', ')}.`);
+// ── THE COLOUR SWAP RUNS FIRST, SO NOTHING DOWNSTREAM SEES THE ORIGINAL ─────────────────────────────
+// A dyed block whose colour is in the swap table (architect_config.COLOR_SWAP) is renamed to the same shape in
+// the swapped colour before any family judges it: the producer, the awaiting list and every body read only the
+// common colour. The dyed shapes are the ones vanilla names `<colour>_<shape>`; longest colour first, so
+// "light_gray" is tried before "gray".
+const DYED_SHAPES = ['wool', 'carpet', 'bed', 'banner', 'wall_banner', 'candle', 'concrete', 'concrete_powder', 'terracotta',
+  'glazed_terracotta', 'stained_glass', 'stained_glass_pane', 'shulker_box'];
+function recolourOf(name, swap, colours) {
+  for (const c of colours) {
+    if (!name.startsWith(`${c}_`)) continue;
+    if (!DYED_SHAPES.includes(name.slice(c.length + 1))) return null;
+    return swap[c] ? `${swap[c]}${name.slice(c.length)}` : null;
+  }
+  return null;
+}
+
+// applyMaterialRule(voxels, { wood, accent, leaves, recolour, serverVersion }) → { voxels, report }
+//   voxels    [x,y,z,block,state?] as blueprint_importer writes them
+//   wood      the primary species: the download's most-used wood is built from it ('oak')
+//   accent    the species every other wood is built from ('birch')
+//   leaves    true to build leaves from shears, false to leave them out
+//   recolour  { colour: colour } — each dyed block of a key colour is built in its value colour ({} swaps none)
+function applyMaterialRule(voxels, { wood, accent, leaves, recolour = {}, serverVersion }) {
+  for (const sp of [wood, accent]) {
+    if (!SPECIES.includes(sp)) throw new Error(`[blueprint_material_rule] CODING VIOLATION: wood "${sp}" is not a species. Species: ${SPECIES.join(', ')}.`);
+  }
   const mc = require('minecraft-data')(serverVersion);
   const count = (o, k) => { o[k] = (o[k] || 0) + 1; };
-  const report = { wood, leaves, kept: {}, substituted: {}, left_out: {}, iron_ingots: 0 };
-  const judged = voxels.map(v => ({ v, j: judge(v[3], wood, leaves) }));
+  const report = { wood, accent, leaves, recolour, recoloured: {}, kept: {}, substituted: {}, awaiting: {}, left_out: {}, iron_ingots: 0 };
+  const colours = require('@thinking/architect_config').WOOL_COLORS.slice().sort((a, b) => b.length - a.length);
+  voxels = voxels.map(v => {
+    const to = recolourOf(v[3], recolour, colours);
+    if (!to) return v;
+    if (!mc.blocksByName[to]) throw new Error(`[blueprint_material_rule] CODING VIOLATION: ${v[3]} is recoloured to ${to}, which Minecraft ${serverVersion} does not have. Correct COLOR_SWAP in architect_config.`);
+    count(report.recoloured, `${v[3]} → ${to}`);
+    const out = v.slice();
+    out[3] = to;
+    return out;
+  });
+  const tones = woodTones(voxels, wood, accent);
+  const judged = voxels.map(v => ({ v, j: judge(v[3], wood, leaves, tones) }));
 
   const at = new Map();
   for (const { v, j } of judged) if (j) at.set(`${v[0]},${v[1]},${v[2]}`, j);
   const out = [];
+  const awaiting = [];
   for (const { v, j } of judged) {
     if (!j) { count(report.left_out, v[3]); continue; }
+    if (j.family === 'awaiting') { awaiting.push(v); count(report.awaiting, `${j.producer}: ${v[3]}`); continue; }
     let to = j.to;
     if (j.family === 'gravel') {
       let stone = 0, dirt = 0;
@@ -173,7 +239,7 @@ function applyMaterialRule(voxels, { wood, leaves, serverVersion }) {
     }
     // A DOUBLE SLAB IS BUILT AS THE FULL BLOCK IT FILLS: two slabs in one cell are two clicks and no placement
     // rule sets `type=double`; the full block of the same material fills the same cell in one.
-    let state = v[4];
+    let state = j.stateless ? undefined : v[4];
     if (/_slab$/.test(to) && state && state.type === 'double') {
       const base = to.slice(0, -'_slab'.length);
       to = [`${base}_planks`, base, `${base}s`].find(n => mc.blocksByName[n]);
@@ -187,10 +253,16 @@ function applyMaterialRule(voxels, { wood, leaves, serverVersion }) {
   }
   report.iron_ingots = Math.ceil(report.iron_ingots);
   standInSupports(voxels, judged, out, report, wood);
+  const stoodIn = new Set(out.map(v => `${v[0]},${v[1]},${v[2]}`));
+  for (const v of awaiting) {
+    if (stoodIn.has(`${v[0]},${v[1]},${v[2]}`)) continue;
+    out.push(v[4] !== undefined ? [v[0], v[1], v[2], v[3], v[4]] : [v[0], v[1], v[2], v[3]]);
+  }
   return { voxels: out, report };
 }
 
-// standInSupports — a left-out block that is the ONLY thing a kept block hangs on is built as planks instead.
+// standInSupports — a left-out or awaiting block that is the ONLY thing a kept block hangs on is built as planks
+// instead (an awaiting block's cell is air until its producer stands, and a producer may never come).
 // Nothing in the download floats: a lantern hung from wool, a sign on a bed, a door on concrete each stood on
 // a block this rule leaves out, and leaving the support out strands the block it held (support_plan counts
 // them). The planks stand where the support stood; each one is reported under its own name.
@@ -199,7 +271,7 @@ function standInSupports(voxels, judged, out, report, wood) {
   const VEC = { north: [0, 0, -1], south: [0, 0, 1], east: [1, 0, 0], west: [-1, 0, 0], up: [0, 1, 0], down: [0, -1, 0] };
   const key = (x, y, z) => `${x},${y},${z}`;
   const built = new Set(out.map(v => key(v[0], v[1], v[2])));
-  const dropped = new Map(judged.filter(({ j }) => !j).map(({ v }) => [key(v[0], v[1], v[2]), v]));
+  const dropped = new Map(judged.filter(({ j }) => !j || j.family === 'awaiting').map(({ v, j }) => [key(v[0], v[1], v[2]), { v, j }]));
   const planks = `${wood}_planks`;
   for (const v of out.slice()) {
     if (!hangs(v[3], v[4])) continue;
@@ -209,12 +281,13 @@ function standInSupports(voxels, judged, out, report, wood) {
     if (cells.some(c => built.has(c))) continue;
     const c = cells.find(k => dropped.has(k));
     if (!c) continue;
-    const d = dropped.get(c);
+    const { v: d, j: dj } = dropped.get(c);
     out.push([d[0], d[1], d[2], planks]);
     built.add(c);
     dropped.delete(c);
-    report.left_out[d[3]] -= 1;
-    if (!report.left_out[d[3]]) delete report.left_out[d[3]];
+    const from = dj ? report.awaiting : report.left_out, k = dj ? `${dj.producer}: ${d[3]}` : d[3];
+    from[k] -= 1;
+    if (!from[k]) delete from[k];
     const name = `${d[3]} → ${planks} (holds up ${v[3]})`;
     report.substituted[name] = (report.substituted[name] || 0) + 1;
   }

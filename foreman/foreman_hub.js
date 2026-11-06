@@ -16,25 +16,21 @@ const WebSocket = require('ws');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
-const { createEnvelope, parseEnvelope, pickBuildingEntry, isBuildingTombstone, BUILDING_ROOM_SEPARATOR } = require('./message_schema');
+const { createEnvelope, parseEnvelope, mergeFresherRows, pickBuildingEntry, isBuildingTombstone, BUILDING_ROOM_SEPARATOR } = require('./message_schema');
 const brain = require('./foreman_brain');
 // The foreman's own hold on world status (started, reached, failed, stopping), reported in fleetState.
 const foremanWorld = require('./foreman_world');
 
 // Operator vocabulary (Law 16).
-const { OPERATOR_VERBS, INGAME_VERBS, COMMAND_ORIGIN: ORIGIN, VALID_ORIGINS, INGAME_DOOR_PORT_OFFSET,
-  roomKeyOwner } = require('./message_schema');
-
-// Species vocabulary, shared with architect_config (Law 16).
-const { BOT_MODES } = require('../Thinking_fragments/architect_config');
+const { OPERATOR_VERBS, READ_DOOR_PORT_OFFSET, roomKeyCrew } = require('./message_schema');
 
 // Registers @-aliases and module homes for this process root (Law 16).
 require('../js_kernel/utils/node_module_homes').bootstrapModulePath();
+const cameraSpots = require('../js_kernel/utils/camera_spots');
 require('module-alias')(path.resolve(__dirname, '..'));
 
 // Request rules, used as pure functions over this process's own map (Invariant D, Law 6). Required at
 // load, not inside the handler, so a missing module is a startup failure (Law 13).
-const requestLedger = require('@kernel/request_ledger');
 // The fleet's one item book: every body's moves land here (item_book says what a move is).
 const itemBook = require('./item_book');
 itemBook.start();
@@ -42,7 +38,15 @@ itemBook.start();
 // ── ONE PROCESS WITH THE FOREMAN ──────────────────────────────────────────
 // Required by foreman/foreman.js; not started on its own. PORT comes from FOREMAN_PORT, not argv.
 const PORT = parseInt(process.env.FOREMAN_PORT, 10) || 3001;
-const INGAME_DOOR_PORT = PORT + INGAME_DOOR_PORT_OFFSET;
+const READ_DOOR_PORT = PORT + READ_DOOR_PORT_OFFSET;
+// The Auren_Bot root this foreman runs from: a terminal verb naming another is a neighbour's (handleOperatorCommand).
+const OWN_COPY = path.resolve(__dirname, '..');
+// sameCopy(a, b) → whether two roots name one folder, compared the way the file system does (case-insensitive on Windows).
+function sameCopy(a, b) {
+  if (typeof a !== 'string' || !a) return false;
+  const norm = (p) => { const r = path.resolve(p); return process.platform === 'win32' ? r.toLowerCase() : r; };
+  return norm(a) === norm(b);
+}
 
 // Combined fleet trace file: forwarded bot logs + the foreman's own events, for reviewing the whole
 // fleet after a run. Path from record_homes (Law 16). Append-only, foreman's own lines only.
@@ -99,22 +103,36 @@ const botClients = new Map();
 // 3). A removal rides in as an entry with `removed_at`, written by station_registry.
 let mergedStations = {};
 
-// Standing requests: what each human has asked their crew for. The foreman is the sole writer.
-let standingRequests = {};
-
 function mergeStationsInto(incoming) {
-  if (!incoming || typeof incoming !== 'object') return;
-  for (const [id, entry] of Object.entries(incoming)) {
-    if (!entry || typeof entry !== 'object') continue;
-    const cur = mergedStations[id];
-    const incomingAt = entry.updated_at || 0;
-    const curAt = (cur && cur.updated_at) || 0;
-    if (!cur || incomingAt >= curAt) mergedStations[id] = entry;
-  }
+  mergeFresherRows(mergedStations, incoming);
 }
+
+// The fleet's survey book (perception_nodes.js/survey_book): what is available in each scanned sector and
+// cave, merged by the station map's rule. The world's, not a crew's: it is relayed, never saved here; each
+// homesteader keeps it in its own memory and sends it again on registering.
+let mergedSurvey = {};
 
 // Merged fleet structures across all bots, first-writer-wins via pickBuildingEntry (Law 3).
 let mergedBuildings = {};
+
+// The mine's registered units, every body's merged (mining_cell_graph keeps each body's in its own memory). Read
+// only by the integrity keeper, which paints every unit; never broadcast, so no body adopts another's units.
+let mergedMineCells = {};
+function mergeMineCellsInto(incoming) {
+  if (!incoming || typeof incoming !== 'object') return;
+  for (const [id, unit] of Object.entries(incoming)) {
+    if (!unit || typeof unit !== 'object' || !unit.anchor) continue;
+    const had = mergedMineCells[id];
+    mergedMineCells[id] = had ? { ...had, ...unit, complete: !!(had.complete || unit.complete), blocked: !!(had.blocked || unit.blocked) } : unit;
+  }
+}
+
+// The integrity keeper's latest verdict per subject, sent to every body as it changes and to a body as it registers.
+const keeperVerdicts = new Map();
+function publishVerdict(subject, verdict) {
+  keeperVerdicts.set(subject, verdict);
+  for (const [id, client] of botClients) sendToBot(client.ws, 'keeper_verdict', id, { subject, verdict });
+}
 
 function mergeBuildingsInto(incoming) {
   if (!incoming || typeof incoming !== 'object') return;
@@ -157,19 +175,19 @@ function botBuildingsOnly(incoming, botId) {
   return kept;
 }
 
-// lockSite(rows) — the one writer of a location, called by the desk before any body exists. Each row
-// becomes the two chairs `site_chairs` builds, saved to the owner's file and broadcast.
+// lockSite(rows, crew) — the one writer of a location, called by the foreman before any body exists. Each row
+// becomes the two chairs `site_chairs` builds, saved to the crew's file and broadcast.
 //
 // ONE BASE HAS ONE SITE: a matching centre is accepted, a different centre is refused (Law 13).
 //
-// The owner half of the key is the desk's (`bot_mandate.ownerKeyFor`), joined here once with the row's
-// plain structure name (`bot_mandate.buildingRoomKey`).
-async function lockSite(rows, ownerKey) {
+// The crew half of the key is the species the foreman raises, joined here once with the row's plain
+// structure name, as a body joins its own (`bot_mandate.buildingRoomKey`).
+async function lockSite(rows, crew) {
   if (!Array.isArray(rows) || rows.length === 0) {
-    throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): lockSite needs the rows the desk sited, got ${JSON.stringify(rows)}.`);
+    throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): lockSite needs the rows the foreman sited, got ${JSON.stringify(rows)}.`);
   }
-  if (typeof ownerKey !== 'string' || !ownerKey || ownerKey.includes(BUILDING_ROOM_SEPARATOR)) {
-    throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): lockSite needs the crew's owner key (ownerKeyFor), got ${JSON.stringify(ownerKey)}.`);
+  if (typeof crew !== 'string' || !crew || crew.includes(BUILDING_ROOM_SEPARATOR)) {
+    throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): lockSite needs the crew's species, got ${JSON.stringify(crew)}.`);
   }
   const { siteChairs } = require('@kernel/site_chairs');
   const locked = [];
@@ -178,47 +196,40 @@ async function lockSite(rows, ownerKey) {
     if (typeof row.roomKey !== 'string' || !row.roomKey || row.roomKey.includes(BUILDING_ROOM_SEPARATOR)) {
       throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): a site row names its plain structure ('headframe'), got roomKey ${JSON.stringify(row.roomKey)}.`);
     }
-    const key = `${row.roomKey}${BUILDING_ROOM_SEPARATOR}${ownerKey}`;
+    const key = `${row.roomKey}${BUILDING_ROOM_SEPARATOR}${crew}`;
     const held = mergedBuildings[key];
     const bc = row.candidate && row.candidate.transpose_origin;
     if (held && !isBuildingTombstone(held) && held.set_buildspot && held.set_buildspot.transpose_origin) {
       const h = held.set_buildspot.transpose_origin;
       if (bc && h.x === bc.x && h.y === bc.y && h.z === bc.z) { already.push(key); continue; }
       throw new Error(`[foreman_hub] CODING VIOLATION (Law 13): '${key}' is already sited at (${h.x},${h.y},${h.z}); `
-        + `the desk asked for (${bc && bc.x},${bc && bc.y},${bc && bc.z}). One base has one site — the desk hands an existing base back, it never surveys over it.`);
+        + `the foreman asked for (${bc && bc.x},${bc && bc.y},${bc && bc.z}). One base has one site — the foreman hands an existing base back, it never surveys over it.`);
     }
     mergedBuildings[key] = siteChairs(row, 'foreman');
     locked.push(key);
   }
   log(`Sited: locked [${locked.join(', ') || 'nothing new'}]${already.length ? `, already held [${already.join(', ')}]` : ''}.`);
-  savePlayerMemory();
-  await ownerMemory.flushNow();
+  saveCrewMemory();
+  await crewMemory.flushNow();
   broadcastBoardroom();
   return { locked, already };
 }
 
 // ── THE FLOOR UNDER BOTH MIRRORS ─────────────────────────────────────────────
-// mergedBuildings/mergedStations are a live mirror only, empty on every foreman start. `owner_memory` is
-// the durable disk copy beneath them, one file per player (Law 3).
-const ownerMemory = require('./owner_memory');
+// mergedBuildings/mergedStations are a live mirror only, empty on every foreman start. `crew_memory` is
+// the durable disk copy beneath them, one file per crew (Law 3).
+const crewMemory = require('./crew_memory');
 
-// Saved on every merge, debounced inside owner_memory.
-// wipedOwners: every owner who has wiped, so a later save may write their file empty.
-const wipedOwners = new Set();
+// Saved on every merge, debounced inside crew_memory.
+// wipedCrews: every crew that has been wiped, so a later save may write its file empty.
+const wipedCrews = new Set();
 
-function savePlayerMemory() {
-  const chairsByOwner = {};
-  for (const [id, client] of botClients) {
-    // Only a contractor's chair carries an owner name (bot_mandate).
-    if (!client.owner || !client.boardroom_chair) continue;
-    if (!chairsByOwner[client.owner]) chairsByOwner[client.owner] = {};
-    chairsByOwner[client.owner][id] = client.boardroom_chair;
-  }
-  ownerMemory.save(mergedBuildings, mergedStations, chairsByOwner, (m) => log(m), wipedOwners);
+function saveCrewMemory() {
+  crewMemory.save(mergedBuildings, mergedStations, (m) => log(m), wipedCrews);
 }
 
 // Read at require time; applied to the two maps at listen time (see the startup banner below).
-const _restored = ownerMemory.loadAll((m) => log(m));
+const _restored = crewMemory.loadAll((m) => log(m));
 
 // Salvage (death piles) is not relayed: each bot scans its own entity table live (Law 23).
 
@@ -253,7 +264,26 @@ function sendToBot(ws, type, botId, payload) {
 // Each bot receives every OTHER bot's chair (it owns its own).
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── ONE BROADCAST PER BURST OF CHANGES ──
+// A body's hq_delta arrives several times a second across a crew, and every broadcast carries the whole HQ to every body,
+// so the deltas are gathered for BOARDROOM_BATCH_MS and sent as one broadcast. A body granted the planning gate must
+// hold every peer's claim before it plans: a gathered broadcast is sent before any grant (onPlanningGrant), ahead of the
+// grant on the same socket.
+const BOARDROOM_BATCH_MS = 250;
+let _boardroomDue = null;
+function broadcastBoardroomSoon() {
+  if (_boardroomDue) return;
+  _boardroomDue = require('../js_kernel/utils/timeout_crash').later('foreman_hub', 'send the gathered HQ changes to every body as one broadcast', () => {
+    _boardroomDue = null;
+    broadcastBoardroom();
+  }, BOARDROOM_BATCH_MS);
+}
+function flushBoardroom() {
+  if (_boardroomDue) broadcastBoardroom();
+}
+
 function broadcastBoardroom() {
+  if (_boardroomDue) { require('../js_kernel/utils/timeout_crash').stop(_boardroomDue); _boardroomDue = null; }
   const allChairs = {};
   for (const [id, client] of botClients) {
     if (client.boardroom_chair) {
@@ -275,10 +305,8 @@ function broadcastBoardroom() {
     const payload = { connected_bots: [...botClients.keys()] };
     if (Object.keys(chairsForBot).length > 0) payload.bot_boardroom = chairsForBot;
     if (stationsPresent) payload.logistics_stations = mergedStations;
-    // Sent whole and unconditionally, including when empty, so a withdrawn requirement does not stick on
-    // a bot's stale mirror (Invariant B).
-    payload.standing_requests = standingRequests;
     if (buildingsPresent) payload.building_conference = mergedBuildings;
+    if (Object.keys(mergedSurvey).length > 0) payload.survey_book = mergedSurvey;
     if (Object.keys(payload).length > 0) {
       sendToBot(client.ws, 'hq_broadcast', id, payload);
     }
@@ -318,21 +346,20 @@ function handleRegister(ws, msg) {
   botClients.set(botId, {
     ws,
     mode: mode.trim().toLowerCase(),
-    // Owner/species pairing is not re-validated here; bot_mandate already guarantees it (Law 16).
-    owner: typeof msg.payload.owner === 'string' && msg.payload.owner.trim() ? msg.payload.owner.trim() : null,
     boardroom_chair: msg.payload.boardroom_chair || null,
     connected_at: new Date().toISOString(),
     last_sync: null,
   });
   mergeStationsInto(msg.payload.logistics_stations);
+  mergeFresherRows(mergedSurvey, msg.payload.survey_book);
   mergeBuildingsInto(botBuildingsOnly(msg.payload.building_conference, msg.bot_id));
 
-  const declaredOwner = botClients.get(botId).owner;
-  log(`Bot '${botId}' registered as ${mode.trim().toUpperCase()}${declaredOwner ? ` for ${declaredOwner}` : ''}. Total bots: ${botClients.size}`);
+  log(`Bot '${botId}' registered as ${mode.trim().toUpperCase()}. Total bots: ${botClients.size}`);
   sendToBot(ws, 'registered', botId, { success: true });
+  for (const [subject, verdict] of keeperVerdicts) sendToBot(ws, 'keeper_verdict', botId, { subject, verdict });
 
   broadcastBoardroom();
-  savePlayerMemory();
+  saveCrewMemory();
 }
 
 function handleHqDelta(ws, msg) {
@@ -347,10 +374,12 @@ function handleHqDelta(ws, msg) {
   client.boardroom_chair = msg.payload.boardroom_chair || client.boardroom_chair;
   client.last_sync = new Date().toISOString();
   mergeStationsInto(msg.payload.logistics_stations);
+  mergeFresherRows(mergedSurvey, msg.payload.survey_book);
   mergeBuildingsInto(botBuildingsOnly(msg.payload.building_conference, msg.bot_id));
+  mergeMineCellsInto(msg.payload.mining_cells);
 
-  broadcastBoardroom();
-  savePlayerMemory();
+  broadcastBoardroomSoon();
+  saveCrewMemory();
 }
 
 function handleClaimRequest(ws, msg) {
@@ -387,6 +416,7 @@ function handleClaimRelease(ws, msg) {
 brain.onPlanningGrant((botId, entry, resource) => {
   const client = botClients.get(botId);
   if (!client) return;   // winner vanished mid-grant — its disconnect cleanup closes the entry
+  flushBoardroom();
   sendToBot(client.ws, 'planning_granted', botId, { entry, ...resource });
 });
 // The other answer to a request: the body's place in the line and who holds the token.
@@ -425,7 +455,7 @@ function handleBodyStoodDown(ws, msg) {
   const reason = (msg.payload && msg.payload.reason) || 'no reason given';
   warn(`Bot '${botId}' stood down: ${reason}.`);
   brain.releaseForBot(botId, 'stood down');
-  bodyLeft(botId, 'it stood down', reason);
+  bodyLeft(botId, `it stood down: ${reason}`, reason);
 }
 
 function handlePlanningRelease(ws, msg) {
@@ -457,7 +487,7 @@ const departedBots = new Map();   // bot_id → { gone_at, last_error, sent_home
 
 // ── A BOT SENT HOME IS NOT A CRASH ────────────────────────────────────────────────────────
 // `stop`/`shutdown`/`wipe` deliveries are recorded here so a departure reads as ordered.
-const sentHome = new Map();       // bot_id → { verb, origin, asker }
+const sentHome = new Map();       // bot_id → { verb }
 
 function _tallyFor(botId) {
   let t = logTally.get(botId);
@@ -518,53 +548,34 @@ function handleLog(msg) {
 }
 
 // Relays one fleet verb to every registered bot (Law 3). Returns the number of bots reached.
-// `only` addresses a single bot (Law 4). `origin` is stamped by the foreman, the one party that
-// observed which socket spoke (Law 23). In-game commands reach only the contractors owned by the
-// asker; the terminal is outside the ownership model. Skipped counts are returned, not dropped (Law
-// 6/25).
-function broadcastCommand(verb, args = {}, only = null, origin, asker = null) {
+// `only` addresses a single bot (Law 4).
+function broadcastCommand(verb, args = {}, only = null) {
   let sent = 0;
-  let skippedSpecies = 0;
-  let skippedOwner = 0;
   for (const [id, client] of botClients) {
     if (only && id !== only) continue;
-    if (origin === ORIGIN.INGAME) {
-      if (client.mode !== BOT_MODES.CONTRACTOR) { skippedSpecies++; continue; }
-      if (!asker || client.owner !== asker) { skippedOwner++; continue; }
-    }
-    if (sendToBot(client.ws, 'command', id, { verb, args, origin })) {
+    if (sendToBot(client.ws, 'command', id, { verb, args })) {
       sent++;
-      if (verb === 'stop' || verb === 'shutdown') sentHome.set(id, { verb, origin, asker });
+      if (verb === 'stop' || verb === 'shutdown') sentHome.set(id, { verb });
     }
   }
-  return { sent, skippedSpecies, skippedOwner };
+  return { sent };
 }
 
-// The one operator-verb pathway (Law 16): console, socket, and the in-game door.
-// `origin` is a required argument, stated explicitly by each transport, and never defaults (Law 13).
-function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
+// The one operator-verb pathway (Law 16): the console, the terminal socket, and the foreman's own body.
+function runOperatorVerb(verb, source, args = {}) {
   // Every exit returns a verdict (Law 25).
-  const nil = { sent: 0, skippedSpecies: 0, skippedOwner: 0 };
-  if (!VALID_ORIGINS.has(origin)) {
-    warn(`Refusing '${verb}' from ${source} — unstamped or unknown origin '${origin}'. Every operator verb must declare where it entered the fleet (${[...VALID_ORIGINS].join(' | ')}).`);
-    return { ...nil, reason: 'bad_origin' };
-  }
-  // An in-game verb with no asker is refused (Law 13).
-  if (origin === ORIGIN.INGAME && !asker) {
-    warn(`Refusing '${verb}' from ${source} — it arrived from inside the world with nobody named as the asker.`);
-    return { ...nil, reason: 'no_asker' };
-  }
+  const nil = { sent: 0 };
   if (!OPERATOR_VERBS.has(verb)) {
     warn(`Unknown ${source} verb '${verb}' — valid: ${[...OPERATOR_VERBS].join(' | ')}.`);
     return { ...nil, reason: 'unknown_verb' };
   }
-  // ── THE IN-GAME VOCABULARY IS SMALLER THAN THE OPERATOR'S ────────────────────────────────────
-  // Enforced by the origin the foreman observed, not at the bot (Law 23). `move`/`surveylayout`/
-  // `respawn`/`sentry`/`flush` stay operator-only; the player's scoped equivalent of `flush` is `wipe`.
-  if (origin === ORIGIN.INGAME && !INGAME_VERBS.has(verb)) {
-    warn(`Refusing '${verb}' from ${asker} inside the world — it is an operator verb, not one of the `
-      + `in-game vocabulary (${[...INGAME_VERBS].join(' | ')}). The terminal keeps it.`);
-    return { ...nil, reason: 'not_ingame_verb' };
+  // ── A NUMBERED CAMERA IS THE FOREMAN'S OWN ANSWER ──────────
+  // Not delivered to any bot. The answer is a promise: it reads the server.
+  if (cameraSpots.VERBS.has(verb)) {
+    return cameraSpots.run(verb, args).then((r) => {
+      log(`camera: ${r.said}`);
+      return { ...nil, ...r };
+    });
   }
   // ── 'shutdown' ENDS THE WHOLE RUN, TERMINAL ONLY ──────────
   // Not delivered to any bot: hands foremanWorld's shutdown road the reason.
@@ -572,64 +583,55 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
     const begun = foremanWorld.askShutdown(`the terminal's 'shutdown' (${source})`);
     return { ...nil, reason: begun ? 'shutting_down' : 'no_shutdown_road' };
   }
-  // ── 'teleport' MOVES A PERSON, AND THE TERMINAL IS NOT ONE ───────────────────────────────────────
-  // The in-game path never reaches here — the desk answers it directly. The terminal refuses it.
-  if (verb === 'teleport') {
-    warn(`'teleport' from ${source} has nobody to move — it brings the ASKER to the alpha anchor, so it is said inside the world by the person who wants to go there, never from the terminal.`);
-    return { ...nil, reason: 'no_asker' };
-  }
   // ── 'wipe' IS SETTLED HERE, ABOVE THE no_bots GATE, AND NEEDS NO BODY AT ALL ──────────────────
-  // Contractors are stateless; the player's file is the only durable HQ, owned by this process (Law 16).
-  // Struck centrally, in the same tombstone shape as station_registry. Scope is the speaker: in-game the
-  // owner is the asker; the terminal's scope is the fleet (Law 27/28).
+  // Struck centrally, in the same tombstone shape as station_registry, for the crew of every connected body
+  // (its species, the crew half of every key it writes).
   if (verb === 'wipe') {
-    const owners = new Set();
-    if (origin === ORIGIN.INGAME) owners.add(asker);
-    else for (const [botId, c] of botClients.entries()) {
+    const crews = new Set();
+    for (const [botId, c] of botClients.entries()) {
       if (args.bot && args.bot !== botId) continue;
-      if (c.owner) owners.add(c.owner);
+      crews.add(c.mode);
     }
-    if (owners.size === 0) {
-      warn(`Wipe from ${source} named nobody — no owner could be resolved, so nothing was struck.`);
+    if (crews.size === 0) {
+      warn(`Wipe from ${source} named nobody — no connected body names a crew, so nothing was struck.`);
       return { ...nil, reason: 'reached_nobody' };
     }
 
     const now = Date.now();
     let struckBuildings = 0;
     for (const [key, entry] of Object.entries(mergedBuildings)) {
-      const keyOwner = roomKeyOwner(key);
-      if (keyOwner === null || !owners.has(keyOwner)) continue;   // null is the commons and is never taken
+      if (!crews.has(roomKeyCrew(key))) continue;
       if (entry && entry.removed_at) continue;                    // already struck — do not re-stamp
       mergedBuildings[key] = { removed_at: now };
       struckBuildings++;
     }
-    // Station tombstones keep pos/type/owner; building tombstones keep nothing (station_registry's shape).
+    // Station tombstones keep pos/type/owner (the row's crew); building tombstones keep nothing (station_registry's shape).
     let struckStations = 0;
     for (const [stationId, entry] of Object.entries(mergedStations)) {
-      if (!entry || !owners.has(entry.owner)) continue;
+      if (!entry || !crews.has(entry.owner)) continue;
       if (entry.removed_at) continue;
       mergedStations[stationId] = { pos: entry.pos, type: entry.type, owner: entry.owner, removed_at: now, updated_at: now };
       struckStations++;
     }
 
-    for (const o of owners) wipedOwners.add(o);
-    savePlayerMemory();
-    const saved = ownerMemory.flushNow();
+    for (const c of crews) wipedCrews.add(c);
+    saveCrewMemory();
+    const saved = crewMemory.flushNow();
     broadcastBoardroom();
 
     // ── THE CREW GOES WITH THE MEMORY (Law 8) ──
-    // Bots whose owner was wiped are stopped and sent home.
+    // Bots whose crew was wiped are stopped and sent home.
     let stopped = 0;
     for (const [botId, client] of botClients) {
-      if (!client.owner || !owners.has(client.owner)) continue;
-      if (sendToBot(client.ws, 'command', botId, { verb: 'stop', args: {}, origin })) {
+      if (!crews.has(client.mode)) continue;
+      if (sendToBot(client.ws, 'command', botId, { verb: 'stop', args: {} })) {
         stopped++;
-        sentHome.set(botId, { verb: 'wipe', origin, asker: client.owner });
+        sentHome.set(botId, { verb: 'wipe' });
       }
     }
 
-    Promise.resolve(saved).then(() => log(`Wipe for ${[...owners].join(', ')}: ${struckBuildings} building room(s) and ${struckStations} station(s) `
-      + `tombstoned, player-file flush finished (any failed save is reported above), ${stopped} bot(s) sent away.`));
+    Promise.resolve(saved).then(() => log(`Wipe for ${[...crews].join(', ')}: ${struckBuildings} building room(s) and ${struckStations} station(s) `
+      + `tombstoned, crew-file flush finished (any failed save is reported above), ${stopped} bot(s) sent away.`));
     return { ...nil, reason: 'wiped', struckBuildings, struckStations, stopped };
   }
 
@@ -638,28 +640,20 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
     return { ...nil, reason: 'no_bots' };
   }
 
-  // 'flush' clears the mirrored fleet HQ (stations + structures + standing requests) so bots re-sync
-  // from empty. Fleet-wide and not scopable — not in INGAME_VERBS, terminal only.
+  // 'flush' clears the mirrored fleet HQ (stations + structures) so bots re-sync from empty. Fleet-wide
+  // and not scopable.
   if (verb === 'flush') {
     mergedStations = {};
     mergedBuildings = {};
-    standingRequests = {};
-    log('Flush: cleared mirrored fleet HQ (stations + structures + standing requests) — bots re-sync from empty.');
+    mergedMineCells = {};
+    mergedSurvey = {};
+    log('Flush: cleared mirrored fleet HQ (stations + structures + survey book) — bots re-sync from empty.');
   }
 
   const only = typeof args.bot === 'string' && args.bot ? args.bot : null;
-  const { sent, skippedSpecies, skippedOwner } = broadcastCommand(verb, args, only, origin, asker);
-  const out = { sent, skippedSpecies, skippedOwner };
+  const { sent } = broadcastCommand(verb, args, only);
+  const out = { sent };
   // A verb that reaches nobody is not a delivery; which nobody is reported (Law 25).
-  if (sent === 0 && skippedOwner > 0) {
-    warn(`'${verb}' from ${asker} reached nobody — ${skippedOwner} contractor(s) belong to someone else.`);
-    return { ...out, reason: 'not_yours' };
-  }
-  if (sent === 0 && skippedSpecies > 0) {
-    const who = only ? `'${only}' is` : `${skippedSpecies} connected bot(s) are`;
-    warn(`'${verb}' from inside the world reached nobody — ${who} not a contractor. Homesteaders take no orders from a human.`);
-    return { ...out, reason: 'not_a_contractor' };
-  }
   if (only && sent === 0) {
     warn(`'${verb}' addressed to '${only}' — no such bot connected; nothing sent.`);
     return { ...out, reason: 'no_such_bot' };
@@ -668,32 +662,40 @@ function runOperatorVerb(verb, source, args = {}, origin, asker = null) {
     warn(`'${verb}' from ${source} reached no bot.`);
     return { ...out, reason: 'reached_nobody' };
   }
-  log(`Broadcast '${verb}' to ${sent} bot(s) [${source}, origin:${origin}${asker ? `, asker:${asker}` : ''}]${only ? ` (addressed: ${only})` : ''}.`);
+  log(`Broadcast '${verb}' to ${sent} bot(s) [${source}]${only ? ` (addressed: ${only})` : ''}.`);
   return { ...out, reason: null };
 }
 
-// Headless transport. `origin` is a fixed argument per door, never read off the message (Law 23). The
-// result travels back on the same socket (Law 25).
-function handleOperatorCommand(ws, msg, origin) {
-  const payload = operatorResult(msg.payload || {}, `socket:${msg.bot_id}`, origin);
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(createEnvelope('command_result', 'foreman', payload)));
-  }
+// Headless transport: the terminal socket. The result travels back on the same socket (Law 25).
+//
+// ONE COPY'S TOOLS COMMAND ONLY ITS OWN FLEET. Several copies run fleets on one machine, each foreman on its own port,
+// and a tool that guessed a port could reach a neighbour's. A terminal verb names the copy it was sent from (`copy`,
+// the sender's Auren_Bot root); one from another copy, or naming none, is refused unless it says it is `deliberate`.
+function handleOperatorCommand(ws, msg) {
+  const p = msg.payload || {};
+  const foreign = p.deliberate !== true && !sameCopy(p.copy, OWN_COPY);
+  const verdict = foreign
+    ? (warn(`Refusing '${p.verb}' from socket:${msg.bot_id} — sent from ${p.copy || 'a copy that did not name itself'}, `
+        + `and this fleet belongs to ${OWN_COPY}. A verb for another copy's fleet says --deliberate.`),
+      { sent: 0, reason: 'other_copy', copy: OWN_COPY })
+    : operatorResult(p, `socket:${msg.bot_id}`);
+  Promise.resolve(verdict).then((payload) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(createEnvelope('command_result', 'foreman', payload)));
+    }
+  });
 }
 
-// Verdict half of the handler above, shared by the socket and the desk.
-function operatorResult(p, source, origin) {
+// Verdict half of the handler above.
+async function operatorResult(p, source) {
   const verb = p.verb;
   const args = p.args || {};
-  // `asker` is meaningful only on the in-game origin; the terminal door reads none (see broadcastCommand).
-  const asker = typeof p.asker === 'string' && p.asker.trim() ? p.asker.trim() : null;
-  const result = runOperatorVerb(typeof verb === 'string' ? verb.trim() : '', source, args, origin, asker)
-    || { sent: 0, skippedSpecies: 0, skippedOwner: 0, reason: 'refused' };
-  return { verb, origin, ...result };
+  const result = (await runOperatorVerb(typeof verb === 'string' ? verb.trim() : '', source, args))
+    || { sent: 0, reason: 'refused' };
+  return { verb, ...result };
 }
 
-// Who is out there, and whose — answered from the live registry, never a PID file (Invariant B).
-// Reports the whole fleet; ownership governs delivery, not visibility.
+// Who is out there — answered from the live registry, never a PID file (Invariant B).
 // ── WHERE EACH BODY IS AND WHAT IT IS DOING ────────────
 // Relayed from the chair each bot already writes: `body_cell` and the dispatcher's `magnet` (Law 3,
 // Law 16). Null is an answer — no magnet is idle, no body_cell is unreported (Law 25). Carries the live
@@ -708,7 +710,6 @@ function fleetState() {
   const bots =[...botClients.entries()].map(([id, c]) => ({
     id,
     mode: c.mode,
-    owner: c.owner,
     body_cell: (c.boardroom_chair && c.boardroom_chair.body_cell) || null,
     magnet: (c.boardroom_chair && c.boardroom_chair.magnet) || null,
     // First route search / first walk (navigator.announceFirstMove); null before then.
@@ -723,12 +724,14 @@ function fleetState() {
     cubes_finished: (c.boardroom_chair && c.boardroom_chair.cubes_finished) || null,
     // The highest layer of that building the body has seen released for building (downloaded_build); null before.
     layer_released: (c.boardroom_chair && c.boardroom_chair.layer_released) || null,
+    // The books the building's stood-in cells still owe on the body's last read (downloaded_plan_registry standIns); null before.
+    books_owed: (c.boardroom_chair && typeof c.boardroom_chair.books_owed === 'number') ? c.boardroom_chair.books_owed : null,
     ...tallyOf(id),
   }));
   // Departed bots ride beside the roster, never inside it (Law 8).
   const departed = [...departedBots.entries()].map(([id, d]) => ({ id, ...d, ...tallyOf(id) }));
-  // Sites that already exist, read-only, so the desk doesn't survey over an existing lock. Keyed
-  // `<structure>|<owner>`; wiped rows left out.
+  // Sites that already exist, read-only, so the foreman doesn't survey over an existing lock. Keyed
+  // `<structure>|<crew>`; wiped rows left out.
   const buildings = {};
   for (const [key, entry] of Object.entries(mergedBuildings)) {
     if (!entry || isBuildingTombstone(entry) || !entry.set_buildspot) continue;
@@ -737,84 +740,18 @@ function fleetState() {
   return { bots, departed, buildings, warnings: warningsNow(), workspace: brain.workspaceState(), world: foremanWorld.status(), run: require('./foreman_plan').progressNow() };
 }
 
-// handleRequestCommand — a person's standing requirement, from the desk.
-// Asker is the owner key; refused when unnamed (Law 13). Rules live in request_ledger, called never
-// copied (Law 16).
-
-// crewProgress(asker) → freshest measurement per item for the bots this person owns, or {} (Law 3, Law
-// 16). Silence is reported as silence, not zero (Law 25).
-function crewProgress(asker) {
-  const out = {};
-  for (const [botId, client] of botClients.entries()) {
-    if (client.owner !== asker) continue;
-    const chair = client.boardroom_chair;
-    const rows = chair && Array.isArray(chair.request_progress) ? chair.request_progress : null;
-    if (!rows) continue;
-    const at = chair.request_progress_at || null;
-    for (const row of rows) {
-      if (!row || !row.item) continue;
-      const held = out[row.item];
-      if (held && (held.measured_at || '') >= (at || '')) continue;
-      out[row.item] = { ...row, measured_at: at, by: botId };
-    }
-  }
-  return out;
-}
-
-function handleRequestCommand(ws, msg) {
-  const payload = requestResult(msg.payload || {});
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(createEnvelope('request_result', 'foreman', payload)));
-  }
-}
-
-// Verdict half of the handler above, shared by the socket and the desk.
-function requestResult({ action, item, quantity, asker }) {
-  if (!asker) {
-    warn('In-game door: a request naming no asker was refused.');
-    return { ok: false, reason: 'no_asker' };
-  }
-
-  const ledger = requestLedger;
-
-  if (action === 'post') {
-    const result = ledger.applyPost(standingRequests, item, quantity, asker, asker);
-    if (!result.ok) return { ok: false, reason: result.reason, blockedBy: result.blockedBy || null };
-    standingRequests = result.rows;
-    log(`Request: ${asker} asks for ${quantity} ${item}.`);
-    return { ok: true, item: result.row.item, quantity: result.row.quantity, replaced: result.replaced };
-  }
-  if (action === 'cancel') {
-    const { rows, removed } = ledger.applyCancel(standingRequests, item, asker);
-    standingRequests = rows;
-    log(`Request: ${asker} withdrew ${item} (${removed} row(s)).`);
-    return { ok: true, removed };
-  }
-  if (action === 'status') {
-    return { ok: true, rows: ledger.rowsFor(standingRequests, asker), progress: crewProgress(asker) };
-  }
-  warn(`In-game door: request action '${action}' is not spoken here.`);
-  return { ok: false, reason: `unknown_action: ${action}` };
-}
-
-// ── THE IN-GAME DOOR ─────────────────────────────────────────────────────────────────────────────
-// Its own listener, accepting operator verbs and one roster question. Anything else is reported and
-// dropped (Law 6).
-function onIngameConnection(ws) {
-  log('In-game door: a client connected.');
+// ── THE READ DOOR ────────────────────────────────────────────────────────────────────────────────
+// Its own listener, answering one roster question for the tools that read a live fleet (foreman_door.query).
+// It carries no verb: a verb comes through the terminal socket. Anything else is reported and dropped (Law 6).
+function onReadDoorConnection(ws) {
   ws.on('message', (raw) => {
     const parsed = parseEnvelope(raw.toString());
-    if (!parsed.ok) { warn(`In-game door: bad message: ${parsed.reason}`); return; }
+    if (!parsed.ok) { warn(`Read door: bad message: ${parsed.reason}`); return; }
     const msg = parsed.msg;
     if (msg.type === 'fleet_query') { handleFleetQuery(ws, msg); return; }
-    if (msg.type === 'request_command') { handleRequestCommand(ws, msg); return; }
-    if (msg.type !== 'operator_command') {
-      warn(`In-game door: '${msg.type}' is not spoken here — the door carries operator verbs and one roster question, nothing else. Dropped.`);
-      return;
-    }
-    handleOperatorCommand(ws, msg, ORIGIN.INGAME);
+    warn(`Read door: '${msg.type}' is not spoken here — the door answers one roster question, nothing else. Dropped.`);
   });
-  ws.on('error', (err) => warn(`In-game door socket error: ${err.message}`));
+  ws.on('error', (err) => warn(`Read door socket error: ${err.message}`));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -836,6 +773,9 @@ function onConnection(ws) {
       case 'hq_delta':
         handleHqDelta(ws, msg);
         break;
+      case 'combat_note':
+        for (const [botId, client] of botClients) if (botId !== msg.bot_id) guardExternalSync('foreman_hub', 'relay combat note', () => client.ws.send(raw.toString()));
+        break;
       case 'claim_request':
         handleClaimRequest(ws, msg);
         break;
@@ -845,6 +785,31 @@ function onConnection(ws) {
       case 'planning_request':
         handlePlanningRequest(ws, msg);
         break;
+      // A body's ask before its planning turn takes a verdict: the foreman's own claim of where the keeper's body is
+      // and where it belongs. The body checks the claim against the server (keeper_verdicts.verifyAuthority).
+      case 'keeper_where': {
+        if (!botClients.has(msg.bot_id)) break;
+        const spot = alphaSpot();
+        const { LIFT } = require('./utils/observer');
+        sendToBot(ws, 'keeper_here', msg.bot_id, {
+          requestId: msg.payload && msg.payload.requestId,
+          ...require('./integrity_keeper').where(),
+          station: spot ? { x: spot.x, y: spot.y + LIFT, z: spot.z } : null,
+        });
+        break;
+      }
+      // A body's ask for the nearest biome of a whitelisted decorative dye source, answered by the server's own locate.
+      case 'decoration_locate': {
+        if (!botClients.has(msg.bot_id)) break;
+        const { requestId, item, biome, from } = msg.payload || {};
+        const locator = require('./decoration_locate');
+        (biome ? locator.locateForModule(biome, from) : locator.locate(item, from)).then((answer) => {
+          log(`DECORATION_LOCATE bot=${msg.bot_id} item=${answer.item} from=(${Math.floor(from.x)},${Math.floor(from.z)}) reason=${answer.reason}`
+            + (answer.found ? ` biome=${answer.found.biome} at=(${answer.found.x},${answer.found.z}) distance=${answer.found.distance}` : ''));
+          sendToBot(ws, 'decoration_located', msg.bot_id, { requestId, ...answer });
+        });
+        break;
+      }
       case 'planning_cancel':
         if (botClients.has(msg.bot_id)) brain.cancelWorkspaceRequest(msg.bot_id, msg.payload && msg.payload.requestId);
         break;
@@ -865,7 +830,7 @@ function onConnection(ws) {
         break;
       case 'operator_command':
         // This listener is the terminal door (fleet_control and the console).
-        handleOperatorCommand(ws, msg, ORIGIN.TERMINAL);
+        handleOperatorCommand(ws, msg);
         break;
       default:
         warn(`Unexpected message type '${msg.type}' from bot '${msg.bot_id}'.`);
@@ -882,9 +847,8 @@ function onConnection(ws) {
         botClients.delete(botId);
         brain.releaseForBot(botId);
         broadcastBoardroom();
-        // The player's file must show the crew actually here; a chair dies with the connection (Law 8).
-        savePlayerMemory();
-        ownerMemory.flushNow();   // not queued behind the debounce
+        saveCrewMemory();
+        crewMemory.flushNow();   // not queued behind the debounce
         bodyLeft(botId, 'its connection to the foreman closed', departedBots.get(botId).last_error || 'the body reported no error before it left');
         break;
       }
@@ -905,24 +869,27 @@ function onConnection(ws) {
 const wss = new WebSocket.Server({ port: PORT, host: '127.0.0.1' });
 wss.on('connection', onConnection);
 
-// A port already in use is refused in world terms, with the fix named (Law 13, Law 25).
+// A port already in use is refused in world terms, with the fix named (Law 13, Law 25). A foreman holds TWO ports,
+// FOREMAN_PORT and the one above it (the read door). start_auren.js takes a free pair before raising the foreman
+// (port_book), so this is reached when FOREMAN_PORT named a pair that is held, or a port was taken in the moment between.
 const listenFailure = (which) => (err) => {
   if (err && err.code === 'EADDRINUSE') {
     console.error(`\n  The foreman cannot start: something is already using port ${err.port || PORT}`
       + ` (${which}).\n`
-      + `\n  Almost always this is an foreman that is already running — a second launcher, or one left`
-      + `\n  over from earlier. There is only meant to be one.\n`
-      + `\n  Either use the one that is running, or close it and start again.\n`);
+      + `\n  This foreman takes two ports: ${PORT} for the fleet and ${READ_DOOR_PORT} for the read door.`
+      + `\n  Either a foreman is already running from this copy (use it, or close it and start again),`
+      + `\n  or another program holds a port of this pair. Start without FOREMAN_PORT set and the start takes`
+      + `\n  the first free pair itself; with FOREMAN_PORT set, name a pair that is free.\n`);
     process.exit(1);
   }
   throw err;
 };
 wss.on('error', listenFailure('the fleet port'));
 
-// The in-game door binds to localhost only — the surface that carries a stranger's authority.
-const ingameDoor = new WebSocket.Server({ port: INGAME_DOOR_PORT, host: '127.0.0.1' });
-ingameDoor.on('connection', onIngameConnection);
-ingameDoor.on('error', listenFailure('the in-game door'));
+// The read door binds to localhost only.
+const readDoor = new WebSocket.Server({ port: READ_DOOR_PORT, host: '127.0.0.1' });
+readDoor.on('connection', onReadDoorConnection);
+readDoor.on('error', listenFailure('the read door'));
 
 // Startup banner, magenta — distinct from the bots' cyan banner.
 (function hubBanner() {
@@ -935,12 +902,12 @@ ingameDoor.on('error', listenFailure('the in-game door'));
 })();
 
 // ── THE MIRROR STARTS FULL, NOT EMPTY ───────────────────────────────────────────────────────────────
-// Restores a player's HQ before the first bot can register.
+// Restores the crew's HQ before the first bot can register.
 Object.assign(mergedBuildings, _restored.buildings);
 Object.assign(mergedStations,  _restored.stations);
 
 log(`Foreman WebSocket server listening on ws://127.0.0.1:${PORT}`);
-log(`In-game door listening on ws://127.0.0.1:${INGAME_DOOR_PORT} — verbs arriving here reach CONTRACTORS only.`);
+log(`Read door listening on ws://127.0.0.1:${READ_DOOR_PORT} — it answers the fleet's state, and carries no verb.`);
 log(`Waiting for bot connections...`);
 log(`Operator console ready — type a verb + Enter to command every bot: start | stop | flush | shutdown.`);
 
@@ -953,13 +920,15 @@ const rl = readline.createInterface({ input: process.stdin, output: process.stdo
 rl.on('line', (input) => {
   const verb = (input || '').trim();
   if (!verb) return;
-  runOperatorVerb(verb, 'console', {}, ORIGIN.TERMINAL);   // the operator's own keyboard IS the terminal
+  const [first, number] = verb.split(/\s+/);
+  if (cameraSpots.VERBS.has(first)) { runOperatorVerb(first, 'console', { number }); return; }
+  runOperatorVerb(verb, 'console', {});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 7 — The desk's entrance (the foreman lives in this process)
+// SECTION 7 — The foreman's entrance (the foreman lives in this process)
 // ─────────────────────────────────────────────────────────────────────────────
-// Calls the same three answers the socket handlers call (Law 16). Origin fixed as in-game.
+// The foreman body's own reads and writes on the hub, in this process (Law 16).
 // ── WHERE THE CREW LIVES, AS ONE CELL ────────────────────────────────────────
 // The alpha structure's buildspot (`architect_config.ALPHA_STRUCTURE`), read from lockSite's write.
 // Null when nothing is sited (Law 25).
@@ -977,25 +946,29 @@ function alphaSpot() {
   return null;
 }
 
-const desk = Object.freeze({
+const hub = Object.freeze({
   fleetState: () => fleetState(),
   // The item book's file, written on demand; the run's end calls it once the bodies have left.
   writeItemBook: () => itemBook.write(),
-  flushMemory: () => ownerMemory.flushNow(),
-  // The crew's home cell, for the one verb that takes a person to it (see alphaSpot).
+  flushMemory: () => crewMemory.flushNow(),
+  // The crew's home cell, where the raised crew is put down (see alphaSpot).
   alphaSpot: () => alphaSpot(),
-  operator: (payload) => operatorResult(payload || {}, 'desk', ORIGIN.INGAME),
-  request: (payload) => requestResult(payload || {}),
-  // The one writer of a location (see lockSite). The desk calls it after its survey, before any spawn.
-  lockSite: (rows, ownerKey) => lockSite(rows, ownerKey),
+  // The one writer of a location (see lockSite). The foreman calls it after its survey, before any spawn.
+  lockSite: (rows, crew) => lockSite(rows, crew),
+  // The plans the integrity keeper compares the world against: every structure and every mine unit.
+  keeperPlans: () => ({ buildings: mergedBuildings, mine_cells: mergedMineCells }),
+  // A verdict from the integrity keeper, out to every body.
+  publishVerdict: (subject, verdict) => publishVerdict(subject, verdict),
+  // The foreman's home-sector scan (sector_scan.foremanScan), into the survey book every body receives.
+  recordSurvey: (pages) => { mergeFresherRows(mergedSurvey, pages); broadcastBoardroomSoon(); },
   // ── THE FLEET STOPS WHEN THE RUN ENDS ──
   // `why` rides to the bodies so each records the real cause of its own stop.
   // The foreman's own start for one body: a held crew's release, the operator's staggered `start` given by the run.
-  startBody: (botId) => runOperatorVerb('start', 'foreman-body', { bot: botId }, ORIGIN.TERMINAL),
+  startBody: (botId) => runOperatorVerb('start', 'foreman-body', { bot: botId }),
   stopFleet: (why) => {
     warn(`STOPPING THE FLEET — ${why}`);
-    return runOperatorVerb('stop', 'foreman-body', { why }, ORIGIN.TERMINAL);
+    return runOperatorVerb('stop', 'foreman-body', { why });
   },
 });
 
-module.exports = { desk };
+module.exports = { hub };

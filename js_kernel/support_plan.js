@@ -12,7 +12,7 @@
 // not, the helpers that make it placeable, in the order to try them:
 //   pull  — the support cell is itself a plain block of the plan: place it first, early, from this stand.
 //   temp  — the support cell is air in the plan: stand a filler block there, place, dig the filler out.
-// A block that falls off when its support goes (a lantern, a torch, a door) takes no temp. A voxel with no
+// A block that falls off when its support goes (a lantern, a torch, a door, an anvil) takes no temp. A voxel with no
 // helper is a block the plan asks for that no survival player can place, and is counted as such.
 //
 // THIS LIST PRICES; IT DOES NOT PLACE. The cube's price reads it to carry a neighbour's block
@@ -23,6 +23,7 @@
 
 const { familyOf } = require('@utils/movement/facing_aim');
 const { cubeCells } = require('@kernel/blueprint_anchor_calculator');
+const { fallsWithoutBelow } = require('@utils/gravity_utils');
 
 const VEC = { north: [0, 0, -1], south: [0, 0, 1], east: [1, 0, 0], west: [-1, 0, 0], up: [0, 1, 0], down: [0, -1, 0] };
 const SIX = ['down', 'up', 'north', 'south', 'east', 'west'];
@@ -38,6 +39,8 @@ const key = (x, y, z) => `${x},${y},${z}`;
 // that is never placed on its own (a door's upper half, a bed's head).
 function normalsOf(name, state) {
     const s = state || {};
+    // A falling block (an anvil, sand) stays only on the block below it, whatever face it was clicked onto.
+    if (fallsWithoutBelow(name)) return ['up'];
     const fam = familyOf(name);
     if (!fam) return SITS.test(name) ? ['up'] : SIX;
     if (fam.family === 'door' && s.half === 'upper') return null;
@@ -54,6 +57,7 @@ function supportCells(cell, name, state) {
 }
 
 function hangs(name, state) {
+    if (fallsWithoutBelow(name)) return true;
     const fam = familyOf(name);
     if (!fam) return SITS.test(name);
     if (fam.family === 'face_attached') return name !== 'grindstone';

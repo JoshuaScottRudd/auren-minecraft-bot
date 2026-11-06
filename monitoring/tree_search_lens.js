@@ -10,8 +10,15 @@
 'use strict';
 
 const out = require('./data_out');
+const { relativeTime: relTime } = require('./report_formatting');
 
 const SEARCH_RE = /search outcome=(\w+) zone=(\S+) ring=(\S+) dist=(\S+) rings=(\d+) sections=(\d+) scan_ms=(\d+) seen=(\d+) in_zone=(\d+) examined=(\d+) peer_held=(\d+) boxed=(\d+) path_failed=(\d+) spent=(\d+) search_ms=(\d+) tree=(\S+) species=(\S+)/;
+// Why the passed-over trees were passed over (tree_feller.passedOverWhy); absent on records written before the split.
+const PASSED_RE = / peer_felling=(\d+) tried=(\d+) wet=(\d+)/;
+const passedOf = (raw) => {
+  const p = PASSED_RE.exec(raw);
+  return p ? { peerFelling: +p[1], tried: +p[2], wet: +p[3] } : {};
+};
 
 const UNREACHED_RE = /unreached tree=(\S+) stand=(\S+) from=(\S+) flat=(-?\d+) rise=(-?\d+) reason=(\S+) attempts=(\S+) stand_closed_by=(\S+) ended=(\S+) moved=(\d+) held_ms=(\d+) under=(\S+) at=(\S+) above=(\S+)/;
 const UNREACHED_ROWS = 20;
@@ -19,15 +26,32 @@ const VALVE_RE = /trip_size at=(\S+) item=(\S+) walk=(\d+) walk_s=(\d+) elapsed_
 
 // The sapling planter's ledger line, one per tree harvest that held a primary sapling and stood on a sited farm.
 const PLANTED_RE = /PLANTED n=(\d+) of=(\d+) sapling=(\S+) pocket=(\d+) held_before=(\d+) grid_cells_in_reach=(\d+) peer_held=(\d+) misses=(\d+)(?: no_stand=(\d+))?(?: near_lava=\d+ near_water=\d+)? walk=(\d+) ms=(\d+) stopped=(\S+)(?: cells=(.*))?$/;
-const RING_BLOCKS = 16;     // the ring width tree_feller's search reads by (surface_filter.RING_BLOCKS)
+const RING_BLOCKS = 16;     // the ring width tree_feller's search reads by (ring_scan.RING_BLOCKS)
 const WINDOW_MIN = 5;        // the run is cut into windows this long, so a receding forest reads as a column
 const SLOW_ROWS = 10;
+
+// outward_sections' walk to the next section and its count of the section searched from (any product).
+const OUTWARD_WALK_RE = /OUTWARD_WALK product=(\S+) section=(\S+) ring=(\d+) centre=\((\S+)\) from=\((\S+)\) to=\((\S+)\) hops=(\d+) left=(\d+) inside=(\w+)/;
+const OUTWARD_SECTION_RE = /OUTWARD_SECTION section=(\S+) ring=(\d+) counted=(\w+)(?: product=(\S+))?/;
 
 function reduceTreeSearch({ seg = [], bot: botFilter = null } = {}) {
   const searches = [];
   const unreached = [];
+  const outward = [];
   for (const l of seg) {
     if (botFilter && l.bot !== botFilter) continue;
+    const w = OUTWARD_WALK_RE.exec(l.raw);
+    if (w) {
+      const [fx, , fz] = w[5].split(',').map(Number), [tx, , tz] = w[6].split(',').map(Number);
+      outward.push({ bot: l.bot, wallSec: l.wallSec, kind: 'walk', product: w[1], section: w[2], ring: +w[3], centre: w[4],
+        from: w[5], to: w[6], walked: Math.round(Math.hypot(tx - fx, tz - fz)), hops: +w[7], left: +w[8], inside: w[9] === 'true' });
+      continue;
+    }
+    const sct = OUTWARD_SECTION_RE.exec(l.raw);
+    if (sct) {
+      outward.push({ bot: l.bot, wallSec: l.wallSec, kind: 'count', section: sct[1], ring: +sct[2], counted: sct[3], product: sct[4] || null });
+      continue;
+    }
     const u = UNREACHED_RE.exec(l.raw);
     if (u) {
       unreached.push({ bot: l.bot, wallSec: l.wallSec, tree: u[1], stand: u[2], from: u[3], flat: +u[4], rise: +u[5],
@@ -43,9 +67,10 @@ function reduceTreeSearch({ seg = [], bot: botFilter = null } = {}) {
       rings: +m[5], sections: +m[6], scanMs: +m[7], seen: +m[8], inZone: +m[9], examined: +m[10],
       peerHeld: +m[11], boxed: +m[12], pathFailed: +m[13], spent: +m[14], searchMs: +m[15],
       tree: m[16], species: m[17],
+      ...passedOf(l.raw),
     });
   }
-  return { searches, unreached };
+  return { searches, unreached, outward };
 }
 
 const avg = (xs) => (xs.length ? +(xs.reduce((s, x) => s + x, 0) / xs.length).toFixed(1) : null);
@@ -54,7 +79,7 @@ const sum = (xs) => xs.reduce((s, x) => s + x, 0);
 const count = (xs, f) => xs.filter(f).length;
 
 function runTreeSearch({ seg = [], traceName = '?', bot: botFilter = null, verbose = false } = {}) {
-  const { searches, unreached } = reduceTreeSearch({ seg, bot: botFilter });
+  const { searches, unreached, outward } = reduceTreeSearch({ seg, bot: botFilter });
   const picked = searches.filter(s => s.outcome === 'picked');
 
   out.kv('lens', 'trees');
@@ -94,7 +119,11 @@ function runTreeSearch({ seg = [], traceName = '?', bot: botFilter = null, verbo
   out.kv('peer_held', sum(searches.map(s => s.peerHeld)));
   out.kv('boxed_no_stand', sum(searches.map(s => s.boxed)));
   out.kv('path_failed', sum(searches.map(s => s.pathFailed)));
-  out.kv('already_tried', sum(searches.map(s => s.spent)));
+  out.kv('passed_over', sum(searches.map(s => s.spent)));
+  out.kv('passed_over_peer_felling', sum(searches.map(s => s.peerFelling ?? 0)));
+  out.kv('passed_over_tried', sum(searches.map(s => s.tried ?? 0)));
+  out.kv('passed_over_wet', sum(searches.map(s => s.wet ?? 0)));
+  out.kv('passed_over_unsplit', count(searches, s => s.peerFelling === undefined));
   out.kv('searches_with_a_failed_walk', count(searches, s => s.pathFailed > 0));
   out.kv('picked_first_tree_examined', count(picked, s => s.examined === 1));
 
@@ -209,8 +238,12 @@ function runTreeSearch({ seg = [], traceName = '?', bot: botFilter = null, verbo
   const standing = new Map();          // column → second its sapling went in
   const everPlanted = new Set();
   const farmPicks = [], growSec = [];
+  const replants = new Map();          // column → plantings into it while the planter's last sapling there had no pick
   for (const e of events) {
-    if (e.kind === 'plant') { standing.set(e.col, e.at); everPlanted.add(e.col); continue; }
+    if (e.kind === 'plant') {
+      if (standing.has(e.col)) replants.set(e.col, (replants.get(e.col) || 0) + 1);
+      standing.set(e.col, e.at); everPlanted.add(e.col); continue;
+    }
     if (!standing.has(e.col)) continue;
     growSec.push(e.at - standing.get(e.col));
     standing.delete(e.col);
@@ -226,6 +259,8 @@ function runTreeSearch({ seg = [], traceName = '?', bot: botFilter = null, verbo
   out.kv('saplings_planted', saplings);
   out.kv('distinct_cells_planted', everPlanted.size);
   out.kv('saplings_still_standing_at_end', standing.size);
+  out.kv('planted_again_with_no_pick_between', sum([...replants.values()]));
+  out.kv('columns_planted_again_with_no_pick_between', replants.size);
   out.kv('planting_bot_min_total', +(sum(plantings.map(p => p.ms)) / 60000).toFixed(1));
   out.kv('planting_sec_per_sapling', saplings ? +(sum(plantings.map(p => p.ms)) / 1000 / saplings).toFixed(1) : null);
   out.kv('planting_walk_blocks_total', sum(plantings.map(p => p.walk)));
@@ -243,6 +278,7 @@ function runTreeSearch({ seg = [], traceName = '?', bot: botFilter = null, verbo
   out.table(['source', 'picked', 'dist_avg_blocks', 'dist_max_blocks', 'search_sec_avg', 'search_bot_min_total'],
     [['farm', farmPicks], ['wild', wildPicks]].map(([name, g]) => [name, g.length, avg(g.map(s => s.dist)), max(g.map(s => s.dist)),
       avg(g.map(s => s.searchMs / 1000)), +(sum(g.map(s => s.searchMs)) / 60000).toFixed(1)]));
+  out.table(['column_planted_again', 'times'], [...replants.entries()].sort((a, b) => b[1] - a[1]).slice(0, verbose ? Infinity : 10));
   out.table(['stopped', 'harvests', 'saplings'],
     [...new Set(plantings.map(p => p.stopped))].sort().map(k => [k, count(plantings, p => p.stopped === k), sum(plantings.filter(p => p.stopped === k).map(p => p.n))]));
   out.section('tree_farm_by_window');
@@ -254,6 +290,16 @@ function runTreeSearch({ seg = [], traceName = '?', bot: botFilter = null, verbo
       return [w * WINDOW_MIN, sum(plantings.filter(p => inWin(p, w)).map(p => p.n)), f.length, wd.length, pct(f.length, f.length + wd.length),
         avg(f.map(s => s.dist)), avg(wd.map(s => s.dist)), avg(f.map(s => s.searchMs / 1000)), avg(wd.map(s => s.searchMs / 1000))];
     }));
+
+  // ── OUTWARD: each walk to the next section, and each section counted from where a walk ended ──
+  out.section('outward_walks');
+  const walks = outward.filter(o => o.kind === 'walk');
+  out.kv('walks', walks.length);
+  out.kv('walked_blocks_total', sum(walks.map(o => o.walked)));
+  out.kv('sections_counted', count(outward, o => o.kind === 'count'));
+  out.table(['at', 'bot', 'kind', 'product', 'section', 'ring', 'from', 'to', 'walked', 'hops', 'left', 'inside', 'counted'],
+    outward.map(o => [Number.isFinite(o.wallSec) ? relTime(o.wallSec) : null, o.bot, o.kind, o.product, o.section, o.ring,
+      o.from ?? null, o.to ?? null, o.walked ?? null, o.hops ?? null, o.left ?? null, o.inside ?? null, o.counted ?? null]));
 
   if (verbose) {
     out.section('searches_by_bot');

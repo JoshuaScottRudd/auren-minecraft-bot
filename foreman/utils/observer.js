@@ -106,4 +106,4 @@ async function atSite(who) {
     : { ok: true, why: `${all.join(', ')} ${all.length > 1 ? 'are' : 'is'} in spectator over the site` };
 }
 
-module.exports = { names, isObserver, seatsRaised, remember, place, atSite };
+module.exports = { names, isObserver, seatsRaised, remember, place, atSite, LIFT: OBSERVER_LIFT };

@@ -1,33 +1,33 @@
 'use strict';
 // foreman/utils/get_crew.js — the one way a crew is raised, and the read of a base a crew already holds.
 //
-//   bind({ door, desk, getBot })   the foreman's recorded door, its hub, and its body
-//   getCrew(from, species, opts)   gates the asker's ground, sites the base, launches the crew
-//   existingSite(buildings, key)   the base an owner already holds, exactly as it was locked
+//   bind({ door, hub, getBot })    the foreman's recorded door, its hub, and its body
+//   getCrew(species, opts)          gates the landing's ground, sites the base, launches the crew;
+//                                   → { ok: true } or { ok: false, code, why }
+//   existingSite(buildings, key)    the base a crew already holds, exactly as it was locked
 //
-// Two callers, one road (Law 16): a person's `foreman get <species>` and the foreman raising its own crew.
+// One caller: the foreman raising its own crew, from the cell its body landed on (`at`).
 
-const { FOREMAN_PREFIX, BOT_SENIORITY, PERSON_CLEAR_OF_SPAWN, SEA_LEVEL, HUMAN_SURFACE_SLACK, HUMAN_MAX_ABOVE_SEA,
-        ACCEPTABLE_BIOMES } = require('@thinking/architect_config');
+const { BOT_SENIORITY, BASE_CLEAR_OF_SPAWN, SEA_LEVEL, LANDING_SURFACE_SLACK, LANDING_MAX_ABOVE_SEA,
+        settles } = require('@thinking/architect_config');
 const record = require('../foreman_record');
 const { log } = require('./say');
 const { startBot, firstMeaningfulLine } = require('./crew_launch');
-const { crewSizeFor } = require('../foreman_vocabulary');
-const correction = require('../correction');
-// The ground test the desk declines on, and the same one every base is sited with (Law 16).
+// The crew the run page sizes, the one answer shared with the startup proof and the cameras (Law 16).
+const CREW_COUNT = require('../../foreman_config').count;
+// The ground test the foreman declines on, and the same one every base is sited with (Law 16).
 const siteGeometry = require('@utils/site_geometry');
 const { worldSpawnPoint, chebyshevFromWorldSpawn } = require('@perception/spawn_protection');
 const { getBiomeName } = require('@perception/biome_scanner');      // the one biome read (Law 16)
-// The body's own siter, run dry, so the desk's answer and the crew's answer agree (Law 16).
+// The body's own siter, run dry, so the foreman's answer and the crew's answer agree (Law 16).
 const lockAllBuildspots = require('@action/lock_all_buildspots');
-const { ownerKeyFor } = require('@kernel/bot_mandate');
-const { roomKeyName, roomKeyOwner } = require('@foreman/message_schema');
+const { roomKeyName, roomKeyCrew } = require('@foreman/message_schema');
 const { makeVoxelReader } = require('@utils/voxel_reader');
 
 let door = null;
-let desk = null;
+let hub = null;
 let getBot = () => null;
-function bind(c) { ({ door, desk, getBot } = c); }
+function bind(c) { ({ door, hub, getBot } = c); }
 
 // How long a crew gets to appear in the registry, matched to `fleet_control.waitForBotsOnline`'s 90s so
 // the two answers cannot drift apart (Law 16).
@@ -52,20 +52,29 @@ const FIRST_MOVE_CEILING_MS = 45000;
 const SPAWN_LANES = 2;
 const SPAWN_LANE_OFFSET_MS = 1000;
 
-// How close "beside the human" means, matched to the body's own arrival tolerance so the desk and body
+// How close "on the cell" means, matched to the body's own arrival tolerance so the foreman and body
 // agree on the same cell (Law 25).
 const CREW_PLACEMENT_RADIUS = 4;
 
-const ROSTER = Object.keys(BOT_SENIORITY).sort((a, b) => BOT_SENIORITY[a] - BOT_SENIORITY[b]);
+// The names a crew is raised from: every roster name by seniority, or only the ones the run names (foreman_config.only).
+const ONLY = require('../../foreman_config').only;
+const ROSTER = Object.keys(BOT_SENIORITY).filter(id => !ONLY || ONLY.includes(id)).sort((a, b) => BOT_SENIORITY[a] - BOT_SENIORITY[b]);
 
-// existingSite(buildings, ownerKey) → { site, seat, unreadable } for the base this crew already holds, or
+// A refusal: recorded under its code, logged with its numbers, and handed back to the step that asked.
+function refuse(code, why) {
+  record.refused(code, why);
+  log(`crew raise refused [${code}]: ${why}`);
+  return { ok: false, code, why };
+}
+
+// existingSite(buildings, crewKey) → { site, seat, unreadable } for the base this crew already holds, or
 // null when it holds none — read from the fleet's memory (Invariant B), exactly as locked. `unreadable`
 // names a buildspot with no blueprint record, a damaged row (`set_buildspot` writes both chairs at once).
-function existingSite(buildings, ownerKey) {
+function existingSite(buildings, crewKey) {
   const site = [];
   const unreadable = [];
   for (const [key, entry] of Object.entries(buildings || {})) {
-    if (roomKeyOwner(key) !== ownerKey) continue;
+    if (roomKeyCrew(key) !== crewKey) continue;
     const spot = entry && entry.set_buildspot;
     if (!spot || !spot.transpose_origin) continue;
     const blueprint = entry.blueprint_paster && entry.blueprint_paster.building_name;
@@ -85,239 +94,208 @@ function existingSite(buildings, ownerKey) {
   return { site, seat: c ? { x: Math.floor(c.x), y: Math.floor(c.y), z: Math.floor(c.z) } : null, unreadable };
 }
 
+// missingFromBase(species, site) → the structures this crew raises (STRUCTURE_PRIORITY; the mine's site is its
+// SHAFT_HEAD; the wheat and cane field copies critical mass asks for) that the held base has no row for: a structure added to
+// the crew after its base was sited.
+function missingFromBase(species, site) {
+  const { STRUCTURE_PRIORITY, SHAFT_HEAD } = require('@thinking/architect_config');
+  const sited = new Set(site.map(r => r.roomKey));
+  const fields = require('@utils/calculators/wheat_critical_mass').fieldKeysSited(species);
+  return [...new Set([...(STRUCTURE_PRIORITY[species] || []), ...fields].map(s => (s === 'shallow_shaft' ? SHAFT_HEAD[species] : s)))]
+    .filter(s => !sited.has(s));
+}
+
 // ── getCrew — the one way a crew is raised ──────────────────────────────────────────────
-// Gates the asker's ground, sites the base into the fleet's memory, launches the crew one body at a time
-// (Law 16). `at` is the foreman's own position when raising its own crew; `build` is builder.build or null;
-// `resume` is a continued run, whose crew goes back to the base in memory with nobody placed.
-async function getCrew(from, species, { reply, correct, trouble, at = null, build = null, siteOnly = false, resume = false, held = false }) {
+// Gates the landing's ground, sites the base into the fleet's memory, launches the crew one body at a time
+// (Law 16). `at` is the cell the foreman's body landed on; `build` is builder.build or null; `resume` is a
+// continued run, whose crew goes back to the base in memory with nobody placed; `siteOnly` stops once the
+// base is in memory.
+async function getCrew(species, { at = null, build = null, siteOnly = false, resume = false, held = false }) {
   const bot = getBot();
-  const wantsContractors = species === 'contractor';
-  const size = crewSizeFor(species);   // the one crew-size answer shared with startup proof and cameras
+  const size = CREW_COUNT;
 
   const state = await door.query();
-  if (!state.ok) {
-    trouble(from, 'fleet_unreachable', "can't check what you have right now — try again in a moment.",
-            `door.query failed on get: ${state.error}`);
-    return;
+  if (!state.ok) return refuse('fleet_unreachable', `door.query failed: ${state.error}`);
+  // A half crew is completed, not treated as full: every connected body counts toward whether the crew is
+  // staffed (Invariant B).
+  const standingNow = state.bots;
+  if (!siteOnly && standingNow.length >= size) {
+    return refuse('crew_full', `crew full: ${standingNow.map(b => b.id).join(', ')} of ${size}`);
   }
-  // A half crew is completed, not treated as full (Law 27): `get` means "bring me up to a crew". A
-  // contractor crew is counted against the asker; a homestead has no owner by constitution (`bot_mandate`),
-  // so every ownerless body counts toward whether it is staffed (Invariant B) — one predicate, used both
-  // here and to recognise each body as it registers below (Law 16).
-  const isOurs = (b) => (wantsContractors ? b.owner === from : !b.owner);
-  const mine = state.bots.filter(isOurs);
-  if (mine.length >= size) {
-    const said = `${FOREMAN_PREFIX} get ${species}`;
-    const names = mine.map(b => b.id);
-    correct(wantsContractors
-      ? correction.crewFull(said, names, size)
-      : correction.homesteadFull(said, names, size));
-    return;
-  }
-  const needed = size - mine.length;
+  const needed = size - standingNow.length;
 
   // A name is not invented — the roster is the ceiling, so a short house is reported as short (Law 13).
-  // A partial crew is refused whole (Law 13, default-stopped; Law 25), counted against what is still
-  // needed so somebody holding one bot isn't told the house is full.
   const free = ROSTER.filter(id => !state.bots.some(b => b.id === id));
-  if (free.length < needed) {
-    // Two numbers only — how many are free, how many a crew needs (Law 24).
-    reply(`only ${free.length} of ${ROSTER.length} bots free and a crew is ${size} — somebody has to let theirs go first.`);
-    return;
+  if (!siteOnly && free.length < needed) {
+    return refuse('roster_short', `only ${free.length} of ${ROSTER.length} roster names free and ${needed} are needed`);
   }
-  const crew = free.slice(0, needed);
+  const crew = free.slice(0, Math.max(needed, 0));
 
   // ── A CONTINUED RUN PUTS NOBODY ANYWHERE ──────────────────────────────────
   // Its base is the one in memory and each body starts where the last run left it standing, so there is
   // no ground to measure and no cell to place a body on: the crew is launched with no placement at all.
-  const ownerKey = ownerKeyFor(species, wantsContractors ? from : '');
-  const heldBase = existingSite(state.buildings, ownerKey);
+  const heldBase = existingSite(state.buildings, species);
   if (resume && !heldBase) {
-    record.refused(from, 'nothing_to_continue', `${crew.length} launch(es) withheld`);
-    trouble(from, 'nothing_to_continue',
-      `there is no base to continue from. Nobody was sent.`,
-      `start is 'continue' and the fleet's memory holds no base under '${ownerKey}' — a continued run carries on from `
-      + `a base an earlier run sited; start: 'rollback' sites one | withheld ${crew.join(', ')}`);
-    return;
+    return refuse('nothing_to_continue', `start is 'continue' and the fleet's memory holds no base under '${species}' — a `
+      + `continued run carries on from a base an earlier run sited; start: 'rollback' sites one`);
   }
-  const ground = resume ? { feet: null, reader: null, placeAt: '' } : await groundBesideAsker(bot, from, crew, at, trouble);
-  if (!ground) return;
-  const { feet, reader } = ground;
-  let placeAt = ground.placeAt;
+  let feet = null;
+  let reader = null;
+  let placeAt = '';
+  if (!resume) {
+    const ground = await landingGround(bot, at);
+    if (!ground.ok) return ground;
+    ({ feet, reader, placeAt } = ground);
+  }
 
   // ── AND THE WHOLE BASE IS SITED BEFORE ANYBODY IS SPAWNED ─────────────────
   // The same siter the body uses, run dry (Law 16), written into the fleet's memory before any body
-  // exists, surveyed from the person's feet.
-  // A crew that already has a base is sent to it — the survey below is blind to the fleet's memory, so
-  // without this read it would hand a second site and the hub would refuse it against the crew's lock.
+  // exists, surveyed from the landing. A crew that already has a base is sent to it — the survey below is
+  // blind to the fleet's memory, so without this read it would hand a second site and the hub would refuse
+  // it against the crew's lock.
   let site;
   let seat;
   if (heldBase && heldBase.unreadable.length) {
-    record.refused(from, 'base_record_damaged', `${crew.length} launch(es) withheld`);
-    trouble(from, 'base_record_damaged',
-      `your saved base is damaged, so I won't send a crew into it. "${FOREMAN_PREFIX} wipe" clears it. Nobody was sent.`,
-      `building row(s) with a site but no blueprint record: ${heldBase.unreadable.join(', ')} | withheld ${crew.join(', ')}`);
-    return;
+    return refuse('base_record_damaged', `building row(s) with a site but no blueprint record: ${heldBase.unreadable.join(', ')} — `
+      + 'a rollback start clears them');
   }
   if (heldBase) {
     site = heldBase.site;
     seat = heldBase.seat;
-    record.note(`${from}: '${ownerKey}' already has a base — handing it back, no survey: ${site.map(r => r.roomKey).join(', ')}`);
-  } else {
-    reply('checking the ground around you...');
-    const layout = await lockAllBuildspots.run(bot, { dryRun: true, species, unlockedWorld: true, origin: feet, build });
-    if (layout.transient) {
-      record.refused(from, 'world_streaming', `${crew.length} launch(es) withheld`);
-      trouble(from, 'world_streaming',
-        `the world around you is still loading — try again in a few seconds. Nobody was sent.`,
-        `base-layout dry run hit unloaded chunks | withheld ${crew.join(', ')}`);
-      return;
+    // A STRUCTURE THE CREW GAINED SINCE ITS BASE WAS SITED is sited now, around the base it holds: the survey keeps every
+    // held structure where it stands (lock_all_buildspots `held`) and the hub locks only the rows it adds.
+    const gained = missingFromBase(species, site);
+    if (gained.length) {
+      const kept = new Map(site.map(r => [r.roomKey, r.candidate]));
+      const layout = await lockAllBuildspots.run(bot, { dryRun: true, species, held: kept, origin: seat, build });
+      const rows = layout.ok ? layout.site.filter(r => gained.includes(r.roomKey)) : [];
+      if (layout.transient || !layout.ok || rows.length < gained.length) {
+        return refuse('base_gain_unsited', `held base lacks [${gained.join(', ')}]; survey around (${seat.x},${seat.y},${seat.z}) `
+          + (layout.transient ? 'hit unloaded chunks' : `gave [${rows.map(r => r.roomKey).join(', ')}]: ${(layout.problems || []).join('; ')}`)
+          + `\n  survey:\n  ${(layout.report || []).join('\n  ')}`);
+      }
+      await hub.lockSite(rows, species);
+      site = [...site, ...rows];
+      record.note(`'${species}' base gained [${gained.join(', ')}] — sited beside the held base, the rest kept`);
     }
+    record.note(`'${species}' already has a base — handing it back, no survey: ${site.map(r => r.roomKey).join(', ')}`);
+  } else {
+    const layout = await lockAllBuildspots.run(bot, { dryRun: true, species, unlockedWorld: true, origin: feet, build });
+    if (layout.transient) return refuse('world_streaming', 'base-layout dry run hit unloaded chunks');
     if (!layout.ok) {
-      record.refused(from, 'no_base_site', `${crew.length} launch(es) withheld`);
-      // One problem in chat, all of them in the log — a full survey line is a wall of text, and the first
-      // line is what they can act on (Law 24).
-      const firstProblem = String(layout.problems[0] || 'the ground here will not hold it').slice(0, 90);
-      trouble(from, 'no_base_site',
-        `no room for a base here — ${firstProblem}. Try flatter ground near a river. Nobody was sent.`,
-        `base-layout dry run refused: ${layout.problems.join('; ')}\n  survey:\n  ${layout.report.join('\n  ')}\n  withheld ${crew.join(', ')}`);
-      return;
+      return refuse('no_base_site', `base-layout dry run refused: ${layout.problems.join('; ')}\n  survey:\n  ${layout.report.join('\n  ')}`);
     }
     site = layout.site;
     seat = layout.anchor;
-    // The desk writes the site into memory before any body exists; an existing base above is not rewritten.
-    await desk.lockSite(site, ownerKey);
+    // The foreman writes the site into memory before any body exists; an existing base above is not rewritten.
+    await hub.lockSite(site, species);
+    await scanHomeSector(bot, site, species);
   }
 
-  // Said before the crew is fetched, so the reason a body walks off arrives before it walks. A contractor's
-  // house lands near the person; a homestead follows the water and can be far out.
-  if (seat && resume) {
-    reply(`continuing at the base at (${seat.x}, ${seat.y}, ${seat.z}) — each of the crew starts where it stood.`);
-  } else if (seat) {
-    const far = Math.round(Math.hypot(seat.x - feet.x, seat.z - feet.z));
-    reply(heldBase
-      ? `your base is already at (${seat.x}, ${seat.y}, ${seat.z}) — ${far}b away. sending the crew there.`
-      : `base goes at (${seat.x}, ${seat.y}, ${seat.z}) — ${far}b ${far > 60 && species === 'homesteader' ? 'out, following the water' : 'away'}.`);
-  }
-  // ── THE CREW IS PUT DOWN ON THE BUILD, NOT BESIDE THE PERSON WHO ASKED ──────
-  // The cell above was the only ground known before the base was sited; now it moves to where the work is.
-  // Asks `desk.alphaSpot()`, the same function `foreman teleport` sends a person to (Law 16). The
-  // asker's cell stays as the fallback for a seat whose chunks haven't streamed in.
-  const alpha = (!resume && desk.alphaSpot) ? desk.alphaSpot() : null;
+  // ── THE CREW IS PUT DOWN ON THE BUILD, NOT ON THE LANDING ──────
+  // The landing was the only ground known before the base was sited; now it moves to where the work is.
+  // Asks `hub.alphaSpot()`, the one answer to where the crew's home cell is (Law 16). The landing cell
+  // stays as the fallback for a seat whose chunks haven't streamed in.
+  const alpha = !resume ? hub.alphaSpot() : null;
   if (alpha) {
     const atAlpha = await siteGeometry.standingSpotNear(reader, { x: alpha.x, y: alpha.y, z: alpha.z },
       { radius: CREW_PLACEMENT_RADIUS });
     if (atAlpha.found) {
       placeAt = `${atAlpha.cell.x} ${atAlpha.cell.y} ${atAlpha.cell.z}`;
-      record.note(`${from}: crew placed on the ${alpha.structure} anchor at ${placeAt}`);
+      record.note(`crew placed on the ${alpha.structure} anchor at ${placeAt}`);
     } else {
-      record.note(`${from}: the ${alpha.structure} anchor has no readable standing cell (${atAlpha.why}) — crew placed beside the asker at ${placeAt}`);
+      record.note(`the ${alpha.structure} anchor has no readable standing cell (${atAlpha.why}) — crew placed on the landing at ${placeAt}`);
+    }
+  }
+  if (seat) log(`${resume ? 'continuing at' : 'base at'} (${seat.x}, ${seat.y}, ${seat.z})`);
+
+  // ── A CONTINUED CREW CARRIES ITS HOME CELL ──────
+  // Nobody is placed, but a body the last rollback never raised logs in at world spawn; it is put on this cell
+  // (start_injector), the same anchor a rollback places the crew on. Read from the foreman's own ground reader; an
+  // unreadable anchor is noted and the crew goes without one.
+  let homeCell = '';
+  const home = resume ? hub.alphaSpot() : null;
+  if (home) {
+    const atHome = await siteGeometry.standingSpotNear(makeVoxelReader(bot), { x: home.x, y: home.y, z: home.z },
+      { radius: CREW_PLACEMENT_RADIUS });
+    if (atHome.found) {
+      homeCell = `${atHome.cell.x} ${atHome.cell.y} ${atHome.cell.z}`;
+      record.note(`continued crew's home cell on the ${home.structure} anchor at ${homeCell}`);
+    } else {
+      record.note(`the ${home.structure} anchor has no readable standing cell (${atHome.why}) — a continued body at world spawn has no home cell`);
     }
   }
 
   // The foreman's own startup sites and raises as two steps; this call stops here with the base in memory.
-  if (siteOnly) return;
+  if (siteOnly) return { ok: true };
 
-  return launchCrew({ from, species, crew, mine, needed, size, wantsContractors, isOurs, placeAt, reply, trouble, held });
+  return launchCrew({ species, crew, size, placeAt, held, homeCell });
 }
 
-// groundBesideAsker(bot, from, crew, at, trouble) → { feet, reader, placeAt }, or null once it has refused.
-// ── NOTHING IS LAUNCHED UNTIL THE GROUND BESIDE THE ASKER WILL HOLD A BODY ─────────────────────
-// The desk declines before spawning when there's no standing spot beside the human — the last moment a
-// refusal is free (Law 13, Law 16); no entity in the player table is "can't see", not "no room" (Law 23).
-async function groundBesideAsker(bot, from, crew, at, trouble) {
-  const asker = at ? { position: at } : (bot.players && bot.players[from] && bot.players[from].entity);
-  if (!asker || !asker.position) {
-    trouble(from, 'asker_unseen', `I can't see where you're standing, so I won't send anyone. Come back into view and say "${FOREMAN_PREFIX} get" again.`,
-            `no entity for '${from}' in the desk's player table — nothing to measure ground against`);
-    return null;
-  }
-  const feet = { x: Math.floor(asker.position.x), y: Math.floor(asker.position.y), z: Math.floor(asker.position.z) };
+// ── THE CREW ARRIVES TO A BOOK WITH ITS HOME PAGE ────────────────────────────────────────────────────
+// The home sector is sector 0,0, the one the alpha structure stands in (assessors/survey.home reads the same chair).
+// Scanned on the foreman's own body from what it has loaded; when the home sector's ground is not loaded here the page
+// is left for the crew's own home-sector job, and the note says so.
+async function scanHomeSector(bot, site, species) {
+  const head = require('@thinking/architect_config').ALPHA_STRUCTURE[species];
+  const row = site.find(r => r.roomKey === head);
+  const home = row && row.candidate && row.candidate.transpose_origin;
+  if (!home) { record.note(`home sector: no '${head}' row in the sited base, so no home scan from the foreman`); return; }
+  const scan = await require('@perception/sector_scan').foremanScan(bot, home);
+  if (!scan) { record.note(`home sector of (${home.x},${home.y},${home.z}) is not loaded ground for the foreman — the crew scans it`); return; }
+  hub.recordSurvey(scan.pages);
+  record.note(`home sector ${scan.sector} scanned by the foreman from (${scan.stand.x},${scan.stand.y},${scan.stand.z}): `
+    + `${scan.categories} categories`);
+}
 
-  // ── AND NOT AT WORLD SPAWN, WHICHEVER OF US IS ASKING ───────────────────
-  // Refuses a launch inside the spawn-protected square (Law 16), where every break and placement is
+// landingGround(bot, at) → { ok: true, feet, reader, placeAt }, or a refusal.
+// ── NOTHING IS LAUNCHED UNTIL THE LANDING'S GROUND WILL HOLD A BODY ─────────────────────
+// The foreman declines before spawning when the landing cannot hold a crew — the last moment a refusal is
+// free (Law 13, Law 16).
+async function landingGround(bot, at) {
+  if (!at) return refuse('no_landing', 'no landing cell to measure ground against');
+  const feet = { x: Math.floor(at.x), y: Math.floor(at.y), z: Math.floor(at.z) };
+
+  // ── AND NOT AT WORLD SPAWN ───────────────────
+  // Refuses a landing inside the spawn-protected square (Law 16), where every break and placement is
   // blocked. Clearance is read from config, measured Chebyshev; an unknown centre refuses too (Law 13).
   const spawnAt = worldSpawnPoint(bot);
-  if (!spawnAt) {
-    record.refused(from, 'world_spawn_unknown', `${crew.length} launch(es) withheld`);
-    trouble(from, 'world_spawn_unknown',
-      `I don't know where world spawn is yet — try again in a moment. Nobody was sent.`,
-      `no spawn_position packet latched for the desk — cannot measure ${from}'s clearance | withheld ${crew.join(', ')}`);
-    return null;
-  }
+  if (!spawnAt) return refuse('world_spawn_unknown', 'no spawn_position packet latched for the foreman — cannot measure the landing\'s clearance');
   const outFromSpawn = chebyshevFromWorldSpawn(bot, feet);
-  if (outFromSpawn < PERSON_CLEAR_OF_SPAWN) {
-    record.refused(from, 'too_close_to_world_spawn', `${crew.length} launch(es) withheld at ${outFromSpawn}b`);
-    trouble(from, 'too_close_to_world_spawn',
-      `too close to world spawn (${outFromSpawn}b, need ${PERSON_CLEAR_OF_SPAWN}) — building is blocked there. `
-      + `Walk ${PERSON_CLEAR_OF_SPAWN - outFromSpawn} more blocks out. Nobody was sent.`,
-      `${from} at (${feet.x},${feet.y},${feet.z}) is ${outFromSpawn}b Chebyshev from world spawn (${spawnAt.x},${spawnAt.z}), `
-      + `inside the ${PERSON_CLEAR_OF_SPAWN}b clearance | withheld ${crew.join(', ')}`);
-    return null;
+  if (outFromSpawn < BASE_CLEAR_OF_SPAWN) {
+    return refuse('too_close_to_world_spawn', `the landing (${feet.x},${feet.y},${feet.z}) is ${outFromSpawn}b Chebyshev from world spawn `
+      + `(${spawnAt.x},${spawnAt.z}), inside the ${BASE_CLEAR_OF_SPAWN}b clearance`);
   }
 
   // ── ON THE OVERWORLD SURFACE, NEAR SEA LEVEL ───────────────────────────────
-  // This fleet sites bases on the overworld surface against sea-level water (the farm pins to the water
-  // plane, the headframe sinks from the surface). No dimension check needed: `asker_unseen` above already
-  // turns away the nether and the end (Law 16).
+  // This fleet sites bases on the overworld surface near sea level (the headframe and the shallow shaft sink from
+  // the surface).
   const reader = makeVoxelReader(bot);
   const ground = siteGeometry.surfaceY(reader, feet.x, feet.z, feet.y);
-  if (!ground) {
-    record.refused(from, 'ground_unreadable', `${crew.length} launch(es) withheld`);
-    trouble(from, 'ground_unreadable',
-      `I can't read the ground where you are — move a little and try again. Nobody was sent.`,
-      `surfaceY found no ground in the window at (${feet.x},${feet.z}) ref y=${feet.y} | withheld ${crew.join(', ')}`);
-    return null;
+  if (!ground) return refuse('ground_unreadable', `surfaceY found no ground in the window at (${feet.x},${feet.z}) ref y=${feet.y}`);
+  if (feet.y < ground.y - LANDING_SURFACE_SLACK) {
+    return refuse('underground', `the landing is at y=${feet.y}, and the surface of that column is y=${ground.y} (${ground.name})`);
   }
-  if (feet.y < ground.y - HUMAN_SURFACE_SLACK) {
-    record.refused(from, 'underground', `${crew.length} launch(es) withheld at y${feet.y}`);
-    trouble(from, 'underground',
-      `you're underground (${ground.y - feet.y}b below the surface) — come up top. Nobody was sent.`,
-      `${from} at y=${feet.y}, surface of that column is y=${ground.y} (${ground.name}) | withheld ${crew.join(', ')}`);
-    return null;
+  if (feet.y > SEA_LEVEL + LANDING_MAX_ABOVE_SEA) {
+    return refuse('too_high', `the landing is at y=${feet.y}, and the ceiling is SEA_LEVEL+${LANDING_MAX_ABOVE_SEA}=${SEA_LEVEL + LANDING_MAX_ABOVE_SEA}`);
   }
-  if (feet.y > SEA_LEVEL + HUMAN_MAX_ABOVE_SEA) {
-    record.refused(from, 'too_high', `${crew.length} launch(es) withheld at y${feet.y}`);
-    trouble(from, 'too_high',
-      `you're too high up (y${feet.y}) — a base needs ground near sea level (y${SEA_LEVEL}). Head downhill. Nobody was sent.`,
-      `${from} at y=${feet.y}, ceiling is SEA_LEVEL+${HUMAN_MAX_ABOVE_SEA}=${SEA_LEVEL + HUMAN_MAX_ABOVE_SEA} | withheld ${crew.join(', ')}`);
-    return null;
-  }
-  // The biome at the feet, judged against the same set the siter gates on (Law 16).
+  // The biome at the feet, judged against the same banned-biome list the siter gates on (Law 16).
   const biome = getBiomeName(bot, feet.x, feet.y, feet.z);
-  if (!ACCEPTABLE_BIOMES.has(biome)) {
-    record.refused(from, 'biome', `${crew.length} launch(es) withheld in ${biome}`);
-    trouble(from, 'biome',
-      `${String(biome).replace(/_/g, ' ')} won't work — find forest or plains. Nobody was sent.`,
-      `${from} stands in '${biome}', not in ACCEPTABLE_BIOMES | withheld ${crew.join(', ')}`);
-    return null;
-  }
+  if (!settles(biome)) return refuse('biome', `the landing stands in '${biome}', in BANNED_BIOMES`);
 
   const room = await siteGeometry.standingSpotNear(reader, feet, { radius: CREW_PLACEMENT_RADIUS });
-  // ── THE CREW IS PLACED ON THE CELL MEASURED HERE, NOT ON THE ASKER'S NAME ─────────────────
+  // ── THE CREW IS PLACED ON THE CELL MEASURED HERE ─────────────────
   // One placement for every crew (Law 16), handed to each body as "x y z". Re-pointed at the alpha anchor
-  // below once the base is sited; this is the fallback for a seat whose chunks haven't streamed in.
-  if (!room.found) {
-    record.refused(from, 'no_standing_room', `${crew.length} launch(es) withheld`);
-    trouble(from, 'no_standing_room',
-      `there's nowhere beside you for anyone to stand — try again on open ground. Nobody was sent.`,
-      `${room.why} | withheld ${crew.join(', ')} before launch`);
-    return null;
-  }
-  return { feet, reader, placeAt: `${room.cell.x} ${room.cell.y} ${room.cell.z}` };
+  // once the base is sited; this is the fallback for a seat whose chunks haven't streamed in.
+  if (!room.found) return refuse('no_standing_room', room.why);
+  return { ok: true, feet, reader, placeAt: `${room.cell.x} ${room.cell.y} ${room.cell.z}` };
 }
 
 // launchCrew — brings the named bodies up one lane at a time and says what actually arrived. `placeAt` is
 // the cell every body is put on, "x y z", or '' for a crew that starts where each body stands.
-async function launchCrew({ from, species, crew, mine, needed, size, wantsContractors, isOurs, placeAt, reply, trouble, held = false }) {
-  // Said while they wait, not after — the two species look identical until a homesteader doesn't answer
-  // (Law 25).
-  const forWhom = wantsContractors ? 'for you' : 'for the homestead — they won\'t answer you';
-  reply(needed === size
-    ? `getting ${crew.join(' and ')} ${forWhom}...`
-    : `you have ${mine.map(b => b.id).join(' and ')} — getting ${crew.join(' and ')} to finish the crew...`);
-  // The owner is stamped at each launch, un-forgeable afterward. The crew list is fixed above, so the
-  // lanes below never race the free-bot list.
+async function launchCrew({ species, crew, size, placeAt, held = false, homeCell = '' }) {
+  log(`raising ${crew.join(' and ')}`);
+  // The crew list is fixed above, so the lanes below never race the free-bot list.
   // ── AT MOST SPAWN_LANES BODIES ON THE SPAWN SPOT ──────────────────────────────────────────────────
   // Each lane launches a body, waits for it to register, and waits for it to walk off before launching its
   // next, so the spot never holds more than SPAWN_LANES bodies and a fast walker frees its lane at once.
@@ -328,7 +306,7 @@ async function launchCrew({ from, species, crew, mine, needed, size, wantsContra
   let reach = null;                       // the last fleet error, when the registry could not be read
   const queue = crew.slice();
   const bringOne = async (target) => {
-    const r = await startBot(target, species, wantsContractors ? from : '', placeAt, held);
+    const r = await startBot(target, species, placeAt, held, homeCell);
     said.push(firstMeaningfulLine(r.out) || `${target}: the launcher exited ${r.code}`);
 
     // Polled, not slept-then-checked, so a fast registration is brought over fast.
@@ -338,12 +316,12 @@ async function launchCrew({ from, species, crew, mine, needed, size, wantsContra
       const state2 = await door.query();
       if (!state2.ok) { reach = state2.error; break; }
       reach = null;
-      if (state2.bots.some(b => b.id === target && isOurs(b))) { seen = true; break; }
+      if (state2.bots.some(b => b.id === target)) { seen = true; break; }
       if (Date.now() >= deadline) break;
       await new Promise(r2 => setTimeout(r2, CREW_ARRIVAL_POLL_MS));
     }
     if (!seen) {
-      log(`${target} did not register within ${BODY_ARRIVAL_WAIT_MS}ms for ${from}`);
+      log(`${target} did not register within ${BODY_ARRIVAL_WAIT_MS}ms`);
       await new Promise(r => setTimeout(r, CREW_LAUNCH_GAP_MS));   // the lane's spacing, since no arrival gave it
       return;
     }
@@ -363,44 +341,27 @@ async function launchCrew({ from, species, crew, mine, needed, size, wantsContra
     log(moved
       ? `${target} is walking ${((Date.now() - t0) / 1000).toFixed(1)}s after registering — its lane launches the next body`
       : `${target} did not start walking within ${FIRST_MOVE_CEILING_MS / 1000}s — its lane launches the next body anyway (the ceiling, not the pace)`);
-    // The body places itself and confirms it (`body_recovery.arriveAtPlayer`); one place a crew is put
-    // where its person is standing (Law 16).
+    // The body places itself and confirms it (`body_recovery.arriveAtCell`); one place a crew is put (Law 16).
   };
   const lane = async (k) => {
     if (k > 0) await new Promise(r => setTimeout(r, SPAWN_LANE_OFFSET_MS * k));
     while (queue.length) await bringOne(queue.shift());
   };
   await Promise.all(Array.from({ length: Math.min(SPAWN_LANES, crew.length) }, (_, k) => lane(k)));
-  log(`get crew ${crew.join(', ')} for ${from} -> ${said.join(' | ')}`
-      + ` | stood: ${standing.join(', ') || 'none'}`);
+  log(`raised ${crew.join(', ')} -> ${said.join(' | ')} | stood: ${standing.join(', ') || 'none'}`);
 
   // ── WHAT ARRIVED IS ASKED OF THE FLEET, NEVER QUOTED FROM THE LAUNCHER ─────────────────────────
   // A launcher says whether it started a process; the registry says whether a body is standing (Law 26).
-  // Registry unreachable is a third answer, not a failure — the desk truthfully doesn't know (Law 25).
+  // Registry unreachable is a third answer, not a failure — the foreman truthfully doesn't know (Law 25).
   if (reach && standing.length === 0) {
-    trouble(from, 'crew_unconfirmed', `I started ${crew.join(' and ')} but can't confirm they arrived.`,
-            `door.query failed: ${reach} | launcher said: ${said.join(' | ')}`);
-    return;
+    return { ok: false, code: 'crew_unconfirmed', why: `door.query failed: ${reach} | launcher said: ${said.join(' | ')}` };
   }
-
-  if (standing.length >= size) {
-    // "Yours" must be true — said to a homesteader's asker it would be the opposite of the fact (Law 25).
-    // "Here" is proved, not reported: each body places itself and refuses to work unconfirmed, so working
-    // means standing here (Law 27).
-    const whose = wantsContractors ? 'yours' : 'the homestead\'s';
-    reply(`${standing.join(' and ')} are ${whose}, here, and ${held ? 'waiting for start' : 'working'}.`);
-    return;
+  if (standing.length >= crew.length) {
+    log(`${standing.join(' and ')} ${standing.length === 1 ? 'is' : 'are'} ${held ? 'waiting for start' : 'working'}`);
+    return { ok: true };
   }
-  // What they have and what to do, no machine detail — that belongs in the log and record, not open chat
-  // in front of the server (Law 24).
-  record.refused(from, 'crew_short', `${standing.length} of ${size}`);
   const missing = crew.filter(id => !standing.includes(id));
-  trouble(from, 'crew_short',
-    standing.length
-      ? `${standing.join(' and ')} is yours and working. ${missing.join(' and ')} didn't make it — say "${FOREMAN_PREFIX} get" to try for the rest.`
-      : `couldn't get your crew up. say "${FOREMAN_PREFIX} get" to try again.`,
-    `${standing.length} of ${size} stood; missing ${missing.join(', ')}; launcher said: ${said.join(' | ')}`);
-  return;
+  return refuse('crew_short', `${standing.length} of ${size} stood; missing ${missing.join(', ')}; launcher said: ${said.join(' | ')}`);
 }
 
 module.exports = { bind, getCrew, existingSite };

@@ -3,8 +3,9 @@
 //   action='load'    — walk to a registered furnace, put an order-sized batch of input + fuel in,
 //                      stamp { order, qty, input, fuel, started_at } onto the furnace's station entry,
 //                      and leave without waiting out the cook.
-//   action='collect' — walk to a furnace whose batch the cook-time calculator marked done, take
-//                      the output, clear the order, and bank the surplus.
+//   action='topup'   — walk to a furnace cooking this order and add input and fuel, emptying nothing.
+//   action='collect' — walk to a furnace the cook-time calculator says has enough cooked, take the
+//                      output, keep the order on what is still cooking or clear it, and bank the surplus.
 //
 // A furnace and a chest are one fitting (Law 13, asserted below): the furnace is a shared batch
 // producer, so its surplus goes through the chest to reach whichever bot asked for it. A furnace
@@ -37,9 +38,9 @@ const { retrieveItems } = require('@api/inventory_swapper');
 const { group_to_item: OBJECT_GROUPS } = require('@utils/fragment_utils');
 const { FUEL_PREFERENCES } = require('@thinking/architect_config');
 
-// Smelts per unit of fuel, for sizing a batch (coal 8, plank 1.5). FUEL_PREFERENCES lives in the
-// config because assessors/furnace shares the array (Law 16); this yield table has no second reader.
-const FUEL_SMELT_YIELD = { coal: 8, charcoal: 8, planks: 1.5 };
+// Smelts per unit of fuel, for sizing a batch (coal 8, plank 1.5): the fuel calculator's table, which the
+// charcoal row is sized from too (Law 16).
+const { FUEL_SMELT_YIELD } = require('@utils/calculators/fuel_calculator');
 const { routeToJudge } = require('@utils/signal_utils');
 const { guardExternal } = require('@utils/external_library_guard');
 
@@ -126,19 +127,24 @@ async function fetchFuel(bot, batch, payload) {
     const got = await retrieveItems(bot, banked.pref, Math.min(banked.count, short));
     return got === undefined ? undefined : banked.pref;
   }
-  // Only the planks this batch burns are made, and only the logs those planks take are fetched: what the
-  // pocket already holds of either counts first.
-  const planks = `${banked.log.replace(/_log$/, '')}_planks`;
+  return makePlanks(bot, banked.log, batch, banked.count, payload);
+}
+
+// makePlanks(bot, log, batch, inChests, payload) → the planks' name, null with none to burn, undefined once routed.
+// Only the planks this batch burns are made, and only the logs those planks take are fetched: what the
+// pocket already holds of either counts first.
+async function makePlanks(bot, log, batch, inChests, payload) {
+  const planks = `${log.replace(/_log$/, '')}_planks`;
   const heldOf = name => bot.inventory.items().filter(i => i.name === name).reduce((n, i) => n + i.count, 0);
   const short = Math.ceil(batch / FUEL_SMELT_YIELD.planks) - heldOf(planks);
   if (short <= 0) return planks;
   const logs = Math.ceil(short / PLANKS_PER_LOG);
-  const fetch = Math.min(banked.count, logs - heldOf(banked.log));
+  const fetch = Math.min(inChests, logs - heldOf(log));
   if (fetch > 0) {
-    const got = await retrieveItems(bot, banked.log, fetch);
+    const got = await retrieveItems(bot, log, fetch);
     if (got === undefined) return undefined;
   }
-  const make = Math.min(logs, heldOf(banked.log));
+  const make = Math.min(logs, heldOf(log));
   if (make === 0) return heldOf(planks) > 0 ? planks : null;
   const book = await require('@api/craft_handler').craftBatch(bot, [{ item: planks, quantity: make * PLANKS_PER_LOG }], payload);
   if (!book || !book.success) return undefined;
@@ -163,13 +169,6 @@ function _route(success, reason, extra = {}) {
     readable: `${TAG}: ${reason}`,
     [TAG]: { success, ...extra },
   });
-}
-
-// Abandonment (Law 15): locomotion could not deliver the bot to the furnace. Drop this line;
-// the furnace state is untouched (load: nothing written yet; collect: order stays for next sweep).
-function _abandon(reason) {
-  watcher.warn(TAG, `Abandoning — ${reason}`);
-  _route(false, reason);
 }
 
 // _reach — walks to the furnace's stance: goToStationStance resolves the blueprint anchor beside
@@ -206,6 +205,13 @@ module.exports = {
       throw new Error(`[${TAG}] CODING VIOLATION (Law 10/13): furnace job missing action/station_id/where — ${JSON.stringify({ action, stationId, where })}`);
     }
 
+    // ── THE READOUT CARRIES WHAT MOVED ──────────────────────────────────────────────────────────────
+    // Every outcome says how many of what went into a furnace or came out of one. A run of outcomes that moved
+    // nothing then reads the same each time, whichever furnace each claim named, and the judge counts it as the loop
+    // it is. Which furnace, and where, is said on the warn line beside it.
+    const moved = (n) => `${action === 'collect' ? 'collected' : action === 'topup' ? 'topped up' : 'loaded'} ${n}x ${job.order}`;
+    const fail = (why) => _route(false, `${moved(0)} — ${why}`, { action, order: job.order, moved: 0 });
+
     // ── THE FURNACE/CHEST COUPLING, ASSERTED BEFORE THE WALK (Law 13) ───────────────────────────────
     // Checked only on collect: emptying a shared furnace with no registered chest to hand the batch
     // to declines loudly, `success:false`, so the judge counts the shortfall (Law 25).
@@ -234,13 +240,27 @@ module.exports = {
       const banked = await require('@api/inventory_swapper').dumpExcess(bot);
       if (banked && banked.abandoned) return;
       if (bot.inventory.emptySlotCount() < FURNACE_SLOTS) {
-        _route(false, `pocket has ${bot.inventory.emptySlotCount()} free slot(s) after banking — a load needs ${FURNACE_SLOTS} to empty the furnace into`);
+        fail(`pocket has ${bot.inventory.emptySlotCount()} free slot(s) after banking — a load needs ${FURNACE_SLOTS} to empty the furnace into`);
         return;
       }
     }
     if (action === 'load') {
       fetchedFuel = await fetchFuel(bot, job.batch_quantity || 1, payload);
       if (fetchedFuel === undefined) return;
+    }
+    // A top-up carries only the input already in the slot, and the fuel kind already in the slot, which the window reads on arrival.
+    if (action === 'topup') {
+      const heldOf = name => bot.inventory.items().filter(i => i.name === name).reduce((n, i) => n + i.count, 0);
+      const fuelShort = Math.ceil((job.batch_quantity || 1) / yieldOf(job.fuel)) - heldOf(job.fuel);
+      const lens = require('@kernel/inventory_lens');
+      if (/_planks$/.test(job.fuel)) {
+        const log = job.fuel.replace(/_planks$/, '_log');
+        if (await makePlanks(bot, log, job.batch_quantity || 1, require('@perception/chest_ledger').unclaimedOf([log]), payload) === undefined) return;
+      } else if (fuelShort > 0 && lens.inChests(job.fuel) > 0) {
+        if (await retrieveItems(bot, job.fuel, Math.min(fuelShort, lens.inChests(job.fuel))) === undefined) return;
+      }
+      const take = Math.min((job.batch_quantity || 1) - heldOf(job.input), require('@perception/chest_ledger').unclaimedOf([job.input]));
+      if (take > 0 && await retrieveItems(bot, job.input, take, undefined, { only: [job.input] }) === undefined) return;
     }
     if (action === 'load' && job.input) {
       const names = smeltInputs(job.order);
@@ -259,7 +279,9 @@ module.exports = {
 
     const pos = new Vec3(where.x, where.y, where.z);
     if (!(await _reach(bot, pos))) {
-      _abandon(`locomotion could not reach furnace at (${where.x},${where.y},${where.z})`);
+      // Abandonment (Law 15): the furnace state is untouched (load: nothing written yet; collect: order stays for next sweep).
+      watcher.warn(TAG, `Abandoning — locomotion could not reach furnace ${stationId} at (${where.x},${where.y},${where.z})`);
+      fail('locomotion could not reach the furnace');
       return;
     }
     const block = bot.blockAt(pos);
@@ -268,17 +290,81 @@ module.exports = {
       // entry (Law 6 self-heal) and soft-fail so job_board re-plans from fresh world state.
       watcher.warn(TAG, `furnace gone at (${where.x},${where.y},${where.z}) — removing stale entry`);
       stationRegistry.removeStation(stationId);
-      _route(false, `furnace gone at station ${stationId}`);
+      fail('the furnace was gone');
+      return;
+    }
+
+    // ── TOP UP ──────────────────────────────────────────────────────────────
+    // Nothing leaves the furnace. The window says what is in the slots; what goes in is bounded by a stack of input, by a
+    // stack of output once it has all cooked, and by the fuel. The clock is rebuilt from the window: the output is what has cooked.
+    if (action === 'topup') {
+      const smelt = stationRegistry.getSmeltState(stationId);
+      const heldCount = name => bot.inventory.items().filter(i => i.name === name).reduce((n, i) => n + i.count, 0);
+      let added = 0, batch = 0, burnt = 0, inputName = job.input, fuelName = job.fuel, outCount = 0, cold = false;
+      const book = require('@kernel/item_book');
+      await book.open();
+      const topped = await guardExternal(TAG, `furnace window (topup) @ ${stationId}(${block.position.x},${block.position.y},${block.position.z})`, async () => {
+        const furnace = await bot.openFurnace(block);
+        const inSlot = furnace.inputItem(), fuelSlot = furnace.fuelItem(), outSlot = furnace.outputItem();
+        const inCount = inSlot ? inSlot.count : 0;
+        const fuelCount = fuelSlot ? fuelSlot.count : 0;
+        outCount = outSlot ? outSlot.count : 0;
+        // A COLD FURNACE IS NEVER TOPPED UP: nothing left to cook, or nothing burning and no fuel to light it. It is emptied.
+        if (!inSlot || (fuelCount === 0 && !(furnace.fuel > 0))) { cold = true; furnace.close(); return; }
+        inputName = inSlot.name;
+        const chosen = fuelSlot ? null : selectFuel(bot, job.fuel);
+        fuelName = fuelSlot ? fuelSlot.name : (chosen ? chosen.item.name : job.fuel);
+        const yieldPer = yieldOf(fuelName);
+        const spareFuel = heldCount(fuelName);
+        const stack = 64;
+        const add = Math.min(job.batch_quantity || 1, heldCount(inputName), stack - inCount, stack - outCount - inCount,
+          Math.floor((fuelCount + spareFuel) * yieldPer) - inCount);
+        if (add > 0) {
+          const { item: winInput } = await awaitWindowItem(furnace, inputName);
+          if (winInput) {
+            burnt = Math.max(0, Math.ceil((inCount + add) / yieldPer) - fuelCount);
+            if (burnt > 0) {
+              const { item: winFuel } = await awaitWindowItem(furnace, fuelName);
+              if (winFuel) await furnace.putFuel(winFuel.type, null, burnt);
+              else burnt = -1;
+            }
+            if (burnt >= 0) {
+              await furnace.putInput(winInput.type, null, add);
+              added = add;
+              batch = inCount + add;
+            }
+          }
+        }
+        furnace.close();
+      });
+      await sleep(FURNACE_BOOK_SETTLE_MS);
+      await book.close('furnace_topup', `furnace:${stationId}`);
+      if (!topped.ok) { fail(`furnace top-up failed: ${topped.reason}`); return; }
+      if (cold) {
+        // The clock ends now, so the next sweep posts this furnace to be emptied.
+        if (smelt) stationRegistry.setSmeltState(stationId, { ...smelt, qty: 1, started_at: new Date(0).toISOString() });
+        fail('the furnace had gone cold: it is emptied, not topped up');
+        return;
+      }
+      if (added === 0) { fail(`nothing could go in: ${heldCount(inputName)} ${inputName} and ${heldCount(fuelName)} ${fuelName} held`); return; }
+      const cookMs = require('@utils/calculators/smelt_calculator').smeltCookMsPerItem(job.order);
+      stationRegistry.setSmeltState(stationId, {
+        ...smelt, order: job.order, qty: outCount + batch, input: inputName, fuel: fuelName,
+        started_at: new Date(Date.now() - outCount * cookMs).toISOString(),
+        locked_by: process.env.BOT_ID || 'default',
+      });
+      watcher.summary(TAG, `WINDOW furnace-topup @ ${stationId}: ${added}x ${job.order} — ${outCount} cooked, ${batch} cooking, ${burnt} ${fuelName} added`);
+      _route(true, `topped up ${added}x ${job.order} at furnace ${stationId}`, { order: job.order, qty: added });
       return;
     }
 
     // ── LOAD ────────────────────────────────────────────────────────────────
     if (action === 'load') {
       const inputItem = _largestHeld(bot, smeltInputs(job.order));
-      if (!inputItem) { _route(false, `none of ${smeltInputs(job.order).join('|')} on hand to smelt ${job.order}`); return; }
+      if (!inputItem) { fail(`none of ${smeltInputs(job.order).join('|')} on hand`); return; }
 
       const fuel = selectFuel(bot, fetchedFuel || job.fuel);   // throws on logs-only
-      if (!fuel) { _route(false, `no fuel on hand to smelt ${job.order}`); return; }
+      if (!fuel) { fail('no fuel on hand'); return; }
 
       // Batch size bounded by input held, deficit, and fuel capacity (one open, walk away).
       const yieldPer = yieldOf(fuel.pref);
@@ -329,12 +415,12 @@ module.exports = {
       if (desyncWaitedMs !== null) {
         // The window never surfaced an item the bot holds — a true desync, having waited the full timeout.
         watcher.warn(TAG, `furnace window never surfaced ${inputItem.name} (held ${inputItem.count}) after ${desyncWaitedMs}ms — releasing to replan`);
-        _route(false, `furnace window desync: ${inputItem.name} not visible after ${desyncWaitedMs}ms`);
+        fail(`furnace window desync: ${inputItem.name} not visible`);
         return;
       }
       if (!loaded.ok) {
         watcher.warn(TAG, `WINDOW furnace-load @ ${stationId} — the window session FAILED after ${Date.now() - openT0}ms`);
-        _route(false, `furnace load failed: ${loaded.reason}`);
+        fail(`furnace load failed: ${loaded.reason}`);
         return;
       }
 
@@ -384,11 +470,22 @@ module.exports = {
       await book.close('furnace_collect', `furnace:${stationId}`);
       if (!collected.ok) {
         watcher.warn(TAG, `WINDOW furnace-collect @ ${stationId} — the window session FAILED after ${Date.now() - openT0}ms`);
-        _route(false, `furnace collect failed: ${collected.reason}`);
+        fail(`furnace collect failed: ${collected.reason}`);
         return;
       }
 
-      stationRegistry.clearSmeltState(stationId);
+      // ── WHAT IS STILL COOKING KEEPS THE FURNACE ──────────────────────────────────────────────────────
+      // A body empties the output slot mid-cook, so the input left in the window is the batch now, and its clock starts
+      // again. Left input with a batch past its time and nothing to take has stopped (no fuel): the order ends, and the
+      // next load empties the slots.
+      const smelt = stationRegistry.getSmeltState(stationId);
+      const leftInput = (items.find(i => smeltInputs(job.order).includes(i.name)) || {}).count || 0;
+      const stopped = smelt && taken === 0 && require('@utils/calculators/smelt_calculator').isSmeltComplete(smelt.started_at, smelt.order, smelt.qty || 1);
+      if (smelt && leftInput > 0 && !stopped) {
+        stationRegistry.setSmeltState(stationId, { ...smelt, qty: leftInput, started_at: new Date().toISOString() });
+      } else {
+        stationRegistry.clearSmeltState(stationId);
+      }
       stationRegistry.snapshotStation(stationId, items);
 
       // ── THE HANDOVER: KEEP THIS BOT'S SHARE, BANK THE REST ────────────────────────────────────────
@@ -405,7 +502,7 @@ module.exports = {
         if (dropped?.abandoned) return;
       }
 
-      watcher.summary(TAG, `WINDOW furnace-collect @ ${stationId}: ${taken}x ${job.order} — openFurnace OK in ${openMs}ms — order cleared, surplus banked`);
+      watcher.summary(TAG, `WINDOW furnace-collect @ ${stationId}: ${taken}x ${job.order} — openFurnace OK in ${openMs}ms — ${stationRegistry.getSmeltState(stationId) ? `${leftInput} still cooking` : 'order cleared'}, surplus banked`);
       _route(true, `collected ${taken}x ${job.order} from furnace ${stationId}`, { order: job.order, taken });
       return;
     }

@@ -54,7 +54,7 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 - **job_gates** — every reason a fully-built job may be disqualified before it is posted. `Thinking_fragments/job_gates.js`
 - **job_ranking** — where a posted job's position comes from: two names, never a number. `Thinking_fragments/job_ranking.js`
 - **dispatcher** — picks the lowest unmet need *this species may take*. `Thinking_fragments/dispatcher.js`
-- **requested_work** — which requirements are live for this body; the whole contractor/homesteader split. `Thinking_fragments/requested_work.js`
+- **requested_work** — which requirements are live for this body, selected by its species. `Thinking_fragments/requested_work.js`
 - **idle_scheduler** — the re-entry heartbeat when every job is peer-claimed and the chain would otherwise terminate for good. `js_kernel/idle_scheduler.js`
 - **portable_judge** — stall and oscillation detection inside a running executor. `js_kernel/portable_judge.js`
 - **architect_config** — every tunable that shapes fleet behaviour, as pure data. Nothing downstream redefines a table. `Thinking_fragments/architect_config.js`
@@ -63,21 +63,25 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 
 - **spawn_protection** — the one answer to "may this cell be changed", sensed from the server rather than assumed. `perception_nodes.js/spawn_protection.js`
 - **threat_scanner** — what is hostile and where. `perception_nodes.js/threat_scanner.js`
-- **the integrity family** — "is what I built still there and still right": `building_integrity`, `farming_integrity`, `mining_integrity`, `health_integrity`, `torch_integrity`
+- **the integrity family** — "is what I built still there and still right": `building_integrity`, `farming_integrity`, `mining_integrity`, `health_integrity`, `lighting_integrity`
 - **the siting family** — "where should the next thing go": `farmland_site`, `blueprint_survey`, `mining_blueprinter`, `mining_cell_graph`, `station_registry`, `surface_filter`
-- **the resource family** — "where is the material": `biome_scanner`, `ground_drop_scanner`, `stone_column_scanner`
+- **the resource family** — "where is the material": `biome_scanner`, `ground_drop_scanner`
+- **sector_finder** — the one escalation for "I cannot find this": a book sector recording it (`survey_book`), then the next frontier sector's full scan (`sector_scan`), one body per sector, ring by ring. `custom_api/sector_finder.js`
+- **squid_hunt** — the one ink trip: a squid found (sector_finder past sight), the surface water over it entered, and dives for its ink (`ink_diver` over `underwater_swimming`'s borrowed breath). `custom_api/squid_hunt.js`
 - **voxel_reader** — the one bulk block-read pathway. `js_kernel/utils/voxel_reader.js`
 - **voxel_scan_throttle** — the one cooperative pacer for any scan reading hundreds of voxels. Reused, never re-invented. `js_kernel/utils/voxel_scan_throttle.js`
 
 ## C. Action — a manager decides, an executor does
 
 - **building** — `build_executor`, `building_manager`, `blueprint_paster`, `preconstruction`, `land_prep`, `find_buildingspot`, `set_buildspot`, `lock_all_buildspots`
-- **mining** — `mining_executor`, `mining_manager`, `stone_prospect_executor`
+- **mining** — `mining_executor`, `mining_manager`
 - **farming** — `farm_executor`, `farm_manager`, `harvest_executor`, `compost_executor`
 - **supply and crafting** — `supply_manager`, `delivery_executor`, `ground_salvage_executor`, `craft_executor`, `furnace_executor`
-- **survival** — `eat_executor`, `eat_manager`, `death_manager`, `torch_executor`, `await_aggro`
-- **exploration** — `exploration_executor`, `canopy_clear_executor`
-- **idle and reporting** — `idle_park`, `report_to_owner`, `set_wood_preference`
+- **survival** — `eat_executor`, `eat_manager`, `death_manager`, `await_aggro`
+- **lighting** — `lighting_manager`, `lighting_executor`; every torch stands where a design puts it, never where a light reading asks: the mine's on its staircase and unit designs (`lighting_integrity.designLamps`, placed by the digger as it digs), the base's on posts over its spawn proofing (`base_layout`), the headframe door's two on its own `light_points`. Each design is proven lit at load with `js_kernel/utils/calculators/light_calculator.js` (the game's own rule). Whether each designed torch stands is the integrity keeper's light verdict; a lighting visit takes the dug shaft's missing ones from it, and the night gate opens on the base once every spawn-proofing torch stands. Every crew lays them, in the mine, the branches and on the surface
+- **the scattered base** — every crew's structures are sited one at a time, each on its own ground (`lock_all_buildspots`): one layout for every crew, differing only in the blueprints its `CREW_PROFILE` row names: the crew's downloaded building first when it has one (`CREW_BUILD`); the home — beside the building (the laydown yard), or from where the body stands on ground its shaft descends safely through when the shaft hangs from it (the headframe, `find_buildingspot.locate`); the waste pit; a shallow shaft that stands alone; the wheat field, the pens and the crop fields, each beside the structure it serves, nearest first (`footprint_survey.siteBeside`, `utils/surface_site`). A support with no spot there is sited beside any structure already placed, nearest first, so every support finds a place while the land holds one. Every base then gets its spawn proofing (`SPAWN_PROOFING`): torch posts on the ground as it stands round every footprint, no earthwork, painted at siting over the surface the survey read (`base_layout.paintLights`, `BASE_LIGHTS`): a grid post every 10 blocks, then a post wherever the game's light rule (`light_calculator`) still leaves a stand cell dark, until none is; a base its posts cannot light is refused. The posts ride on the spawn proofing's site row (`lights`), and the spawn proofing is a generated blueprint drawn from them (`base_layout.proofingBuilding`, served by `blueprint_registry`), one anchor per post on a stand beside it; the integrity keeper checks the same posts and the night gate opens on the base's ground once every one stands (`lighting_integrity.baseTorches`, `litAtNight`). A random landing that cannot hold the base is rolled again up to three times, then the run stops with every landing's refusal (`startup_steps`, read with `--site`; benched on saved snapshots with `Auren_Workshop/tools/base_scatter_bench.js`).
+- **exploration** — `exploration_executor`; site felling — `canopy_clear_executor`
+- **idle** — `idle_park`
 
 ## D. The body — the layer between the bot's vocabulary and Minecraft's
 
@@ -101,8 +105,6 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 - **crafting_blueprint_registry** — the one route to `crafting_blueprints.json`. `js_kernel/crafting_blueprint_registry.js`
 - **monster_tactics_registry** — the one route to `monster_tactics.json`. `js_kernel/monster_tactics_registry.js`
 - **inventory_lens** — the one place anything asks where a material is and how much of it exists. Nothing assembles a material pool of its own and nothing counts a chest itself. `js_kernel/inventory_lens.js`
-- **request_ledger** — what a human has asked this crew for, and how far it is from done. A request is a stock row, not a job. `js_kernel/request_ledger.js`
-- **requestable_catalogue** — what a human *may* ask the fleet for, computed rather than listed. `js_kernel/requestable_catalogue.js`
 - **durable_write** — the one way this fleet replaces a file it cannot afford to lose. `js_kernel/durable_write.js`
 - **flush_system** — the `flush` operator verb: resets a bot to "fresh on a server". `js_kernel/flush_system.js`
 - **wipe_system** — the `wipe` operator verb: forget one owner's places, so the human accountable for a crew can move their base. `js_kernel/wipe_system.js`
@@ -111,12 +113,12 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 
 ## F. Identity, voice and command
 
-- **bot_mandate** — what species this process is, decided at birth and never again. A homesteader has no chat listener mounted at all, not a filtered one. `js_kernel/bot_mandate.js`
-- **bot_voice** — a contractor says one thing and one thing only: whether it is available. `js_kernel/bot_voice.js`
+- **bot_mandate** — what species this process is, decided at birth and never again. No species mounts a chat listener. `js_kernel/bot_mandate.js`
 - **operator_commands** — start / stop / flush / wipe and the bench verbs, as one implementation behind two transports (the per-bot console, and the foreman's broadcast). `js_kernel/operator_commands.js`
 - **body_recovery** — the two acts of putting a dead body back on its feet, owned in one place. `js_kernel/body_recovery.js`
-- **the foreman** — the in-game desk. A human in the world asks and a crew arrives where they are standing; everything is hired from inside the game and that is the only way. `foreman/` (foreman, foreman_channel, foreman_record, foreman_vocabulary, correction, foreman_door)
+- **the foreman** — the body that runs the world, sites the base and raises the crew its run page names; it hears nothing in chat and says the run's beats there (run_announcer). `foreman/` (foreman, foreman_record, foreman_door — the read door)
 - **the foreman** — claim arbitration, which is its only decision; everything else it does is pure relay (Law 3). `foreman/` (foreman_brain, foreman_hub, owner_memory, message_schema)
+- **the integrity keeper** — the one place a plan is compared with the world, for the whole crew: a thread inside the foreman's process, fed the chunks and block changes the foreman's body hears, keeping each verdict current and broadcasting it. Its subjects: light (whether every designed torch, spawn proofing and mine, stands, is missing, blocked or still in rock); structures (every sited blueprint the registry carries, against the world); pens (`foreman/pen_keeper.js`, on the keeper's main thread since entities reach only its body: watched from the keeper's first structures reading of the pen built whole; every penned animal by id, in and out, the gate, each escape or loss named with the bodies beside it and their hands, the wolves near a pen; the one pen census bodies read through `pen_gate.keptPen`, and the ids a herder's guard never strikes, `pen_gate.foreignNear`). The downloaded building, the mine and the pens' tending ground are still read by bodies. Bodies read verdicts from their own memory and treat a stale one as unknown. `foreman/integrity_keeper.js`, `foreman/integrity_keeper_worker.js`, `js_kernel/keeper_verdicts.js`
 - **foreman_link** — the bot-side WebSocket client. `js_kernel/foreman_link.js`
 - **crew_log** · **crew_board** — what the crew said, and what the crew agrees about. `custom_api/`
 
@@ -131,7 +133,7 @@ This file removes that bound. It is an index of names, **not** a restatement of 
 
 - **start_bot.js** — the one birth. A bot exists because this ran.
 - **start_overseer.js** — DELETED 2026-09-18: the referee (now the foreman's hub) runs inside `foreman/foreman.js`.
-- **start_auren.js** — the desk and the referee together; the one way in for a user.
+- **start_auren.js** — the foreman and the referee together; the one way in for a user.
 - **master_core.js** — what a bot runs once it has been told who it is.
 - **child_fleet** — how a parent process raises and holds bots. `js_kernel/utils/child_fleet.js`
 

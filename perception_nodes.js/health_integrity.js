@@ -1,5 +1,5 @@
 // perception node: health_integrity
-// The self-preservation counterpart to building_integrity / farming_integrity / torch_integrity — the one
+// The self-preservation counterpart to building_integrity / farming_integrity / lighting_integrity — the one
 // node that reads the bot's own vital internals and hands the brain a single verdict. Covers hunger (food)
 // and health (hp), and is the expansion point for every self-state check to come (armor, potion effects,
 // drowning, fall exposure). assessors/hunger gates the `eat` job on needs_to_eat; the health read rides

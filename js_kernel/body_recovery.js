@@ -1,6 +1,6 @@
 'use strict';
 // body_recovery — click respawn and verify a body came back; teleport and verify it arrived. Shared by
-// every path that can face a corpse (natural death, a continued run, a fresh spawn, `foreman get`), so
+// every path that can face a corpse (natural death, a continued run, a fresh spawn, the foreman's crew raise), so
 // all four share one discipline (Law 16). Neither act trusts its own command: a respawn packet accepted
 // is not a body, a `tp` that returned cleanly is not an arrival (Law 25). Each function takes a bot
 // HANDLE and creates none; WHERE the body goes stays a policy the caller owns.
@@ -21,13 +21,6 @@ const VERIFY_POLL_MS = 100;
 
 // A tp to integer coords lands the body at cell centre (+0.5); this absorbs settle drift, still failing a wrong block.
 const ARRIVAL_TOLERANCE = 2.0;
-
-// Act 2c's pair: wider tolerance for a walking person, longer wait for their entity to load into the bot's player table.
-const PLAYER_ARRIVAL_TOLERANCE = 4.0;
-const PLAYER_ARRIVAL_WAIT_MS = 10000;
-
-// Vanilla username shape, checked so a selector like `@a` can never reach `tp` (Law 27), one spelling for both acts below (Law 16).
-const MINECRAFT_USERNAME = /^[A-Za-z0-9_]{3,16}$/;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -115,80 +108,13 @@ async function teleportTo(bot, at, { name = null } = {}) {
 }
 
 // ── ACT 2b ───────────────────────────────────────────────────────────────────────────────────────────
-// teleportToPlayer(botName, playerName) → { sent, error }
-// Moves a body to a PERSON by name, resolved server-side so it needs neither coordinates nor a loaded
-// chunk — the form the foreman uses, since it holds no client handle on the body it moves (Law 16).
-// Reports `sent`, not `moved`: verifying arrival needs a handle only the bot's own process has.
-async function teleportToPlayer(botName, playerName) {
-  // Neither name is defaulted — a guessed name would move the wrong body while still reporting success (Law 13).
-  if (!botName || !playerName) {
-    throw new Error(`[${TAG}] CODING VIOLATION: teleportToPlayer needs both names — got bot='${botName}' player='${playerName}'.`);
-  }
-  for (const [label, value] of [['bot', botName], ['player', playerName]]) {
-    if (!MINECRAFT_USERNAME.test(value)) {
-      throw new Error(`[${TAG}] CODING VIOLATION: teleportToPlayer was handed a ${label} name that is not a `
-        + `Minecraft username: '${value}'. A selector reaching \`tp\` moves bodies nobody named.`);
-    }
-  }
-  // rcon_link owns the socket to the server; a throw here originates in the rcon package behind it.
-  const sent = await guardExternal(TAG, `rcon tp ${botName} -> ${playerName}`,
-    () => require('./utils/rcon_link').once([`tp ${botName} ${playerName}`]));
-  if (!sent.ok) return { sent: false, error: `rcon: ${sent.reason}` };
-  return { sent: true, error: null };
-}
-
-// ── ACT 2c ───────────────────────────────────────────────────────────────────────────────────────────
-// arriveAtPlayer(bot, playerName) → { arrived, error, distance }
-// Composes Act 2b's send with the verification only the live client can do: distance is read off the
-// bot's and the player's own entities, so arrival is measured against the world, not assumed (Law 25).
-async function arriveAtPlayer(bot, playerName) {
-  if (!bot || !bot.entity) {
-    throw new Error(`[${TAG}] CODING VIOLATION: arriveAtPlayer needs a live bot handle — verification is the whole point of this act, and there is nothing to verify with.`);
-  }
-  const botName = bot.username || process.env.BOT_ID;
-  if (!botName) {
-    throw new Error(`[${TAG}] CODING VIOLATION: arriveAtPlayer has no username — the bot handle carries none and BOT_ID is unset.`);
-  }
-  // A malformed placement name is operator input, not a coding fault, so it is answered, not thrown (Law 25).
-  if (!MINECRAFT_USERNAME.test(String(playerName || ''))) {
-    return { arrived: false, distance: null, error: `'${playerName}' is not a Minecraft username, so there is nobody to be placed beside` };
-  }
-
-  // The cell beside a player is the server's to choose, so this move is expected by its time alone.
-  require('./server_account').expect(null, PLAYER_ARRIVAL_WAIT_MS);
-  const sent = await teleportToPlayer(botName, playerName);
-  if (!sent.sent) return { arrived: false, distance: null, error: sent.error };
-
-  // Polled, not slept-then-checked, so a fast placement is confirmed as fast as it lands.
-  let lastSeen = null;
-  for (const end = Date.now() + PLAYER_ARRIVAL_WAIT_MS; Date.now() < end;) {
-    const them = bot.players && bot.players[playerName] && bot.players[playerName].entity;
-    const us = bot.entity && bot.entity.position;
-    if (them && them.position && us) {
-      lastSeen = us.distanceTo(them.position);
-      if (lastSeen <= PLAYER_ARRIVAL_TOLERANCE) return { arrived: true, distance: lastSeen, error: null };
-    }
-    await sleep(VERIFY_POLL_MS);
-  }
-  // Two distinct failures, said differently (Law 25): unseen player versus a tp accepted but not delivered.
-  return {
-    arrived: false,
-    distance: lastSeen,
-    error: lastSeen === null
-      ? `'${playerName}' never appeared in this body's player table within ${PLAYER_ARRIVAL_WAIT_MS}ms — nobody by that name is in the world where this body can see them`
-      : `still ${lastSeen.toFixed(1)} blocks from ${playerName} after ${PLAYER_ARRIVAL_WAIT_MS}ms (needs ${PLAYER_ARRIVAL_TOLERANCE}) — the server took the tp and the body did not land there`,
-  };
-}
-
-// ── ACT 2d ───────────────────────────────────────────────────────────────────────────────────────────
-// arriveAtPlace(bot, place) → { arrived, error, distance }
-// The one door a placement comes through, whether it names a person (Act 2c) or a cell (Act 2) — a
-// foreman-raised crew has no person to stand beside, so it is handed a measured cell, "x y z" (Law 16).
+// arriveAtCell(bot, cell) → { arrived, error, distance }
+// The one door a placement comes through: the measured cell the foreman hands a body it raises, "x y z"
+// (Law 16). A cell in any other form is operator input from a hand launch, so it is answered, not thrown (Law 25).
 const CELL_FORM = /^(-?\d+)\s+(-?\d+)\s+(-?\d+)$/;
-function isCellPlace(place) { return CELL_FORM.test(String(place || '').trim()); }
-async function arriveAtPlace(bot, place) {
-  const m = CELL_FORM.exec(String(place || '').trim());
-  if (!m) return arriveAtPlayer(bot, place);
+async function arriveAtCell(bot, cell) {
+  const m = CELL_FORM.exec(String(cell || '').trim());
+  if (!m) return { arrived: false, distance: null, error: `'${cell}' is not a cell written "x y z"` };
   const at = { x: Number(m[1]), y: Number(m[2]), z: Number(m[3]) };
   const r = await teleportTo(bot, at);
   if (!r.moved) return { arrived: false, distance: null, error: r.error };
@@ -207,6 +133,6 @@ function anchorZeroPoint(blueprintName, transposeOrigin) {
 }
 
 module.exports = {
-  isDead, awaitKnownHealth, reviveBody, teleportTo, teleportToPlayer, arriveAtPlayer, arriveAtPlace, isCellPlace, anchorZeroPoint,
+  isDead, awaitKnownHealth, reviveBody, teleportTo, arriveAtCell, anchorZeroPoint,
   ARRIVAL_TOLERANCE, HEALTH_WAIT_MS, RESPAWN_WAIT_MS, TELEPORT_WAIT_MS,
 };

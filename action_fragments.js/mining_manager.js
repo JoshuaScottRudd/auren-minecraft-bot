@@ -24,19 +24,52 @@ const BATCH_BLOCKED_EXITS = new Set(['pocket_short']);
 // Exported so job_board's toolGate reads the same predicate (Law 16).
 function hasPickaxe(bot) {
     if (!bot || !bot.inventory) return { ok: false, reason: 'bot/inventory not ready' };
-    const count = bot.inventory.items().filter(i => i && i.name && i.name.endsWith('_pickaxe')).length;
+    // The reserved pickaxe is not a working one: it is kept for the ores no lower tier takes (fragment_utils.RESERVED_TOOLS).
+    const { RESERVED_TOOLS } = require('@utils/fragment_utils');
+    const count = bot.inventory.items().filter(i => i && i.name && i.name.endsWith('_pickaxe') && !RESERVED_TOOLS.includes(i.name)).length;
     if (count === 0) return { ok: false, reason: 'no pickaxe in inventory' };
     return { ok: true, count };
+}
+
+// THE FIRST ORDER'S IRON COMES UP AT ONCE: while the chests lack an item the kit waits on (a row's after_fulfilled —
+// the bucket), a body carrying what the chests are short of that item's smelted material, as ore or as ingot, ends
+// its trip and banks it, rather than carrying it until its pickaxes wear out. firstOrderAboard(bot) → that item, or null.
+function firstOrderAboard(bot) {
+    const lens = require('@kernel/inventory_lens');
+    const registry = require('@kernel/crafting_blueprint_registry');
+    const { requirementTree } = require('@utils/calculators/build_material_calculator');
+    const waitedOn = new Set(require('@thinking/requested_work').activeStockRows().filter(r => r.after_fulfilled).map(r => r.after_fulfilled));
+    const pocket = {};
+    for (const it of bot.inventory.items()) pocket[it.name] = (pocket[it.name] || 0) + it.count;
+    for (const item of waitedOn) {
+        // The row's own count: a bucket out at the field, empty or full, is the crew's one (SIGNED_OUT_ITEMS).
+        if (lens.forChestRequest(item) > 0) continue;
+        let short = false;
+        let carried = true;
+        for (const [material, n] of Object.entries(requirementTree(item, 1, {}))) {
+            const inputs = registry.smeltInputsFor(material);
+            if (!inputs) continue;
+            const forms = [material, ...[].concat(inputs)];
+            const owed = n - forms.reduce((sum, form) => sum + lens.inChests(form), 0);
+            if (owed <= 0) continue;
+            short = true;
+            if (forms.reduce((sum, form) => sum + (pocket[form] || 0), 0) < owed) carried = false;
+        }
+        if (short && carried) return item;
+    }
+    return null;
 }
 
 // The trip's bound. A body below ground takes the next cell (or segment) only while it holds MORE than
 // MINING_LAST_PICKAXE, so the last pickaxe is always in hand for finishing the piece it is on; at the
 // last one it surfaces with its cell closed instead of leaving a half-dug room for a peer.
-// The pickaxes are the trip's only bound of its own: a tunnel uncovers ore a block at a time, so the body stays on
-// its line and brings up whatever the line gave.
+// The pickaxes are the trip's bound of its own: a tunnel uncovers ore a block at a time, so the body stays on
+// its line and brings up whatever the line gave. One order ends it sooner: the first order's iron (firstOrderAboard).
 function keepsDigging(bot) {
     const held = hasPickaxe(bot);
     if (!held.ok) return held;
+    const first = firstOrderAboard(bot);
+    if (first) return { ok: false, count: held.count, reason: `carries the smelt for the ${first} the chests lack — surfacing to bank it` };
     if (held.count > MINING_LAST_PICKAXE) return { ok: true, count: held.count };
     return { ok: false, count: held.count, reason: `down to the last pickaxe (${held.count}) — surfacing to restock` };
 }
@@ -66,8 +99,8 @@ function canEnterMine(bot) {
         + `the mine takes ${row.deficit_below}${row.stone_level ? ` or ${row.stone_level} stone` : ''}` };
 }
 
-// The shelf's mining pickaxes, best first.
-const SHELF_PICKS = ['copper_pickaxe', 'stone_pickaxe'];
+// The shelf's mining pickaxes, stone first, so a stone one is worn out before copper is taken.
+const SHELF_PICKS = ['stone_pickaxe', 'copper_pickaxe'];
 
 // takeMiningPicks — the trip's stone pickaxes, withdrawn from the shelf by the body about to descend, up to
 // the row's stone_level. Returns true, or null when the withdrawal already abandoned to the judge (Law 15).
@@ -91,18 +124,20 @@ async function takeMiningPicks(bot) {
     return true;
 }
 
-// The torches one trip carries to place in passing: the shaft's torch cells that hold no torch now
-// (mining_integrity.shaftTorchNeed), up to what a pocket keeps (the `torch` bot row). A lit shaft asks for
-// none. Light is optional — a trip goes with whatever the body could craft, including none.
-function miningTorchNeed(bot) {
-    const { STOCK_THRESHOLDS } = require('@thinking/architect_config');
-    const pocket = STOCK_THRESHOLDS.find(r => r.item === 'torch' && r.holder === 'bot').dump_threshold;
-    return Math.min(pocket, miningIntegrity.shaftTorchNeed(bot));
+// The torches one trip carries to place the mine paint's planned torches in the segments it digs (lighting_integrity):
+// TORCH_NETWORK.mine_torches, counting what the pocket already holds, which it keeps between trips. While the
+// chests hold no fuel a body goes down without; once they hold any, it crafts them before it descends.
+// tripTorches(job) → how many this job's trip carries: a trip below the shallow shaft takes TORCH_NETWORK.deep_torches.
+function tripTorches(job) {
+    const { TORCH_NETWORK } = require('@thinking/architect_config');
+    // A pour walks tunnels already dug and lit, and opens two cells of its own.
+    if (job && job.what === 'pour_obsidian') return 0;
+    const deep = job && (job.deep_y != null || job.structure === 'deep_shaft');
+    return deep ? TORCH_NETWORK.deep_torches : TORCH_NETWORK.mine_torches;
 }
-
-function hasMiningLight(bot) {
+function hasMiningLight(bot, job = null) {
     if (!bot || !bot.inventory) return { ok: false, reason: 'bot/inventory not ready' };
-    const need = miningTorchNeed(bot);
+    const need = tripTorches(job);
     const count = bot.inventory.items()
         .filter(i => i && i.name === 'torch')
         .reduce((n, i) => n + (i.count || 0), 0);
@@ -112,33 +147,84 @@ function hasMiningLight(bot) {
     return { ok: true, count };
 }
 
-// takeMiningLight — the trip's torches, crafted by the body about to descend: coal first, then charcoal, from
-// its pocket and then the chests, over a stick it holds or makes from its planks. It crafts the trip's need
-// and no more; what a craft makes over that stays in the pocket (the `torch` bot row). Light is optional, so a
-// body with no fuel or no wood goes without and the trip is never refused.
-// Returns true, or null when a withdrawal or the craft already abandoned to the judge (Law 15).
-const TORCH_FUELS = ['coal', 'charcoal'];
-const TORCHES_PER_CRAFT = 4;
-async function takeMiningLight(bot) {
-    const light = hasMiningLight(bot);
-    if (light.ok) return true;
-    const held = (test) => bot.inventory.items().filter(i => i && test(i.name)).reduce((n, i) => n + (i.count || 0), 0);
-    const crafts = Math.ceil((light.need - light.count) / TORCHES_PER_CRAFT);
-    let fuel = held(n => TORCH_FUELS.includes(n));
-    for (const source of TORCH_FUELS) {
-        const want = Math.min(require('@kernel/inventory_lens').inChests(source), crafts - fuel);
-        if (want <= 0) continue;
-        if (await retrieveItems(bot, source, want) === undefined) return null;
-        fuel = held(n => TORCH_FUELS.includes(n));
+// THE MINE IS DUG ONLY LIT: the digger places the mine paint's torches as it digs, so a mine job waits until the
+// trip's torches can be had, and a body that runs out surfaces.
+const _torchesHeld = (bot) => bot.inventory.items().filter(i => i && i.name === 'torch').reduce((n, i) => n + (i.count || 0), 0);
+
+// mineLightReady(bot) → { ok, reason }: whether this body can take the trip's torches (TORCH_NETWORK.mine_torches)
+// now: held, or crafted by takeTorches from coal or charcoal in its pocket and the chests over the wood it carries.
+// Read by job_gates.toolGate for mining jobs.
+// A BODY GOES WITH THE WHOLE TRIP'S TORCHES OR WAITS: `fuelShort` is what it waits on, and the furnace is emptied for it (furnace assessor).
+function mineLightReady(bot, job = null) {
+    const light = hasMiningLight(bot, job);
+    if (light.ok) return { ok: true };
+    const can = require('@action/lighting_manager').canMakeTorches(bot, light.need);
+    if (can.ok) return { ok: true };
+    return { ok: false, crafts: can.crafts, fuelShort: can.fuelShort, reason: `${light.count} of ${light.need} torches held, ${can.crafts} craft(s) owed, ${can.fuel} coal or charcoal to make them${can.wood ? '' : ', too little wood for the sticks'}` };
+}
+
+// mineStaysLit(bot) → { ok, reason }: whether a body digs on: while it holds a torch.
+function mineStaysLit(bot) {
+    if (_torchesHeld(bot) > 0) return { ok: true };
+    return { ok: false, reason: 'no torch left to light the dig — surfacing' };
+}
+
+// takeMiningLight — the trip's torches, made through the one torch route (lighting_manager.takeTorches) by the
+// body about to descend. A crew that lays no network descends without when none could be made; a lighting crew's
+// body that holds none after it releases the trip (mineStaysLit). Returns true, false when released, or null when
+// a withdrawal or the craft already abandoned to the judge (Law 15).
+async function takeMiningLight(bot, job = null) {
+    if (tripTorches(job) === 0) return true;
+    const light = hasMiningLight(bot, job);
+    if (!light.ok && await require('@action/lighting_manager').takeTorches(bot, light.need, 'mining light') === null) return null;
+    const lit = mineStaysLit(bot);
+    if (lit.ok) return true;
+    _release(`the mine is dug lit and no torch could be made: ${lit.reason}`);
+    return false;
+}
+
+// takeIronPick — every trip below the shallow shaft signs out one iron pickaxe from the chests (SIGNED_OUT_ITEMS) and banks it
+// on the way home with the rest of the haul (its row's dump_threshold 0). A seat is posted per pickaxe on hand, so a peer
+// taking the last one first ends this trip here. Returns true, or null when released.
+async function takeIronPick(bot, job) {
+    if (!(job && (job.deep_y != null || job.structure === 'deep_shaft'))) return true;
+    const held = () => bot.inventory.items().some(i => i.name === 'iron_pickaxe');
+    if (!held() && await require('@api/inventory_swapper').retrieveItems(bot, 'iron_pickaxe', 1) === undefined) return null;
+    if (held()) return true;
+    _release('deep trip: no iron pickaxe left in the chests');
+    return null;
+}
+
+// takeShaftPicks — the shaft in one trip: before the shaft's owner descends it carries SHAFT_PICKAXES' count plus
+// its spare in all, crafting only the wooden pickaxes it is short of that total. The spare is spent if the dig needs it
+// (shaftKeepsDigging). A short craft descends with what was made; the trip is never refused here.
+// Returns true, or null when the craft already abandoned to the judge (Law 15).
+async function takeShaftPicks(bot) {
+    const { item, count, spare } = require('@thinking/architect_config').SHAFT_PICKAXES;
+    const held = bot.inventory.items().filter(i => i && i.name === item).length;
+    if (held >= count + spare) return true;
+    // The spare is made from what this pocket holds and is never fetched for: craft_handler crafts from the pocket
+    // alone, so with the shaft's own set in hand and the spare's roots not in the pocket, the body descends without it.
+    if (held >= count) {
+        const { craftShortfall } = require('@utils/calculators/build_material_calculator');
+        // The figure is the whole set: the calculator credits the pickaxes already held against it.
+        const short = craftShortfall(item, count + spare, require('@utils/fragment_utils').getBotInventory(), 0);
+        if (Object.keys(short).length) {
+            watcher.summary(TAG, `shaft picks: ${held} ${item} held, the shaft takes ${count}; the pocket cannot make the spare `
+                + `(short ${Object.entries(short).map(([k, v]) => `${k}:${v}`).join(', ')}) — descending without it`);
+            return true;
+        }
     }
-    // A stick is two planks.
-    const sticks = held(n => n === 'stick'), planks = held(n => n.endsWith('_planks'));
-    if (fuel < 1 || (sticks < 1 && planks < 2)) {
-        watcher.summary(TAG, `mining light: ${light.count}/${light.need} torches held and none crafted — ${fuel} coal or charcoal, ${sticks} stick(s), ${planks} planks in hand; descending without.`);
-        return true;
-    }
-    const made = await require('@api/craft_handler').craftItems(bot, 'torch', light.need);
+    watcher.summary(TAG, `shaft picks: ${held} ${item} held, the shaft takes ${count} and a spare — crafting ${count + spare - held}`);
+    const made = await require('@api/craft_handler').craftItems(bot, item, count + spare);
     return made === undefined ? null : true;
+}
+
+// shaftKeepsDigging — the shaft's owner digs on down to its last pickaxe, the spare included: the shaft is
+// one trip, and the walk up needs no pickaxe.
+function shaftKeepsDigging(bot) {
+    const held = hasPickaxe(bot);
+    return held.ok ? held : { ...held, reason: `${held.reason} — surfacing to restock` };
 }
 
 // takeShaftFill — the shaft's wall fill, withdrawn as cobblestone before the body descends: every fill block
@@ -212,8 +298,10 @@ async function _selectAndDispatchCell(payload, bot, miningPass) {
     const N = MINING_PASSES_PER_DISPATCH;
     // A peer-held cell is skipped, not waited on — replan instead of retry (Law 13).
     const heldByPeer = new Set();
+    // A deep seat digs the floors of its ore (assessors/mining stamps deep_y on the seat).
+    const deepY = hq.readBoardroomChair(process.env.BOT_ID || 'default', {})?.magnet?.deep_y ?? null;
     while (true) {
-        const candidate = miningCellGraph.selectNextCell(bot, heldByPeer);
+        const candidate = miningCellGraph.selectNextCell(bot, heldByPeer, deepY);
         if (!candidate) {
             return { dispatched: false, allHeld: heldByPeer.size > 0, reason: heldByPeer.size > 0
                 ? `dig_cell: all ${heldByPeer.size} candidate cell(s) held by peers — replanning`
@@ -236,7 +324,8 @@ async function _dispatchCandidate(payload, bot, candidate, miningPass) {
         const scan = miningCellGraph.scanCell(bot, candidate.anchor, candidate);
         if (!scan.safe) {
             if (scan.halt_reason === 'unloaded') {
-                return { dispatched: false, reason: `dig_cell: cell ${candidate.id} chunk unloaded — deferring` };
+                // Out of this body's sight is passed for the next open unit, as a peer's is: a long tunnel's far end is often unloaded.
+                return { dispatched: false, held: true, reason: `dig_cell: cell ${candidate.id} chunk unloaded — deferring` };
             }
             miningCellGraph.markCellBlocked(candidate.id, scan.halt_reason);
             return { dispatched: false, reason: `dig_cell: cell ${candidate.id} blocked (${scan.halt_reason}) — skipping` };
@@ -276,7 +365,7 @@ async function _dispatchCandidate(payload, bot, candidate, miningPass) {
             ...payload,
             manager: TAG,
             mining_pass: miningPass,
-            dig_cell: { id: cell.id, anchor: cell.anchor, fan: cell.fan, maintenance: !!cell.maintenance, kind: cell.kind, dir: cell.dir, k0: cell.k0 },
+            dig_cell: { id: cell.id, anchor: cell.anchor, fan: cell.fan, maintenance: !!cell.maintenance, kind: cell.kind, dir: cell.dir, k0: cell.k0, origin: cell.origin },
             readable: `${TAG}: dig_cell ${cell.id}${cell.maintenance ? ' (maintain)' : ''} → mining_executor`,
         });
         return { dispatched: true, cell };
@@ -286,6 +375,32 @@ async function _dispatchCandidate(payload, bot, candidate, miningPass) {
 // Ends the batch: returns to the shaft head, dumps excess into the headframe chests, then releases
 // to recursive_judge. Returning first puts the bot at the chests and starts the next job from the
 // surface. Reuses the one dump primitive dump_executor calls (Law 16).
+const _stoneCarried = (bot) => bot.inventory.items().reduce((n, i) => n + (require('@thinking/assessors/mining').CELL_STONE.has(i.name) ? i.count : 0), 0);
+// _minePledge(bot, botId, magnet) → null, or why the trip surfaces. Read at every clean tunnel section. A seat dug for an order, whole
+// pledge by whole pledge: stone carried past the trip's start becomes the guarantee; another pledge is taken while the order has one
+// open (assessors/mining.stoneOpen). A deep seat holds no stone order.
+function _minePledge(bot, botId, magnet) {
+    if (magnet.deep_y != null) return null;
+    const { stoneOpen } = require('@thinking/assessors/mining');
+    const { PLEDGE_BLOCK } = require('@utils/calculators/yield_pledge_calculator');
+    const carried = _stoneCarried(bot);
+    const guarantee = Math.floor(Math.max(0, carried - magnet.mine_start) / PLEDGE_BLOCK) * PLEDGE_BLOCK;
+    if (magnet.mine_guarantee == null) {
+        magnet.mine_guarantee = 0;
+        magnet.pledge = { job_id: magnet.job_id, what: 'cobblestone', amount: PLEDGE_BLOCK };
+        hq.writeBoardroomChair(botId, hq.readBoardroomChair(botId, {}));
+    }
+    if (guarantee <= magnet.mine_guarantee) return null;
+    magnet.mine_guarantee = guarantee;
+    hq.writeBoardroomChair(botId, hq.readBoardroomChair(botId, {}));
+    const next = stoneOpen(botId, magnet);
+    watcher.summary(TAG, `MINE_GUARANTEE stone=${guarantee} open=${next.open} why=${next.why}`);
+    if (!next.open) return `${guarantee} stone guaranteed and ${next.why}`;
+    magnet.pledge = { job_id: magnet.job_id, what: 'cobblestone', amount: guarantee + PLEDGE_BLOCK };
+    hq.writeBoardroomChair(botId, hq.readBoardroomChair(botId, {}));
+    return null;
+}
+
 async function _exitMine(bot, site, reason) {
     _releaseLine();
     const way = _way; _way = [];
@@ -340,6 +455,27 @@ async function _routeToShaftHead(bot) {
     return { arrived: !(!nav || nav.arrived === false), skipped: false };
 }
 
+// ── A STRIP TRIP STAYS DOWN UNTIL IT HAS PAID FOR ITS WALK, AND NO LONGER ───────────────────────────
+// Ore counts once it is in a chest, so a trip that would walk to another line goes only while it still owes work
+// for its walk: the walk calculator the gathers use (yield_pledge_calculator.walkOwed) against the walk home — up
+// the stairs to the shaft head, then across to the home chest — at the body's own measured pace, and only while
+// staying pays the debt down (staysOut). Read where a line ends, never along one: digging on along a line adds
+// only its own few blocks of walk home. → { stays, walk, owed_s, ... }.
+function _stripTripStays(bot) {
+    const yieldPledge = require('@utils/calculators/yield_pledge_calculator');
+    const head = _shaftHeadAnchor();
+    if (!head) throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a strip trip asked how long to stay with no shaft head sited; no dig_cell is posted before the shaft stands.`);
+    const chest = require('@utils/fragment_utils').homeChest();
+    const home = chest && chest.station && chest.station.pos ? chest.station.pos : head;
+    const at = bot.entity.position;
+    const walk = Math.round(Math.hypot(at.x - head.x, at.z - head.z) + Math.max(0, head.y - at.y) + Math.hypot(head.x - home.x, head.z - home.z));
+    const span = require('@kernel/bot_minutes').snapshot().open_span;
+    const owed = yieldPledge.walkOwed(walk, require('@locomotion/locomotion_dispatcher').walkPace(), span);
+    const stays = yieldPledge.staysOut(span, owed, 'strip');
+    watcher.summary(TAG, `trip_size at=strip walk=${walk} walk_s=${owed.walk_s} elapsed_s=${owed.elapsed_s} walked_s=${owed.walked_s} owed_s=${owed.owed_s} stays_out=${stays ? 1 : 0} pace=${owed.measured ? 'measured' : 'unmeasured'}`);
+    return { stays, walk, ...owed };
+}
+
 // Mirror of _routeToShaftHead, climbing out at batch end; skips when already at/above the head.
 // locomotion.goTo (Law 15 sub-loop API) returns arrived=false; it does not route its own signal.
 async function _returnToHeadframe(bot) {
@@ -354,7 +490,11 @@ async function _returnToHeadframe(bot) {
 module.exports = {
     hasPickaxe,
     canEnterMine,
-    miningTorchNeed,
+    mineLightReady,
+    // The trip bound a surface-stone trip ends on too (survey_executor), so the
+    // last pickaxe is kept the same way above ground and below.
+    keepsDigging,
+    firstOrderAboard,
     receive: watcher.track(TAG, async function (signalType, payload) {
         if (signalType !== TAG) return;
         const foremanLink = require('@kernel/foreman_link');
@@ -375,6 +515,8 @@ module.exports = {
         }
 
         const jobWhat = magnet.what;
+        // The trip's first reading, before any of its digging: a pledge counts only what this trip dug.
+        if (jobWhat === 'dig_cell' && magnet.mine_start == null && global.bot && global.bot.inventory) magnet.mine_start = _stoneCarried(global.bot);
 
         // ── Return from recursive_judge: executor finished one pass ──────
         // Re-dispatches for the next pass of the same batch, or ends the batch (surface, dump,
@@ -407,10 +549,12 @@ module.exports = {
                     if (integrity.all_segments_complete) { complete = true; reason = 'shaft complete'; }
                     else { const seg = integrity.first_incomplete; reason = `segment pass ${passesCompleted}/${N} done — next: y=${seg?.world_position?.y || '?'}`; }
                 } else if (!complete) { complete = true; reason = 'bot not ready after pass'; }
-                // The body starts the next segment only while it holds more than the last pickaxe (keepsDigging);
-                // at the last one it surfaces, and the next trip down takes the shelf's stone pickaxes (takeMiningPicks).
-                const tool = keepsDigging(bot);
+                // The body starts the next segment while it holds any pickaxe, the reserve included (shaftKeepsDigging);
+                // with none it surfaces, and the next trip down tops its picks up again (takeShaftPicks).
+                const tool = shaftKeepsDigging(bot);
                 if (!complete && !tool.ok) { complete = true; reason = `shaft pass ${passesCompleted}: ${tool.reason}`; }
+                const lit = mineStaysLit(bot);
+                if (!complete && !lit.ok) { complete = true; reason = `shaft pass ${passesCompleted}: ${lit.reason}`; }
 
                 // THE BODY THAT OWNS THE SHAFT STAYS DOWN while each pass moves a block: it works segment after
                 // segment top down and carries the shaft's fill (takeShaftFill), so surfacing between segments
@@ -451,11 +595,20 @@ module.exports = {
                     // The trip is bounded by tools (keepsDigging) — a body at its last pickaxe surfaces here,
                     // with its cell closed; the re-pass count restarts at zero for the next cell.
                     // Surfaces otherwise only when nothing is selectable; _exitMine dumps on the way out.
-                    const tool = keepsDigging(bot);
+                    const dug = keepsDigging(bot);
+                    const lit = mineStaysLit(bot);
+                    const tool = dug.ok && !lit.ok ? { ...dug, ok: false, reason: lit.reason } : dug;
                     // A STRIP TRIP KEEPS TO ITS LINE: the fan chose where this trip began; from there the body digs
-                    // the same tunnel straight on until its pickaxes run out or the line ends — a cave, a hazard,
-                    // the staircase, or a peer already on it — and then carries the whole haul up at once.
+                    // the same tunnel straight on until its pickaxes run out or the line ends — a cave, a hazard, the
+                    // staircase, or a peer already on it. At a line's end it takes the next open line, walking out of
+                    // this tunnel by its way, only while the trip still owes work for its walk (_stripTripStays); once
+                    // paid it surfaces with the haul, since ore counts only in a chest.
                     if (tool.ok && rec && miningCellGraph.isStrip(rec)) {
+                        const pledged = _minePledge(bot, botId, magnet);
+                        if (pledged) {
+                            await _exitMine(bot, site, `${reason} — ${pledged}`);
+                            return;
+                        }
                         const ahead = miningCellGraph.lineContinuation(rec);
                         const ends = !ahead ? 'nothing registered ahead' : ahead.blocked ? `blocked (${ahead.blocked})` : ahead.complete ? 'already dug' : null;
                         const go = ends ? null : await _dispatchCandidate(payload, bot, ahead, 0);
@@ -464,8 +617,23 @@ module.exports = {
                             return;
                         }
                         const why = ends || go.reason;
-                        watcher.summary(TAG, `STRIP LINE END ${rec.kind} ${rec.dir} at ${rec.id}: ${why} — surfacing with the haul.`);
-                        await _exitMine(bot, site, `${reason} — line ends: ${why}`);
+                        const trip = _stripTripStays(bot);
+                        if (!trip.stays) {
+                            watcher.summary(TAG, `STRIP LINE END ${rec.kind} ${rec.dir} at ${rec.id}: ${why} — the trip has paid for its walk (walk home ${trip.walk_s}s, walked ${trip.walked_s}s of ${trip.elapsed_s}s), surfacing with the haul.`);
+                            await _exitMine(bot, site, `${reason} — line ends: ${why}; the trip has paid for its walk`);
+                            return;
+                        }
+                        watcher.summary(TAG, `STRIP LINE END ${rec.kind} ${rec.dir} at ${rec.id}: ${why} — owes ${trip.owed_s}s of work for its walk, ${tool.count} pickaxes in hand, taking the next open line.`);
+                        if (await _walkWay(bot, _way, 'out')) {
+                            const next = await _selectAndDispatchCell(payload, bot, 0);
+                            if (next.dispatched) {
+                                watcher.summary(TAG, `${reason} — line ended (${why}); continuing this trip on line ${miningCellGraph.lineKey(next.cell)}.`);
+                                return;
+                            }
+                            await _exitMine(bot, site, `${reason} — line ends: ${why}; ${next.reason}`);
+                            return;
+                        }
+                        await _exitMine(bot, site, `${reason} — line ends: ${why}; its way out was not walked`);
                         return;
                     }
                     // A REPAIR ENDS THE TRIP AT ITS OWN CELL. The next damaged cell can lie in the tunnel beside this
@@ -524,7 +692,7 @@ module.exports = {
             }
 
             throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a mining job returned with what="${jobWhat}"; `
-                + 'assessors/mining posts only dig_shaft and dig_cell.');
+                + 'assessors/mining posts only dig_shaft, dig_cell and pour_obsidian.');
         }
 
         // ── First dispatch from dispatcher ───────────────────────────────
@@ -532,8 +700,15 @@ module.exports = {
         // Tool gating happens once, in job_board (toolGate). The light is the board's promise that the shelf
         // can light this trip (assessors/mining); the body collects it here, before it walks to the shaft.
         if (await takeMiningPicks(global.bot) === null) return;
-        if (await takeMiningLight(global.bot) === null) return;
+        if (await takeMiningLight(global.bot, magnet) !== true) return;
+        if (await takeIronPick(global.bot, magnet) === null) return;
+        if (jobWhat === 'dig_shaft' && await takeShaftPicks(global.bot) === null) return;
         if (jobWhat === 'dig_shaft' && await takeShaftFill(global.bot) === null) return;
+        // The water is carried from the surface; a body that cannot fill a bucket has no pour to make.
+        if (jobWhat === 'pour_obsidian' && !(await require('@action/land_prep').fillBucket(global.bot, 1))) {
+            _release('pour_obsidian: no water bucket could be filled');
+            return;
+        }
 
         // Routes to the shaft head before any executor descends. An unreachable headframe is environmental
         // (caved access, a stranded bot), so this soft-releases to the judge.
@@ -594,7 +769,14 @@ module.exports = {
             return;
         }
 
+        // ── pour_obsidian: one trip to one logged pool, worked here and carried home ──
+        if (jobWhat === 'pour_obsidian') {
+            const said = await require('@action/obsidian_pour').workPool(global.bot);
+            await _exitMine(global.bot, site, `pour_obsidian: ${said}`);
+            return;
+        }
+
         throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a mining job arrived with what="${jobWhat}"; `
-            + 'assessors/mining posts only dig_shaft and dig_cell.');
+            + 'assessors/mining posts only dig_shaft, dig_cell and pour_obsidian.');
     }),
 };

@@ -1,5 +1,5 @@
 // js_kernel/downloaded_plan_registry.js
-// The ONE route from a DOWNLOADED build plan into the fleet (Law 16), and the one place the blueprint's
+// The ONE route from a large-building plan into the fleet (Law 16), and the one place the blueprint's
 // own frame is converted into world coordinates. Every fragment that needs the castle's anchors, its
 // ground floor, its descent lists or the volume navigation must treat as solid asks here; nothing else
 // opens the file.
@@ -14,10 +14,9 @@
 //
 // ── IT LOADS LAZILY, AND THAT IS LOAD-BEARING ───────────────────────────────────────────────────────
 // `createSnapshotRegistry` snapshots at construction and throws on a missing file — correct for a
-// declared file every bot needs, and wrong for one only a BUILDER crew needs: a require-time snapshot
-// would crash every homesteader run on a machine with no plan on disk. So the snapshot is taken on the
-// first `load()`, which only the builder path reaches. Everything the snapshot buys after that —
-// one read, drift warned, never re-opened mid-run — is unchanged.
+// declared file every bot needs, and wrong for an operator plan only a selected crew needs. The first
+// load snapshots that file, or derives a native structure's cubes from blueprint_registry's snapshot.
+// Source edits are warned by their owning registry and apply on the next start.
 //
 // ── THE FRAME, AND THE ONE CONVERSION ───────────────────────────────────────────────────────────────
 // The plan is written in the BLUEPRINT's frame: x 0..w-1, z 0..l-1, y layer 0 = the blueprint's lowest
@@ -45,13 +44,14 @@ const { violation } = require('@utils/external_library_guard');
 const TAG = 'downloaded_plan_registry';
 // `ground` carries the ground floor; the anchors cover the whole box. A plan declaring a different schema
 // is refused at load, and the refusal names the rebuild command.
-const SCHEMA = 'auren.build_plan.v3';
+const SCHEMA = 'auren.build_plan.v4';
 
 // The clockwise compass, matching facing_aim's own `H`. A quarter turn is one step along it.
 const COMPASS = ['north', 'east', 'south', 'west'];
 
 let registry = null;      // the snapshot, once taken
 let loadedFrom = null;    // the absolute path it was taken from
+let view = null;          // the snapshot with every block whose producer is not ready set aside (setAside)
 
 // planPathFor(buildName) — where the plan for a named build is expected to be.
 //
@@ -61,6 +61,7 @@ let loadedFrom = null;    // the absolute path it was taken from
 // plan made with the workshop is found with nothing to configure; a download somebody put elsewhere is
 // one field away.
 function planPathFor(buildName) {
+  if (require('@thinking/architect_config').BUILDER_BUILDS[buildName]?.blueprint) return require('@kernel/blueprint_registry').BLUEPRINTS_PATH;
   const configured = require('../foreman_config').builder?.plan;
   if (configured) return path.resolve(configured);
   // Two levels up from js_kernel is the repository root, which is where the workshop writes.
@@ -79,6 +80,9 @@ function validate(parsed) {
   if (!parsed.material_ratio || !Number.isFinite(parsed.material_ratio.cobblestone)) return 'has no material_ratio — rebuild it with Auren_Workshop/tools/plan_blueprint.js';
   if (!Array.isArray(parsed.anchors) || parsed.anchors.length === 0) return 'carries no anchors';
   if (!Array.isArray(parsed.columns) || parsed.columns.length === 0) return 'carries no columns';
+  // Each cube's trash is the peak its trip stands (cube_trash_need), the figure its price is built on.
+  const untrashed = parsed.anchors.find(a => !Number.isInteger(a.trash) || a.trash < 0);
+  if (untrashed) return `anchor ${untrashed.index} carries no trash figure — rebuild it with Auren_Workshop/tools/plan_blueprint.js`;
   for (const col of parsed.columns) {
     if (!Array.isArray(col.anchors) || !Array.isArray(col.descent)) return `column ${col.column} is missing its anchors or its descent`;
     // A column with no stand cannot be worked at all: the pass enters from beneath the box through the stand
@@ -95,10 +99,11 @@ function validate(parsed) {
 function load(buildName) {
   const file = planPathFor(buildName);
   if (registry) {
-    if (loadedFrom !== file) {
+    if (loadedFrom !== file || view.name !== buildName) {
       throw violation(TAG, `a plan is already loaded from ${loadedFrom} and "${buildName}" asks for ${file}. One run builds one building.`);
     }
-    return registry.data();
+    registry.data();
+    return view;
   }
   if (!fs.existsSync(file)) {
     // A CORRECTION, NOT A BARE THROW (Law 13): the operator supplied this, so the message says what is
@@ -108,16 +113,82 @@ function load(buildName) {
       + `node Auren_Bot/Auren_Workshop/tools/plan_blueprint.js "<downloaded_blueprints.json>" --name=${buildName}. `
       + `If the plan lives somewhere else, name its path in foreman_config.builder.plan (or AUREN_BUILD_PLAN).`);
   }
-  registry = createSnapshotRegistry({ filePath: file, fileName: path.basename(file), tag: TAG, validate });
+  const config = require('@thinking/architect_config'), sourceName = config.BUILDER_BUILDS[buildName]?.blueprint;
+  if (sourceName) {
+    const sourceRegistry = require('@kernel/blueprint_registry');
+    const planned = require('@kernel/blueprint_plan_calculator').calculatePlan(sourceRegistry.getBuilding(sourceName), {
+      name: buildName, schema: SCHEMA, preserveSource: true, serverVersion: config.SERVER_MINECRAFT_VERSION,
+      wood: config.BUILD_WOOD.primary, accent: config.BUILD_WOOD.accent, leaves: true, recolour: config.COLOR_SWAP,
+      substitutions: config.BUILDER_BUILDS[buildName].substitutions, beds: config.BUILDER_BUILDS[buildName].beds,
+    });
+    const error = validate(planned); if (error) throw violation(TAG, `${sourceName} ${error}.`);
+    // The source registry owns the snapshot and drift warnings; the cube plan is a derived view of that source.
+    registry = { data() { sourceRegistry.getBuilding(sourceName); return planned; } };
+  } else registry = createSnapshotRegistry({ filePath: file, fileName: path.basename(file), tag: TAG, validate });
   loadedFrom = file;
-  const plan = registry.data();
+  const plan = setAside(registry.data());
+  view = plan;
   if (plan.name !== buildName) {
     throw violation(TAG, `${file} is the plan for "${plan.name}" and the run was told to build "${buildName}".`);
   }
   verifyPlaceable(plan);
+  sameColourSwap(plan);
   agreesWithTheSurvey(plan, buildName);
   supports = computeSupports(plan, fullBlock(plan.server_version));
   return plan;
+}
+
+// ── A BLOCK WHOSE PRODUCER DOES NOT STAND YET IS SET ASIDE ──────────────────────────────────────────
+// The plan keeps every block a producer makes beyond the base materials (blueprint_material_rule's awaiting
+// family). While that producer is not ready (producer_hooks), its blocks are taken out of the cubes and the
+// descents, so each such cell is an air target and nothing orders the block; every reader of the plan sees the
+// building without them. Said once per producer at load. A kept block is emptied of the states its producer names
+// (producer_hooks.emptied): it is placed as the fleet places it.
+//
+// A HALF WHOSE PARTNER THE DOWNLOAD DOES NOT CARRY IS SET ASIDE FOR GOOD (orphanHalves): a bed head with no foot
+// behind it, a bed foot with no head before it, a door's top with no bottom under it. The game places a bed by its
+// foot and a door by its bottom, the second half coming with the first (facing_aim), so such a cell is one no body
+// can ever build, and its cube would never stand. Built as air, said once at load.
+const BED_DIRS = { north: [0, -1], south: [0, 1], east: [1, 0], west: [-1, 0] };
+function orphanHalves(plan) {
+  const at = new Map();
+  for (const a of plan.anchors) for (const v of a.voxels) at.set(`${v[0]},${v[1]},${v[2]}`, v);
+  const holds = (x, y, z, test) => { const w = at.get(`${x},${y},${z}`); return !!w && test(w[3], w[4] || {}); };
+  const orphans = new Set();
+  for (const v of at.values()) {
+    const s = v[4] || {};
+    const d = BED_DIRS[s.facing];
+    if (/_bed$/.test(v[3]) && d) {
+      const partner = s.part === 'head' ? [v[0] - d[0], v[1], v[2] - d[1], 'foot'] : [v[0] + d[0], v[1], v[2] + d[1], 'head'];
+      if (!holds(partner[0], partner[1], partner[2], (n, t) => n === v[3] && t.part === partner[3] && t.facing === s.facing)) orphans.add(`${v[0]},${v[1]},${v[2]}`);
+    }
+    if (/_door$/.test(v[3]) && s.half === 'upper' && !holds(v[0], v[1] - 1, v[2], (n, t) => n === v[3] && t.half === 'lower')) orphans.add(`${v[0]},${v[1]},${v[2]}`);
+  }
+  return orphans;
+}
+
+function setAside(plan) {
+  const { awaits, producerOf, emptied } = require('@kernel/producer_hooks');
+  const aside = {};
+  const orphans = orphanHalves(plan);
+  const orphan = (v) => orphans.has(`${v[0]},${v[1]},${v[2]}`);
+  const counted = (v) => {
+    if (orphan(v)) return false;
+    if (!awaits(v[3])) return true;
+    const k = producerOf(v[3]); aside[k] = (aside[k] || 0) + 1; return false;
+  };
+  const kept = (v) => !awaits(v[3]) && !orphan(v);
+  const out = {
+    ...plan,
+    anchors: plan.anchors.map(a => ({ ...a, voxels: a.voxels.filter(counted).map(emptied) })),
+    columns: plan.columns.map(c => ({ ...c, descent: c.descent.filter(kept).map(emptied) })),
+  };
+  const watcher = require('@kernel/watcher');
+  for (const [name, n] of Object.entries(aside)) {
+    watcher.summary(TAG, `SET_ASIDE producer=${name} blocks=${n} — built as air until the producer stands (producer_hooks)`);
+  }
+  if (orphans.size) watcher.summary(TAG, `SET_ASIDE orphan_halves=${orphans.size} cells=${[...orphans].slice(0, 8).join('|')} — a two-cell half whose partner the download does not carry, built as air`);
+  return out;
 }
 
 // ── WHAT HOLDS EACH BLOCK UP WHILE IT GOES IN ───────────────────────────────────────────────────────
@@ -136,6 +207,16 @@ function supportsOf(anchorIndex) {
 function supportSummary() {
   getPlan();
   return { ...supports.counts, stranded: supports.stranded.slice() };
+}
+// blockCounts() → { name: count } of every block the whole plan places, the set-aside blocks included: what the
+// building asks for in all, before any of it stands (calculators/cane_critical_mass sizes the cane fields by it).
+function blockCounts() {
+  getPlan();
+  const counts = {};
+  const add = (v) => { counts[v[3]] = (counts[v[3]] || 0) + 1; };
+  for (const a of registry.data().anchors) a.voxels.forEach(add);
+  for (const c of registry.data().columns) c.descent.forEach(add);
+  return counts;
 }
 // materialRatio — the plan's own iron-to-stone statement (plan_blueprint writes it).
 function materialRatio() { return getPlan().material_ratio; }
@@ -196,7 +277,8 @@ function isLoaded() { return registry !== null; }
 // loaded is a startup-order fault, not an operator mistake, so it throws in its own name.
 function getPlan() {
   if (!registry) throw violation(TAG, 'a plan was asked for before any was loaded. The builder start step calls load() once, before any job is posted.');
-  return registry.data();
+  registry.data();
+  return view;
 }
 
 // ── THE FRAME ───────────────────────────────────────────────────────────────────────────────────────
@@ -236,11 +318,10 @@ function siteFrame(site) {
   // stateOf — the plan's state object, unchanged. Nothing about a placed block moves any more.
   const stateOf = (state) => state || null;
 
-  // blockOf — the block the WORLD must show for a plan's block name: the plan's wood swapped for the
-  // site's. Every reader of a voxel's name goes through this, exactly as every reader of a position goes
-  // through worldOf, so a column's order, its done-test and its placement ask about the same block.
+  // blockOf — the block the WORLD must show for a plan's block name. Every reader of a voxel's name goes through
+  // this, exactly as every reader of a position goes through worldOf, so a column's order, its done-test and its
+  // placement ask about the same block. The wood is the plan's own (siteWood).
   const wood = siteWood();
-  const planWood = plan.material_rule && plan.material_rule.wood;
   // Iron's blocks that copper also makes are built of copper (architect_config.COPPER_FOR_IRON).
   const { COPPER_FOR_IRON } = require('@thinking/architect_config');
   // Below the ground floor the plan's stone is ground, and ground a body dug is put back as cobblestone: the
@@ -248,11 +329,16 @@ function siteFrame(site) {
   const blockOf = (name, by) => {
     if (!Number.isInteger(by)) throw violation(TAG, `blockOf("${name}", ${by}) needs the voxel's layer — the same block is built differently below the ground floor.`);
     if (by < G && name === 'stone') return 'cobblestone';
-    return COPPER_FOR_IRON[name]
-      || (wood && planWood && wood !== planWood && name.startsWith(`${planWood}_`)
-        ? `${wood}${name.slice(planWood.length)}`
-        : name);
+    return COPPER_FOR_IRON[name] || name;
   };
+  // voxelBlock(v) / voxelState(v) — the block and state a trip builds for voxel v = [x, y, z, name, state]: blockOf's,
+  // except a STAND-IN block (architect_config.STAND_INS) in a cube not yet paid for (standIns), built as the site
+  // wood's planks with no state. Every reader that orders, places or tests a cell asks these; the building's whole
+  // bill (assessors/downloaded_build castleBalance) asks blockOf, since the real block is still owed.
+  const { STAND_INS } = require('@thinking/architect_config');
+  const stoodIn = (v) => !!STAND_INS[v[3]] && !standIns(frame).real.has(standInCubeOf(v));
+  const voxelBlock = (v) => (stoodIn(v) ? `${wood}_planks` : blockOf(v[3], v[1]));
+  const voxelState = (v) => (stoodIn(v) ? null : stateOf(v[4]));
 
   // holds — does the world block `at` satisfy voxel v = [x, y, z, name, state]? Below the ground floor a natural
   // target is satisfied by any natural block: that is ground, and the plan's rock there is the ground it was cut
@@ -262,53 +348,123 @@ function siteFrame(site) {
   const { standsFor } = require('@utils/movement/facing_aim');
   const GROWN_DIRT = new Set(['grass_block', 'mycelium']);
   const holds =(v, at) => {
+    // A stood-in cell holds its planks, and the real block once it stands, whichever the cube's books say now.
+    if (STAND_INS[v[3]] && at.name === `${wood}_planks`) return stoodIn(v);
     const want = blockOf(v[3], v[1]);
     if (v[1] < G && NATURAL.has(v[3]) && (NATURAL.has(at.name) || at.name.endsWith('_ore'))) return true;
     // Placed dirt grows over under open sky (blueprint_material_rule places every soil as dirt for that reason),
     // so the grown block is the dirt the plan asked for.
     if (want === 'dirt' && GROWN_DIRT.has(at.name)) return true;
     // Copper weathers where it stands, and the plan's own iron block is the block it asked for.
-    const copper = !!COPPER_FOR_IRON[v[3]];
-    const standing = copper ? at.name.replace(/^(waxed_)?(exposed_|weathered_|oxidized_)?/, '') : at.name;
-    if (standing !== want && !(copper && at.name === v[3])) return false;
+    const { unaged } = require('@utils/fragment_utils');
+    if (unaged(at.name) !== unaged(want) && !(COPPER_FOR_IRON[v[3]] && at.name === v[3])) return false;
     const state = stateOf(v[4]);
     return !state || standsFor(at, state);
   };
 
-  return {
+  const frame = {
     groundFloorLayer: G, groundFloorY: f.ground_floor_y, footprint: f,
-    worldOf, facingOf, axisOf, stateOf, blockOf, holds, wood,
+    worldOf, facingOf, axisOf, stateOf, blockOf, voxelBlock, voxelState, holds, wood,
   };
+  return frame;
 }
 
-// ── THE WOOD IS THE SITE'S, NOT THE PLAN'S ──────────────────────────────────────────────────────────
-// siteWood() → 'oak' | 'birch' | 'dark_oak' | … , or null while the fleet has not decided.
-//
-// A plan names ONE species for every wooden block (blueprint_material_rule collapses the rest into it),
-// and a species is only buildable where it GROWS: every log, every plank-shaped block and every leaf
-// comes off a tree the crew can reach. The fleet sites only in ACCEPTABLE_BIOMES — plains, forests, birch
-// and dark forest — so a plan's own species can be one that never grows there, and every voxel of it would
-// have no source and sit ordered forever.
-//
-// So the one species stays ONE, and which one is read off the site: the fleet's own wood preference, the
-// species with the most trunks around the base (set_wood_preference, decided once and never re-posted).
-// That is the species the felling ladder already reaches for first, so the log the order asks for is the
-// log the crew is cutting. NULL WHILE UNDECIDED: the column phase waits on it, so no column builds in the
-// plan's wood while the rest build in the site's.
-//
-// A species the recipe book has no planks for is refused here: every shape of it would read as a raw
-// gather no surface scan can fill.
-function siteWood() {
-  const pref = require('@action/set_wood_preference').readWoodPreference();
-  if (!pref || !pref.species) return null;
-  const wood = pref.species.replace(/^stripped_/, '').replace(/_(log|wood|stem|hyphae)$/, '');
-  const { group_to_item } = require('@utils/fragment_utils');
-  if (!(group_to_item.planks || []).includes(`${wood}_planks`)) {
-    throw violation(TAG, `the fleet's wood preference is ${pref.species}, and the recipe book has no ${wood}_planks — `
-      + 'a downloaded building cannot be made of a wood the fleet never crafts. Add the species to the wood groups in '
-      + 'js_kernel/utils/fragment_utils.js, or site the build where a crafted wood grows.');
+// ── WHICH CUBES OF STOOD-IN BLOCKS ARE PAID FOR ───────────────────────────────────────────────────────────
+// standInCubeOf(v) → the anchor index of the cube whose voxels hold v, or null (a stand shaft's own voxel).
+// standIns(frame) → { real: Set(anchor index), owed, reached }, read again every STAND_IN_READ_MS:
+//   owed     the books every stood-in cell not yet holding its real block is made of (STAND_INS books)
+//   reached  the books the fleet reaches, a bookshelf or lectern counted as the books it is made of
+//   real     the cubes built of the real block: taken in build order, each while `reached` still pays for every
+//            stood-in cell of it not yet real, and the first cube it does not pay for ends the walk, so the books
+//            gather for the next cube in line. A cube whose cells are all real is real and costs nothing.
+// A process with no body (the foreman's keeper) reads no cube as paid for: planks or the real block both hold.
+const STAND_IN_READ_MS = 5000;
+let _standInCells = null;   // { plan, cubeOf: Map("x,y,z" → index), cubes: [{ index, cells: [v] }] }
+let _standIns = { at: 0, real: new Set(), owed: 0, reached: 0 };
+function standInCells() {
+  const plan = getPlan();
+  if (_standInCells && _standInCells.plan === plan.name) return _standInCells;
+  const { STAND_INS } = require('@thinking/architect_config');
+  const cubeOf = new Map(), cubes = [];
+  for (const anchor of [...plan.anchors].sort((a, b) => a.layer - b.layer || a.index - b.index)) {
+    const cells = anchor.voxels.filter(v => STAND_INS[v[3]]);
+    for (const v of cells) cubeOf.set(`${v[0]},${v[1]},${v[2]}`, anchor.index);
+    if (cells.length) cubes.push({ index: anchor.index, cells });
   }
-  return wood;
+  _standInCells = { plan: plan.name, cubeOf, cubes };
+  return _standInCells;
+}
+function standInCubeOf(v) {
+  const i = standInCells().cubeOf.get(`${v[0]},${v[1]},${v[2]}`);
+  return i === undefined ? null : i;
+}
+function standIns(frame) {
+  const now = Date.now();
+  if (now - _standIns.at < STAND_IN_READ_MS) return _standIns;
+  const bot = global.bot;
+  const next = { at: now, real: new Set(), owed: 0, reached: 0 };
+  if (!bot || typeof bot.blockAt !== 'function' || !frame) { _standIns = next; return next; }
+  const Vec3 = require('vec3');
+  const { STAND_INS } = require('@thinking/architect_config');
+  const lens = require('@kernel/inventory_lens');
+  next.reached = lens.reachableByFleet('book')
+    + Object.entries(STAND_INS).reduce((n, [name, s]) => n + s.books * lens.reachableByFleet(name), 0);
+  let left = next.reached, open = true;
+  for (const cube of standInCells().cubes) {
+    let owed = 0;
+    for (const v of cube.cells) {
+      const p = frame.worldOf(v[0], v[1], v[2]);
+      const at = bot.blockAt(new Vec3(p.x, p.y, p.z));
+      if (!at || at.name !== frame.blockOf(v[3], v[1])) owed += STAND_INS[v[3]].books;
+    }
+    next.owed += owed;
+    if (owed === 0 || (open && owed <= left)) { next.real.add(cube.index); left -= owed; }
+    else open = false;
+  }
+  _standIns = next;
+  return next;
+}
+// standInsAtSite() → standIns on this body's own site frame, or null while no plan is loaded or the site is unlocked.
+function standInsAtSite() {
+  if (!registry) return null;
+  const row = require('@kernel/corporate_headquarters').readBuildingChair(registry.data().name, 'set_buildspot');
+  if (!row || !row.footprint || !row.footprint.corner) return null;
+  return standIns(siteFrame(row));
+}
+
+// ── THE WOOD IS THE FLEET'S TWO: OAK, WITH BIRCH ACCENTS ────────────────────────────────────────────────
+// siteWood() → the primary species the loaded plan is built of ('oak'), or null while no plan is loaded.
+//
+// A plan builds its download's most-used wood as the primary and every other wood as the accent
+// (blueprint_material_rule), both fixed fleet-wide (architect_config.BUILD_WOOD). A plan made in other woods is
+// refused here, so the woods the crew fells and replants are the woods the plan asks for. The primary's saplings
+// are the ones the crew plants beside the yard (sapling_planter), and the base is sited where oak grows
+// (architect_config.BASE_BIOMES).
+function siteWood() {
+  if (!registry) return null;
+  const plan = registry.data();
+  const { BUILD_WOOD } = require('@thinking/architect_config');
+  const m = plan.material_rule || {};
+  if (m.wood !== BUILD_WOOD.primary || m.accent !== BUILD_WOOD.accent) {
+    throw violation(TAG, `plan "${plan.name}" is built of ${m.wood} with ${m.accent} accents, and the fleet builds of ${BUILD_WOOD.primary} with `
+      + `${BUILD_WOOD.accent} accents (architect_config.BUILD_WOOD). Regenerate it: node Auren_Bot/Auren_Workshop/tools/plan_blueprint.js `
+      + `"html and json/Downloaded_Blueprints/downloaded_blueprints.json" --name=${plan.name}`);
+  }
+  return m.wood;
+}
+
+// ── A PLAN IS MADE WITH THE FLEET'S COLOUR SWAP ─────────────────────────────────────────────────────
+// The swap is made when the plan is made (blueprint_material_rule), so a plan made with another table, or with
+// none, still asks for a far colour. It is refused here with the command that makes it again.
+function sameColourSwap(plan) {
+  const { COLOR_SWAP } = require('@thinking/architect_config');
+  const flat = (o) => JSON.stringify(Object.entries(o || {}).sort());
+  const m = plan.material_rule || {};
+  if (flat(m.recolour) !== flat(COLOR_SWAP)) {
+    throw violation(TAG, `plan "${plan.name}" was made with the colour swap ${flat(m.recolour)}, and the fleet swaps ${flat(COLOR_SWAP)} `
+      + `(architect_config.COLOR_SWAP). Regenerate it: node Auren_Bot/Auren_Workshop/tools/plan_blueprint.js `
+      + `"html and json/Downloaded_Blueprints/downloaded_blueprints.json" --name=${plan.name}`);
+  }
 }
 
 // ── THE BOX IS SOLID TO NAVIGATION ONCE THE TREES ARE DOWN ────────────────────────────────────────
@@ -323,11 +479,17 @@ function siteWood() {
 // inside, during the build and after it. The latch is asked through `assessors/shared`, its one owner
 // (Law 16).
 //
-// NULL, NOT A THROW, when no plan is loaded: a homesteader or contractor process never loads one and has
+// NULL, NOT A THROW, when no plan is loaded: a homesteader process never loads one and has
 // no box.
+// AN AUTHORED HOME OPENS ONCE IT STANDS: its design_intent names rooms and stands to walk to, so while the assessor's last sweep
+// reads every cube standing, its box is ordinary ground under its own protected voxels. Damage closes it again for the column pass.
+let _standing = false;
+function noteStanding(stands) { _standing = stands; }
+function standing() { return _standing; }
 function closedBox() {
   if (!registry) return null;
   const plan = registry.data();
+  if (_standing && plan.design_intent?.workstations) return null;
   const hq = require('@kernel/corporate_headquarters');
   const row = hq.readBuildingChair(plan.name, 'set_buildspot');
   if (!row || !row.footprint || !row.footprint.corner) return null;
@@ -370,18 +532,60 @@ const anchors = () => getPlan().anchors;
 const columns = () => getPlan().columns;
 const ground = () => getPlan().ground;
 const dimensions = () => getPlan().dimensions;
-// mouthCell — the building's one way in, in plan coordinates [bx, by, bz]: the cell just outside the box on the
-// face nearest the first column's stand, feet ENTRY_FEET_BELOW under layer 0. Pure geometry of the plan, so the
+
+// ── WHAT EACH CUBE AND EACH STAND SHAFT OWNS ──────────────────────────────────────────────────────────
+// cubeTargets(anchor) → [{ b:[x,y,z], v }] for every in-box cell of the cube except the stand column (restored on
+// the column's last descent), `v` the plan's voxel or null for an air target. shaftTargets(column) → the stand
+// column's own cells over the whole box, top first. One answer for the assessor that builds the cubes
+// (assessors/downloaded_build, which caches them) and the integrity keeper that watches them (foreman/mansion_keeper).
+function cubeTargets(anchor) {
+  const { cubeCells } = require('@kernel/blueprint_anchor_calculator');
+  const byCell = new Map(anchor.voxels.map(v => [`${v[0]},${v[1]},${v[2]}`, v]));
+  const t = [];
+  for (const [x, y, z] of cubeCells(anchor, dimensions())) {
+    if (x === anchor.stand[0] && z === anchor.stand[2]) continue;
+    t.push({ b: [x, y, z], v: byCell.get(`${x},${y},${z}`) || null });
+  }
+  return t;
+}
+// `support` marks an air cell the block above it stands on (a piece the download left floating): the descent stands a
+// kept block there, and that cell reads correct holding one.
+function shaftTargets(column) {
+  const { restorableOverhead } = require('@kernel/blueprint_anchor_calculator');
+  const byY = new Map(column.descent.map(v => [v[1], v]));
+  const t = [];
+  for (let y = dimensions().h - 1; y >= 0; y--) {
+    const v = byY.get(y) || null, over = byY.get(y + 1);
+    const support = !v && !!over && !restorableOverhead(over[3], over[4]) && !/_wall_/.test(over[3]);
+    t.push({ b: [column.stand[0], y, column.stand[1]], v, ...(support ? { support: true } : {}) });
+  }
+  return t;
+}
+// basementCell(column) → the mine's old cell under this column, in plan coordinates: { open: [[x,y,z]...], fill:
+// [[x,y,z]...], roof: [[x,y,z]...], lamps: [{ source, attach }] }. An implicit blueprint, like the mine's: generated from its
+// grid, never saved in a plan. It sits on the column's own cube grid, whole, so it hangs past the box wherever the
+// column's cubes do. `roof` is the two fill blocks the climb cuts over the stand, lowest last. mining_cell_graph owns the cell.
+function basementCell(column) {
+  const { CUBE } = require('@kernel/blueprint_anchor_calculator');
+  const graph = require('@perception/mining_cell_graph');
+  const [x0, , z0] = anchors()[column.anchors[0]].cube_min;
+  const anchor = { x: x0 + 2, y: -CUBE, z: z0 + 2 };
+  const voxels = graph.generateCell(anchor).voxels.map(v => ({ b: [v[0], v[1], v[2]], air: v[3] === 'air' }));
+  return {
+    open: voxels.filter(v => v.air).map(v => v.b),
+    fill: voxels.filter(v => !v.air).map(v => v.b),
+    roof: [[column.stand[0], -1, column.stand[1]], [column.stand[0], -2, column.stand[1]]],
+    lamps: graph.unitLamps({ anchor }),
+  };
+}
+
+// mouthCell — the building's one way in, in plan coordinates [bx, by, bz]: the cell just outside the first column's
+// basement cell, level with its west door, so a body walks in through the doors. Pure geometry of the plan, so the
 // foreman (which holds no wood and no mandate) marks it from the same answer the trips walk to.
 function mouthCell() {
   const { ENTRY_FEET_BELOW } = require('@kernel/blueprint_anchor_calculator');
-  const [sx, sz] = columns()[0].stand;
-  const { w, l } = dimensions();
-  const faces = [
-    { d: sx, b: [-1, sz] }, { d: w - 1 - sx, b: [w, sz] },
-    { d: sz, b: [sx, -1] }, { d: l - 1 - sz, b: [sx, l] },
-  ].sort((a, b) => a.d - b.d);
-  return [faces[0].b[0], -ENTRY_FEET_BELOW, faces[0].b[1]];
+  const [x0, , z0] = anchors()[columns()[0].anchors[0]].cube_min;
+  return [x0 - 1, -ENTRY_FEET_BELOW, z0 + 2];
 }
 
-module.exports = { load, isLoaded, getPlan, planPathFor, siteFrame, mouthCell, siteWood, closedBox, buildWoodCells, anchors, columns, ground, dimensions, supportsOf, supportSummary, materialRatio, SCHEMA };
+module.exports = { load, isLoaded, getPlan, planPathFor, siteFrame, standInsAtSite, mouthCell, basementCell, siteWood, closedBox, noteStanding, standing, buildWoodCells, anchors, columns, ground, dimensions, cubeTargets, shaftTargets, supportsOf, supportSummary, materialRatio, blockCounts, agreesWithTheSurvey, SCHEMA };

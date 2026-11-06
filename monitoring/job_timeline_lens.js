@@ -456,11 +456,25 @@ function reduceJobTimeline({ seg = [], bot: botFilter = null } = {}) {
     else if (j.verdict && j.verdict.code === 'open_at_trace_end') t.unfinished++;
   }
 
+  // Per job token and ending: how each claim ended and the reason its closing line gave. Numbers in the
+  // reason fold to `#`, so the same reason with different counts or coordinates is one row.
+  const endings = new Map();
+  for (const j of jobs) {
+    if (!j.verdict) continue;
+    const why = j.verdict.why ? j.verdict.why.replace(/-?\d+(\.\d+)?/g, '#').slice(0, 160) : null;
+    const key = `${j.rank ?? '?'} ${j.token}\u0000${j.verdict.code}\u0000${why}`;
+    let e = endings.get(key);
+    if (!e) { e = { token: `${j.rank ?? '?'} ${j.token}`, code: j.verdict.code, why, claims: 0, totalSec: 0, firstSec: j.startSec }; endings.set(key, e); }
+    e.claims++;
+    if (j.durationSec != null) e.totalSec += j.durationSec;
+  }
+
   const workedSec = jobs.reduce((s, j) => s + (j.durationSec || 0), 0);
   return {
     jobs,
     byBot: [...byBot.values()],
     byType: [...byType.values()].sort((a, b) => b.totalSec - a.totalSec),
+    endings: [...endings.values()].sort((a, b) => b.totalSec - a.totalSec),
     workedSec,
     spanSec: jobs.length ? Math.max(...jobs.map(j => j.endSec ?? j.startSec)) : 0,
     inexact: jobs.filter(j => !j.exact && j.durationSec != null).length,
@@ -660,6 +674,15 @@ function runJobTimeline({ seg = [], traceName = '?', bot: botFilter = null, verb
   out.kv('job_types_not_listed', rest.length);
   out.kv('job_types_not_listed_total', duration(rest.reduce((s, t) => s + t.totalSec, 0)));
 
+  // ── How each job ended, and the reason its closing line gave ──
+  out.section('job_endings');
+  const endRows = verbose ? r.endings : r.endings.slice(0, TYPE_ROWS * 2);
+  out.table(
+    ['job_key', 'ending', 'why', 'claims', 'total', 'first_at'],
+    endRows.map(e => [e.token, e.code, e.why, e.claims, duration(e.totalSec), relativeTime(e.firstSec)]),
+  );
+  out.kv('endings_not_listed', r.endings.length - endRows.length);
+
   // ── Per bot ──
   out.section('by_bot');
   out.table(
@@ -852,9 +875,8 @@ function runJobTimeline({ seg = [], traceName = '?', bot: botFilter = null, verb
 // empty-board verdict — idleness alone would count a bot that never woke up as finished (Law 25). Reads
 // the dispatcher's own claim and idle-verdict lines and adds no new emit (Law 16).
 //
-// The dispatcher has four idle verdicts and only two mean finished:
+// The dispatcher has three idle verdicts and only one means finished:
 //   nothing_outstanding  the board is empty                                      → FINISHED
-//   none_for_species     the board's remainder is outside this species' magnet   → FINISHED for this bot
 //   all_gated            work EXISTS and a gate holds it (night, a missing item) → NOT finished
 //   claimed_by_peers     a partner holds everything this magnet attracts         → NOT finished
 const CLAIM_RE = /\[DISPATCHER\][^]*Claimed \[/i;
@@ -884,13 +906,12 @@ function reduceCrewStanding({ seg = [], bots = [] } = {}) {
     }
     if (CLAIM_RE.test(text)) { state.claims++; decision = 'working'; }
     else if (/No jobs outstanding/i.test(text)) decision = 'nothing_outstanding';
-    else if (/Nothing on the board this species may claim/i.test(text)) decision = 'none_for_species';
     else if (/No jobs CLAIMABLE/i.test(text)) decision = 'all_gated';
     else if (/All jobs this magnet attracts are claimed/i.test(text)) decision = 'claimed_by_peers';
     if (decision) { state.lastDecision = decision; state.lastRelSec = line.relSec ?? state.lastRelSec; }
   }
 
-  const DONE = new Set(['nothing_outstanding', 'none_for_species']);
+  const DONE = new Set(['nothing_outstanding']);
   const rows = bots.map(id => perBot[id]);
   const finished = rows.filter(r => r.claims > 0 && DONE.has(r.lastDecision));
   const halted = rows.filter(r => r.halted);

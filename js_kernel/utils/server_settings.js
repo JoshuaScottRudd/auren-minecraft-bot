@@ -7,7 +7,9 @@ const net = require('net');
 const path = require('path');
 const crypto = require('crypto');
 const { parseServerProperties: readProps } = require('./rcon_link');
-const { SPAWN_PROTECTION_RADIUS, BOT_SENIORITY } = require('../../Thinking_fragments/architect_config');
+const { guardExternalSync } = require('./external_library_guard');
+const { SPAWN_PROTECTION_RADIUS, BOT_SENIORITY, CREW_DIFFICULTY } = require('../../Thinking_fragments/architect_config');
+const CREW = require('../../foreman_config').crew;
 
 const REQUIRED = [
   { key: 'online-mode', value: 'false',
@@ -25,17 +27,17 @@ const FLEET_SLOTS = ROSTER_SIZE * 2 + 4;
 // Settings the fleet cannot run correctly without, asserted at every launch instead of trusted to a
 // server's own file — each entry's `why` names what it protects. spawn-protection matches
 // SPAWN_PROTECTION_RADIUS, the same square `perception_nodes.js/spawn_protection` keeps the bots out of
-// (Law 16). difficulty is temporarily 'peaceful' while a separate subsystem is under construction;
-// spawn-monsters stays 'true' so restoring 'hard' is one word. All four load once at JVM start, so a live
+// (Law 16). difficulty is the configured crew's own (architect_config.CREW_DIFFICULTY): a builder crew
+// builds on peaceful, a homesteader crew on normal or hard. These load once at JVM start, so a live
 // server holding the wrong value can only be reported and restarted, never hot-corrected.
 const FLEET_PROPS = [
   { key: 'max-players', value: String(FLEET_SLOTS),
     why: `the roster is ${ROSTER_SIZE} bots and each may have a camera, the foreman and the camera scout hold a slot each, and two are left for a person` },
   { key: 'spawn-protection', value: String(SPAWN_PROTECTION_RADIUS),
     why: 'the bots avoid exactly this square around world spawn, so the server must protect the same one' },
-  { key: 'difficulty', value: 'peaceful',
-    why: 'peaceful while the builder is under construction (Architect 2026-08-30)' },
-  { key: 'spawn-monsters', value: 'true', why: 'left on so restoring hard difficulty is one word' },
+  { key: 'difficulty', value: CREW_DIFFICULTY[CREW],
+    why: `a ${CREW} crew works on ${CREW_DIFFICULTY[CREW]}: builders build on peaceful, homesteaders where monsters spawn` },
+  { key: 'spawn-monsters', value: 'true', why: 'a homesteader world spawns monsters; peaceful spawns none whatever this says' },
   { key: 'spawn-animals', value: 'true', why: 'the crews farm and hunt' },
   { key: 'sync-chunk-writes', value: 'false',
     why: 'with it on, a chunk save blocks the game thread for minutes and every client times out' },
@@ -71,6 +73,28 @@ function propertiesFile(serverDir) {
 // serverPort(serverDir) → the port this server listens on for players, as its own file says.
 function serverPort(serverDir) {
   return parseInt(readProps(fs.readFileSync(propertiesFile(serverDir), 'utf8'))['server-port'], 10) || 25565;
+}
+
+// rconPort(serverDir) → the port this server's console listens on, as its own file says.
+function rconPort(serverDir) {
+  return parseInt(readProps(fs.readFileSync(propertiesFile(serverDir), 'utf8'))['rcon.port'], 10) || 25575;
+}
+
+// movePorts(serverDir, { game, rcon }) → writes the ports this server will listen on into its own file, read at its
+// next boot. The rest of the file stays byte-for-byte.
+function movePorts(serverDir, { game, rcon }) {
+  const file = propertiesFile(serverDir);
+  let text = fs.readFileSync(file, 'utf8');
+  text = setKey(setKey(text, 'server-port', game), 'rcon.port', rcon);
+  fs.writeFileSync(file, text);
+}
+
+// worldInUse(serverDir) → true when a running server holds this folder's world: Minecraft locks the world's
+// session.lock for as long as it runs, and a locked file cannot be read.
+function worldInUse(serverDir) {
+  const lock = path.join(serverDir, levelName(serverDir), 'session.lock');
+  if (!fs.existsSync(lock)) return false;
+  return !guardExternalSync('server_settings', `reading ${lock}`, () => fs.readFileSync(lock)).ok;
 }
 
 // levelName(serverDir) → the world folder's name (`level-name`), as the server's own file says.
@@ -149,4 +173,4 @@ const CLOCKS = {
   day:  { time: '6000', cycle: 'false', said: 'PINNED AT MIDDAY — the daylight cycle frozen, so it stays light for the whole run' },
 };
 
-module.exports = { prepare, serverPort, levelName, serverAnswers, REQUIRED, REQUIRED_PROPS, REQUIRED_GAMERULES, CLOCKS };
+module.exports = { prepare, serverPort, rconPort, movePorts, worldInUse, levelName, serverAnswers, REQUIRED, REQUIRED_PROPS, REQUIRED_GAMERULES, CLOCKS };

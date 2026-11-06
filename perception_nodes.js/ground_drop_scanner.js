@@ -53,16 +53,14 @@ async function scan(bot) {
   const center = bot && bot.entity && bot.entity.position;
   if (!bot || !center || typeof center.x !== 'number') return out;
 
-  for (const e of Object.values(bot.entities || {})) {
+  // `displayName`/`name` carry 'item'; never `objectType`, which logs a stack trace on every read.
+  const isItem = (e) => e.name === 'item' || e.displayName === 'Item' || e.entityType === 'item';
+  // The fleet's ring search (@utils/ring_scan) outward from the body, flat distance like every other proximity
+  // test in the fleet; what lies past SALVAGE_RADIUS is counted far.
+  const items = require('@utils/ring_scan').entitiesNearest(bot, { match: isItem });
+  for (const { entity: e, distance } of items) {
     await pace();
-    // `displayName`/`name` carry 'item'; never `objectType`, which logs a stack trace on every read.
-    if (!e || !e.position) continue;
-    const isItem = e.name === 'item' || e.displayName === 'Item' || e.entityType === 'item';
-    if (!isItem) continue;
     out.scanned++;
-
-    // Horizontal only, matching every other proximity test in the fleet.
-    const distance = Math.hypot(e.position.x - center.x, e.position.z - center.z);
     if (distance > SALVAGE_RADIUS) { out.rejected.far++; continue; }
 
     const stack = e.metadata && e.metadata.find && e.metadata.find((m) => m && m.itemId !== undefined);
@@ -78,8 +76,7 @@ async function scan(bot) {
     out.drops.push({ id: e.id, name, count, pos: { x: e.position.x, y: e.position.y, z: e.position.z }, distance });
   }
 
-  // Nearest first, sorted here, not by the caller — one ordering (Law 16).
-  out.drops.sort((a, b) => a.distance - b.distance);
+  // Nearest first, in the rings' order, not the caller's — one ordering (Law 16).
   return out;
 }
 

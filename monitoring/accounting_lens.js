@@ -12,7 +12,7 @@ from `census_lens.reduceCensus`, whose end-of-run sum is the honest total. Per-j
 `reduceJobTimeline.byType`. Only the four site readings below are new here, since nothing else folds them.
 
 ── THE ONE THING THIS LENS WILL NOT DO ──────────────────────────────────────────────────────────────
-It reports `stone_prospect` as a source with a zero when no pierce job ran; it never omits the row. A
+It reports a stone source with a zero when its verb never ran; it never omits the row. A
 source missing from the table would read as not considered, where a source present at zero reads as asked
 and answered — a question the table should answer standing still, without anyone having to know the
 verb's name.
@@ -35,6 +35,8 @@ const CUBES_FINISHED_RE = /CUBES_FINISHED done=(\d+) of=(\d+) by_layer=(\S+)/;
 // The layer the castle posted cubes on, said by each body when it changes (assessors/downloaded_build noteOpenLayer).
 const OPEN_LAYER_RE = /OPEN_LAYER layer=(\d+) posted=(\d+)/;
 const CUBES_WAITING_ON_RE = /CUBES_WAITING_ON cubes=(\d+) cells=(\d+) cells_by=(\S+) cubes_by=(\S+)/;
+const OPEN_LAYER_SHORT_RE = /OPEN_LAYER_SHORT layer=(\d+) posted=(\d+) cubes_short_of=(\S+)/;
+const FALLING_RE = /(FALLING_LIFT|FALLING_LIFTED|FALLING_NOT_LIFTED) cube=(\d+) (.*)/;
 const CUBE_WAITS_RE = /CUBE_WAITS cube=(\d+) layer=(\d+) column=(\d+) cells=(\d+) on=(\S+)/;
 const CUBE_RE = COLUMN_TRIP_RE;
 
@@ -65,9 +67,9 @@ const ALL_COMPLETE_RE = /(\w+) all_complete after \d+ iteration/;
 const DISPATCH_RE = /dispatching to (\w+)/;
 
 // THE FOUR VERBS THAT CAN PUT STONE IN A POCKET, named as a closed list so the table can carry a zero
-// for one that never ran. `stone_prospect_executor` is the surface column pierce; `mining_manager` owns
+// for one that never ran. `survey_executor` digs stone open to the sky; `mining_manager` owns
 // both the shaft descent and the cells; the cube trips and the salvage pick up whatever the site held.
-const STONE_VERBS = ['mining_manager', 'stone_prospect_executor', 'build_column_executor', 'ground_salvage_executor'];
+const STONE_VERBS = ['mining_manager', 'survey_executor', 'build_column_executor', 'ground_salvage_executor'];
 
 const STONE_ITEMS = new Set(['cobblestone', 'stone', 'andesite', 'diorite', 'granite', 'deepslate', 'cobbled_deepslate', 'tuff']);
 
@@ -250,7 +252,7 @@ function reduceAccounting({ seg = [], bot: botFilter = null } = {}) {
   const census  = reduceCensus({ seg });
 
   // ── THE FOUR SITE READINGS ──────────────────────────────────────────────────────────────────────
-  const cubes = { waitsTotal: new Map(), waitsByBot: new Map(), trips: 0, dug: 0, placed: 0, failed: 0, shaftPlaced: 0, climbStopped: 0, zeroYield: 0,
+  const cubes = { layerShort: [], falling: [], waitsTotal: new Map(), waitsByBot: new Map(), trips: 0, dug: 0, placed: 0, failed: 0, shaftPlaced: 0, climbStopped: 0, zeroYield: 0,
     cubeSet: new Set(), columnSet: new Set(), finished: null, byCube: new Map(), found: new Map(), foundTrips: 0, foundNone: 0, visits: [],
     openLayers: new Map() };          // layer → first fleet second any body said it was the open layer
   const settles = new Map();         // "kind stop" → { kind, stop, count, cycles, dug, placed, left }
@@ -322,6 +324,8 @@ function reduceAccounting({ seg = [], bot: botFilter = null } = {}) {
     if ((m = CUBES_WAITING_ON_RE.exec(raw))) {
       cubes.waitsTotal.set(l.bot || 'fleet', { cubes: Number(m[1]), cells: Number(m[2]), cellsBy: m[3], cubesBy: m[4] });
     }
+    if ((m = OPEN_LAYER_SHORT_RE.exec(raw))) cubes.layerShort.push({ bot: l.bot || 'fleet', at: l.wallSec, layer: +m[1], posted: +m[2], short: m[3] });
+    if ((m = FALLING_RE.exec(raw))) cubes.falling.push({ bot: l.bot || 'fleet', at: l.wallSec, kind: m[1], cube: +m[2], rest: m[3].split(' ').filter(t => t.includes('=')).join(' ').slice(0, 160) });
     if ((m = CUBE_WAITS_RE.exec(raw))) {
       const mine = cubes.waitsByBot.get(l.bot || 'fleet') || new Map();
       if (m[5] === 'none') mine.delete(Number(m[1]));
@@ -592,7 +596,7 @@ function runAccounting({ seg = [], traceName = '?', bot: botFilter = null, verbo
   const collectRe = /WINDOW furnace-collect @ \S+: (\d+)x iron_ingot/;
   const ironCraftRe = /WINDOW craft ((?:iron_\w+|\w*lantern|chain|shears|shield|bucket|\w*_rail|rail|hopper|anvil|cauldron)) @.*bot\.craft OK/;
   let loaded = 0, collected = 0, firstLoad = null, firstCollect = null;
-  const ironCrafts = {};
+  const ironCrafts = {}, firstCraft = {};
   for (const l of seg) {
     if (botFilter && l.bot && l.bot !== botFilter) continue;
     const raw = l.raw || '';
@@ -601,13 +605,18 @@ function runAccounting({ seg = [], traceName = '?', bot: botFilter = null, verbo
     const b = collectRe.exec(raw);
     if (b) { collected += +b[1]; if (l.wallSec != null && (firstCollect === null || l.wallSec < firstCollect)) firstCollect = l.wallSec; }
     const c = ironCraftRe.exec(raw);
-    if (c) ironCrafts[c[1]] = (ironCrafts[c[1]] || 0) + 1;
+    if (c) {
+      ironCrafts[c[1]] = (ironCrafts[c[1]] || 0) + 1;
+      if (l.wallSec != null && (firstCraft[c[1]] === undefined || l.wallSec < firstCraft[c[1]])) firstCraft[c[1]] = l.wallSec;
+    }
   }
   out.kv('raw_iron_loaded', loaded);
   out.kv('first_iron_load_run_sec', firstLoad === null ? 'never' : firstLoad);
   out.kv('iron_ingots_collected', collected);
   out.kv('first_ingot_collect_run_sec', firstCollect === null ? 'never' : firstCollect);
   out.kv('iron_item_crafts', Object.entries(ironCrafts).map(([k, n]) => `${k}=${n}`).join(' ') || 'none');
+  out.kv('first_bucket_run_sec', firstCraft.bucket === undefined ? 'never' : firstCraft.bucket);
+  out.kv('first_iron_craft_run_sec', Object.entries(firstCraft).sort((x, y) => x[1] - y[1]).map(([k, s]) => `${k}=${s}`).join(' ') || 'none');
   // The stone-tool shelf: each time a body wanted shelf tools and found too few (shared.noteShelfShort), and
   // every pickaxe crafted, by tier.
   out.section('tool_shelf');
@@ -719,6 +728,20 @@ function runAccounting({ seg = [], traceName = '?', bot: botFilter = null, verbo
       [...(r.cubes.waitsByBot.get(seer[0]) || new Map()).values()].sort((x, y) => x.layer - y.layer || y.cells - x.cells)
         .map(c => [c.cube, c.layer, c.column, c.cells, c.on]));
   }
+
+  // What the open layer was short of whenever no cube of it could be posted (downloaded_build OPEN_LAYER_SHORT), the
+  // last 12 statements of any body.
+  out.section('anchor_cubes_layer_short');
+  out.kv('statements', r.cubes.layerShort.length);
+  out.table(['at_min', 'bot', 'layer', 'posted', 'cubes_short_of'],
+    r.cubes.layerShort.slice(-12).map(x => [minute(x.at), x.bot, x.layer, x.posted, x.short]));
+
+  // Every falling block a trip lifted off a cell it dug, whether its item came back, and every dig left standing
+  // because one still stood on it (build_column_executor FALLING_LIFT / FALLING_LIFTED / FALLING_NOT_LIFTED).
+  out.section('anchor_cubes_falling_lift');
+  out.kv('lines', r.cubes.falling.length);
+  out.table(['at_min', 'bot', 'line', 'cube', 'detail'],
+    r.cubes.falling.slice(-24).map(x => [minute(x.at), x.bot, x.kind, x.cube, x.rest]));
 
   // Every cube worked more than once, its trips in fleet-clock order as dug.placed.failed.
   const reworked = [...r.cubes.byCube.values()].filter(c => c.trips.length > 1).sort((a, b) => b.trips.length - a.trips.length);

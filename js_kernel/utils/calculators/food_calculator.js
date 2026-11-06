@@ -30,6 +30,8 @@ const HUNGER_RESTORED = {
   melon_slice: 2,
   sweet_berries: 2,
   dried_kelp: 1,
+  beef: 3,
+  mutton: 2,
 };
 
 // Floor for a food this table does not name; under-stating the restore over-states the count, which

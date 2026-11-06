@@ -150,8 +150,11 @@ module.exports = {
     }
 
     // Scopes prep to the claimed anchor when named, so prepping the whole building doesn't over-withdraw.
+    // A declared section (blueprint_registry.sectionOf) is one trip, so its every anchor's need is prepared at once.
     const anchorNeed = (anchorIndex != null)
-      ? buildingIntegrity.materialsForAnchor(integrity, anchorIndex)
+      ? require('@kernel/blueprint_registry').sectionOf(blueprintName, anchorIndex)
+        .map(ai => buildingIntegrity.materialsForAnchor(integrity, ai))
+        .reduce((sum, need) => { for (const [k, c] of Object.entries(need)) sum[k] = (sum[k] || 0) + c; return sum; }, {})
       : integrity.materials_needed;
     // `buildable` is the affordable part of this anchor; a block outside it waits for a later pass.
     const buildable = payload?.buildable || null;

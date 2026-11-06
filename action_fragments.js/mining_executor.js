@@ -35,13 +35,18 @@ const { routeToJudge } = require('@utils/signal_utils');
 const { guardExternal, withCleanup } = require('@utils/external_library_guard');
 
 // ── VEINS: THE ORE A STRIP SEGMENT UNCOVERS ──────────────────────────────────────────────────────────
-// mineVeins(bot, seg) — the ore in the tunnel's walls and ceiling and the ore joined to it face to face, never at
-// or below the floor,
-// out to VEIN_MAX blocks, one block at a time: dig one, walk to what fell, dig the next from where the body
-// now stands. A block is mined only when it is in reach of the feet, is not the block the body stands on,
-// touches no water or lava, carries no falling block on top, and a pickaxe the body holds can harvest it.
-// The spot the vein was started from is kept, and the body returns to it once, when the vein is done, by the
-// navigator's ordinary route. The walls it opens stay open: a branch keeps only its floor (mining_integrity).
+// mineVeins(bot, seg) — the ore in the tunnel's walls, ceiling and floor and the ore joined to it face to face, out
+// to VEIN_MAX blocks, chased block by block: dig one, collect what fell, dig the next. An ore out of reach is walked
+// to, onto the nearest stand that has it in reach (anchored_repair.standInReachOf); one with no stand, or one the
+// walk does not reach, is passed and the next is tried. A block is never the one the body stands on, never touches
+// water or lava, never carries a falling block on top, and is mined only when a pickaxe the body holds can harvest
+// it. The spot the vein was started from is kept, and the body returns to it once, when the vein is done, by the
+// navigator's ordinary route. The walls it opens stay open: a branch keeps only its floor (mining_integrity), so the
+// settle that follows refills a floor hole the vein left.
+// THE FIRST ORDER'S IRON COMES UP AFTER THE VEIN IN HAND (mining_manager.firstOrderAboard): read each time a vein is
+// finished and before the next one in the walls is started, so a body carrying the bucket's iron ends the pass there
+// and its trip surfaces at the segment's end. A vein is the ore joined face to face to what this pass dug; the
+// veins not started are passed as first_order.
 const ORE = /_ore$/;
 const VEIN_MAX = 16;
 async function mineVeins(bot, seg) {
@@ -53,35 +58,46 @@ async function mineVeins(bot, seg) {
   const keyOf = (p) => `${p.x},${p.y},${p.z}`;
   const open = new Map(seg.voxels.filter(v => v[3] !== 'air').map(v => [`${v[0]},${v[1]},${v[2]}`, new Vec3(v[0], v[1], v[2])]));
   const seen = new Set(open.keys());
+  const joined = new Set();   // faces of ore this pass dug: the vein in hand
   const home = bot.entity.position.floored();
-  const floorY = seg.world_position.y;
   const mined = {};
   let passed = {};
+  const unreached = {};
   const drops = { picked: 0, seen: 0, no_route: 0, long_walk: 0 };
   let dug = 0, digFailed = 0;
   while (dug < VEIN_MAX) {
-    // The next ore the body can work from where it stands NOW; what it cannot is read again after the next move.
+    // The next ore, read from where the body stands NOW: one in reach first, else the nearest out of reach, walked to.
     const feet = bot.entity.position.floored();
     const round = {};
-    let pick = null;
+    let pick = null, far = null, farD = Infinity;
     for (const [k, p] of open) {
       const b = bot.blockAt(p);
       if (!b || !ORE.test(b.name)) { open.delete(k); continue; }
       let why = null;
       if (p.x === feet.x && p.z === feet.z && p.y < feet.y) why = 'underfoot';
-      // NO ORE IS TAKEN AT OR BELOW THE TUNNEL'S FLOOR: a cave can lie under it. A vein is chased along the
-      // walls and up, never down.
-      else if (p.y <= floorY) why = 'floor';
-      else if (anchoredRepair.reachFromStand(bot, feet, p) > BLOCK_REACH) why = 'reach';
       else if (SIX.some(([dx, dy, dz]) => { const n = bot.blockAt(p.offset(dx, dy, dz)); return !!n && isFluid(n.name); })) why = 'fluid';
       else if ((() => { const up = bot.blockAt(p.offset(0, 1, 0)); return !!up && isGravityBlock(up.name); })()) why = 'gravity';
       else if (!bot.inventory.items().some(i => b.canHarvest(i.type))) why = 'tool';
       // Named by ore, so a passed vein says which ore was left and why (a 'tool' pass names the pickaxe short).
       if (why) { const key = `${why}:${b.name}`; round[key] = (round[key] || 0) + 1; continue; }
-      pick = { k, p, b };
-      break;
+      if (anchoredRepair.reachFromStand(bot, feet, p) <= BLOCK_REACH) { pick = { k, p, b }; break; }
+      const d = p.distanceSquared(feet);
+      if (d < farD) { far = { k, p, b }; farD = d; }
     }
-    if (!pick) { passed = round; break; }
+    if (!pick && far) {
+      // OUT OF REACH IS WALKED TO: the nearest stand with the ore in reach; one with none, or not reached, is passed.
+      const stand = anchoredRepair.standInReachOf(bot, far.p);
+      const went = stand ? await locomotion.goTo({ ...stand, exact: true, leg: 'work' }) : null;
+      if (!went?.arrived || anchoredRepair.reachFromStand(bot, bot.entity.position.floored(), far.p) > BLOCK_REACH) {
+        open.delete(far.k);
+        const key = `not_reached:${far.b.name}`;
+        unreached[key] = (unreached[key] || 0) + 1;
+        continue;
+      }
+      pick = far;
+    }
+    if (!pick) { passed = { ...round, ...unreached }; break; }
+    if (dug > 0 && !joined.has(pick.k) && require('@action/mining_manager.js').firstOrderAboard(bot)) { passed = { first_order: open.size }; break; }
     open.delete(pick.k);
     const name = pick.b.name;
     if (!(await performDig(bot, pick.p, pick.b, 'mining_executor'))) { digFailed++; continue; }
@@ -89,6 +105,7 @@ async function mineVeins(bot, seg) {
     mined[name] = (mined[name] || 0) + 1;
     for (const [dx, dy, dz] of SIX) {
       const n = pick.p.offset(dx, dy, dz);
+      joined.add(keyOf(n));
       if (!seen.has(keyOf(n))) { seen.add(keyOf(n)); open.set(keyOf(n), n); }
     }
     const got = await collectNearby(bot);
@@ -106,7 +123,19 @@ async function mineVeins(bot, seg) {
   const list = (o) => Object.entries(o).map(([n, c]) => `${n}=${c}`).join(' ') || 'none';
   watcher.summary('mining_executor', `VEINS ${seg.id} dug=${dug} | mined ${list(mined)} | passed ${list(passed)}`);
   if (dug > 0) watcher.summary('mining_executor', `VEIN_DROPS ${seg.id} ore=${dug} picked=${drops.picked}/${drops.seen} no_route=${drops.no_route} long_walk=${drops.long_walk}`);
-  return { dug, mined, back };
+  return { dug, mined, passed, back };
+}
+
+// THE PASS'S YIELD, BOOKED: the blocks a new strip pass dug and the ore its walls held by category, mined or passed
+// (survey_book.noteDig), so the mine's seats for an ore are sized by what the ground turns up (assessors/mining).
+function noteYield(blocks, veins) {
+  const book = require('@perception/survey_book');
+  const found = {};
+  const add = (name, n) => { const c = book.oreCategoryOf(name); if (c && n > 0) found[c] = (found[c] || 0) + n; };
+  for (const [name, n] of Object.entries(veins.mined)) add(name, n);
+  for (const [key, n] of Object.entries(veins.passed)) add(key.slice(key.indexOf(':') + 1), n);
+  book.noteDig(blocks, found);
+  watcher.summary('mining_executor', `DIG_YIELD blocks=${blocks} found=${Object.entries(found).map(([c, n]) => `${c}:${n}`).join(',') || 'none'}`);
 }
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
@@ -161,8 +190,7 @@ function resolveItemName(bot, token) {
 const REASON_WHY = {
   carve_walkway: 'blueprint wants open air here but rock is present — dig it out (this voxel is part of the walkway/room being excavated)',
   wall_breach:   'blueprint wants a solid wall here but found AIR (a cave grazed the shaft) — seal the hole so the shaft stays enclosed',
-  torch_missing: 'blueprint wants a torch here for lighting and none is present — place one',
-  torch_blocked: 'a torch belongs here but a solid block occupies the slot — clear it, then place the torch',
+  torch_missing: 'the torch network plans a torch here (lighting_integrity) and none is present — place one in passing',
   gravity_wall:  'a gravity block (sand/gravel) sits in a wall slot (cave-in risk) — dig it out and reseal with stable fill',
   missing:       'blueprint wants a specific block here and the slot is empty — place it',
   mismatch:      'the wrong block occupies this slot — clear it, then place the blueprint block',
@@ -472,13 +500,15 @@ module.exports = {
           require('@kernel/foreman_link').closeClaimedArea(`cell:${cellSeg.id}`, miningCellGraph.cellWorkBox(anchor, payload.dig_cell));
         }
         r = await settleSegment(cellSeg, { isCell: true });
-        // A STRIP MINES THE ORE IT UNCOVERS, then seals the walls it opened with the stone it took out.
-        if (miningCellGraph.isStrip(payload.dig_cell) && !payload.dig_cell.maintenance) {
-          const veins = await mineVeins(bot, cellSeg);
-          if (veins.dug > 0 && veins.back) {
-            const seal = await settleSegment(cellSeg, { isCell: true });
-            r = { ...r, digOk: r.digOk + seal.digOk, digFail: r.digFail + seal.digFail, placeOk: r.placeOk + seal.placeOk, placeFail: r.placeFail + seal.placeFail };
-          }
+      }
+      // A STRIP MINES THE ORE IT UNCOVERS, then refills the floor holes the vein left (a branch keeps only its floor).
+      // An ore this body's pickaxes cannot take is passed and the line digs on.
+      if (miningCellGraph.isStrip(payload.dig_cell) && !payload.dig_cell.maintenance && cellSeg.steps.length > 0) {
+        const veins = await mineVeins(bot, cellSeg);
+        noteYield(r.digOk + veins.dug, veins);
+        if (veins.dug > 0 && veins.back) {
+          const seal = await settleSegment(cellSeg, { isCell: true });
+          r = { ...r, digOk: r.digOk + seal.digOk, digFail: r.digFail + seal.digFail, placeOk: r.placeOk + seal.placeOk, placeFail: r.placeFail + seal.placeFail };
         }
       }
 
@@ -530,15 +560,15 @@ module.exports = {
     // in the order the staircase is walked — and the trip ends. No per-segment dispatch.
     await centerOnBlock();
     const shaftState = miningIntegrity.scan(bot, excluded);
-    if (shaftState.shaft_excavated) {
-      const copies = require('@perception/mining_blueprinter').generateStaircase().staircase_segments || [];
+    if (shaftState.open_excavated) {
+      const copies = require('@perception/mining_blueprinter').generateStaircase().staircase_segments.filter(c => c.part === 'shallow' || miningIntegrity.isDeepOpen());
       const seen = new Set();
       const voxels = [];
       for (const c of copies) for (const v of c.voxels) {
         const k = `${v[0]},${v[1]},${v[2]}`;
         if (!seen.has(k)) { seen.add(k); voxels.push(v); }
       }
-      const shaft = { id: 'mineshaft', type: 'staircase', world_position: copies[0] && copies[0].world_position,
+      const shaft = { id: 'shaft', type: 'staircase', world_position: copies[0] && copies[0].world_position,
         voxels, anchors: copies.flatMap(c => c.anchors || []) };
       const first = miningIntegrity.scanSegmentSteps(bot, shaft, excluded);
       const r = first

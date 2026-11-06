@@ -33,8 +33,9 @@ const TAG = 'building_manager';
 function anchorBuildableNow(integrity, anchorIndex, blueprintName, excluded) {
     const st = anchorIndex != null ? integrity?.anchor_status?.[anchorIndex] : null;
     const pledged = require('@kernel/blueprint_registry').isPledgeApproved(blueprintName);
+    // A declared section stages its whole bill (building_integrity.tripBill), the same cut the board asked of.
     const mNeeded = st
-        ? (pledged ? st.materials_needed_placeable : st.materials_needed_lowest_y)
+        ? (pledged ? st.materials_needed_placeable : buildingIntegrity.tripBill(integrity, blueprintName, anchorIndex).coursed)
         : (integrity?.materials_needed || {});
     const remaining = Object.fromEntries(
         Object.entries(mNeeded || {}).filter(([k, c]) => typeof c === 'number' && c > 0 && !jobExclusions.excludes(excluded, k))
@@ -53,10 +54,6 @@ const RECIPES = {
         fragment:       'preconstruction',
         blueprint_name: 'headframe',
     },
-    contractor_house_execute: {
-        fragment:       'preconstruction',
-        blueprint_name: 'contractor_house',
-    },
     laydown_yard_execute: {
         fragment:       'preconstruction',
         blueprint_name: 'laydown_yard',
@@ -64,6 +61,18 @@ const RECIPES = {
     waste_pit_execute: {
         fragment:       'preconstruction',
         blueprint_name: 'waste_pit',
+    },
+    sheep_pen_execute: {
+        fragment:       'preconstruction',
+        blueprint_name: 'sheep_pen',
+    },
+    cow_pen_execute: {
+        fragment:       'preconstruction',
+        blueprint_name: 'cow_pen',
+    },
+    spawn_proofing_execute: {
+        fragment:       'preconstruction',
+        blueprint_name: 'spawn_proofing',
     },
 };
 
@@ -115,6 +124,11 @@ module.exports = {
         // A pass that found the structure complete (a peer placed the last block) ends the job outright.
         if (lastPass === 'all_complete') {
             _release(`${jobKey} — the structure is complete; handing back to the board`);
+            return;
+        }
+        // The anchors this job was posted for stand; the board posts the next trip.
+        if (lastPass === 'trip_complete') {
+            _release(`${jobKey} — this trip's anchors are built; handing back to the board`);
             return;
         }
         if (typeof lastPass === 'string' && /^(no_payable_cell|cells_held_by_peers)\(/.test(lastPass)) {

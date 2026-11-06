@@ -23,10 +23,10 @@ const state = { timer: null, woke: false, wokeOn: null, last: null, frozen: fals
 
 // wakeReason(fleet, wake) → a sentence, or null. A crash is an ABSENCE, so a bot that left and never came
 // back always counts; its own last error line is carried through untouched, since it may say why.
-// A bot the foreman itself sent home (a person's `stop` or `wipe`, a player leaving) carries `sent_home`
-// on its departure and is an order obeyed, not a crash.
+// A bot the foreman itself sent home (an operator's `stop` or `wipe`) carries `sent_home` on its departure
+// and is an order obeyed, not a crash.
 const lost = (fleet) => (fleet.departed || []).filter(d => !d.sent_home);
-const sentAway = (d) => `${d.id} (sent home by ${d.sent_home.verb}${d.sent_home.asker ? ` from ${d.sent_home.asker}` : ''})`;
+const sentAway = (d) => `${d.id} (sent home by ${d.sent_home.verb})`;
 
 function wakeReason(fleet, wake) {
   for (const d of lost(fleet)) {
@@ -42,14 +42,15 @@ function wakeReason(fleet, wake) {
 
 // `build` is the building whose standing ends the run (null: the run does not end on one). A body reads it
 // built only with every cube and stand column in sight and standing, so one body's reading is the fact.
-function start({ fleetState, wake, watch, onWake, build, onBuilt }) {
+// `real`: that body also reads no book still owed to a cell standing as its planks (books_owed 0).
+function start({ fleetState, wake, watch, onWake, build, real, onBuilt }) {
   state.workingSince = Date.now();
   state.last = fleetState();
   state.timer = require('../../js_kernel/utils/timeout_crash').every('run_watch', 'read the fleet for an error, a death or a lost body', () => {
     if (state.frozen) return;
     const fleet = fleetState();
     state.last = fleet;
-    const reader = build ? (fleet.bots || []).find(b => b.built && b.built[build] === true) : null;
+    const reader = build ? (fleet.bots || []).find(b => b.built && b.built[build] === true && (!real || b.books_owed === 0)) : null;
     if (reader) {
       require('../../js_kernel/utils/timeout_crash').stop(state.timer);
       onBuilt(reader.id);
@@ -115,14 +116,18 @@ function verdict(why) {
       gone.length ? `${gone.map(d => `${d.id} at ${d.gone_at}`).join(', ')} left and did not come back`
         : `all ${(fleet.bots || []).length} bot(s) still connected${home.length ? `; ${home.map(sentAway).join(', ')}` : ''}`);
     // Walking against working, summed over every body's own clock: the crew may spend no more than the
-    // limit of its time on jobs getting to them.
-    const { fleetShare, WALK_LIMIT_PCT } = require('../../js_kernel/utils/calculators/walk_share_calculator');
-    const share = fleetShare((fleet.bots || []).map(b => b.work_clock));
-    const minutes = (ms) => (ms / 60000).toFixed(1);
-    check(`the crew walked no more than ${WALK_LIMIT_PCT}% of its time on jobs`, share.walk_pct !== null && !share.over,
-      share.walk_pct === null ? 'no bot reported time on a job'
-        : `${share.walk_pct}% walking — ${minutes(share.walk_ms)} bot-min walking, ${minutes(share.work_ms)} bot-min working, ${share.bodies} bot(s)`
-          + (share.over ? `; short by ${minutes(share.work_owed_ms)} bot-min of work` : ''));
+    // limit of its time on jobs getting to them. Ore trips are not on the clock: they are judged by ore per
+    // minute (walk_share_calculator.ORE_TRIPS). A test module run (foreman_config `module`) takes no job, so it is
+    // not judged on this.
+    if (require('../../foreman_config').module === 'off') {
+      const { fleetShare, WALK_LIMIT_PCT } = require('../../js_kernel/utils/calculators/walk_share_calculator');
+      const share = fleetShare((fleet.bots || []).map(b => b.work_clock));
+      const minutes = (ms) => (ms / 60000).toFixed(1);
+      check(`the crew walked no more than ${WALK_LIMIT_PCT}% of its time on jobs`, share.walk_pct !== null && !share.over,
+        share.walk_pct === null ? 'no bot reported time on a job'
+          : `${share.walk_pct}% walking — ${minutes(share.walk_ms)} bot-min walking, ${minutes(share.work_ms)} bot-min working, ${share.bodies} bot(s)`
+            + (share.over ? `; short by ${minutes(share.work_owed_ms)} bot-min of work` : ''));
+    }
     for (const b of fleet.bots || []) {
       console.log(`  ${b.id}: ${b.summary || 0} summary, ${b.warn || 0} warning(s), ${b.error || 0} error(s)${b.dead === true ? ', DEAD at the end' : ''}`);
     }
@@ -132,6 +137,15 @@ function verdict(why) {
   const word = state.crashed ? 'CRASHED' : (failed.length ? 'FAIL' : 'PASS');
   console.log(`\n══ ${word} — ${checks.length - failed.length}/${checks.length} check(s) · ${why} ══`);
   for (const f of failed) console.log(`  FAILED  ${f.name} — ${f.detail}`);
+  // A stop the watch made is the run's purpose, not an obstacle to it: the next reader is told so before
+  // anything is changed, so the stop is answered by finding its cause and not by routing around it.
+  if (state.woke) {
+    console.log('\n  WHY THIS RUN WAS STOPPED: a watched run ends at its first error or death on purpose. The stop keeps the');
+    console.log('  world, the bodies and the record as the fault left them, so the logs can be inspected and the behaviour');
+    console.log('  that caused it corrected. Read the cause through the lenses, fix it where it lives, then run again.');
+    console.log('  Do not bypass it: turning the wake off, lengthening a judge or skipping the job hides the fault, and');
+    console.log('  the next run meets it again.');
+  }
   return outcome.write({
     // CRASHED is its own word, distinct from FAIL: a FAIL is a run that finished and missed its checks;
     // CRASHED never finished. The failing check above already yields the right exit code with no

@@ -228,13 +228,18 @@ function claimedAt(stationId, item) {
 // the second. `poolStations` requires `e.pos`; the fleet's wider readers (`accessibleMaterialPool`, and
 // therefore `reachableByFleet` and the chain gate) require only `isStorage`, a narrower set. A caller
 // that wants claims subtracted from its own count says exactly that and nothing else.
+// `item` may be a list (a furnace input's every member): each claimed token is then counted once if it speaks for
+// any of them, so one claim on a group is not subtracted once per member it holds.
 function claimedByOthers(item, botId) {
     const who = botId || _botId();
+    const items = Array.isArray(item) ? item : [item];
     let n = 0;
     for (const id of poolStations()) {
         for (const row of claimsAt(id)) {
             if (row.botId === who) continue;
-            n += _claimToward(item, row.take);
+            for (const [token, count] of Object.entries(row.take || {})) {
+                if (items.some(i => _claimToward(i, { [token]: count }) > 0)) n += count;
+            }
         }
     }
     return n;
@@ -341,7 +346,7 @@ function lessClaims(pool, exceptBot = null) {
 // later one wait. Without the floor a later claim, over-reported by the group bias, starves the earlier.
 function unclaimedOf(names, botId) {
     const who = botId || _botId();
-    const want = new Set(names);
+    const want = new Set(names.flatMap(name => require('@utils/fragment_utils').agedForms(name)));
     const stations = stationRegistry.getStations();
     let stock = 0, claimed = 0, own = 0;
     for (const id of poolStations()) {
@@ -455,7 +460,14 @@ function memberUnclaimed(name, botId) {
     const stations = stationRegistry.getStations();
     let stock = 0;
     for (const id of poolStations()) stock += chestItemCounts(stations[id])[name] || 0;
-    return Math.max(0, stock - claimedByOthers(name, botId));
+    // Only a claim by this name counts here: a claim on the group is the group cap's (unclaimedOf), and charged in
+    // full against every member it would read 2 logs claimed as no oak and no birch, with 4 logs in the chest.
+    const who = botId || _botId();
+    let named = 0;
+    for (const id of poolStations()) {
+        for (const row of claimsAt(id)) if (row.botId !== who) named += (row.take || {})[name] || 0;
+    }
+    return Math.max(0, stock - named);
 }
 
 module.exports = {

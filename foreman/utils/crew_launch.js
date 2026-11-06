@@ -12,26 +12,25 @@ const { log } = require('./say');
 
 const BOT_DIR = path.resolve(__dirname, '..', '..');
 
-// Launches ONE contractor body through `start_bot.js`, the tree's one birth (Law 16); `fleet_control` is
+// Launches ONE body through `start_bot.js`, the tree's one birth (Law 16); `fleet_control` is
 // personal equipment that does not ship. The caller already filters to free, not-already-running bots,
 // so this file only launches and ends bodies. It resolves on launch, not on exit: `start_bot.js` does not
 // return until the bot dies, so a death inside the grace window below is the one outcome reported here.
 const BOT_LAUNCH_GRACE_MS = 3000;
 
-// Bodies this desk fetched, so they leave when it does (Law 8 — whatever raised a process terminates it).
+// Bodies this foreman fetched, so they leave when it does (Law 8 — whatever raised a process terminates it).
 const fetched = [];
 
-// `species` is 'contractor' or 'homesteader'; owner is '' for a homesteader (`bot_mandate` requires it).
-// `BOT_AUTOSTART` starts a homesteader at fetch (a contractor is already born started); `BOT_START_NEAR`
-// places both species beside the asker, confirmed by the body itself before planning (`start_injector`'s
+// `species` is 'homesteader' or 'builder'. `BOT_AUTOSTART` starts the body at fetch; `BOT_START_CELL`
+// places it on the foreman's chosen cell, confirmed by the body itself before planning (`start_injector`'s
 // gate, Law 16). `held` withholds `BOT_AUTOSTART`: the body places itself and waits for the operator's
 // `start` (foreman_config `go`). Each body's console drains to a file under `record_homes` (Law 16), tailed by a window.
-function startBot(botId, species, owner, placeBeside, held = false) {
+function startBot(botId, species, cell, held = false, homeCell = '') {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(BOT_DIR, 'start_bot.js')], {
       cwd: BOT_DIR,
       // The mandate stamped as environment, the path `start_bot.js` documents for a non-human caller.
-      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_OWNER: owner, BOT_AUTOSTART: held ? '0' : '1', BOT_START_NEAR: placeBeside },
+      env: { ...process.env, BOT_ID: botId, BOT_MODE: species, BOT_AUTOSTART: held ? '0' : '1', BOT_START_CELL: cell, BOT_HOME_CELL: homeCell },
       stdio: ['ignore', 'pipe', 'pipe'], // Piped, not shown: the follower window opened below is the only console.
       // Detached so the child survives a force-killed foreman long enough for `foreman_link`'s close
       // handler to report it lost. Not `child.unref()`: `stopAll` still ends every body by pid (Law 8).
@@ -78,7 +77,7 @@ function startBot(botId, species, owner, placeBeside, held = false) {
   });
 }
 
-// Ends every body this desk fetched, registered for ordinary exits and for Ctrl-C; each entry's console
+// Ends every body this foreman fetched, registered for ordinary exits and for Ctrl-C; each entry's console
 // log and window end with its child (Law 8). Closes windows concurrently; `releaseFetched` below is the
 // sync backstop for process exit.
 async function releaseFetchedAsync() {
@@ -94,7 +93,7 @@ function releaseFetched() {
   for (const { child, sink, window } of fetched) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     if (window) consoleWindow.closeWindow(window.pid);
-    // Closed, not deleted, so a desk going down can still be read (`fleet_logs/` empties on the next
+    // Closed, not deleted, so a foreman going down can still be read (`fleet_logs/` empties on the next
     // start). Checked with `writableEnded` instead of caught (Law 13).
     if (sink && !sink.writableEnded) sink.end();
   }

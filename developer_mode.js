@@ -74,7 +74,7 @@ if (verb === 'status' || verb === '--help' || verb === '-h' || verb === 'help') 
   } else {
     console.log('\n  Developer mode is OFF — this is an ordinary copy of Auren.');
     console.log('');
-    console.log('  To play:   node start_auren.js      then say "foreman get" in chat');
+    console.log('  To play:   node start_auren.js      the foreman raises the crew foreman_config names');
     console.log('  To build:  node developer_mode.js on');
     whatIsBehindIt();
   }

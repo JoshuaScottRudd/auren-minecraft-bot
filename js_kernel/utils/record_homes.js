@@ -20,8 +20,15 @@ const path = require('path');
 
 const BOT_DIR = path.resolve(__dirname, '..', '..');
 
-// The records room. Every run trace, whatever unit wrote it — bots, the foreman, the cameras, the desk.
-const TRACE_DIR = path.join(BOT_DIR, 'fleet_logs', 'traces');
+// Every file under `fleet_logs/` belongs to exactly one WORLD, from its rollback start on: each run of
+// that world is a segment of the same files, in order.
+//
+// AUREN_RECORDS_DIR points the room at another fleet's folder, for READING its run (trace_monitor --records
+// sets it). No fleet process sets it; a sweep refuses while it is set.
+const RECORDS_DIR = process.env.AUREN_RECORDS_DIR ? path.resolve(process.env.AUREN_RECORDS_DIR) : path.join(BOT_DIR, 'fleet_logs');
+
+// The records room. Every run trace, whatever unit wrote it — bots, the foreman, the cameras.
+const TRACE_DIR = path.join(RECORDS_DIR, 'traces');
 
 // Creates the trace directory on demand. Recursive so the parent is made too; idempotent, so any caller
 // may simply call it.
@@ -42,10 +49,6 @@ function deepTraceFile(unit) {
   return path.join(TRACE_DIR, unit ? `watcher_${unit}_trace.json` : 'watcher_trace.json');
 }
 
-// Every file under `fleet_logs/` belongs to exactly one WORLD, from its rollback start on: each run of
-// that world is a segment of the same files, in order.
-const RECORDS_DIR = path.join(BOT_DIR, 'fleet_logs');
-
 // consoleLogFile(unit) → the file this unit's visible console window is tailing (Law 16, shared by the
 // foreman and the bot itself).
 //
@@ -63,7 +66,21 @@ function consoleLogFile(unit) {
 // when a bench asks for a rollback): the world goes back to its clean copy and so does what was written
 // about it. A continue start adds to every file here. Returns what it removed, not just a count, so a
 // caller can verify against the room afterwards (Law 25).
+// A HOLD KEEPS THESE RECORDS FOR INSPECTION: while its file lies in the room, no start runs on this world and no
+// sweep empties it, whoever asks.
+function architectHold() {
+  const file = path.join(RECORDS_DIR, 'architect_hold.json');
+  if (!fs.existsSync(file)) return null;
+  const read = require('./external_library_guard').guardExternalSync('record_homes', 'reading the hold', () => JSON.parse(fs.readFileSync(file, 'utf8')));
+  return read.ok ? read.value : { session: 'unreadable hold file', reason: read.reason };
+}
+
 function sweepRecords() {
+  if (process.env.AUREN_RECORDS_DIR) {
+    throw new Error(`[record_homes] CODING VIOLATION: sweepRecords with AUREN_RECORDS_DIR set (${RECORDS_DIR}). That variable is for reading another fleet's run; a fleet sweeps only its own.`);
+  }
+  const hold = architectHold();
+  if (hold) throw new Error(`[record_homes] ARCHITECT HOLD on ${RECORDS_DIR} (${hold.session}: ${hold.reason}). Nothing was swept; only his release lifts it.`);
   if (!fs.existsSync(RECORDS_DIR)) return { swept: false, entries: [], dir: RECORDS_DIR };
   const entries = fs.readdirSync(RECORDS_DIR);
   for (const name of entries) {
@@ -73,5 +90,5 @@ function sweepRecords() {
 }
 
 module.exports = {
-  TRACE_DIR, RECORDS_DIR, ensureTraceDir, traceFile, deepTraceFile, consoleLogFile, sweepRecords, BOT_DIR,
+  TRACE_DIR, RECORDS_DIR, ensureTraceDir, traceFile, deepTraceFile, consoleLogFile, sweepRecords, architectHold, BOT_DIR,
 };

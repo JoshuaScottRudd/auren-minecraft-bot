@@ -24,7 +24,7 @@ const { withCleanup, guardExternal } = require('./external_library_guard');
 // operator's workstation file — asked at the moment of reading, never computed at load (Law 16: one
 // answer to which server folder in the tree).
 //
-// Bot infrastructure: body_recovery, death_manager and report_to_owner all require this module directly.
+// Bot infrastructure: body_recovery and death_manager require this module directly.
 //
 // A stranger usually never reaches this file: `credentials()` below reads `AUREN_RCON_PASSWORD` /
 // `AUREN_RCON_PORT` first and only falls back to a properties file when no environment says otherwise,
@@ -203,17 +203,24 @@ async function once(cmds, opts = {}) {
 // `bot.players[name].entity` only while that player is inside the bot's own loaded chunks, so the same
 // call answers two different questions depending on distance (Invariant B: what is not sensed is not
 // known). The server holds every entity regardless of who has streamed it in, so this reading means the
-// same thing at any range. The answer is parsed by form; `null` when the form does not match, never a
-// guess (Law 26).
+// same thing at any range. The answer is parsed by form: `null` only when the server says there is no such
+// entity, a throw for any other reply, never a guess (Law 26).
 //
 // FLOORED TO A CELL, because every consumer of this is aiming a `tp`, which places FEET at the y it is
 // given. The conversion belongs with the read (Law 16).
 const POS_REPLY = /\[\s*(-?[\d.]+)d?,\s*(-?[\d.]+)d?,\s*(-?[\d.]+)d?\s*\]/;
+const NO_ENTITY_REPLY = /No entity was found/i;
 
 async function entityPos(name, opts = {}) {
   const [reply] = await once([`data get entity ${name} Pos`], opts);
-  const m = POS_REPLY.exec(reply ? reply.body : '');
-  if (!m) return null;              // not logged in, not an entity, or the server refused — all "no position"
+  const body = reply ? reply.body : '';
+  const m = POS_REPLY.exec(body);
+  if (!m) {
+    // Only the server's own "no entity" is an absence; an empty reply (the command timed out) or any other
+    // answer says nothing of where the entity is, and a caller reads it as the console not answering.
+    if (NO_ENTITY_REPLY.test(body)) return null;
+    throw new Error(`the server gave no position for ${name}: ${body ? JSON.stringify(body.slice(0, 120)) : 'no reply'}`);
+  }
   return { x: Math.floor(Number(m[1])), y: Math.floor(Number(m[2])), z: Math.floor(Number(m[3])) };
 }
 
@@ -222,12 +229,12 @@ async function entityPos(name, opts = {}) {
 // WHY IT HAS TO EXIST SEPARATELY FROM `once()`. Every other entry here answers a specific request, and
 // each fails in its own caller's context, late, one body at a time. The question a person needs answered
 // is different and comes earlier: can this fleet place a crew at all on this machine. A body refuses to
-// plan until it has confirmed it is standing with the person who raised it
-// (`body_recovery.arriveAtPlayer`), so a fleet with no reachable console is not degraded, it is inert.
+// plan until it has confirmed it is standing on the cell the foreman raised it on
+// (`body_recovery.arriveAtCell`), so a fleet with no reachable console is not degraded, it is inert.
 //
 // REPORTS, NEVER THROWS — the whole point of a separate verb. `credentials()` throws on a missing
 // properties file and on rcon being switched off, which is right for a caller mid-teleport and useless to
-// a launcher deciding whether to open the desk. The throw is converted here, once, through the boundary
+// a launcher deciding whether to raise the foreman. The throw is converted here, once, through the boundary
 // guard — the fs read and the socket are both outside code (Law 16: one pathway to the outside).
 //
 // THE REASON IS RAW ON PURPOSE. It says what the machine found; it does not say `pass --rcon-password`,

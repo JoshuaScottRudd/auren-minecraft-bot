@@ -44,7 +44,7 @@
     where      local | remote           the foreman starts your server / joins one
     start      standard | continue      bots know nothing + clean world / carry on
     soak       minutes                  how long once the crew works (0 = until stopped)
-    crew       homesteader | builder | contractor
+    crew       homesteader | builder
     builder    { build }                builder only: overgrown_survival_castle
     clock      dawn | day | held        sunrise / pinned midday / leave it
     record     off | cameras | film     cameras to watch; film needs a recorder
@@ -119,7 +119,7 @@
   THE LOCAL WORLD
 ================================================================================
 
-  node start_auren.js --start continue --crew contractor --soak 0   # world + foreman, no bots
+  node start_auren.js --start continue --test world   # world + foreman, no bots
   node Auren_Workshop/fleet_control.js down                             # ...and everything off
 
   Join at localhost, Java Edition 26.1.

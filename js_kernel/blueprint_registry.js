@@ -110,6 +110,30 @@ function validatePledgeApproved(parsed) {
   return null;
 }
 
+// ── A SECTION IS ONE TRIP'S WORK ──────────────────────────────────────────────────────────────────────
+// A plan may group its anchors into `sections`: one job claims a whole section, stages the whole section's
+// bill, and builds its anchors in order, each from its own stand. A section is how a structure whose blocks are
+// thin on the ground (a fence ring) gives one trip enough to carry, while every stand still reaches only its own
+// cells. Every anchor belongs to exactly one section, a section builds its anchors in the order it lists them, and a
+// plan without the field builds one anchor per trip.
+function validateSections(parsed) {
+  for (const [name, building] of Object.entries(parsed.buildings)) {
+    if (building.sections === undefined) continue;
+    const n = Array.isArray(building.anchors) ? building.anchors.length : 0;
+    const seen = new Set();
+    const ok = Array.isArray(building.sections) && building.sections.every(sec => Array.isArray(sec) && sec.length > 0
+      && sec.every(i => Number.isInteger(i) && i >= 0 && i < n && !seen.has(i) && seen.add(i)));
+    if (!ok || seen.size !== n) {
+      throw violation(`"${name}" declares sections ${JSON.stringify(building.sections)}, which do not hold each of its `
+        + `${n} anchor index(es) exactly once. A section is a list of anchor indices built in one trip; every anchor `
+        + `belongs to exactly one.`);
+    }
+    if (building.pledge_approved === true) {
+      throw violation(`"${name}" is pledge_approved and declares sections; a pledged plan is one anchor built by every body at once.`);
+    }
+  }
+}
+
 // A throw out of `validate` reaches the caller as-is (createSnapshotRegistry does not catch), which is
 // what lets the two messages above say the whole thing, each in its own words.
 function violation(message) {
@@ -122,7 +146,11 @@ const registry = createSnapshotRegistry({
   tag: 'blueprint_registry',
   validate: (parsed) => {
     if (!parsed.buildings || typeof parsed.buildings !== 'object') return 'has no "buildings" section';
+    // A whole-building export of the stacked home would silently stand in front of the floors it is stacked from.
+    const home = require('@thinking/architect_config').BOT_HOME.blueprint;
+    if (parsed.buildings[home]) throw violation(`"${home}" is stacked from the file's "floors" section and also stands whole in "buildings", so the floors would never be read. Remove the whole entry; a floor edit goes into the "floors" section (floor_stack).`);
     validateAnchorFooting(parsed);
+    validateSections(parsed);
     return validatePledgeApproved(parsed);
   },
 });
@@ -134,11 +162,41 @@ function getBuildings() {
   return registry.data().buildings;
 }
 
+// ── GENERATED BLUEPRINTS: THE BASE'S PAD ───────────────────────────────────────────────────────────────
+// A crew's spawn proofing (architect_config.SPAWN_PROOFING) is drawn from the lights its site carries (base_layout.proofingBuilding), never
+// written to the file, so it cannot disagree with the posts the siting proved. It is served beside the file's
+// entries and held to the same anchor rule, on first ask.
+const _generated = new Map();
+// A field copy (architect_config.FARM_FIELD.copyOf, sited by critical mass) is the design of the field it copies under its
+// own name, so every lookup by room key finds the design it is built to.
+function generated(blueprintName) {
+  if (_generated.has(blueprintName)) return _generated.get(blueprintName);
+  const { SPAWN_PROOFING, FARM_FIELD, BOT_HOME } = require('@thinking/architect_config');
+  // The bot home is stacked from the file's separate floors, the ones BOT_HOME names.
+  if (blueprintName === BOT_HOME.blueprint) {
+    const entry = require('@kernel/floor_stack').stackFloors(blueprintName, registry.data().floors, BOT_HOME);
+    validateAnchorFooting({ buildings: { [blueprintName]: entry } });
+    _generated.set(blueprintName, entry);
+    return entry;
+  }
+  if (FARM_FIELD.copyOf[blueprintName]) {
+    const entry = { ...registry.data().buildings[FARM_FIELD.copyOf[blueprintName]], name: blueprintName };
+    _generated.set(blueprintName, entry);
+    return entry;
+  }
+  if (SPAWN_PROOFING !== blueprintName) return null;
+  const entry = require('@kernel/base_layout').proofingBuilding();
+  validateAnchorFooting({ buildings: { [blueprintName]: entry } });
+  validateSections({ buildings: { [blueprintName]: entry } });
+  _generated.set(blueprintName, entry);
+  return entry;
+}
+
 // One blueprint by name. A name that is not in the file is a Law 13 coding violation — the caller asked
 // for something that does not exist, which no correct system does. `tag` names the caller so the throw
 // reads as that caller's own.
 function getBuilding(blueprintName, tag) {
-  const building = registry.data().buildings[blueprintName];
+  const building = registry.data().buildings[blueprintName] || generated(blueprintName);
   if (!building) {
     throw new Error(`[${tag || 'blueprint_registry'}] CODING VIOLATION: Blueprint "${blueprintName}" not found in building_blueprints.json.`);
   }
@@ -148,7 +206,7 @@ function getBuilding(blueprintName, tag) {
 // Absence-tolerant lookup for the one caller with a legitimate fallback (farming_integrity computes
 // per-design constants at load and degrades to zeros when a blueprint is absent).
 function tryGetBuilding(blueprintName) {
-  return registry.data().buildings[blueprintName] || null;
+  return registry.data().buildings[blueprintName] || generated(blueprintName);
 }
 
 // The full parsed document, for a caller that needs a section other than `buildings`.
@@ -172,4 +230,13 @@ function isPledgeApproved(blueprintName) {
   return tryGetBuilding(blueprintName)?.pledge_approved === true;
 }
 
-module.exports = { getBuildings, getBuilding, tryGetBuilding, isPledgeApproved, raw, bootHash, BLUEPRINTS_PATH };
+// THE ANCHORS ONE TRIP BUILDS, in order (see `validateSections`): the section holding `anchorIndex`, or that anchor
+// alone when the plan declares none. The board, the manager, preconstruction and the executor all ask here, so they
+// cannot disagree about how much one job is (Law 16).
+function sectionOf(blueprintName, anchorIndex) {
+  if (!Number.isInteger(anchorIndex)) return [];
+  const sections = tryGetBuilding(blueprintName)?.sections;
+  return (Array.isArray(sections) && sections.find(sec => sec.includes(anchorIndex))) || [anchorIndex];
+}
+
+module.exports = { getBuildings, getBuilding, tryGetBuilding, isPledgeApproved, sectionOf, raw, bootHash, BLUEPRINTS_PATH };

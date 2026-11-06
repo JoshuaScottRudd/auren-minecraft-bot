@@ -29,12 +29,12 @@ function collectAllVoxels(building) {
 
 // siteChairs(row, writer) → { set_buildspot, blueprint_paster }
 //
-// `row` is the shape the desk's survey hands (`lock_all_buildspots.siteRow`):
-//   { blueprint, roomKey, candidate: { transpose_origin:{x,y,z}, footprint, staircase } }
+// `row` is the shape the foreman's survey hands (`lock_all_buildspots.siteRow`):
+//   { blueprint, roomKey, candidate: { transpose_origin:{x,y,z[,turn]}, footprint, staircase[, lights] } }
 //
-// NO ROTATION FIELD: a blueprint has exactly one facing (blueprint_survey's header), so a reader that
-// rebuilds world coordinates from this chair (scan, getProtectedBlocks, getWorldAnchors, farmland_site)
-// transposes from transpose_origin alone and can only ever land on the footprint the candidate was proven at.
+// The origin is carried whole: a turned structure's `turn` (blueprint_survey) rides on it, so a reader that rebuilds
+// world coordinates from this chair transposes from transpose_origin alone and lands on the footprint the candidate
+// was proven at. A spawn proofing's `lights` (base_layout) ride beside it.
 function siteChairs(row, writer) {
   const bc = row && row.candidate && row.candidate.transpose_origin;
   if (!bc || ![bc.x, bc.y, bc.z].every(Number.isFinite)) {
@@ -48,6 +48,8 @@ function siteChairs(row, writer) {
   }
   // A HAND-AUTHORED blueprint is counted from the registry. A downloaded one is not in that registry —
   // downloads never share a file with hand-authored blueprints — so its row carries its own size.
+  // A spawn proofing is drawn from the lights its site carries before it is counted.
+  require('@kernel/base_layout').learnProofing(row.blueprint, { transpose_origin: bc, lights: row.candidate.lights || null });
   const hand = blueprintRegistry.tryGetBuilding(row.blueprint);
   const total = hand ? collectAllVoxels(hand).length : row.total_voxels;
   if (!Number.isInteger(total) || total <= 0) {
@@ -58,9 +60,10 @@ function siteChairs(row, writer) {
   const c = row.candidate;
   return {
     set_buildspot: {
-      transpose_origin: { x: bc.x, y: bc.y, z: bc.z },
+      transpose_origin: { x: bc.x, y: bc.y, z: bc.z, ...(bc.turn ? { turn: bc.turn } : {}) },
       footprint: c.footprint || null,
       staircase: c.staircase || null,
+      ...(c.lights ? { lights: c.lights } : {}),
       locked_at: now,
       writer,
     },

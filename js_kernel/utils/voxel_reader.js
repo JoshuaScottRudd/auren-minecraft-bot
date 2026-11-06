@@ -75,6 +75,7 @@ const MASK_RECHECK_READS = 4096;
 // (Law 16), re-read on the same schedule as the bounds, since enrolment happens at login and a reader
 // built before it must not cache "unmasked" for the rest of the run.
 let _spawnProtection = null;
+let _hazardZones = null;   // lazily required for the same load-cycle reason as spawn_protection
 function makeMask(bot) {
     const m = { version: -1, enrolled: false, on: false, minX: 0, maxX: 0, minZ: 0, maxZ: 0, stateId: -1 };
     m.refresh = () => {
@@ -211,9 +212,13 @@ function makeVoxelReader(bot, opts = {}) {
     // The read counter below is the backstop for a reader that never crosses one.
     const mask = makeMask(bot);
     mask.refresh();
+    // The drowned zones ride the same refresh (hazard_zones.readerMask): another mask, the same bedrock.
+    if (!_hazardZones) _hazardZones = require('@api/hazard_zones');
+    const hazard = _hazardZones.readerMask(bot);
+    hazard.refresh();
     let sinceMaskCheck = 0;
 
-    const onColumnChange = () => { cx = 0x7fffffff; cz = 0x7fffffff; col = null; mask.refresh(); };
+    const onColumnChange = () => { cx = 0x7fffffff; cz = 0x7fffffff; col = null; mask.refresh(); hazard.refresh(); };
     const world = bot.world;
     world.on('chunkColumnUnload', onColumnChange);
     world.on('chunkColumnLoad', onColumnChange);
@@ -229,8 +234,9 @@ function makeVoxelReader(bot, opts = {}) {
             // THE SPAWN MASK IS READ HERE AND NOT ONLY ON THE BODY, because this path never calls
             // bot.blockAt: it reads mineflayer's ChunkColumn directly, so the body's wrapper cannot see it.
             // One answer, two paths (Law 16) — a masked cell is the same block whichever door asked.
-            if (++sinceMaskCheck > MASK_RECHECK_READS) { sinceMaskCheck = 0; mask.refresh(); }
+            if (++sinceMaskCheck > MASK_RECHECK_READS) { sinceMaskCheck = 0; mask.refresh(); hazard.refresh(); }
             if (mask.on && x >= mask.minX && x <= mask.maxX && z >= mask.minZ && z <= mask.maxZ) return mask.stateId;
+            if (hazard.on && x >= hazard.minX && x <= hazard.maxX && z >= hazard.minZ && z <= hazard.maxZ && hazard.masks(x, z)) return hazard.stateId;
             const qx = x >> 4, qz = z >> 4;   // arithmetic shift: correct for negatives, unlike /16|0
             if (qx !== cx || qz !== cz) {
                 stats.columnMisses++;
@@ -266,7 +272,7 @@ function makeVoxelReader(bot, opts = {}) {
         get statesSeen() { return table.size; },
         resetStats() { stats.reads = 0; stats.unloaded = 0; stats.columnHits = 0; stats.columnMisses = 0; },
         // Law 8: these listeners are raised by this reader and must not outlive it. The WeakMap holders
-        // (surface_filter) drop the reader with the bot; a caller that builds one per call must dispose.
+        // (ring_scan) drop the reader with the bot; a caller that builds one per call must dispose.
         dispose() { world.removeListener('chunkColumnUnload', onColumnChange); world.removeListener('chunkColumnLoad', onColumnChange); },
     };
     Object.assign(fast, derived(fast));

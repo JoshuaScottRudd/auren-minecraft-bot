@@ -41,11 +41,13 @@ const requestedWork = require('@thinking/requested_work');
 // `keep_order` lists the family best tier first, so the ones banked are the worst. The 'tools' row after
 // them is the allowance for every tool no family row names.
 const { group_to_item: _families } = require('@utils/fragment_utils');
+const keepRank = (s) => (s.item === 'tools' ? 2 : s.kind === 'tool' ? 1 : 0);
 function inventoryWhitelist() {
-    const rows = requestedWork.activeStockRows()
+    const rows = requestedWork.minimumRows()
         .filter(s => s.holder === 'bot')
-        // Family allowances consume their own tools before the general tool allowance.
-        .sort((a, b) => Number(a.item === 'tools') - Number(b.item === 'tools'))
+        // A concrete tool row settles its tool first (an iron pickaxe is kept by its own row, not counted among
+        // the pickaxe family's three), then the family allowances, then the general tool allowance.
+        .sort((a, b) => keepRank(a) - keepRank(b))
         .map(s => (s.kind === 'tool'
             ? { item: s.item, dump_threshold: s.dump_threshold, keep_order: [..._families[s.item]].reverse() }
             : { item: s.item, dump_threshold: s.dump_threshold }));
@@ -112,16 +114,6 @@ async function _sweep() {
         boardroom.position = { x: _pos.x, y: _pos.y, z: _pos.z };
         boardroom.position_at = now;
     }
-    // Request progress travels the boardroom chair, not a second sync: only the body holds the owner key
-    // to measure it (Law 16). Carries its own timestamp (Invariant B); empty for a homesteader.
-    const _progress = require('@thinking/requested_work').requestProgress();
-    if (_progress.length > 0) {
-        boardroom.request_progress = _progress;
-        boardroom.request_progress_at = now;
-    } else {
-        delete boardroom.request_progress;
-        delete boardroom.request_progress_at;
-    }
     // Read by any supervisor off the chair, not a lens matching the ☠️ line below out of a live
     // trace file (Law 16). Written every sweep, not only when true — a flag only ever set would report a
     // bot dead for the rest of its window after it recovered (Invariant B).
@@ -132,6 +124,8 @@ async function _sweep() {
     boardroom.built = _builtLastSweep || {};
     boardroom.cubes_finished = require('./assessors/downloaded_build').finishedCount();
     boardroom.layer_released = require('./assessors/downloaded_build').releasedLayer();
+    const standIns = require('@kernel/downloaded_plan_registry').standInsAtSite();
+    boardroom.books_owed = standIns ? standIns.owed : null;
     hq.writeBoardroomChair(botId, boardroom);
 
 
@@ -146,6 +140,14 @@ async function _sweep() {
         watcher.warn(TAG, '☠️ Bot is DEAD — the board holds ONE job (respawn_recover) and nothing else. Every other job needs a body to do it with.');
         await hq.flushNow();
         return gate.jobs;
+    }
+    // TEMPORARY, the same short circuit for a body in running water: its only plan is the way out (assessors/current).
+    const carried = require('./assessors/current').assess();
+    if (carried.jobs.length) {
+        hq.writeConfRoomFlag('job_board_room', 'jobs', jobRanking.orderSweep(carried.jobs));
+        watcher.warn(TAG, '🌊 Body in RUNNING WATER — the board holds ONE job (leave_current) and nothing else until it is out.');
+        await hq.flushNow();
+        return carried.jobs;
     }
 
     // Drop dead station entries before assessments read them — a stale chest must not credit supply.
@@ -217,7 +219,7 @@ async function _sweep() {
     }
 
     // Excluded list stamped onto every job (posted and held) before the gates see it: a job carries the
-    // world it was posted against, the same guard `stone_is_mined` and `stations_at_claim` use at claim
+    // world it was posted against, the same guard `stations_at_claim` uses at claim
     // time. Changes land on the next sweep.
     for (const job of assembled) job.excluded = excluded;
 
@@ -401,7 +403,11 @@ module.exports = {
     // synced its magnet, never before.
     async receive(signalType, payload) {
         const foremanLink = require('@kernel/foreman_link');
+        // The keeper's authority is verified for this turn before the sweep takes any verdict (keeper_verdicts).
+        // Asked as the turn is asked for, so the wait in line covers it and no other body waits on it.
+        const authority = require('@kernel/keeper_verdicts').verifyAuthority();
         await foremanLink.acquirePlanningToken();
+        await authority;
         // The token is handed on to the dispatcher, which releases it. A sweep that throws never reaches
         // the dispatcher, so the token is released here on that path alone and the throw travels on.
         let swept = false;

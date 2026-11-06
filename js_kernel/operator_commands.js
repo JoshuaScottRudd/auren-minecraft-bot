@@ -8,7 +8,6 @@
 'use strict';
 
 const watcher = require('@kernel/watcher');
-const botMandate = require('@kernel/bot_mandate');
 
 const { OPERATOR_VERBS: VERBS } = require('@foreman/message_schema');   // one vocabulary, three processes (Law 16)
 const { guardExternalSync } = require('@utils/external_library_guard');
@@ -17,18 +16,9 @@ const { guardExternalSync } = require('@utils/external_library_guard');
 // before calling, so an unknown verb here means a caller bug (Law 13: throw).
 // `args` is the operator's authored data for verbs that take some (only `move` today). It travels
 // the same one pathway as the verb itself (Law 16), and it is the operator's input — never sensed,
-// never defaulted (Law 23: the fragment validates it).
-//
-// `origin` says WHERE the command entered the fleet — the operator's terminal, or a human speaking
-// inside the world. It is recorded only; nothing refuses on it.
-//
-// Not a permission: the operator verbs mean the same thing to both species — `stop` ends a homesteader
-// and a contractor alike, and the operator can send it from the console either way. A contractor
-// additionally mounts the foreman's ear and the sign desk (capability added, not withheld), so there is
-// nothing here to gate. The stamp lets the watcher trace say truthfully where a verb came from (Law 25),
-// and gives a future multi-human fleet a seam to tell one human's request from another's.
-async function execute(verb, args = {}, origin) {
-  botMandate.validateOrigin(verb, origin);   // must SAY where it came from; nothing is refused on it
+// never defaulted (Law 23: the fragment validates it). The operator verbs mean the same thing to both
+// species, so there is nothing here to gate.
+async function execute(verb, args = {}) {
 
   switch (verb) {
     case 'start': {

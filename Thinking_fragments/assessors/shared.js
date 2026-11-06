@@ -56,11 +56,13 @@ for (const row of STOCK_THRESHOLDS) {
 
 // Best owned tier, read off item NAMES — not countInInventory, which is group-aware and answers "how
 // many swords", not "which tier".
-// tierOrBetter(family, inventory, tool) → how many tools of the family at `tool`'s tier or above are held.
+// tierOrBetter(family, inventory, tool) → how many tools of the family at `tool`'s tier or above are held, a
+// reserved tool left out (fragment_utils.RESERVED_TOOLS).
 function tierOrBetter(family, inventory, tool) {
+    const { RESERVED_TOOLS } = require('@utils/fragment_utils');
     let n = 0;
     for (const [name, count] of Object.entries(inventory || {})) {
-        if (count && name.endsWith(`_${family}`) && tierRank(name) >= tierRank(tool)) n += count;
+        if (count && !RESERVED_TOOLS.includes(name) && name.endsWith(`_${family}`) && tierRank(name) >= tierRank(tool)) n += count;
     }
     return n;
 }
@@ -70,28 +72,83 @@ function stoneOrBetter(family, inventory) {
     return tierOrBetter(family, inventory, 'stone');
 }
 
+// ── STONE GOES TO THE HOME FIRST ────────────────────────────────────────────────────────────────────
+// homeStands() → whether the crew's home (bot_mandate.homeBlueprint, the alpha structure) is built by this body's
+// last sweep, every furnace in it. Until it is, no stone tool is made from the chests, so every block gathered is
+// the home's. No furnace smelts cobblestone before the home stands at all (assessors/furnace).
+function homeStands() {
+    const home = require('@kernel/bot_mandate').homeBlueprint();
+    const chair = require('@kernel/corporate_headquarters').readBoardroomChair(process.env.BOT_ID || 'default', {}) || {};
+    return !!(chair.built && chair.built[home] === true);
+}
+
+// mineStands() → whether this body's chair has the shallow shaft built.
+function mineStands() {
+    const chair = require('@kernel/corporate_headquarters').readBoardroomChair(process.env.BOT_ID || 'default', {}) || {};
+    return !!(chair.built && chair.built[require('@thinking/assessors/mining').MINE_STRUCTURE] === true);
+}
+
 // ── WHICH TOOL A BODY GETS WHEN ITS POCKET IS SHORT ─────────────────────────────────────────────────
+// spareCopperIngots() → the ingots in the chests past what the building and the structures still ask for. An unread
+// building is not a building that needs nothing (Law 25): none is spare until it is read.
+function spareCopperIngots() {
+    const build = require('@thinking/assessors/downloaded_build');
+    const ordered = build.buildName() ? build.reservedFor('copper_ingot') : 0;
+    if (ordered === null) return 0;
+    const structures = require('@thinking/assessors/building').structureNeed();
+    return require('@kernel/inventory_lens').inChests('copper_ingot') - ordered - (structures.copper_ingot || 0);
+}
+// spareInChests(material) → the same reading for any material: banked past what the building and the structures still ask for.
+function spareInChests(material) {
+    const build = require('@thinking/assessors/downloaded_build');
+    const ordered = build.buildName() ? build.reservedFor(material) : 0;
+    if (ordered === null) return 0;
+    return require('@kernel/inventory_lens').inChests(material) - ordered - (require('@thinking/assessors/building').structureNeed()[material] || 0);
+}
+
 // kitTier(row, inventory) → the concrete tool, the first of the row's `tiers` it can have, or null when it can
 // have none (the body works with what it holds):
-//   'stone'  — when the shelf holds one (supply_manager's ladder takes it off the shelf before crafting), or
-//              when cobblestone for one (3) is in the pocket or the chests (the body crafts it);
+//   'copper' — a stone tool the shelf holds goes first; then a copper one on the shelf, or the recipe's ingots spare
+//              in the chests (spareCopperIngots), a building's copper being its own;
+//   'stone'  — when the shelf holds one (supply_manager's ladder takes it off the shelf before crafting), for
+//              the pickaxe once the mine stands when the body's pocket holds cobblestone for one (3), or when
+//              cobblestone for one (3) sits in the chests and the crew's home stands (homeStands): stone goes to
+//              the home's furnaces first, and the kit is made after;
+//   'iron'   — when the shelf holds one, or the recipe's ingots sit in the pocket and the chests together;
 //   'wooden' — always: planks come off the surface.
 // A row without `tiers` makes the best tier its own min/max allow (resolveCraftTier).
 function kitTier(row, inventory) {
     if (!Array.isArray(row.tiers)) return resolveCraftTier(row.item, inventory, row.min_tier, row.max_tier);
     for (const tier of row.tiers) {
         if (tier === 'wooden') return `wooden_${row.item}`;
+        if (tier === 'iron') {
+            // An iron tool from the shelf, or the ingots its recipe takes in this pocket and the chests together.
+            const iron = `iron_${row.item}`;
+            const lens = require('@kernel/inventory_lens');
+            if (lens.inChests(iron) > 0) return iron;
+            const { requirementTree } = require('@utils/calculators/build_material_calculator');
+            const ingots = requirementTree(iron, 1, {}).iron_ingot || 0;
+            if (ingots > 0 && countInInventory('iron_ingot', inventory) + lens.inChests('iron_ingot') >= ingots) return iron;
+        }
         if (tier === 'copper') {
             const copper = `copper_${row.item}`;
             const lens = require('@kernel/inventory_lens');
+            if (lens.inChests(`stone_${row.item}`) > 0) return `stone_${row.item}`;
             if (lens.inChests(copper) > 0) return copper;
-            if (countInInventory('copper_ingot', inventory) + lens.inChests('copper_ingot') >= 3) return copper;
+            const { requirementTree } = require('@utils/calculators/build_material_calculator');
+            if (spareCopperIngots() >= requirementTree(copper, 1, {}).copper_ingot) return copper;
         }
         if (tier === 'stone') {
             const stone = `stone_${row.item}`;
             const lens = require('@kernel/inventory_lens');
             if (lens.inChests(stone) > 0) return stone;
-            if (countInInventory('cobblestone', inventory) + lens.inChests('cobblestone') >= 3) return stone;
+            // Once the shaft stands, the stone pickaxe is paid from the body's own dug stone: iron is dug with
+            // nothing less, and a miner on wood passes every iron ore of its first trip. The chests' stone is
+            // the home's furnaces'.
+            if (row.item === 'pickaxe' && mineStands() && countInInventory('cobblestone', inventory) >= 3) return stone;
+            // THE STONE KIT WAITS FOR THE HOME: the home's furnaces take the stone first, so no stone tool is made
+            // from the chests until the home stands.
+            if (homeStands() && lens.inChests('cobblestone') >= 3) return stone;
         }
     }
     return null;
@@ -165,6 +222,19 @@ function kitRawShortfall(inventory) {
         if (need > held) short[raw] = need - held;
     }
     return short;
+}
+
+// kitDone(inventory) -> whether this body holds its kit: every active bot row's number, tools counted by family. A row
+// that cannot be had yet is not owed: a tool row none of whose tiers can be had (kitTier: the body works with what it
+// holds), and a row whose material the shelf orders (a for_kit storage row), which waits on the chests.
+// A tool row's spare is passive unless the row names its spare_mode active (assessors/supply), so nothing makes it while
+// other work is offered: a tool row owes one tool, and a row with an active spare owes its whole number.
+const kitNumber = r => (r.kind === 'tool' && r.spare_mode !== 'active' ? 1 : r.deficit_below);
+function kitDone(inventory) {
+    const rows = require('@thinking/requested_work').minimumRows();
+    const shelfOrdered = new Set(rows.filter(r => r.holder === 'storage' && r.for_kit).flatMap(r => r.for_kit));
+    return rows.filter(r => r.holder === 'bot' && r.mode === 'active' && r.deficit_below > 0 && !shelfOrdered.has(r.item))
+        .every(r => (r.kind === 'tool' && !kitTier(r, inventory)) || countInInventory(r.item, inventory) >= kitNumber(r));
 }
 
 // Smelt input token if the recipe needs a furnace (charcoal←logs, iron_ingot←raw_iron), else null.
@@ -250,17 +320,25 @@ function currentBiome() {
 // ── A SITE'S TREES COME DOWN BEFORE ITS BUILD — every blueprint, one job ──────────
 // downloaded_build, building, and mining all post the same felling job, `site_trees_<structure>`,
 // carrying their own box to canopy_clear_executor. A locked blueprint's own solid voxel is never a tree.
-const SITE_TREE_LOG = /(.*_)?log$/;   // tree_feller's own definition of a trunk
+const SITE_TREE_LOG = /^(?!stripped_)(.*_)?log$/;   // tree_feller's own definition of a trunk
 
-// ── THE REGION IS THE BLUEPRINT'S OWN FOOTPRINT, AND NOTHING MORE ────────────
+// ── THE REGION IS THE BLUEPRINT'S OWN FOOTPRINT ───────────────────────────────
 // The clear region is a box, not a radius — exactly the footprint's own offsets at the blueprint's
-// actual rotation (`footprintExtent`), never padded beyond it.
-// How far outside the footprint the tree pass reaches — zero, the one place this size is decided.
+// actual rotation (`footprintExtent`). A crew's wheat field, crop fields and pens are sited over trees, so their box
+// reaches SURFACE_TREE_MARGIN past the footprint: every tree whose wood stands that close comes down whole,
+// and its leaves with it. Every other blueprint's box is its footprint alone.
+// How far outside the footprint the tree pass reaches for every other blueprint — zero.
 const TREE_MARGIN = 0;
-function siteTreeBox(blueprintName) {
+function surfaceStructures() {
+    const cfg = require('@thinking/architect_config');
+    return new Set([...cfg.FARM_FIELD.keys, ...cfg.FARM_PENS]);
+}
+// `origin` — the locked transpose_origin, whose turn (blueprint_survey.turnOf) turns the box with the site.
+function siteTreeBox(blueprintName, origin = null) {
     const building = require('@kernel/blueprint_registry').getBuilding(blueprintName, TAG);
-    const e = require('@perception/blueprint_survey').footprintExtent(building);
-    const m = TREE_MARGIN;
+    const survey = require('@perception/blueprint_survey');
+    const e = survey.footprintExtent(building, survey.turnOf(origin));
+    const m = surfaceStructures().has(blueprintName) ? require('@thinking/architect_config').SURFACE_TREE_MARGIN : TREE_MARGIN;
     return { min_dx: e.min_dx - m, max_dx: e.max_dx + m, min_dz: e.min_dz - m, max_dz: e.max_dz + m };
 }
 // A box from a downloaded plan's own dimensions, for the one caller with a plan instead of a registered
@@ -276,34 +354,48 @@ const inBox = (box, centre, p) => (p.x - centre.x) >= box.min_dx && (p.x - centr
 // ── A SITE'S CENSUS IS IN TREES, NOT LOG BLOCKS ──────────────────────────
 // Counts trunks by base block (`@perception/trunk_bases`), the same test tree_feller uses to claim one,
 // so the census and the claim agree (Law 16).
-const SITE_TREE_SCAN_CAP = 512;   // roughly 64-100 trees on a forest — sized for a 20-body fleet
+// The logs are read by the fleet's ring search (@utils/ring_scan) outward from the centre to the box's far corner,
+// every ring of it: a census counts every tree in the box, so no ring ends it early. A section with no log in its
+// palette is never read.
+const SITE_TREE_BAND = 48;
+// buriedShaftCells() → "x,y,z" of every staircase cell below the shaft's ground; empty while no shaft is locked. A log
+// there is wall fill the mine laid (a gravel wall is resealed with structural_fill, logs among it), not a tree: the
+// mine's protection lets such a log go as a tree (mining_integrity.getProtectedBlocks), and a site counting it posts a
+// trunk in a wall that no body reaches. A tree at the shaft's mouth stands at or over its ground and is still counted.
+function buriedShaftCells() {
+    const site = require('@perception/mining_blueprinter').shaftChair();
+    if (!site) return new Set();
+    const ground = site.staircase.surfaceY;
+    const cells = require('@perception/mining_cell_graph').staircaseDeclarations().keys();
+    return new Set([...cells].filter(k => Number(k.split(',')[1]) < ground));
+}
 async function standingSiteTrees(bot, centre, box) {
     const Vec3 = require('vec3');
-    const scan = guardExternalSync(TAG, `site trees around (${centre.x},${centre.z})`, () =>
-        bot.findBlocks({
-            point: new Vec3(centre.x, centre.y, centre.z),
-            matching: (b) => !!(b && b.name && SITE_TREE_LOG.test(b.name)),
-            // The Euclidean sweep must reach the box's far CORNER, which is its own diagonal.
-            maxDistance: Math.ceil(Math.hypot(Math.max(Math.abs(box.min_dx), box.max_dx),
-                                              Math.max(Math.abs(box.min_dz), box.max_dz))) + 2,
-            count: SITE_TREE_SCAN_CAP,
-        }));
-    // A refused sweep is NOT a measurement of "clear" — it returns null, which the phase reads as
-    // "ask again next sweep" and never as "done" (Invariant B). An empty array is a real clear site.
-    if (!scan.ok) return null;
+    const ringScan = require('@utils/ring_scan');
+    const rings = ringScan.blockRings(bot, {
+        names: ringScan.namesMatching(bot, SITE_TREE_LOG),
+        center: centre,
+        // The box's far CORNER is its own diagonal.
+        reach: Math.ceil(Math.hypot(Math.max(Math.abs(box.min_dx), box.max_dx), Math.max(Math.abs(box.min_dz), box.max_dz))) + 1,
+        band: { low: centre.y - SITE_TREE_BAND, high: centre.y + SITE_TREE_BAND },
+        source: 'site_trees',
+    });
+    const logs = [];
+    for (let ring = await rings.next(); ring; ring = await rings.next()) for (const o of ring.objectives) logs.push(o.position);
     const built = require('@perception/blueprint_survey').getAllProtectedBlocks() || new Set();
     // The downloaded building's own log cells are the building, counted by nobody as a tree (the plan
     // registry answers for every body alike, before and after the latch).
     const planned = require('@kernel/downloaded_plan_registry').buildWoodCells() || new Map();
-    const inSite = (scan.value || []).filter(p => !built.has(`${p.x},${p.y},${p.z}`)
-        && !planned.has(`${p.x},${p.y},${p.z}`) && inBox(box, centre, p));
+    const shaft = buriedShaftCells();
+    const inSite = logs.filter(p => !built.has(`${p.x},${p.y},${p.z}`)
+        && !planned.has(`${p.x},${p.y},${p.z}`) && !shaft.has(`${p.x},${p.y},${p.z}`) && inBox(box, centre, p));
     // `collapseToTrunkBases` is the feller's own target test, so a phase can never be sized off trees no
     // executor would accept (Law 16).
     const { collapseToTrunkBases, readerForBot } = require('@perception/trunk_bases');
     // The walk down a trunk to its base stops above a cell that is the building's: a wild log standing on
     // a building log has its base on the wild one, which is a target the feller accepts.
     const world = readerForBot(bot);
-    const reader = { blockAt: (x, y, z) => (built.has(`${x},${y},${z}`) || planned.has(`${x},${y},${z}`) ? null : world.blockAt(x, y, z)) };
+    const reader = { blockAt: (x, y, z) => (built.has(`${x},${y},${z}`) || planned.has(`${x},${y},${z}`) || shaft.has(`${x},${y},${z}`) ? null : world.blockAt(x, y, z)) };
     return (await collapseToTrunkBases(reader, inSite.map(p => {
         const b = bot.blockAt(new Vec3(p.x, p.y, p.z));
         return { name: b?.name, position: { x: p.x, y: p.y, z: p.z } };
@@ -350,7 +442,7 @@ function openTreeSites() {
         if (planRegistry.isLoaded() && planRegistry.getPlan()?.name === name) {
             box = planTreeBox(planRegistry.getPlan().dimensions);
         } else if (require('@kernel/blueprint_registry').tryGetBuilding(name)) {
-            box = siteTreeBox(name);
+            box = siteTreeBox(name, centre);
         }
         if (!box) continue;
         out.push({ structure: name, centre, box });
@@ -368,7 +460,8 @@ function treeWorkersAndClaims(standing, structure) {
     const selfId = process.env.BOT_ID || 'default';
     let claims = 0, workers = 0;
     for (const [botId, chair] of Object.entries(hq.getFullBoardroom({}) || {})) {
-        for (const key of Object.keys(chair?.active_claims || {})) if (wanted.has(key)) claims++;
+        // A tree claim key carries its top log after the base (tree_feller.treeKeyOf); the base names the trunk.
+        for (const key of Object.keys(chair?.active_claims || {})) if (wanted.has(key.split(',').slice(0, 3).join(','))) claims++;
         // This body does not count itself: it is asking whether there is room for IT.
         if (botId === selfId) continue;
         const m = chair?.magnet;
@@ -377,21 +470,23 @@ function treeWorkersAndClaims(standing, structure) {
     return { claims, workers, taken: claims + workers };
 }
 
-// freeSiteTrees: the standing trunks this body could be granted — the ones outside every column a peer
-// holds, read off the peers' own `active_claims` by the footprint the foreman grants by (Law 16).
+// freeSiteTrees: the standing trunks this body could be granted — the ones outside the ground every resource
+// claim a peer holds covers, read off the peers' own `active_claims` by the box the foreman grants by (Law 16).
+// A trunk is judged by its base column: any peer box over that column, at any height, takes it.
 function freeSiteTrees(standing) {
     const hq = require('@kernel/corporate_headquarters');
-    const { TREE_KEY_PREFIX, parseTreeFootprint, inFootprint } = require('@utils/tree_footprint');
+    const { boxOfKey } = require('@utils/resource_footprint');
     const selfId = process.env.BOT_ID || 'default';
     const held = [];
     for (const [botId, chair] of Object.entries(hq.getFullBoardroom({}) || {})) {
         if (botId === selfId) continue;
         for (const key of Object.keys(chair?.active_claims || {})) {
-            const f = key.startsWith(TREE_KEY_PREFIX) ? parseTreeFootprint(key) : null;
-            if (f) held.push(f);
+            const box = boxOfKey(key);
+            if (box) held.push(box);
         }
     }
-    return standing.filter(p => !held.some(f => inFootprint(f, p)));
+    const r = require('@utils/resource_footprint').RESOURCE_RADIUS;
+    return standing.filter(p => !held.some(b => p.x + r >= b.min.x && p.x - r <= b.max.x && p.z + r >= b.min.z && p.z - r <= b.max.z));
 }
 
 // siteTreesJob — one call that decides the whole tree phase for a blueprint, returning an ARRAY of seat
@@ -458,7 +553,9 @@ async function siteTreesJob(structure, centre, box) {
 
 module.exports = {
     TAG,
+    spareInChests,
     PHASE_TAG,
+    homeStands,
     siteTreeBox,
     planTreeBox,
     boxReach,
@@ -473,6 +570,7 @@ module.exports = {
     supplyJob,
     furnaceInput,
     kitRawShortfall,
+    kitDone,
     resolveCraftTier,
     kitTier,
     noteShelfShort,

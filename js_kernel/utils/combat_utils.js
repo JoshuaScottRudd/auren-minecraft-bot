@@ -135,6 +135,25 @@ async function equipBestWeapon(bot) {
   return choice;
 }
 
+// ── THE SHIELD RIDES IN THE OFF-HAND ─────────────────────────────────────────────────────────────────
+// holdsShield(bot) → true when the off-hand holds a shield: the gunner's raise (activateItem(true)) blocks only then.
+function holdsShield(bot) {
+  const slot = bot && bot.inventory && bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+  return !!(slot && slot.name === 'shield');
+}
+
+// readyShield(bot) → holdsShield after the call. A shield in the pocket goes to an EMPTY off-hand when a fight opens;
+// an off-hand already holding something (a herder's wheat) is left as it is, since herd_executor owns putting it back.
+async function readyShield(bot) {
+  if (holdsShield(bot)) return true;
+  const slot = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+  if (slot) return false;
+  const shield = bot.inventory.items().find(it => it && it.name === 'shield');
+  if (!shield) return false;
+  await guardExternal(TAG, 'equip the shield to the off-hand', () => bot.equip(shield, 'off-hand'));
+  return holdsShield(bot);
+}
+
 // swingNow(bot, entity, tag) — raw hit + clock stamp, in that order, never separated. Every swing goes
 // through here or the clock lies about how long it should wait (Law 25). Range travels with the swing
 // record, since an out-of-reach swing cannot land yet still spends the cooldown. The caller hands down
@@ -150,6 +169,42 @@ function swingDistance(bot, entity) {
   if (!bot.entity?.position || !entity?.position) return null;
   return bot.entity.position.distanceTo(entity.position);
 }
+
+// ── A SWING THAT WOULD LAND ON A FRIEND IS NOT SENT ─────────────────────────────────────────────
+// A charged sword hit sweeps: the server deals 1 damage to every living thing whose box meets the target's
+// box grown 1.0 across and 0.25 up and down, within 3 blocks of the attacker, except the attacker's allies.
+// Friendly fire is on, so a player beside the target is struck. SWEEP_MARGIN covers both bodies moving
+// between this read and the server's tick.
+const SWEEP_ACROSS = 1.0;
+const SWEEP_UP = 0.25;
+const SWEEP_ATTACKER_REACH = 3.0;
+const SWEEP_MARGIN = 0.3;
+
+// sweepFriend(bot, entity) → { name, d } for the first player a sword swing at `entity` would sweep, or null.
+// Null for any hand that does not sweep.
+function sweepFriend(bot, entity) {
+  const held = bot.heldItem && bot.heldItem.name;
+  if (!held || !/_sword$/.test(held)) return null;
+  const me = bot.entity && bot.entity.position;
+  const t = entity && entity.position;
+  if (!me || !t) return null;
+  const tw = (entity.width || BOT_WIDTH) / 2 + SWEEP_ACROSS + SWEEP_MARGIN;
+  const tLow = t.y - SWEEP_UP - SWEEP_MARGIN;
+  const tHigh = t.y + (entity.height || 1.8) + SWEEP_UP + SWEEP_MARGIN;
+  for (const e of Object.values(bot.entities || {})) {
+    if (!e || e === bot.entity || e === entity || e.type !== 'player' || !e.position) continue;
+    const p = e.position;
+    if (me.distanceTo(p) >= SWEEP_ATTACKER_REACH + SWEEP_MARGIN) continue;
+    const pw = (e.width || BOT_WIDTH) / 2;
+    if (Math.abs(p.x - t.x) > tw + pw || Math.abs(p.z - t.z) > tw + pw) continue;
+    if (p.y > tHigh || p.y + (e.height || 1.8) < tLow) continue;
+    return { name: e.username || e.name || `player#${e.id}`, d: Math.round(p.distanceTo(t) * 100) / 100 };
+  }
+  return null;
+}
+
+// One line per friend a run of withheld swings protects, not one per tick.
+let _withheldFor = null;
 
 function swingNow(bot, entity, tag) {
   // A missing tag is a coding violation (Law 13): a silent fallback here would make a strike
@@ -167,6 +222,16 @@ function swingNow(bot, entity, tag) {
       `the moment the body is inside reach.`);
     return false;
   }
+  // A swing whose sweep would reach a player is not sent and spends nothing.
+  const friend = sweepFriend(bot, entity);
+  if (friend) {
+    if (_withheldFor !== friend.name) {
+      _withheldFor = friend.name;
+      crewLog.event(tag, 'withheld', { subject: crewLog.subject(entity), friend: friend.name, friend_d: friend.d });
+    }
+    return false;
+  }
+  _withheldFor = null;
   // mineflayer can refuse an attack on an entity that left the table between the gate above and this
   // line. A refused swing spends nothing, so the clock is not stamped, same as a reach refusal (Law 25).
   if (!guardExternalSync(TAG, `attack ${entity && entity.name}`, () => bot.attack(entity)).ok) return false;
@@ -285,9 +350,27 @@ for (const [tactic, names] of Object.entries(MONSTER_TACTICS)) {
 //
 // Also the roster of known hostiles: camera's combat_witness and tools/combat_recorder test `!== null`
 // directly; a separate membership set would be a second route that could drift (Law 16).
-function combatTactic(entityName) {
+// `entity`, when given, lets the hand decide where the name alone cannot: a drowned holding a trident is a KITER.
+function combatTactic(entityName, entity) {
   if (!entityName) return null;
+  if (throwsTrident(entity)) return COMBAT_TACTICS.KITER;
   return _TACTIC_OF[String(entityName).toLowerCase()] || null;
+}
+
+// throwsTrident(entity) → a drowned with a trident in its main hand. It throws from where it stands every 40 ticks and
+// holds its arm up (the "using an item" flag) the whole time it aims, through every throw: no release ends that draw,
+// so it is never a notched arrow. A drowned with an empty hand walks in and strikes like a zombie.
+function throwsTrident(entity) {
+  return !!entity && entity.name === 'drowned' && !!entity.heldItem && entity.heldItem.name === 'trident';
+}
+
+// endermanAngry(bot, entity) → true only when the server flags this enderman `creepy`: angry and screaming at a
+// target. The index is read from the live registry, as archer_calculator reads a draw; an unread field is not anger.
+function endermanAngry(bot, entity) {
+  if (!entity || entity.name !== 'enderman' || !Array.isArray(entity.metadata)) return false;
+  const row = bot && bot.registry && bot.registry.entitiesByName && bot.registry.entitiesByName.enderman;
+  const idx = row && Array.isArray(row.metadataKeys) ? row.metadataKeys.indexOf('creepy') : -1;
+  return idx >= 0 && entity.metadata[idx] === true;
 }
 
 // The neutrals, separate from the tactic table: tactics answer how to fight something, this answers
@@ -311,6 +394,7 @@ function shouldInitiate(entityName) {
 
 module.exports = {
   BOT_STRIKE_REACH, BOT_WIDTH,
+  sweepFriend,
 
   // The one live swing route is `swingNow`, called by `gunner.fire`; sprint stays armed through the
   // driver's approach, read by `swingNow` at resolve time.
@@ -321,6 +405,8 @@ module.exports = {
   COMBAT_TACTICS,
   MONSTER_TACTICS,
   combatTactic,
+  throwsTrident,
+  endermanAngry,
   NEVER_INITIATE,
   shouldInitiate,
 
@@ -328,6 +414,8 @@ module.exports = {
   pickBestWeapon,
   heldWeaponName,
   equipBestWeapon,
+  holdsShield,
+  readyShield,
 
   // The swing clock — one clock, and `swingNow` is the one thing that stamps it
   swingClock,

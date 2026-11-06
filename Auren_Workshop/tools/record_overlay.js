@@ -90,7 +90,7 @@ const OVERLAYS = {
 };
 
 // Flags the overlay owns, for a conductor to union into its own accepted set (Law 25).
-const OVERLAY_FLAGS = ['architect', 'host'];
+const OVERLAY_FLAGS = ['architect', 'host', 'scout'];
 
 // The operator's eye — a spectator seat, off unless asked for.
 function architectEye() { return seatSwitch('architect', c => c.architect); }
@@ -99,6 +99,10 @@ function eyeSeatCount() { return require(paths.workshop('camera', 'camera_config
 
 // THE HOST SEAT — the client a human PLAYS, the only file in a take that carries a microphone.
 function hostSeat() { return seatSwitch('host', c => c.host); }
+
+// THE SCOUT SEAT — one directed camera that films whichever bot is doing the activity the operator ranked highest.
+// Its standing answer is the focus he sets on the Cutting Room's scout page (camera/scout_focus.js), not camera_configure.
+function scoutSeat() { return seatSwitch('scout', () => require(paths.workshop('camera', 'scout_focus.js')).readFocus()); }
 
 // One reader for both seats: a flag wins, `=off` forces it off, absent defers to camera_configure (Law 16).
 function seatSwitch(name, pick) {
@@ -298,6 +302,7 @@ function raise({ overlay, count, fill, test, conductorPid, host: hostOpt }) {
 
   const eye = architectEye();
   const host = typeof hostOpt === 'boolean' ? hostOpt : hostSeat();
+  const scout = scoutSeat();
 
   // `-Count 0` means "the whole roster" to the launcher, the wrong reading for a run that starts with
   // no bots; `named` distinguishes an explicitly empty set from an unstated count.
@@ -307,11 +312,13 @@ function raise({ overlay, count, fill, test, conductorPid, host: hostOpt }) {
     '-Framing',
     ...(eye ? ['-Architect'] : []),
     ...(host ? ['-HostSeat'] : []),
+    ...(scout ? ['-Scout'] : []),
   ];
   const crewWords = [
     named ? (fillLater ? 'no bot cameras yet (they arrive with the crew)' : 'no bot cameras') : `${count} bot camera(s)`,
     ...(eye ? ["the Architect's eye"] : []),
     ...(host ? ['the HOST SEAT'] : []),
+    ...(scout ? ['the scout seat'] : []),
   ].join(' + ');
   if (!runScript('start_cameras.ps1', camArgs, `camera crew — ${crewWords} + director + titler`)) {
     return { ok: false, why: 'the camera crew did not come up' };
@@ -320,7 +327,7 @@ function raise({ overlay, count, fill, test, conductorPid, host: hostOpt }) {
   // Recorded the moment the crew is up: the clients are already ours to reap, and a session written
   // only on full success would strand them if the recorder failed (Law 8).
   writeSession({
-    overlay, test: test || null, count, records: decl.records, architect: eye, host,
+    overlay, test: test || null, count, records: decl.records, architect: eye, host, scout,
     conductor_pid: conductorPid || null,
     raised_at: Date.now(),
     alive_at: conductorPid ? Date.now() : null,
@@ -328,25 +335,25 @@ function raise({ overlay, count, fill, test, conductorPid, host: hostOpt }) {
 
   // Gates on the RIG'S published fact (Law 16), counting only the seats actually launched (Law 25).
   // The repair, if it stalls, is the same launch plus `-Add`.
-  const crew = waitForCrew(count + (eye ? eyeSeatCount() : 0) + (host ? 1 : 0),
+  const crew = waitForCrew(count + (eye ? eyeSeatCount() : 0) + (host ? 1 : 0) + (scout ? 1 : 0),
     () => runScript('start_cameras.ps1', [...camArgs, '-Add'], 'camera crew — relaunching what died on its first start'));
   if (!crew.ok) return { ok: false, why: crew.why };
 
   if (!decl.records) {
     console.log(`\n${stamp()} OVERLAY   '${overlay}': cameras only — nothing is being recorded, by definition.`);
-    if (!raiseWarden(overlay, count, eye, host, fillLater)) return { ok: false, why: 'the camera warden did not start' };
+    if (!raiseWarden(overlay, count, eye, host, fillLater, scout)) return { ok: false, why: 'the camera warden did not start' };
     return { ok: true, records: false };
   }
 
   // Mirrors the launcher's own set exactly, so the two raisers cannot disagree about what "none" meant.
   const setArgs = count === 0 ? ['--bots='] : [`--count=${count}`];
-  const seatArgs = [`--architect=${eye ? 'on' : 'off'}`, `--host=${host ? 'on' : 'off'}`];
+  const seatArgs = [`--architect=${eye ? 'on' : 'off'}`, `--host=${host ? 'on' : 'off'}`, `--scout=${scout ? 'on' : 'off'}`];
   const started = rec.raise({ setArgs, seatArgs });
   if (!started.ok) return { ok: false, why: started.why };
 
   // The warden goes up last, after the recording is proven: each attach proves the new file is really
   // writing, which needs a live output to check against.
-  if (!raiseWarden(overlay, count, eye, host, fillLater)) return { ok: false, why: 'the camera warden did not start' };
+  if (!raiseWarden(overlay, count, eye, host, fillLater, scout)) return { ok: false, why: 'the camera warden did not start' };
   return { ok: true, records: true };
 }
 
@@ -355,7 +362,7 @@ function raise({ overlay, count, fill, test, conductorPid, host: hostOpt }) {
 // — the missing half of "one camera per bot" on a crew hired in chat. DETACHED with no pipes, like the
 // machine-load sampler, so an undrained pipe cannot block it. `seeded` is the crew that already has
 // cameras, so the first pass is not a needless full converge.
-function raiseWarden(overlay, count, eye, host, fillLater) {
+function raiseWarden(overlay, count, eye, host, fillLater, scout) {
   // A run that asked for no bot cameras gets no warden: the whole warden is "give the next bot a camera",
   // and there is nothing for it to do that the run did not already refuse. Said as a success, because the
   // absence is the run's own answer rather than a step that failed to happen.
@@ -371,17 +378,17 @@ function raiseWarden(overlay, count, eye, host, fillLater) {
   try {
     const child = spawn('powershell', ['-NoProfile', '-Command',
       `& '${process.execPath}' '${path.join(TOOLS_DIR, 'camera_warden.js')}' ` +
-      `--overlay=${overlay} --host=${host ? 'on' : 'off'} --architect=${eye ? 'on' : 'off'} ` +
+      `--overlay=${overlay} --host=${host ? 'on' : 'off'} --architect=${eye ? 'on' : 'off'} --scout=${scout ? 'on' : 'off'} ` +
       `--seeded=${seeded.join(',')}`,
     ], { detached: true, stdio: 'ignore', cwd: REPO_ROOT });
     child.unref();
     console.log(`\n${stamp()} OVERLAY → camera warden up — every bot that stands up from here on gets a ` +
-      `camera${overlay === 'record' ? ' that records' : ''}. Say "foreman get" in game.`);
+      `camera${overlay === 'record' ? ' that records' : ''}.`);
     return true;
   } catch (e) {
     // Fatal to the raise, unlike the sampler: a missing warden means the crew the episode is about is
     // never filmed at all (Law 25).
-    console.error(`${stamp()} ✗ the camera warden did not start (${e.message}) — contractors would not ` +
+    console.error(`${stamp()} ✗ the camera warden did not start (${e.message}) — late bots would not ` +
       `be filmed, which is the whole point of this run.`);
     return false;
   }
@@ -391,7 +398,7 @@ function raiseWarden(overlay, count, eye, host, fillLater) {
 // The mirror of raise. Does not take the fleet down — the fleet is the conductor's to reap (Law 8).
 // Recording is finalised before anything it is recording can disappear. Every step runs even if an
 // earlier one failed, so a failure never leaves the zombies an early return would.
-function reap(why) {
+function reap(why, { deferWrap = false } = {}) {
   const session = readSession();
 
   console.log(`\n${'─'.repeat(96)}\n${stamp()} OVERLAY TEARDOWN — ${why}\n${'─'.repeat(96)}`);
@@ -416,9 +423,8 @@ function reap(why) {
     failed.push('camera crew down');
   }
 
-  // Pairs footage to trace before the next run overwrites every bot's trace (Law 8), after the files
-  // are finalised and the sampler stopped.
-  if (rec && !rec.wrapTake()) failed.push('wrap the take');
+  // A standalone stop wraps here; a run owner defers until its final outcome is on disk (Law 8).
+  if (rec && !deferWrap && !rec.wrapTake()) failed.push('wrap the take');
 
   // Deleted, never rewritten, so a later `stop` cannot find a session describing a run already gone.
   try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch (e) { /* already gone */ }
@@ -429,7 +435,17 @@ function reap(why) {
     console.error(`\n${stamp()} ⚠ the overlay teardown did not report clean: ${failed.join(', ')}. ` +
       `Check for stray camera windows${session && session.records ? ' and a recorder still running' : ''} before the next run.`);
   }
-  return { ok: failed.length === 0, reaped: true, failed };
+  return { ok: failed.length === 0, reaped: true, failed, wrapPending: !!rec && deferWrap };
+}
+
+// A run owner defers this until its final outcome and shutdown records have reached disk.
+function wrapRecording() {
+  const rec = recorder();
+  if (!rec) {
+    console.error('record_overlay: cannot archive this recording: no recorder is configured on this machine.');
+    return false;
+  }
+  return rec.wrapTake();
 }
 
 // Matched by command line, the one discriminator that survives a kill or a lost record. Reports what it
@@ -458,7 +474,7 @@ function stopWarden() {
 // this first and stops dead on 10, since the conductor is about to take the fleet down itself.
 const REQUESTED_NOT_REAPED = 10;
 
-function stopCommand(force, why) {
+function stopCommand(force, why, deferWrap = false) {
   const session = readSession();
 
   if (!session && !force) {
@@ -511,7 +527,7 @@ function stopCommand(force, why) {
     return ok ? 0 : 1;
   }
 
-  const r = reap(why || 'the operator asked for it, and no conductor was holding the run');
+  const r = reap(why || 'the operator asked for it, and no conductor was holding the run', { deferWrap });
   console.log(`\n  The FLEET is untouched — the overlay never raised it, so it is not the overlay's to reap.`);
   console.log(`  Take it down with:  node Auren_Workshop/fleet_control.js down`);
   return r.ok ? 0 : 1;
@@ -540,8 +556,8 @@ function statusCommand() {
   const live = conductorIsLive(session);
   console.log(`\nrecord_overlay: a '${session.overlay}' overlay is up.`);
   console.log(`  run       : ${session.test || 'unnamed'}`);
-  console.log(`  cameras   : ${session.count === 0 ? 'on order — a camera per contractor as it stands up' : `${session.count} bot camera(s)`}` +
-    `${session.architect ? " + the Architect's eye" : ''}${session.host ? ' + the HOST SEAT (yours to play, mic on its file)' : ''}`);
+  console.log(`  cameras   : ${session.count === 0 ? 'on order — a camera per bot as it stands up' : `${session.count} bot camera(s)`}` +
+    `${session.architect ? " + the Architect's eye" : ''}${session.host ? ' + the HOST SEAT (yours to play, mic on its file)' : ''}${session.scout ? ' + the scout seat' : ''}`);
   // Sensed, not read off the declaration: the session is written before the recorder is raised, so a
   // raise that failed at the crew-ready gate would leave the flag claiming a recording that never
   // started (Law 25). What is sensed is that the process exists, not that bytes reach a file.
@@ -561,7 +577,7 @@ function statusCommand() {
       "(Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%camera_warden.js%'\" -ErrorAction SilentlyContinue | Measure-Object).Count"],
       { encoding: 'utf8' });
     const n = parseInt(String(r.stdout || '0').trim(), 10) || 0;
-    console.log(`  warden    : ${n > 0 ? 'UP — new bots get a camera as they stand up' : 'NOT RUNNING — a contractor hired now would not be filmed'}`);
+    console.log(`  warden    : ${n > 0 ? 'UP — new bots get a camera as they stand up' : 'NOT RUNNING — a bot standing up now would not be filmed'}`);
   }
   console.log(`  raised    : ${Math.round((Date.now() - session.raised_at) / 60000)} min ago`);
   // States the evidence: a fresh heartbeat proves the process was healthy that recently (Law 23).
@@ -592,7 +608,8 @@ if (require.main === module) {
     });
     if (!r.ok) console.error(`record_overlay: not raised — ${r.why}`);
     code = r.ok ? 0 : 1;
-  } else if (cmd === 'stop') code = stopCommand(argv.includes('--force'), why);
+  } else if (cmd === 'stop') code = stopCommand(argv.includes('--force'), why, argv.includes('--defer-wrap'));
+  else if (cmd === 'wrap') code = wrapRecording() ? 0 : 1;
   else if (cmd === 'status') code = statusCommand();
   else { usage(); code = cmd ? 1 : 0; }
   process.exit(code);
@@ -600,7 +617,7 @@ if (require.main === module) {
 
 module.exports = {
   OVERLAYS, OVERLAY_FLAGS, SLICE_SECONDS, architectEye,
-  raise, reap, heartbeat, stopRequested, readSession, conductorIsLive,
+  raise, reap, wrapRecording, heartbeat, stopRequested, readSession, conductorIsLive,
   SESSION_FILE, STOP_FILE,
   // The stop-request exit code, exported so `fleet_control.stopAnyRecording()` reads the same value
   // (Law 16).

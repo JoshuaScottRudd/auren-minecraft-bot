@@ -5,7 +5,7 @@
 // world-reading geometry each overlay contributes — each independently testable against a mock bot.
 //
 // shaft overlay (payload.require_shaft):
-//   The ONLY reason the bot scans for a mineshaft is to pick the headframe's location, so that scan
+//   The ONLY reason the bot scans for a shallow shaft is to pick the headframe's location, so that scan
 //   folds into the site search: every surface candidate's column is checked for a safe diagonal-
 //   staircase descent AS IT IS FOUND (evaluateStaircasePrism), instead of a second full pass. It
 //   projects the REAL staircase geometry (mining_blueprinter.projectStaircase — one tiling pathway,
@@ -20,7 +20,7 @@ const Vec3 = require('vec3');
 // (Law 16) so find_buildingspot, mining_integrity and the cell scanner all agree on what is a
 // gravity block, a fluid, and a hazardous conduit.
 const { GRAVITY_BLOCKS: SHAFT_GRAVITY_BLOCKS, FLUID_HAZARDS: SHAFT_FLUID_HAZARDS, followGravityColumn } = require('@utils/gravity_utils');
-const { projectStaircase } = require('@perception/mining_blueprinter');
+const { projectStaircase, placePiece } = require('@perception/mining_blueprinter');
 const { transposeAttachPoints } = require('@perception/building_integrity');
 const { CLEARABLE } = require('@utils/site_geometry');
 const { guardExternalSync } = require('@utils/external_library_guard');
@@ -84,8 +84,8 @@ const STAIRCASE_SAFETY = {
   REQUIRED_DEPTH_Y: 14,
   PRISM_MARGIN:     1,   // shell of blocks around the staircase envelope checked for fluids —
                         // a fluid one block outside the carved volume still floods in
-  // A cave is air this many blocks or more under the ground the descent starts from. A standalone shaft is
-  // sited only where the whole descent meets at most CAVE_AIR_MAX such cells (lock_all_buildspots.siteShaft).
+  // A cave is air this many blocks or more under the ground the descent starts from. A descent meeting more
+  // than CAVE_AIR_MAX such cells is refused (evaluateStaircaseFrom), for every shaft alike.
   CAVE_BELOW_SURFACE: 4,
   CAVE_AIR_MAX:       0,
 };
@@ -102,8 +102,8 @@ const SUFFICIENT_STAIRCASE_MATCHES = 5;
 // conduct, and the descent's natural vertical steps, are not hazards.
 
 // getBiomeName — returns the stripped biome name (no 'minecraft:' prefix) at the given position, or
-// null when the read itself fails. Gates staircase candidates onto the settle-able ACCEPTABLE_BIOMES
-// set (require_shaft mode), and stamps informational biome on farmland candidates.
+// null when the read itself fails. Gates staircase candidates off the banned biomes (architect_config.settles,
+// require_shaft mode), and stamps informational biome on farmland candidates.
 //
 // An unloaded chunk is not distinguished from a loaded one reading biome id 0: prismarine-world's
 // getBiome returns 0, not null, for an unloaded chunk, so this can report biome 0's name as a sensed
@@ -179,30 +179,29 @@ function checkCopyHazards(bot, segment, surfY = Infinity) {
 // too-shallow / unsafe, or { ok:true, startX, startZ, surfaceY, lowestSafeY, depthReached,
 // safeCopies, haltReason }.
 //
-// acceptableBiomes: a Set of settle-able biome names (ACCEPTABLE_BIOMES). When passed, the build
-// center's own biome must be a member, the same gate exploration uses to decide when to stop seeking
-// (one set, Law 16). A candidate in a rejected biome is out before any hazard work.
-function evaluateStaircasePrism(bot, headframeBuilding, transposeOrigin, acceptableBiomes) {
-  if (acceptableBiomes) {
+// settlesIn: a biome predicate (architect_config.settles). When passed, the build center's own biome
+// must settle, the same gate exploration uses to decide when to stop seeking (one list, Law 16). A candidate in a rejected biome is out before any hazard work.
+function evaluateStaircasePrism(bot, headframeBuilding, transposeOrigin, settlesIn) {
+  if (settlesIn) {
     const biome = getBiomeName(bot, transposeOrigin.x, transposeOrigin.y, transposeOrigin.z);
-    if (!acceptableBiomes.has(biome)) return { ok: false, reason: 'biome_mismatch', biome };
+    if (!settlesIn(biome)) return { ok: false, reason: 'biome_mismatch', biome };
   }
   // Headframe attach A in world for THIS candidate — the staircase's first copy lands here.
   const headAWorld = transposeAttachPoints(headframeBuilding, transposeOrigin).A;
   if (!headAWorld) return { ok: false, reason: 'no_attach_point' };
-  const r = evaluateStaircaseFrom(bot, headAWorld, transposeOrigin.y);
+  const r = evaluateStaircaseFrom(bot, headAWorld, transposeOrigin.y, require('@perception/blueprint_survey').turnOf(transposeOrigin));
   return r.ok ? { ...r, startX: transposeOrigin.x, startZ: transposeOrigin.z } : r;
 }
 
-// evaluateStaircaseFrom — THE DESCENT ITSELF, from the world point its first copy's inbound joint lands
-// on. The headframe's check above resolves that point through the headframe's attach A; a STANDALONE
-// mineshaft, built with no headframe attach point, names the point directly. One hazard walk for both
+// evaluateStaircaseFrom — THE DESCENT ITSELF, and the one judgment of whether a shaft may be dug there,
+// from the world point its first copy's inbound joint lands on. The headframe's check above resolves that point through the headframe's attach A; a STANDALONE
+// shallow shaft, built with no headframe attach point, names the point directly. One hazard walk for both
 // (Law 16). `surfY` is the ground the descent starts from. On success it also carries `prism` — the
 // staircase's horizontal reach {minX,maxX,minZ,maxZ} and its copy count — so a siter can keep the whole
-// diagonal, not just its mouth, clear of other buildings.
-function evaluateStaircaseFrom(bot, headAWorld, surfY) {
+// diagonal, not just its mouth, clear of other buildings. `turn` is the descent's quarter turns from east.
+function evaluateStaircaseFrom(bot, headAWorld, surfY, turn = 0) {
   // Project the descent to the required floor; hazard-walk the copies shallow → deep.
-  const proj = projectStaircase({ headAWorld, lowestSafeY: STAIRCASE_SAFETY.REQUIRED_DEPTH_Y });
+  const proj = projectStaircase({ headAWorld, lowestSafeY: STAIRCASE_SAFETY.REQUIRED_DEPTH_Y, turn });
   if (proj.segments.length === 0) {
     return { ok: false, reason: 'too_shallow', haltReason: 'no_copy_fits' };
   }
@@ -226,14 +225,72 @@ function evaluateStaircaseFrom(bot, headAWorld, surfY) {
   if (safeCopies < proj.segments.length) {
     return { ok: false, reason: 'unsafe_descent', depthReached: surfY - lowestSafeY, lowestSafeY, haltReason };
   }
+  // A descent through or beside a cave has no wall or floor there: refused, however little of it there is.
+  if (caveAir > STAIRCASE_SAFETY.CAVE_AIR_MAX) {
+    return { ok: false, reason: 'cave_air', depthReached: surfY - lowestSafeY, lowestSafeY, haltReason, caveAir };
+  }
 
+  // The deep shaft turns its way down from here. `deep` is its route, locked with the site and dug only when a
+  // material asks for it (assessors/mining); null where none reaches the floor, and the site still makes a shallow shaft.
+  const floorY = require('@thinking/architect_config').SHAFT_TURNS.floor_y;
+  const below = routeBelow(bot, proj, surfY, floorY);
+  const deep = below ? { route: below.route, pieces: below.pieces, lowestSafeY: projectStaircase({ headAWorld, lowestSafeY: floorY, turn, route: below.route }).bottomY } : null;
+
+  // `prism` is the straight run from the surface: what a building on the ground has to keep clear of.
   return {
     ok: true,
     startX: headAWorld.x, startZ: headAWorld.z,
     surfaceY: surfY, lowestSafeY, depthReached: surfY - lowestSafeY, safeCopies,
-    haltReason, caveAir,
+    haltReason, caveAir, deep,
     prism: staircaseReach(proj),
   };
+}
+
+// ── THE DEEP SHAFT TURNS ───────────────────────────────────────────────────────────────
+// routeBelow — from the bottom of the straight run, on down to floorY (architect_config.SHAFT_TURNS): a flight while
+// the rock ahead is clean, and where a flight is refused (fluid, cave air, ground not loaded, the shaft's own cells) a
+// landing to either side. A way that dead-ends is backed out of and turned earlier. No landing stands above
+// SHAFT_TURNS.first_turn_y, and a landing is always followed by a flight. Returns { route, pieces } or null, at most
+// SHAFT_TURNS.max_checks pieces walked.
+function routeBelow(bot, proj, surfY, floorY) {
+  const { max_checks, first_turn_y } = require('@thinking/architect_config').SHAFT_TURNS;
+  const claimed = new Map(proj.occupiedCells);
+  const last = proj.segments[proj.segments.length - 1];
+  let checks = 0;
+  const failed = new Set();
+  const lay = (piece) => {
+    const mine = [];
+    for (const v of piece.voxels) {
+      const key = `${v[0]},${v[1]},${v[2]}`;
+      const prev = claimed.get(key);
+      if (prev !== undefined && prev !== v[3]) { for (const k of mine) claimed.delete(k); return null; }
+      if (prev === undefined) { claimed.set(key, v[3]); mine.push(key); }
+    }
+    return mine;
+  };
+  const clean = (piece) => {
+    const hz = checkCopyHazards(bot, piece, surfY);
+    return hz.safe && hz.caveAir <= STAIRCASE_SAFETY.CAVE_AIR_MAX;
+  };
+  // walk(at, n, flightOnly) → the landings from piece n down, or null when no way down exists from here.
+  const walk = (at, n, flightOnly) => {
+    if (placePiece(at.origin, at.heading).minY < floorY) return { route: [], pieces: n };
+    const state = `${at.origin.x},${at.origin.y},${at.origin.z},${at.heading},${flightOnly}`;
+    if (failed.has(state)) return null;
+    for (const side of flightOnly || at.origin.y > first_turn_y ? [null] : [null, 'right', 'left']) {
+      if (++checks > max_checks) return null;
+      const piece = placePiece(at.origin, at.heading, side);
+      if (!clean(piece)) continue;
+      const mine = lay(piece);
+      if (!mine) continue;
+      const below = walk(piece.next, n + 1, !!side);
+      if (below) return side ? { route: [{ at: n, side }, ...below.route], pieces: below.pieces } : below;
+      for (const k of mine) claimed.delete(k);
+    }
+    failed.add(state);
+    return null;
+  };
+  return walk(placePiece(last.world_position, last.turn).next, proj.segments.length, false);
 }
 
 // staircaseReach(proj) — the horizontal box every voxel of a projected descent falls in.

@@ -9,7 +9,7 @@
 const watcher = require('@kernel/watcher');
 const Vec3 = require('vec3');
 const { sleep } = require('@utils/fragment_utils');
-const { routeToJudge } = require('@utils/signal_utils');
+const { routeToJudge, routeSignal } = require('@utils/signal_utils');
 const { canLandStrike } = require('@utils/movement/combat_movement');
 const { clearMotion } = require('@utils/movement/motion_primitives');
 const combatUtils = require('@utils/combat_utils');
@@ -22,12 +22,12 @@ const driver = require('@api/driver');
 
 // Creeper's own fuse, read off `swell_dir`.
 const fuseMeter = require('@api/combat_counters/fuse_meter');
-const survival = require('@locomotion/survival_instincts');
 const gunner = require('@api/gunner');
 // Voice only; monster data arrives on the board.
 const commander = require('@api/commander');
 // Reads the commander's section, writes none (Law 16).
 const crewBoard = require('@api/crew_board');
+const mobClaims = require('@api/mob_claims');
 const { withCleanup } = require('@utils/external_library_guard');
 const {
   aggroRangeFor, withinAggroRange, AGGRO_VERTICAL_RANGE,
@@ -80,9 +80,30 @@ let _lastDamageEvent = null;
 // Distinguishes the server never sending the packet from the packet arriving and being missed (Law 23).
 let _damageEventsSeen = 0;      // for THIS bot's body
 let _damageEventsForOthers = 0; // any body
+// THE SHIELD AS THE SERVER SAW IT: when the body's own synced off-hand use began (`_guardSince`, client clock on
+// the metadata's arrival), and when the server last played this body's shield-block status (entity status 29).
+let _guardSince = null;
+let _lastShieldBlock = null;
 function _armDamageAttribution(bot) {
   if (!bot || !bot._client || bot._aurenDamageAttribution) return;
   bot._aurenDamageAttribution = true;
+  bot._client.prependListener('entity_status', (p) => {
+    if (bot.entity && p.entityId === bot.entity.id && p.entityStatus === 29) _lastShieldBlock = Date.now();
+  });
+  // The block as the world hears it: a shield or arrow sound within 3b of the body is posted, so blocks and
+  // blows that landed can be counted against each other.
+  bot.on('soundEffectHeard', (name, pt) => {
+    if (!bot.entity || !pt || typeof name !== 'string') return;
+    if (!/shield|arrow/.test(name)) return;
+    if (pt.distanceTo(bot.entity.position) > 3) return;
+    if (/shield/.test(name) && /block/.test(name)) _lastShieldBlock = Date.now();
+    crewLog.event('battle_stations', 'sound', { what: name.replace(/^minecraft:/, ''), guard: _selfGuard(bot) });
+  });
+  bot.on('entityUpdate', (e) => {
+    if (e !== bot.entity) return;
+    const g = _selfGuard(bot);
+    if (g === 'offhand') { if (_guardSince === null) _guardSince = Date.now(); } else _guardSince = null;
+  });
   bot._client.prependListener('damage_event', (p) => {
     _damageEventsForOthers++;
     if (!bot.entity || p.entityId !== bot.entity.id) return;   // somebody else's blow
@@ -102,23 +123,26 @@ function _armDamageAttribution(bot) {
 const DAMAGE_EVENT_FRESH_MS = 1000;
 function _attributeBlow(bot) {
   const ev = _lastDamageEvent;
-  if (!ev || Date.now() - ev.at > DAMAGE_EVENT_FRESH_MS) return { by: null, byId: null, kind: null };
+  if (!ev || Date.now() - ev.at > DAMAGE_EVENT_FRESH_MS) return { by: null, byId: null, kind: null, kindName: null, via: null, directId: null, causeId: null };
   // Direct first, then cause.
   let by = null;
   let byId = null;
+  let via = null;
   const resolve = (id) => (id != null && bot.entities && bot.entities[id]) ? bot.entities[id] : null;
-  for (const id of [ev.byId, ev.causeId]) {
+  for (const [id, which] of [[ev.byId, 'direct'], [ev.causeId, 'cause']]) {
     const e = resolve(id);
     if (!e) continue;
-    const n = e.name || e.mobType || e.username || null;
+    const n = e.name || e.displayName || e.username || null;
     if (!n) continue;
-    by = n; byId = id;
+    by = n; byId = id; via = which;
     break;
   }
   // Keep the direct id when nothing resolves — a packet with an unresolvable attacker (Law 25).
   if (by === null) byId = ev.byId;
-  // `byId === null` on a blow = the world did it (environmental).
-  return { by, byId, kind: ev.kindId };
+  // `byId === null` on a blow = the world did it (environmental). Both raw ids and the damage type's name ride
+  // along, so a blow laid on the wrong mob can be told from the packet that said so.
+  return { by, byId, kind: ev.kindId, kindName: require('@api/damage_types').nameOf(bot, ev.kindId), via,
+    directId: ev.byId, causeId: ev.causeId };
 }
 
 // WORLD DAMAGE STREAK — repeated blows of one world kind (suffocation, drowning, fire tick the body
@@ -153,6 +177,33 @@ function _closeWorldStreak() {
   watcher.summary('battle_stations',
     `WORLD_DAMAGE_STREAK kind=${s.kind} blows=${s.blows} lost=${s.lost.toFixed(1)}` +
     ` over ${((s.last - s.since) / 1000).toFixed(1)}s → hp ${s.hp.toFixed(1)}/20 · last blow ${s.where}`);
+}
+
+// _selfGuard(bot) → what the SERVER says the body's hands are doing, off its own synced living flags: bit 0 is
+// "using an item", bit 1 "with the off-hand". 'offhand' is a raised shield as the server holds it (blocking once
+// it has been held 5 ticks); 'mainhand', 'idle' or 'unread' otherwise. Beside it, `commanded` is the gunner's
+// own latch, so a blow through a shield the client thinks is up reads as the two disagreeing.
+function _selfGuard(bot) {
+  const md = bot.entity && bot.entity.metadata;
+  const keys = bot.registry && bot.registry.entitiesByName && bot.registry.entitiesByName.player
+    ? bot.registry.entitiesByName.player.metadataKeys : null;
+  if (!Array.isArray(md) || !Array.isArray(keys)) return 'unread';
+  const idx = keys.indexOf('living_entity_flags');
+  if (idx < 0 || typeof md[idx] !== 'number') return 'unread';
+  const v = md[idx];
+  if (!(v & 0x01)) return 'idle';
+  return (v & 0x02) ? 'offhand' : 'mainhand';
+}
+
+// _offFacing(bot, pos) → degrees between where the body faces and the bearing to `pos`, 0..180, or null. A shield
+// blocks only a blow from within 90 of the facing.
+function _offFacing(bot, pos) {
+  if (!pos || !bot.entity || typeof bot.entity.yaw !== 'number') return null;
+  const dx = pos.x - bot.entity.position.x, dz = pos.z - bot.entity.position.z;
+  if (Math.hypot(dx, dz) < 1e-3) return null;
+  let d = Math.abs(Math.atan2(-dx, -dz) - bot.entity.yaw) % (2 * Math.PI);
+  if (d > Math.PI) d = 2 * Math.PI - d;
+  return Math.round(d * 180 / Math.PI);
 }
 
 // _standingIn(bot) → where the body is and the blocks at its head, feet and under it, as the bot reads
@@ -300,21 +351,48 @@ function armDeathWatch(bot) {
 
     const near = scanFailed ? `no scan: ${scanFailed}`
       : list.length
-        ? list.slice(0, 3).map(h => `${h.name}#${h.id != null ? h.id : '?'} ${h.distance.toFixed(1)}b${h.aggroed ? ' (aggro✓)' : ' (no line)'}`).join(', ')
+        ? list.slice(0, 3).map(h => `${h.name}#${h.id != null ? h.id : '?'} ${h.distance.toFixed(1)}b${h.aggroed ? ' (aggro✓)' : h.seen === false ? ' (no line)' : ' (not aggroed)'}`).join(', ')
         : 'nothing hostile in scan';
 
     const nearby = list.length;
     const suspect = list.length ? list[0].name : null;
     const suspectD = list.length ? Math.round(list[0].distance * 100) / 100 : null;
     const wasEngaged = !!engaging;   // captured with the blow, not with the write below
+    const guardAtBlow = _selfGuard(bot);
+    const raisedMs = guardAtBlow === 'offhand' && _guardSince !== null ? Date.now() - _guardSince : null;
+    const commandedAtBlow = crewBoard.readGunner().shield === true;
+    const nearestPos = list.length && list[0].entity && list[0].entity.position ? list[0].entity.position.clone() : null;
+    const ownSwingAt = crewBoard.readGunner().lastSwingAt;
+    const ownLowerAt = crewBoard.readGunner().loweredAt;
+    const nearestSwing = list.length
+      ? `${list[0].name}#${list[0].id}${list[0].swungAt != null ? ` swung ${Date.now() - list[0].swungAt}ms ago` : ' never swung'} closing=${Number.isFinite(list[0].closing) ? list[0].closing.toFixed(1) : '?'}b/s` +
+        ` · bot swung ${ownSwingAt != null ? `${Date.now() - ownSwingAt}ms ago` : 'never'}` +
+        ` lowered ${ownLowerAt != null ? `${Date.now() - ownLowerAt}ms ago` : 'never'}`
+      : null;
 
     // READ ONE MACROTASK LATE: `health` and `damage_event` are different packets in one server tick.
     // World state (scan, hp, engaged flag) is captured synchronously above; only attribution is
     // deferred (Invariant B).
     setImmediate(() => {
     const blow = _attributeBlow(bot);
+    const attacker = blow.byId != null && bot.entities ? bot.entities[blow.byId] : null;
+    const attackerD = attacker && attacker.position && bot.entity
+      ? Math.round(attacker.position.distanceTo(bot.entity.position) * 10) / 10 : null;
+    const off = _offFacing(bot, attacker && attacker.position ? attacker.position : nearestPos);
+    // The attributed or nearest mob can stand square in front while another lands the blow from the side: the widest
+    // angle among every mob within 3 b is the one the shield's 90° cone may have missed.
+    let widest = null;
+    for (const h of list) {
+      if (!(h.distance <= 3) || !h.entity || !h.entity.position) continue;
+      const o = _offFacing(bot, h.entity.position);
+      if (o != null && (!widest || o > widest.o)) widest = { o, name: h.name, id: h.id, d: h.distance };
+    }
+    const widestNote = widest ? ` widest=${widest.o}°(${widest.name}#${widest.id}@${widest.d.toFixed(1)}b)` : '';
+    const blockedMs = _lastShieldBlock !== null && Date.now() - _lastShieldBlock < 1000 ? Date.now() - _lastShieldBlock : null;
+    const guardNote = ` · guard server=${guardAtBlow}${raisedMs == null ? '' : ` raised=${raisedMs}ms`}${blockedMs == null ? '' : ` shield_block=${blockedMs}ms_ago`} commanded=${commandedAtBlow ? 'up' : 'down'} off_facing=${off == null ? '?' : off}°${attacker ? '' : ' (nearest)'}${widestNote}${attacker && attacker.position && bot.entity ? ` dy=${(attacker.position.y - bot.entity.position.y).toFixed(1)}` : ''} yaw=${bot.entity ? bot.entity.yaw.toFixed(2) : '?'}${nearestSwing ? ` · ${nearestSwing}` : ''}`;
     const from = blow.by
-      ? `by ${blow.by}#${blow.byId}`
+      ? `by ${blow.by}#${blow.byId} at ${attackerD == null ? '?' : attackerD}b (${blow.kindName || `kind ${blow.kind}`}, the blow's ${blow.via}` +
+        `${blow.via === 'cause' ? `; direct #${blow.directId} unresolved` : ''})`
       : blow.byId === null && blow.kind != null
         ? 'by the WORLD (fall/drown/fire — no entity on the blow)'
         : 'attacker UNATTRIBUTED (no damage_event)';
@@ -327,9 +405,9 @@ function armDeathWatch(bot) {
     } else {
       _closeWorldStreak();
       watcher.warn('battle_stations',
-        `💔 TOOK ${lost.toFixed(1)} DAMAGE ${from}${worldBlow ? ` kind=${blow.kind} ${_standingIn(bot)}` : ''} → hp ${hp.toFixed(1)}/20` +
+        `💔 TOOK ${lost.toFixed(1)} DAMAGE ${from}${worldBlow ? ` kind=${blow.kindName || blow.kind} ${_standingIn(bot)}` : ''} → hp ${hp.toFixed(1)}/20` +
         ` · ${wasEngaged ? 'ENGAGED (the counter is running)' : '⚠️ NOT ENGAGED — no engagement was open'}` +
-        ` · ${list.length} hostile(s) in scan: ${near}`);
+        ` · ${list.length} hostile(s) in scan: ${near}${guardNote}`);
       if (worldBlow) _openWorldStreak(blow.kind, lost, hp);
     }
     if (_worldStreak) _worldStreak.where = _standingIn(bot);
@@ -349,7 +427,8 @@ function armDeathWatch(bot) {
     crewLog.post('battle_stations', 'hurt', {
       subject: blow.by && blow.byId != null ? `${blow.by}#${blow.byId}` : null,
       lost: Math.round(lost * 10) / 10, hp: Math.round(hp * 10) / 10,
-      kind: blow.kind, nearby,
+      kind: blow.kind, type: blow.kindName, via: blow.via, d: attackerD, nearby,
+      guard: guardAtBlow, raised_ms: raisedMs, shield_block_ms: blockedMs, commanded: commandedAtBlow ? 'up' : 'down', off_facing: off,
       unengaged: wasEngaged ? null : true,
       no: _life.hits,
     });
@@ -401,6 +480,16 @@ function abandonToJudge(readable) {
 // signal_bus (spoils branch below).
 
 let engaging = false;
+// True while water survival holds the body (combatCheckpoint's water branch). The rescue digs and places through the
+// same primitives that call combatCheckpoint, and survival stays pending until it ends, so a dig or place inside it
+// would start the rescue again: once the swim has failed nothing in that loop waits on a timer, so it would run as
+// one unbroken chain of promises, starving the event loop until the heap fills.
+let rescuing = false;
+// The mend's own walks and places pass the gate's mend branch (THE PAD MENDED BETWEEN JOBS).
+let mending = false;
+// When the last wave ended (Date.now()). A commander sweep taken before it still lists the mobs that wave
+// just killed, so the gate opens no fight from it; the next sweep is one tick away.
+let _waveEndedAt = 0;
 
 // The reason the gate last declined to fight, or null. Posted on change, cleared when a fight opens.
 let _lastDeclineWhy = null;
@@ -421,7 +510,8 @@ let _waveMeterLines = [];
 const ENGAGEMENT_MAX_MS = 60000;
 
 // THE DEAD-WAIT CLOCK — a second clock with a different predicate. Fires only when nothing is
-// happening: the bot did not move, the held mob did not move, the held mob took no damage (Law 25).
+// happening: the bot did not move, the held mob did not move, the held mob took no damage, and the gunner
+// has no terrain errand working — a dig the driver asked for is the fight opening a way (Law 25).
 const IDLE_STALL_MS = 1000;
 // Jitter tolerance while standing and swinging.
 const IDLE_MOVE_EPSILON = 0.25;
@@ -490,10 +580,12 @@ function enqueue(queue, id, name, distance) {
 
 // admitAggro: queue every mob the commander has posted as ACTIVE that is not already in the queue.
 // No raycast here (Invariant D — the commander says who is a threat, this seat which it has taken on).
-function admitAggro(bot, queue) {
+function admitAggro(bot, queue, yielded) {
   let admitted = 0;
   for (const h of crewBoard.readCommander().active) {
-    if (queue.has(h.id)) continue;
+    // A yielded mob is not taken back, unless the commander takes it past the claim (a swelling creeper within blast
+    // reach of this body, or a peer's attacker answered for its call).
+    if (queue.has(h.id) || (yielded.has(h.id) && !h.pastClaim)) continue;
     if (enqueue(queue, h.id, h.name, h.distance)) admitted++;
   }
   return admitted;
@@ -514,7 +606,7 @@ function orderQueue(bot, queue) {
 }
 
 // NO TARGET COMPARATOR AND NO REPICK GATE HERE (Law 16). The target is the commander's `focus`,
-// committed by `chooseFocus` — hysteresis by identity, not distance.
+// the closest engaged mob, re-picked every sweep by `chooseFocus`.
 
 // retirementVerdict(entry, wasHeld, now) → 'dequeued' | 'detonated' | 'cleared' | 'lost'.
 // Named so a bench can drive the claim directly (Law 26).
@@ -538,6 +630,7 @@ function retireTarget(bot, choice, entry, verdict, wasHeld) {
     d: Math.round(entry.lastDistance * 100) / 100,
     hp: typeof bot.health === 'number' ? Math.round(bot.health * 10) / 10 : null,
   });
+  require('@api/activity_log').end('fight', { subject: `${entry.name}#${entry.id}`, why: verdict });
   if (!wasHeld) return;
   bankFuseLine();
   fuseMeter.reset();
@@ -551,7 +644,9 @@ async function targetEngaged(bot, firstBoard, choice) {
   for (const h of firstBoard.active || []) enqueue(queue, h.id, h.name, h.distance);
   if (!queue.size) enqueue(queue, firstBoard.engage.id, firstBoard.engage.name, firstBoard.engage.distance);
 
-  const tally = { cleared: 0, lost: 0, dequeued: 0, taken: 0, detonated: 0 };
+  const tally = { cleared: 0, lost: 0, dequeued: 0, taken: 0, detonated: 0, yielded: 0, unreachable: 0 };
+  // Mobs a peer's claim took from this body this wave (mob_claims): left, and not taken again this wave.
+  const yielded = new Set();
 
   // IS THE WAVE LOOP ACTUALLY FIGHTING THE COMMANDER'S FOCUS? Does the seat that decides the target
   // agree with the seat that executes it (Law 25). `offClosestB` prices the overhang.
@@ -573,6 +668,8 @@ async function targetEngaged(bot, firstBoard, choice) {
   let heldId = null;
   let outcome = null;
   let passes = 0;
+  // Whether the body ran this wave (self_preservation): once it has, the wave ends 'fled' the pass it is clear.
+  let ran = false;
   // Peak simultaneous live hostiles across this wave.
   let maxConcurrent = 0;
 
@@ -585,9 +682,65 @@ async function targetEngaged(bot, firstBoard, choice) {
       passes++;
       // Death exit (sentry mode); catches the bot dying during a fight (Law 13).
       if (!bot.entity || (typeof bot.health === 'number' && bot.health <= 0)) { outcome = 'died'; break; }
+      if (require('@locomotion/underwater_swimming').survivalHasControl(bot)) { outcome = 'water_survival'; break; }
+      // ── THE RUN ENDS THE WAVE ONCE THE BODY IS CLEAR (self_preservation) ─────────────────────────────────
+      // Every mob it ran from is released; one that comes on again opens a new fight, run like this one while the body
+      // heals (RETURN_HP). A run called off before the body is clear (the fight priced winnable again) goes back to the
+      // fight in this wave: ending it 'fled' with the mob in reach re-opened the same fight at once, and a creeper that
+      // priced walled and unwalled as the run changed level looped five waves in 8 s until the judge killed it.
+      const survival = crewBoard.readSurvival();
+      if (survival.fleeing) { ran = true; mobClaims.release(); }
+      if (ran && survival.clear) {
+        outcome = 'fled';
+        for (const id of queue.keys()) commander.markFled(id);
+        break;
+      }
+      if (ran && !survival.fleeing) {
+        ran = false;
+        crewLog.event('battle_stations', 'run', { state: 'called_off', why: 'winnable_again' });
+      }
 
       const now = Date.now();
-      admitAggro(bot, queue);
+      admitAggro(bot, queue, yielded);
+
+      // ── A PEER'S CLAIM WON THE HELD MOB (mob_claims) ─────────────────────────────────────────────
+      // Both bodies took it inside the relay's latency; the earlier claim fights it and this body leaves it,
+      // unless the mob is biting this body, or the commander takes it past the claim (a creeper swelling within
+      // blast reach, or a peer's attacker answered for its call).
+      const biting = struckWithin(require('@api/commander').REACTIVE_WINDOW_MS);
+      const pastClaim = heldId !== null && crewBoard.readCommander().active.some((h) => h.id === heldId && h.pastClaim);
+      if (heldId !== null && mobClaims.ownerOf(heldId) && !(biting && biting.byId === heldId) && !pastClaim) {
+        const entry = queue.get(heldId);
+        const owner = mobClaims.ownerOf(heldId);
+        if (entry) retireTarget(bot, choice, entry, 'yielded', true);
+        crewLog.post('battle_stations', 'yield', { subject: entry ? `${entry.name}#${entry.id}` : `mob#${heldId}`, to: owner });
+        tally.yielded++;
+        yielded.add(heldId);
+        queue.delete(heldId);
+        heldId = null;
+        mobClaims.release();
+      }
+
+      // ── A MOB THE BODY COULD NOT GET CLOSER TO (driver's chase verdict) ───────────────────────────
+      // Retired unreachable and marked, so the sight door does not hand it back and the body's work resumes; not taken again this wave.
+      // A blow it lands after the mark still admits it. 'chasing' is the fight still open.
+      const covered = driver.chaseVerdict();
+      const verdict = covered && covered.state === 'gave_up';
+      if (verdict && queue.has(covered.mobId)) {
+        const entry = queue.get(covered.mobId);
+        const wasHeld = entry.id === heldId;
+        tally.unreachable++;
+        bucketRetirement(entry, 'unreachable');
+        retireTarget(bot, choice, entry, 'unreachable', wasHeld);
+        crewLog.post('battle_stations', 'unreachable', { subject: `${entry.name}#${entry.id}`, chase: covered.state, why: covered.why });
+        commander.markUnreachable(entry.id);
+        driver.endChase(entry.id);
+        yielded.add(entry.id);
+        queue.delete(entry.id);
+        if (wasHeld) { heldId = null; mobClaims.release(); }
+      } else if (verdict) {
+        driver.endChase(covered.mobId);
+      }
       const { live, gone } = orderQueue(bot, queue);
 
       // STAGE 4, PER MOB. A kill only if it vanished close (KILL_CONFIDENCE_RANGE) and was the mob
@@ -604,6 +757,7 @@ async function targetEngaged(bot, firstBoard, choice) {
         queue.delete(entry.id);
         if (wasHeld) {
           heldId = null;
+          mobClaims.release();
           // Progress resets the per-target clock (ENGAGEMENT_MAX_MS). Only a kill does.
           if (verdict === 'cleared') deadline = Date.now() + ENGAGEMENT_MAX_MS;
         }
@@ -611,7 +765,7 @@ async function targetEngaged(bot, firstBoard, choice) {
 
       if (!live.length) {
         // `detonated` tested before the fall-through (Law 25).
-        outcome = tally.cleared ? 'cleared' : tally.detonated ? 'detonated' : tally.lost ? 'lost' : 'cleared';
+        outcome = tally.cleared ? 'cleared' : tally.detonated ? 'detonated' : tally.lost ? 'lost' : tally.unreachable ? 'unreachable' : tally.yielded ? 'yielded' : 'cleared';
         break;
       }
 
@@ -626,7 +780,15 @@ async function targetEngaged(bot, firstBoard, choice) {
           mobAt: (watched.entity && watched.entity.position) || null,
           mobHp: typeof watched.entity.health === 'number' ? watched.entity.health : null,
         };
-        if (combatActivity(lastSample, sample)) idleSince = now;
+        const errand = crewBoard.readGunner().terrainStatus;
+        // A chase the give-up clock still allows, or the shield held up against a live threat while the arm waits out a draw, is the
+        // fight's answer to that mob.
+        const chasing = driver.chaseVerdict();
+        const shielding = crewBoard.readGunner().shield === true;
+        // Standing behind a blast wall is the answer to a swelling creeper, as a raised shield is.
+        const walled = !!crewBoard.readGunner().wall;
+        if (combatActivity(lastSample, sample) || (errand && errand.state === 'working') || shielding || walled
+          || (chasing && chasing.state === 'chasing')) idleSince = now;
         else if (now - idleSince >= IDLE_STALL_MS) {
           // Split horizontal/vertical — the two have different repairs.
           const mobAt = sample.mobAt, botAt = sample.botAt;
@@ -639,6 +801,13 @@ async function targetEngaged(bot, firstBoard, choice) {
             `fight, it is a fight that never opened. Abandoning to judge rather than holding the signal to ` +
             `the ${ENGAGEMENT_MAX_MS / 1000}s ceiling.`);
           outcome = 'stalled';
+          // A predator the predator door admitted (a wolf near a pen) is not hostile to the body, so a fight that never
+          // opens on it opens no better on the next sweep: it is marked as a mob no route reached (THE UNREACHABLE MARK),
+          // and a bite from it still admits it at once. Any other mob is only released.
+          const watchedVia = (crewBoard.readCommander().active || []).find((h) => h.id === watched.id)?.via;
+          if (watchedVia === 'predator') commander.markUnreachable(watched.id);
+          else commander.release(watched.id);
+          if (heldId !== null && heldId !== watched.id) commander.release(heldId);
           break;
         }
         // Cloned, not referenced: `entity.position` is a live Vec3 mineflayer mutates in place.
@@ -659,6 +828,7 @@ async function targetEngaged(bot, firstBoard, choice) {
           if (prev) retireTarget(bot, choice, prev, 'switched', true);
         }
         heldId = wantId;
+        if (heldId !== null && !survival.fleeing) mobClaims.claim(heldId); else mobClaims.release();
         const entry = queue.get(heldId);
         const at = live.find((x) => x.id === heldId);
         tally.taken++;
@@ -681,6 +851,7 @@ async function targetEngaged(bot, firstBoard, choice) {
           weapon: choice.profile.name || null,
           hp: typeof bot.health === 'number' ? Math.round(bot.health * 10) / 10 : null,
         });
+        require('@api/activity_log').start('fight', { subject: `${entry.name}#${entry.id}`, at: bot.entity ? bot.entity.position : null });
         // NO PROSE TARGET LINE HERE — the seats report, not this file (Law 16, Invariant D).
       }
 
@@ -698,7 +869,9 @@ async function targetEngaged(bot, firstBoard, choice) {
         }
       }
 
-      // THIS PASS DOES NOT FIGHT. IT WAITS ONE TICK AND LOOKS AGAIN — the fight runs on the physicsTick.
+      // THIS PASS DOES NOT FIGHT. IT THINKS THE DRIVER'S ROUTE, WAITS ONE TICK AND LOOKS AGAIN — the fight runs on
+      // the physicsTick; the route search is the one awaited piece of it (driver SECTION 4c).
+      await driver.think(bot);
       const PASS_MS = 50;
       await sleep(PASS_MS);
     }
@@ -710,8 +883,11 @@ async function targetEngaged(bot, firstBoard, choice) {
         `without killing it (${passes} pass(es), ${queue.size} still queued, ${tally.cleared} cleared so far) — ` +
         `abandoning to judge (Law 13 stall).`);
       outcome = 'stalled';
+      if (heldId !== null) commander.release(heldId);
     }
   }, () => {
+    // The claim ends with the wave (Law 8).
+    mobClaims.release();
     // The held target's `engage` row must always find its `end` row (Law 8).
     if (heldId !== null && queue.has(heldId)) {
       bucketRetirement(queue.get(heldId), outcome || 'error');
@@ -746,8 +922,9 @@ async function engageThreat(bot, firstBoard, source) {
   _lastDeclineWhy = null;
   // Cleared where the wave begins, not where it ends (Law 8).
   _waveMeterLines = [];
-  survival.disableReflex('autoTorch');
-  // NO SHIELD GATE — shields are not in scope.
+  // THE SHIELD GOES TO THE OFF-HAND AS THE FIGHT OPENS, before the gunner is armed: the gunner's raise blocks only
+  // with a shield there, and its tick may not await an equip. No shield is no gate: the body fights without one.
+  await combatUtils.readyShield(bot);
   //
   // THE GUNNER IS ARMED FOR THE WHOLE WAVE, AT THIS SEAT AND NOT PER TACTIC — the facing, the
   // approach no tactic owns (Invariant D).
@@ -783,8 +960,8 @@ async function engageThreat(bot, firstBoard, source) {
     // THE THIRD SEAT SPEAKS HERE TOO (Law 6). Not disengaged with it — the commander sweeps whether
     // or not a fight is open.
     commander.report();
-    survival.enableReflex('autoTorch');
     engaging = false;
+    _waveEndedAt = Date.now();
     // Consumed here when the fight ran through the death (Law 16).
     _diedSince = false;
     // THE WAVE'S OWN LINE — not an `end` (those are per target). How many mobs one arrival dealt with.
@@ -794,6 +971,7 @@ async function engageThreat(bot, firstBoard, source) {
       cleared: result ? result.tally.cleared : 0,
       lost: result ? result.tally.lost : 0,
       dequeued: result ? result.tally.dequeued : 0,
+      unreachable: result ? result.tally.unreachable : 0,
       queued: result ? result.queued : null,
       passes: result ? result.passes : 0,
       hp: typeof bot.health === 'number' ? Math.round(bot.health * 10) / 10 : null,
@@ -809,7 +987,7 @@ async function engageThreat(bot, firstBoard, source) {
       const dNow = nearestHostileDistance();
       watcher.summary('battle_stations',
         `🏁 Wave ${outcome}: ${result.tally.taken} target(s) taken, ${result.tally.cleared} cleared, ` +
-        `${result.tally.lost} lost, ${result.tally.dequeued} dequeued, ` +
+        `${result.tally.lost} lost, ${result.tally.dequeued} dequeued, ${result.tally.unreachable} unreachable, ` +
         `${result.queued} still queued over ${result.passes} pass(es). ` +
         `Nearest hostile now ${dNow == null ? 'none in range' : `${dNow.toFixed(1)}b`}. ` +
         // THE FOCUS AUDIT, PRINTED EVEN WHEN EMPTY (Law 25).
@@ -824,6 +1002,18 @@ async function engageThreat(bot, firstBoard, source) {
     for (const line of _waveMeterLines) watcher.summary('battle_stations', line);
     _waveMeterLines = [];
   });
+  // A FIGHT CUT BY THE BREATH OVERRIDE: the body goes to air at the gate, and then the caller is abandoned as after any
+  // wave, since the fight already released its job's claim.
+  if (outcome === 'water_survival') {
+    await combatCheckpoint(bot, source);
+    return abandonToJudge('battle_stations: engagement cut by the breath override; breath restored, replanning from current state');
+  }
+  // A BODY THAT RAN EATS WHAT IT CARRIES before the board has it again: the fed body heals, and it seeks no fight
+  // until it has (self_preservation, RETURN_HP).
+  if (outcome === 'fled' && typeof bot.food === 'number' && bot.food < 20) {
+    const eaten = await require('@action/eat_executor').eatUntilFull(bot);
+    watcher.summary('battle_stations', `🍞 FLED_AND_ATE ate=${eaten.ate} food=${eaten.foodBefore}->${eaten.foodAfter} hp=${Math.round(bot.health * 10) / 10}${eaten.ranOut ? ' — the pocket ran out of food' : ''}.`);
+  }
   // THE SPOILS — battle_stations collects drops after winning a fight, the fleet's mob-drop supply
   // route. Gated on 'cleared'. After the finally (Law 8).
   //
@@ -856,6 +1046,12 @@ async function engageThreat(bot, firstBoard, source) {
       `${spoils.left ? `, ${spoils.left} left (window closed)` : ''}. ` +
       `Nearest hostile ${dSpoils == null ? 'none in range' : `${dSpoils.toFixed(1)}b`}.`);
   }
+  // THE PAD MENDED — a blast this body saw on the base is laid again, its top layer only (blast_mender), whatever opened
+  // the wave: the arena's blasts break no ground (mob_griefing off), so its bench cell owes nothing.
+  if (require('@api/blast_mender').mendable(bot)) {
+    const m = await require('@api/blast_mender').mend(bot);
+    watcher.summary('battle_stations', `🧱 BLAST_MEND laid=${m.laid} failed=${m.failed} left=${m.left}${m.why ? ` why=${m.why}` : ''}.`);
+  }
   // WHICH ENTITY DIED, AND WHICH WALKED — ON EVERY EXIT, NOT ONLY FOR THE SENTRY. Loop detection off
   // the `readable` string (Law 11).
   const entityNames = result ? result.entityNames : {};
@@ -872,7 +1068,8 @@ async function engageThreat(bot, firstBoard, source) {
       `Returning to the sentry loop (its own judge owns the replan decision). ` + _dTail());
     return sentryReport(outcome, result);
   }
-  // NO 'stuck' AND NO 'yield' BRANCH — nothing sets either outcome (Law 16).
+  // NO 'stuck' BRANCH — nothing sets it. A 'yielded' wave (a peer's claim took every mob) replans like any other.
+  if (outcome === 'fled' || outcome === 'died') require('@thinking/dispatcher.js').noteFightFled();
   watcher.summary('battle_stations', `Engagement ${outcome} — ${entitiesText} — abandoning caller to recursive_judge for replan. ` + _dTail());
   // The ids ride in the readable (Law 11).
   return abandonToJudge(`battle_stations: engagement ${outcome} (${entitiesText}) — replanning from current state`);
@@ -884,7 +1081,7 @@ async function engageThreat(bot, firstBoard, source) {
 // caller abandons.
 //
 // THE WHOLE CAN-I-FIGHT-AND-SHOULD-I DECISION LIVES HERE (Law 16, Invariant B).
-async function battleStations(bot, source) {
+async function battleStations(bot, source, before) {
   // Re-entrancy guards (Law 13).
   if (engaging) return source === 'sentry' ? sentryReport('busy_engaging', null) : undefined;
 
@@ -903,6 +1100,7 @@ async function battleStations(bot, source) {
     // (Law 13, Law 4).
 
     // The watchdog may already own this death (Law 4).
+    if (before) before();
     if (_deathRouted) {
       require('@kernel/foreman_link').abandonComputationWorkspace();
       watcher.warn('battle_stations',
@@ -932,14 +1130,24 @@ async function battleStations(bot, source) {
   // over and never returns; with nothing to fight it returns.
   // READ, NOT SCANNED — one main scanner for monsters (Law 16).
   const scan = crewBoard.readCommander();
-  if (scan.engage) { releaseJobClaim(source); return engageThreat(bot, scan, source); }
+  // A sweep older than the last wave's end describes the field before that wave's kills.
+  const fresh = scan.sweptAt === null || scan.sweptAt > _waveEndedAt;
+  if (scan.engage && fresh) {
+    if (before) before();
+    if (source !== 'sentry') require('@thinking/dispatcher.js').noteFightTookJob();
+    releaseJobClaim(source);
+    return engageThreat(bot, scan, source);
+  }
   // A DECLINE IS RECORDED WHEN IT CHANGES, NOT WHEN IT REPEATS (Law 5).
   if (scan.hostiles && scan.hostiles.length) {
     const self = bot.entity.position;
     const inRange = scan.hostiles.filter(h => withinAggroRange(self, h.position, h.name));
+    // 'no_sightline' only when a cast was paid and failed; otherwise no line was asked this sweep (a throttled
+    // re-cast, a marked mob, or a provoked-only species that waits for its blow) and it is 'awaiting_strike'.
     const why = !inRange.length ? 'out_of_aggro_range'
       : inRange.some(h => h.aggroed) ? 'aggroed_but_not_selected'
-      : 'no_sightline';
+      : inRange.some(h => h.seen === false) ? 'no_sightline'
+      : 'awaiting_strike';
     if (why !== _lastDeclineWhy) {
       _lastDeclineWhy = why;
       // The nearest hostile only. `dh`/`dy`: the gate judges the two axes separately (architect_config's cylinder).
@@ -959,28 +1167,118 @@ async function battleStations(bot, source) {
   }
   // The quiet pass is stated explicitly (Law 13, Law 25).
   if (source === 'sentry') return sentryReport('clear', null);
+
 }
 
-// combatCheckpoint — THE GATE A PRIMITIVE CALLS. A bypass for when the gate is already inside
-// battle_stations, and a clock that stops a primitive paying a full check per call. Bound to a STEP
-// count, not wall time (Law 16). One clock for the whole process (Law 6). Never returns on a threat
-// (Law 15, Invariant B).
-const CHECKPOINT_MS = 500;
-let _lastCheckpointAt = 0;
+// ── NIGHT RECALL ─────────────────────────────────────────────────────────────────────────────────────
+// Asked on every inline check (combatCheckpoint, below), never on a clock of its own: each step walked, block dug
+// or placed asks it. An active job the board would hold after dusk now (job_gates.nightRecall) is interrupted: its
+// claim is released and the body goes home to its idle spot (idle_park), whose heartbeat then asks the board for
+// night work from there.
+// nightRecallOf() → { job, why } for the claimed job the night would hold now, or null. Cheap by day: the clock first.
+function nightRecallOf() {
+  if (!require('@thinking/architect_config').isNightTime()) return null;
+  const magnet = require('@kernel/corporate_headquarters').readBoardroomChair(process.env.BOT_ID || 'default', {})?.magnet;
+  const hold = require('@thinking/job_gates').nightRecall(magnet);
+  if (!hold) return null;
+  return { job: `${magnet.type}/${magnet.what}`, why: typeof hold === 'string' ? hold : `${hold.why}: ${hold.detail}` };
+}
+function recallHome(recall, source) {
+  watcher.summary('battle_stations', `NIGHT_RECALL job=${recall.job} why=${recall.why} source=${source || 'none'} — going home to the idle spot.`);
+  releaseJobClaim(source);
+  routeSignal('battle_stations', 'idle_park', { idle_cause: 'night_recall', readable: `battle_stations: night recall — ${recall.job} (${recall.why}) → idle_park` });
+  return new Promise(() => {});
+}
 
-// `opts.before` — RELEASE WHAT THE CALLER IS HOLDING (Law 8).
+// combatCheckpoint — THE GATE A PRIMITIVE CALLS, on every call: each one reads the commander's board, which the
+// commander writes every tick, so a threat it has named is answered at the caller's next step. A bypass for when
+// the gate is already inside battle_stations. Never returns on a threat (Law 15, Invariant B).
+// THE BREATH OVERRIDE IS THE ONE TAKING THAT RETURNS: the body is lent to survival until its breath is full, then
+// handed back with the caller's job still its own; the gate returns { took: 'breath', moved } so a caller holding a
+// route (navigator) re-plans from where the body now floats.
+//
+// `opts.before` — RELEASE WHAT THE CALLER IS HOLDING (Law 8), run only when the gate takes the body: a fight,
+// a death, a night recall or the breath override. A quiet check leaves the caller's controls as they are.
 async function combatCheckpoint(bot, source, opts) {
+  // THE BREATH OVERRIDE: survival's low-air notice (underwater_swimming) is answered here, at the caller's step. The
+  // job's claim is kept: the body is lent to survival until its breath is full and comes back to the same job.
+  // The bypass for the rescue's own digs and places, and for any escape the water unit is running: water survival owns
+  // the body until it hands it back.
+  const swimming = require('@locomotion/underwater_swimming');
+  if (rescuing || swimming.escaping(bot)) return;
+  if (swimming.status(bot).pending) {
+    if (opts && opts.before) opts.before();
+    rescuing = true;
+    const from = bot.entity.position.floored();
+    let surfaced;
+    await withCleanup('battle_stations', 'breath override', async () => {
+      surfaced = await swimming.rescue(bot);
+    }, () => { rescuing = false; });
+    if (!surfaced) {
+      watcher.error('battle_stations', `Water survival stopped work: ${swimming.status(bot).reason}; breathable air was not reached.`);
+      return new Promise(() => {});
+    }
+    const to = bot.entity.position.floored();
+    watcher.summary('battle_stations', `BREATH_RETURNED source=${source || 'none'} from=(${from.x},${from.y},${from.z}) to=(${to.x},${to.y},${to.z}) — the job goes on.`);
+    return { took: 'breath', moved: !from.equals(to) };
+  }
   // The bypass. Combat's own seats drive and dig through this same code.
   if (engaging) return;
-  const now = Date.now();
-  if (now - _lastCheckpointAt < CHECKPOINT_MS) return;
-  _lastCheckpointAt = now;
-  if (opts && opts.before) opts.before();
-  return battleStations(bot, source);
+  const recall = source === 'sentry' ? null : nightRecallOf();
+  if (recall) {
+    if (opts && opts.before) opts.before();
+    return recallHome(recall, source);
+  }
+  const fought = await battleStations(bot, source, opts && opts.before);
+  // THE PAD MENDED BETWEEN JOBS: a blast that opened no fight (the body was working, or the creeper came on it unseen)
+  // is laid again at the next step with no threat named, before the job goes on; the job is discarded and planned
+  // afresh, as a fight's is. The sentry's bench cell owes nothing (the arena's blasts break no ground).
+  if (!mending && source !== 'sentry' && require('@api/blast_mender').mendable(bot)) {
+    if (opts && opts.before) opts.before();
+    releaseJobClaim(source);
+    let m = null;
+    mending = true;
+    await withCleanup('battle_stations', 'blast mend between jobs', async () => {
+      m = await require('@api/blast_mender').mend(bot);
+    }, () => { mending = false; });
+    watcher.summary('battle_stations', `🧱 BLAST_MEND laid=${m ? m.laid : 0} failed=${m ? m.failed : 0} left=${m ? m.left : '?'}${m && m.why ? ` why=${m.why}` : ''} between=${source || 'none'}.`);
+    return abandonToJudge('The spawn-proofed ground was mended after a blast; interrupted work discarded, sensing afresh.');
+  }
+  return fought;
+}
+
+// ── A BODY WITH NO CHAIN STANDS GUARD ────────────────────────────────────────────────────────────────────
+// The gate answers a threat at the caller's next step, so a body running no chain (raised and held until the
+// foreman's release, or waiting for its world before its first plan) has no step to answer at. From spawn to its
+// start, such a body checks the commander's board once a second and fights what it names as the sentry does,
+// outcome returned, no chain abandoned. The start waits for a fight in progress to end (endGuard), so no plan
+// drives the body while it fights.
+const GUARD_MS = 1000;
+let _guard = null;   // { timer, fight: Promise | null }
+function standGuard(bot) {
+  if (_guard) return;
+  const guard = { timer: null, fight: null };
+  _guard = guard;
+  guard.timer = require('@utils/timeout_crash').every('battle_stations', 'answer an attack while this body has no chain', () => {
+    if (_guard !== guard || guard.fight || engaging) return;
+    if (!crewBoard.readCommander().engage) return;
+    guard.fight = battleStations(bot, 'sentry').then((r) => {
+      watcher.summary('battle_stations', `HELD_GUARD outcome=${r ? r.outcome : 'none'} — this body fought before its start.`);
+      guard.fight = null;
+    });
+  }, GUARD_MS);
+}
+// endGuard() — the body's start: the guard stands down, and a fight it opened finishes first.
+async function endGuard() {
+  if (!_guard) return;
+  const guard = _guard;
+  _guard = null;
+  require('@utils/timeout_crash').stop(guard.timer);
+  if (guard.fight) await guard.fight;
 }
 
 module.exports = {
-  battleStations, combatCheckpoint, CHECKPOINT_MS, armDeathWatch,
+  battleStations, combatCheckpoint, armDeathWatch, standGuard, endGuard,
   combatActivity, IDLE_STALL_MS, IDLE_MOVE_EPSILON,
   // Strike latch read side, for the commander's reactive aggro model (Invariant D).
   struckWithin,

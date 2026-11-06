@@ -1,4 +1,5 @@
 // fragment: compost_executor — feed compostables into a composter and collect the bone meal it yields.
+// The bone meal is picked up off the bin before the visit ends and banked with the drop-off (_collectBoneMeal).
 //
 // THE COMPOST JOB. Every body banks its compostables in the fleet's barrels like
 // any other surplus (inventory_swapper.dumpExcess). When COMPOST_BATCH_MIN of them sit banked,
@@ -16,7 +17,7 @@
 // The composter publishes its fill level 0-8 as a readable blockstate, so nothing about it is tracked in
 // HQ or station_registry beyond the transfer lock (Invariant B — every question here asks the block).
 //
-// Each compostable has a 30% chance to raise the level by one; seven levels make one bone meal.
+// Each sapling or leaf litter has a 30% chance to raise the level by one, an apple 65%; seven levels make one bone meal.
 //
 // Only items in COMPOST_INPUTS that no standing stock row still wants are fed (`surplusCompostable`).
 
@@ -27,9 +28,12 @@ const { groupToAllItems, readTransposeOrigin, sleep } = require('@utils/fragment
 const { routeToJudge } = require('@utils/signal_utils');
 const TAG = 'compost_executor';
 
-// Opt-in list: only these item groups are fed to a composter. `wheat_seeds` is deliberately excluded —
-// reserved for planting.
-const COMPOST_INPUTS = ['saplings', 'leaf_litter'];
+// Opt-in list: only these item groups are fed to a composter. An apple raises the level 65% of the time, a sapling or
+// leaf litter 30%. Wheat seeds (30%) are not on it: they are composted only past the stack storage keeps for planting,
+// and only once the first wheat field is sown (SEED, seedSurplus below).
+const COMPOST_INPUTS = ['saplings', 'compostables', 'apple'];
+const LEAF_LITTER = 'leaf_litter';
+const SEED = 'wheat_seeds';
 
 // How far from a blueprint centre this looks for a placed composter.
 const COMPOST_SEARCH_RADIUS = 24;
@@ -65,7 +69,6 @@ function isCompostable(itemName) {
 // surplusCompostable(itemName) → compostable AND no standing stock row still wants it (a still-wanted
 // sapling is stock arriving late, not waste). Reads the crew's selected stock rows (Law 16).
 function surplusCompostable(itemName) {
-  if (!require('@thinking/requested_work').activeWorkRequirements().includes('compost')) return false;
   if (!isCompostable(itemName)) return false;
   for (const row of require('@thinking/requested_work').activeStockRows()) {
     if (row.deficit_below == null) continue;
@@ -76,19 +79,55 @@ function surplusCompostable(itemName) {
 }
 
 // bankedCompostables() → [{ name, count }] of surplus compostables sitting in the fleet's chests, by
-// concrete item name — what one compost job withdraws. Asked of the inventory lens (Invariant B).
+// concrete item name — what one compost job withdraws. Asked of the inventory lens (Invariant B). Of a flower,
+// storage keeps what the wool still owed will be dyed with (flock_colors.flowersKept: one flower per animal a color
+// asks for), and of a farm sapling the tree farm's bank (sapling_planter.bankKept): only what lies past it is compost.
 function bankedCompostables() {
   const inventoryLens = require('@kernel/inventory_lens');
+  const { DYE_STOCK } = require('@thinking/architect_config');
+  const flowers = require('@api/flock_colors').flowersKept();
   const banked = [];
   for (const token of COMPOST_INPUTS) {
     const members = groupToAllItems(token);
     for (const name of (Array.isArray(members) && members.length ? members : [token])) {
       if (!surplusCompostable(name)) continue;
-      const count = inventoryLens.inChests(name);
+      const kept = DYE_STOCK.flowers.includes(name) ? (flowers[name] || 0) : require('@api/sapling_planter').bankKept(name);
+      const count = inventoryLens.inChests(name) - kept;
       if (count > 0) banked.push({ name, count });
     }
   }
+  const seeds = seedSurplus(inventoryLens.inChests(SEED));
+  if (seeds > 0) banked.push({ name: SEED, count: seeds });
   return banked;
+}
+
+// seedSurplus(chestSeeds, pocketSeeds = 0) → the wheat seeds past the stack storage keeps (COMPOST_SEED_KEEP), counting
+// what the chests hold first; 0 until the first wheat field is sown (farming_integrity.firstFieldSown), since until then
+// every seed is the field's.
+function seedSurplus(chestSeeds, pocketSeeds = 0) {
+  if (!require('@perception/farming_integrity').firstFieldSown()) return 0;
+  const { COMPOST_SEED_KEEP } = require('@thinking/architect_config');
+  return Math.max(0, chestSeeds + pocketSeeds - COMPOST_SEED_KEEP);
+}
+
+// compostSurplusSeeds(bot, excess) → the seeds fed. THE HARVEST'S SEEDS GO STRAIGHT TO THE BIN: a body banking its haul
+// (inventory_swapper.dumpExcess) feeds the composter the seeds of `excess` (what it would bank) that storage's stack does
+// not need, so they never take a chest slot. A bin held by a peer or not yet built leaves them to be banked, and the
+// compost batch takes them from the chests (bankedCompostables).
+async function compostSurplusSeeds(bot, excess) {
+  const count = Math.min(excess, seedSurplus(require('@kernel/inventory_lens').inChests(SEED), excess));
+  if (count <= 0) return 0;
+  const r = await feedFromPocket(bot, [{ name: SEED, count }]);
+  return r.fed || 0;
+}
+
+// compostLeafLitter(bot, count) → the leaf litter fed. LEAF LITTER NEVER TAKES A CHEST SLOT: every deposit
+// (inventory_swapper._depositPlanned) brings it here. A bin held by a peer or not yet built leaves it in the pocket for
+// the next drop-off.
+async function compostLeafLitter(bot, count) {
+  if (count <= 0) return 0;
+  const r = await feedFromPocket(bot, [{ name: LEAF_LITTER, count }]);
+  return r.fed || 0;
 }
 
 // The composter's lock id — the same `x|y|z` shape station_registry mints for a chest, fed to the same
@@ -102,24 +141,23 @@ function composterLockId(block) {
 function _home() { return require('@kernel/bot_mandate').homeBlueprint(); }
 
 // findComposters(bot) → every placed composter within COMPOST_SEARCH_RADIUS of the crew's home, nearest
-// the home first. Searches the world directly — the block is its own record, not a registry entry.
-function findComposters(bot) {
+// the home first. Searches the world directly — the block is its own record, not a registry entry — by the
+// fleet's ring search (@utils/ring_scan) outward from the home, within COMPOST_BAND of its height.
+const COMPOST_BAND = 16;
+async function findComposters(bot) {
   const centre = readTransposeOrigin(_home());
   if (!centre || typeof centre.x !== 'number') return [];
-  // Vec3, not the plain {x,y,z} readTransposeOrigin returns: mineflayer calls `.floored()` on `point`,
-  // and a bare object throws a TypeError from inside findBlocks. Same conversion job_board and
-  // surface_filter use at their own findBlock call sites.
+  const { found } = await require('@utils/ring_scan').nearestBlocks(bot, {
+    names: ['composter'], center: centre, reach: COMPOST_SEARCH_RADIUS,
+    band: { low: centre.y - COMPOST_BAND, high: centre.y + COMPOST_BAND },
+    source: 'compost_executor.bins',
+  }, 8);
   const Vec3 = require('vec3');
-  return bot.findBlocks({
-    matching: (b) => b && b.name === 'composter',
-    point: new Vec3(centre.x, centre.y, centre.z),
-    maxDistance: COMPOST_SEARCH_RADIUS,
-    count: 8,
-  }).map((p) => bot.blockAt(p)).filter(Boolean);
+  return found.map((o) => bot.blockAt(new Vec3(o.position.x, o.position.y, o.position.z))).filter(Boolean);
 }
 
 // findComposter(bot) → the nearest placed composter to the crew's home, or null.
-function findComposter(bot) { return findComposters(bot)[0] || null; }
+async function findComposter(bot) { return (await findComposters(bot))[0] || null; }
 
 // composterDeclaredAtAnchor() → the anchor index where the home blueprint declares a composter, or
 // null if it declares none — distinguishing a build not yet reached from a blueprint that never named
@@ -157,6 +195,23 @@ async function reach(bot, block) {
 // settle before every level read is what makes that read mean anything (same trap farm_executor's
 // SETTLE_MS covers for the hoe).
 const SETTLE_MS = 100;
+
+// ── THE BONE MEAL COMES OUT OF THE TOP, ONTO THE GROUND ─────────────────────────────────────────────────
+// Emptying a full composter does not hand the bone meal over: the block throws it out of its top as an item,
+// which the game will not let a body pick up for half a second and which can roll off the bin. A harvest is
+// only bone meal in the crew's hands once the pocket holds it, so the visit waits at the bin for it
+// (PICKUP_WAIT_MS) and then walks onto whatever is still lying there (drop_collector) before it lets the bin go.
+const PICKUP_WAIT_MS = 1500;
+const _boneMealHeld = (bot) => bot.inventory.items().filter(i => i && i.name === 'bone_meal').reduce((n, i) => n + i.count, 0);
+
+// _collectBoneMeal(bot, heldBefore, harvested) → how many of the harvested bone meal reached the pocket.
+async function _collectBoneMeal(bot, heldBefore, harvested) {
+  const gained = () => _boneMealHeld(bot) - heldBefore;
+  const until = Date.now() + PICKUP_WAIT_MS;
+  while (gained() < harvested && Date.now() < until) await sleep(SETTLE_MS);
+  if (gained() < harvested) await require('@api/drop_collector').collectNearby(bot);
+  return Math.max(0, gained());
+}
 
 // _harvest(bot, block) → true if a bone meal actually came out. Empty hand is the harvest verb; a
 // compostable still held would feed the block instead. Re-senses after the click since activateBlock
@@ -236,7 +291,7 @@ function _gaveUp(since, result) {
 async function feedFromPocket(bot, want) {
   if (!Array.isArray(want) || !want.length) return { ok: true, fed: 0, harvested: 0, reason: 'nothing_to_feed' };
 
-  const bins = findComposters(bot);
+  const bins = await findComposters(bot);
   if (!bins.length) {
     const anchor = composterDeclaredAtAnchor();
     return anchor == null
@@ -268,15 +323,18 @@ async function feedFromPocket(bot, want) {
   if (composterLevel(block) == null) { release('composter gone'); return _gaveUp(since, { ok: false, fed: 0, harvested: 0, reason: 'composter_gone_on_arrival' }); }
   const waitedSec = _waited(since);
 
+  const boneBefore = _boneMealHeld(bot);
   const r = await _feedLoop(bot, block, want);
+  const collected = r.harvested ? await _collectBoneMeal(bot, boneBefore, r.harvested) : 0;
   release('composter visit done');
   // States what the block did, not what was attempted (Law 25) — at a 30% rate, zero level gain from a
   // full feed is an honest, ordinary outcome.
-  watcher.summary(TAG, `${TAG}: fed ${r.fed} item(s) into the composter${r.harvested ? `, harvested ${r.harvested} bone_meal` : ''}, `
+  watcher.summary(TAG, `${TAG}: fed ${r.fed} item(s) into the composter`
+    + `${r.harvested ? `, harvested ${r.harvested} bone_meal and picked up ${collected}${collected < r.harvested ? ` (${r.harvested - collected} left on the ground)` : ''}` : ''}, `
     + `level ${r.before} → ${r.after}`
     + `${r.blocked ? ' (stopped early — the composter stopped responding)' : ''}`
     + ` after ${waitedSec}s waiting to get in.`);
-  return { ok: true, fed: r.fed, harvested: r.harvested, blocked: r.blocked, reason: null };
+  return { ok: true, fed: r.fed, harvested: r.harvested, collected, blocked: r.blocked, reason: null };
 }
 
 function _route(success, reason, extra = {}) {
@@ -292,8 +350,10 @@ async function receive(signalType) {
   const bot = global.bot;
   const { retrieveItems, dropOffHaul } = require('@api/inventory_swapper');
 
-  if (!findComposters(bot).length) { _route(false, 'no composter standing to feed'); return; }
+  if (!(await findComposters(bot)).length) { _route(false, 'no composter standing to feed'); return; }
 
+  // The seeds this body already carried are not the batch's: only the ones it withdraws are fed.
+  const seedsCarried = bot.inventory.items().filter(i => i.name === SEED).reduce((n, i) => n + i.count, 0);
   for (const { name, count } of bankedCompostables()) {
     const got = await retrieveItems(bot, name, count);
     if (got === undefined) return;
@@ -303,6 +363,8 @@ async function receive(signalType) {
   for (const it of bot.inventory.items()) {
     if (surplusCompostable(it.name)) held[it.name] = (held[it.name] || 0) + it.count;
   }
+  const seedsWithdrawn = bot.inventory.items().filter(i => i.name === SEED).reduce((n, i) => n + i.count, 0) - seedsCarried;
+  if (seedsWithdrawn > 0) held[SEED] = seedsWithdrawn;
   // A crew that replants keeps its primary sapling's pocket stack: only what it holds past that is fed.
   for (const keep of require('@api/sapling_planter').pocketRow()) {
     if (!(keep.item in held)) continue;
@@ -315,8 +377,8 @@ async function receive(signalType) {
   const r = await feedFromPocket(bot, want);
   const drop = await dropOffHaul(bot);
   if (drop?.abandoned) return;
-  _route(!!r.ok, r.ok ? `fed ${r.fed} compostable(s), harvested ${r.harvested} bone_meal` : `fed nothing — ${r.reason}`,
-    { fed: r.fed, harvested: r.harvested });
+  _route(!!r.ok, r.ok ? `fed ${r.fed} compostable(s), harvested ${r.harvested} bone_meal, banked ${r.collected || 0}` : `fed nothing — ${r.reason}`,
+    { fed: r.fed, harvested: r.harvested, collected: r.collected || 0 });
 }
 
 module.exports = {
@@ -324,5 +386,8 @@ module.exports = {
   composterLevel,
   isCompostable,
   bankedCompostables,
+  compostSurplusSeeds,
+  compostLeafLitter,
+  LEAF_LITTER,
   findComposter,
 };

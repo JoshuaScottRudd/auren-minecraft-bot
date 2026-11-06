@@ -18,6 +18,12 @@
 //   node lanista.js --bot=AurenBot --mob=zombie --count=3    # three at once, spread across bearings
 //   node lanista.js --bot=AurenBot --wave=zombie:1,spider:1,skeleton:1@bow    # one MIXED wave
 //   node lanista.js --bot=AurenBot --kit=wooden_sword,wooden_axe --at=-8,65,16 # author the body too
+//   node lanista.js --bot=AurenBot --mob=skeleton --hand=minecraft:bow --moat=3 --kit=stone_sword,shield,oak_planks*32
+//                                                            # an opponent no walk reaches (carveMoat)
+//   node lanista.js --bot=AurenBot --wave=zombie:1,skeleton:1@bow --opposed   # the two on opposite sides
+//   node lanista.js --bot=AurenBot --mob=enderman --provoke  # a neutral mob turned on the body first
+//   node lanista.js --bot=AurenBot --buddy=TessaBot --buddy-gap=1 --kit=iron_axe,shield,iron_helmet,iron_chestplate,iron_leggings,iron_boots
+//                                                            # two bodies, same kit, side by side (0 stacks them)
 //   node lanista.js --cleanup                                # kill anything this tool left behind
 // Then: node Auren_Bot/monitoring/trace_monitor.js --combat --bot=AurenBot
 // Exit codes: 0 every round ran · 2 a round could not be run (terrain, arming, or the bot out of range)
@@ -27,7 +33,7 @@
 require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/lanista.js');
 
 const {
-  ARENA_TAG, SCOUT_NAME, SITING, WORLD, AGGRO_RANGE, AGGRO_VERTICAL_RANGE, aggroRangeFor,
+  ARENA_TAG, SCOUT_NAME, SITING, WORLD, AGGRO_RANGE, AGGRO_VERTICAL_RANGE, engageRangeFor,
   arena, createScout, fmt, log, pathfinding, rconLink, round2, sleep,
 } = require('./lanista_shared');
 // The bot's combat record has exactly one reader; this is it (Law 16).
@@ -55,6 +61,17 @@ function parseArgs(argv) {
       case 'kit': a.kit = v.split(',').map(s => s.trim()).filter(Boolean); break;
       case 'at': a.at = parseCell(v); break;
       case 'biome': a.biome = v; break;
+      case 'moat': a.moat = parseInt(v, 10); break;     // trench width, see carveMoat
+      case 'pool': a.pool = true; break;                // a sunk water pool under each mob's cell, for a drowned in water
+      case 'pillar': a.pillar = true; break;            // a cover column toward the mob, see carveMoat
+      case 'bare': a.bare = true; break;                // the island cleared above its floor, see carveMoat
+      case 'hold': a.hold = parseInt(v, 10); break;     // seconds the field stands after the wave, see runWave
+      case 'opposed': a.opposed = true; break;          // each mob on the bearing farthest from the others, see siteMobCells
+      case 'hp': a.hp = parseFloat(v); break;         // the round opens on a body wounded to this health, see woundBot
+      case 'provoke': a.provoke = true; break;          // every arena mob summoned angry at the bot, see angerNbt
+      case 'same-ground': a.sameGround = true; break;   // later rounds reuse the first round's arena, see runWave
+      case 'buddy': a.buddies = v.split(',').filter(Boolean); break; // more bodies in the same fight, see placeBuddy
+      case 'buddy-gap': a.buddyGap = parseFloat(v); break; // blocks between the two at the opening, 0 stacks them
       default: break;
     }
   }
@@ -63,7 +80,7 @@ function parseArgs(argv) {
   return a;
 }
 
-// A mob must be sited within the aggro range the bot honours for that species — `aggroRangeFor` /
+// A mob must be sited within the aggro range the bot honours for that species — `engageRangeFor` /
 // architect_config's per-species table is the one route for that number (Law 16). Checked at parse time,
 // before any placement, purge, survey or summon is spent (Law 13).
 //
@@ -79,7 +96,7 @@ function rangeFitsAggro(wave, range) {
   // The tightest species in the wave decides (Law 25).
   let worst = null;
   for (const g of wave) {
-    const r = aggroRangeFor(g.mob);
+    const r = engageRangeFor(g.mob);
     if (!worst || r < worst.r) worst = { r, mob: g.mob };
   }
   const max = worst.r - SITE_BAND_SLACK;
@@ -177,18 +194,26 @@ async function placeBot(rcon, botName, cell, { tries = 20, waitMs = 250 } = {}) 
 // The inventory is wiped first (`clear`) so the kit is the body's whole loadout. Slot order is the
 // kit's order: `hotbar.0`, `hotbar.1`, …; `shield` goes to the offhand, where the fleet's shield reflex
 // reads it from. The verdict is always the server's Inventory NBT, never the command's reply (Law 23/25).
+// `item*N` carries a stack of N (`dirt*32`: the blocks a cover wall is set from); a bare item is one.
 const OFFHAND_ITEMS = new Set(['shield']);
+// Armour is worn, not carried: each piece goes to its own armour slot.
+const ARMOR_SLOT = [[/_helmet$/, 'armor.head'], [/_chestplate$/, 'armor.chest'], [/_leggings$/, 'armor.legs'], [/_boots$/, 'armor.feet']];
+const wornSlot = (id) => { const hit = ARMOR_SLOT.find(([re]) => re.test(id)); return hit ? hit[1] : null; };
 async function kitBot(rcon, botName, kit) {
-  const items = kit.map(i => (i.startsWith('minecraft:') ? i : `minecraft:${i}`));
+  const stacks = kit.map((spec) => {
+    const [name, n] = String(spec).split('*');
+    return { id: name.startsWith('minecraft:') ? name : `minecraft:${name}`, count: n ? parseInt(n, 10) : 1 };
+  });
+  const items = stacks.map(s => s.id);
   await rcon.command(`clear ${botName}`);
   let hotbar = 0;
-  for (const id of items) {
-    const slot = OFFHAND_ITEMS.has(id.replace(/^minecraft:/, '')) ? 'weapon.offhand' : `hotbar.${hotbar++}`;
-    await rcon.command(`item replace entity ${botName} ${slot} with ${id} 1`);
+  for (const { id, count } of stacks) {
+    const slot = OFFHAND_ITEMS.has(id.replace(/^minecraft:/, '')) ? 'weapon.offhand' : wornSlot(id) || `hotbar.${hotbar++}`;
+    await rcon.command(`item replace entity ${botName} ${slot} with ${id} ${count}`);
   }
-  // Both halves of the body's carry: the 36 inventory slots and the offhand (a separate NBT compound).
+  // Both halves of the body's carry: the 36 inventory slots and the worn slots (a separate NBT compound).
   const inv = (await rcon.command(`data get entity ${botName} Inventory`) || '').trim();
-  const off = (await rcon.command(`data get entity ${botName} equipment.offhand`) || '').trim();
+  const off = (await rcon.command(`data get entity ${botName} equipment`) || '').trim();
   const seen = `${inv} ${off}`;
   const missing = items.filter(id => !seen.includes(id));
 
@@ -221,6 +246,56 @@ async function healBot(rcon, botName) {
   return { ok: false, health: last.known ? last.health : null, was: before.known ? before.health : null };
 }
 
+// ── OPEN THE ROUND WOUNDED ───────────────────────────────────────────────────────────────────────────
+// `--hp=N`: after the heal, the body is dealt 20 − N generic damage (the server's own /damage), so a round tests the
+// body at a health it must defend (self_preservation's flee line). Read back off the server (Law 23).
+async function woundBot(rcon, botName, hp) {
+  await rcon.command(`damage ${botName} ${20 - hp} minecraft:generic`);
+  for (let i = 0; i < 10; i++) {
+    await sleep(300);
+    const v = await readBotVitals(rcon, botName);
+    if (v.known && v.health <= hp + 0.5) return { ok: true, health: v.health };
+  }
+  const last = await readBotVitals(rcon, botName);
+  return { ok: false, health: last.known ? last.health : null };
+}
+
+// ── placeBuddy — THE SECOND BODY, BESIDE THE FIRST, KITTED AND HEALED THE SAME ──────────────────────────
+// Each stands `gap` blocks further along x than the last, on the nearest cell the server says is open: two air cells
+// on a floor that is neither leaves nor water. A body teleported blind landed inside a trunk and suffocated.
+const STAND_SEARCH_X = 6, STAND_SEARCH_Z = 3, STAND_SEARCH_Y = 4;
+async function openStand(rcon, x0, y0, z0) {
+  for (let dx = 0; dx <= STAND_SEARCH_X; dx++) {
+    for (const dz of Array.from({ length: 2 * STAND_SEARCH_Z + 1 }, (_, i) => (i % 2 ? (i + 1) / 2 : -i / 2))) {
+      for (const dy of Array.from({ length: 2 * STAND_SEARCH_Y + 1 }, (_, i) => (i % 2 ? (i + 1) / 2 : -i / 2))) {
+        const [x, y, z] = [x0 + dx, y0 + dy, z0 + dz];
+        const r = (await rcon.command(`execute if block ${x} ${y} ${z} minecraft:air if block ${x} ${y + 1} ${z} minecraft:air `
+          + `unless block ${x} ${y - 1} ${z} minecraft:air unless block ${x} ${y - 1} ${z} #minecraft:leaves unless block ${x} ${y - 1} ${z} minecraft:water`)) || '';
+        if (/passed/i.test(r)) return { x, y, z };
+      }
+    }
+  }
+  return null;
+}
+
+async function placeBuddy(rcon, args, name, cell, nth) {
+  const watch = await awaitStandingWatch(name);
+  if (!watch.ok) return { ok: false, reason: `${name}: ${watch.reason}`, cause: 'bot' };
+  const gap = Number.isFinite(args.buddyGap) ? args.buddyGap : 1;
+  const stand = gap === 0 ? cell : await openStand(rcon, cell.x + gap * nth, cell.y, cell.z);
+  if (!stand) return { ok: false, reason: `no open cell for ${name} near ${cell.x + gap * nth},${cell.y},${cell.z}`, cause: 'terrain' };
+  const put = await placeBot(rcon, name, stand);
+  if (!put.ok) return { ok: false, reason: put.why, cause: 'terrain' };
+  const at = await readBotVitals(rcon, name);
+  if (args.kit) {
+    const k = await kitBot(rcon, name, args.kit);
+    if (!k.ok) return { ok: false, reason: `${name} is missing ${k.missing.join(', ')} after the re-kit`, cause: 'bench' };
+  }
+  const healed = await healBot(rcon, name);
+  if (!healed.ok) return { ok: false, reason: `${name} would not heal to full (hp ${healed.health})`, cause: 'bench' };
+  return { ok: true, position: at.position };
+}
+
 // readBiome — the fight's biome, off the SCOUT's chunk cache. Returns null when the column is not
 // loaded; null is never a biome name (Law 23).
 function readBiome(scout, cell) {
@@ -237,6 +312,10 @@ async function readArenaMobs(rcon) {
 
 // applyWorld — author the conditions, then READ THEM BACK (Law 23). The gamerule goes first, before time.
 async function applyWorld(rcon, w) {
+  // NO WILD MOBS: lanista is an isolated test, so the world spawns nothing and every hostile in a round is one this
+  // tool summoned. The rule's prior value is read first, so `close()` hands the world back as it was found.
+  const spawningBefore = ((await rcon.command('gamerule spawn_mobs')) || '').trim();
+  await rcon.command('gamerule spawn_mobs false');
   await rcon.command(`gamerule advance_time ${w.daylightCycle}`);
   await rcon.command(`time set ${w.time}`);
   await rcon.command(`weather ${w.weather} 1000000`);
@@ -244,10 +323,13 @@ async function applyWorld(rcon, w) {
   // mob_griefing is READ here, not set — authored once at server bring-up by fleet_control's
   // REQUIRED_GAMERULES (Law 16). `combat_lens.detonations` reads the server's `explosion` packet.
   return {
-    time: ((await rcon.command('time query daytime')) || '').trim(),
+    // 26.1 reads the time of day as the `day` timeline (`time query daytime` is gone).
+    time: ((await rcon.command('time query day')) || '').trim(),
     difficulty: ((await rcon.command('difficulty')) || '').trim(),
     cycle: ((await rcon.command('gamerule advance_time')) || '').trim(),
     griefing: ((await rcon.command('gamerule mob_griefing')) || '').trim(),
+    spawning: ((await rcon.command('gamerule spawn_mobs')) || '').trim(),
+    spawningBefore,
   };
 }
 
@@ -294,7 +376,7 @@ function reachabilityFor(scout, maxNodes = REACH_MAX_NODES) {
 // asked and got are both returned (Law 25). The lift stands the mob one bot-height above the bot, a
 // CONTROL, with a recorded fallback (`liftFellBack`). Does not choose the anchor — `botCell` arrives
 // already decided (see siteArena). `cache` is a cost dial only.
-async function siteMobCells(scout, botCell, want, range, lift = 0, cache = null) {
+async function siteMobCells(scout, botCell, want, range, lift = 0, cache = null, opposed = false) {
   const dials = { blueprint: SITING.blueprint, flatness: SITING.flatness };
   if (SITING.reachGate) dials.reach = reachabilityFor(scout);
   const band = range > 0 ? { minDistance: Math.max(2, range - 2), maxDistance: range + 2 } : {};
@@ -330,7 +412,26 @@ async function siteMobCells(scout, botCell, want, range, lift = 0, cache = null)
   const usable = liftFellBack ? pool : lifted;
 
   const cells = [];
-  if (range > 0) {
+  if (range > 0 && opposed) {
+    // `--opposed`: the first mob takes the box nearest the asked range; each next one takes, among the boxes within
+    // 2b of it, the one whose bearing from the body is farthest from every bearing already taken.
+    const bearing = (b) => Math.atan2(b.z - botCell.z, b.x - botCell.x);
+    const apart = (a, b) => { const d = Math.abs(a - b) % (2 * Math.PI); return d > Math.PI ? 2 * Math.PI - d : d; };
+    const near = usable.filter((b) => Math.abs(b.distance - range) <= 2)
+      .sort((a, b) => Math.abs(a.distance - range) - Math.abs(b.distance - range));
+    const taken = [];
+    for (let i = 0; i < want && near.length; i++) {
+      let best = near[0], bestGap = -1;
+      if (taken.length) {
+        for (const b of near) {
+          const gap = Math.min(...taken.map((t) => apart(bearing(b), t)));
+          if (gap > bestGap) { best = b; bestGap = gap; }
+        }
+      }
+      taken.push(bearing(best));
+      cells.push({ x: best.x, y: best.y, z: best.z, distance: best.distance });
+    }
+  } else if (range > 0) {
     const byWanted = usable.slice().sort((a, b) => Math.abs(a.distance - range) - Math.abs(b.distance - range));
     for (let i = 0; i < want; i++) {
       const box = byWanted[i % byWanted.length];
@@ -362,7 +463,7 @@ async function siteMobCells(scout, botCell, want, range, lift = 0, cache = null)
 //
 // Two passes: pass 1 finds the first proven partner near the origin; pass 2 re-probes that anchor for
 // its whole band, on the same cache. The origin is a starting point, not a constraint.
-async function siteArena(scout, origin, want, range, lift = 0) {
+async function siteArena(scout, origin, want, range, lift = 0, opposed = false) {
   const dials = { blueprint: SITING.blueprint, flatness: SITING.flatness };
   if (SITING.reachGate) dials.reach = reachabilityFor(scout);
   // The ground dial is passed here, not to `siteMobCells`: this pass chooses WHERE the arena is.
@@ -384,7 +485,7 @@ async function siteArena(scout, origin, want, range, lift = 0) {
 
   const anchor = found.pairs[0];
   const botCell = { x: anchor.bot.x, y: anchor.bot.y, z: anchor.bot.z };
-  const sited = await siteMobCells(scout, botCell, want, range, lift, cache);
+  const sited = await siteMobCells(scout, botCell, want, range, lift, cache, opposed);
 
   // NOT AN ENVIRONMENTAL FAILURE — an instrument fault, never reported as terrain (Law 13).
   if (!sited.cells.length) {
@@ -414,8 +515,8 @@ function equipmentNbt(hand) {
 
 // ── A SUMMONED MOB ARRIVES WITH NOTHING ─────────────────────────────────────────────────────────────
 // `/summon` produces a mob with NO equipment. `--hand` is READ BACK, never trusted (Law 23).
-async function summonAt(rcon, mob, cell, hand) {
-  const nbt = `{PersistenceRequired:1b,Tags:["${ARENA_TAG}"]${hand ? equipmentNbt(hand) : ''}}`;
+async function summonAt(rcon, mob, cell, hand, extraNbt = '') {
+  const nbt = `{PersistenceRequired:1b,Tags:["${ARENA_TAG}"]${hand ? equipmentNbt(hand) : ''}${extraNbt}}`;
   const reply = (await rcon.command(`summon minecraft:${mob} ${cell.x + 0.5} ${cell.y} ${cell.z + 0.5} ${nbt}`) || '').trim();
   const ok = !/failed|error|unknown|incorrect/i.test(reply);
 
@@ -432,6 +533,58 @@ async function clearArena(rcon) {
   return rcon.command(`kill @e[tag=${ARENA_TAG}]`);
 }
 
+// ── `--provoke`: A NEUTRAL MOB SUMMONED ANGRY AT THE BOT ────────────────────────────────────────────────
+// An enderman struck from the console (`damage … by <bot>`) took the damage and never turned on the bot, so the anger
+// is authored where the game keeps it: the neutral mob's saved target and end time, under the field names from
+// 1.21.5 on (`angry_at`, `anger_end_time`) and before (`AngryAt`, `AngerTime`). Whether it took is read off the bot's
+// own trace (the commander's `via=angered`), never assumed.
+const ANGER_TICKS = 1200;
+async function angerNbt(rcon, botName) {
+  const uuid = /\[I;\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\]/.exec((await rcon.command(`data get entity ${botName} UUID`)) || '');
+  const tick = /game time is (\d+)/i.exec((await rcon.command('time query gametime')) || '');
+  if (!uuid || !tick) throw new Error(`lanista: --provoke could not read ${botName}'s UUID or the game time`);
+  const id = `[I;${uuid.slice(1, 5).join(',')}]`;
+  const end = parseInt(tick[1], 10) + ANGER_TICKS;
+  log('round', `  provoke: summoned angry at ${botName} ${id} until game tick ${end}`);
+  return `,angry_at:${id},anger_end_time:${end}L,AngryAt:${id},AngerTime:${ANGER_TICKS}`;
+}
+
+// ── THE MOAT — AN OPPONENT THE BODY CAN SEE AND NO WALK REACHES ────────────────────────────────────
+// `--moat=W` carves a square trench ring round the body's stand after the siting proved the opponent reachable:
+// cells MOAT_INNER+1 to MOAT_INNER+W out (chessboard distance), from MOAT_DEPTH under the floor up through head
+// height, so the body stands on an island with the mob outside it, still in sight. The siting's reach gate is
+// what makes the moat the one thing that changed. `--pillar` stands a 3-high stone column two cells toward the
+// mob, so a stand behind it is cover in reach. Authored over RCON and read back (Law 23): every trench column's
+// floor cell must read air. A rollback start restores the ground; a continue start keeps the trench.
+const MOAT_INNER = 3;
+const MOAT_DEPTH = 8;
+async function carveMoat(rcon, cell, width, mobCell, pillar, bare) {
+  const lo = MOAT_INNER + 1, hi = MOAT_INNER + width;
+  const y0 = cell.y - 1 - MOAT_DEPTH, y1 = cell.y + 2;
+  const box = (x0, z0, x1, z1) => `fill ${cell.x + x0} ${y0} ${cell.z + z0} ${cell.x + x1} ${y1} ${cell.z + z1} minecraft:air`;
+  for (const cmd of [box(-hi, -hi, hi, -lo), box(-hi, lo, hi, hi), box(-hi, -MOAT_INNER, -lo, MOAT_INNER), box(lo, -MOAT_INNER, hi, MOAT_INNER)]) {
+    await rcon.command(cmd);
+  }
+  // Read back on the four axis cells of the ring's inner edge, floor level.
+  const probes = [[lo, 0], [-lo, 0], [0, lo], [0, -lo]];
+  const solid = [];
+  for (const [dx, dz] of probes) {
+    const r = ((await rcon.command(`execute if block ${cell.x + dx} ${cell.y - 1} ${cell.z + dz} minecraft:air`)) || '').trim();
+    if (!/passed/i.test(r)) solid.push(`${cell.x + dx},${cell.y - 1},${cell.z + dz}`);
+  }
+  // `--bare`: the island is cleared above its floor (trees, plants), so nothing on it hides the body and the only
+  // cover is what the body sets itself.
+  if (bare) await rcon.command(`fill ${cell.x - MOAT_INNER} ${cell.y} ${cell.z - MOAT_INNER} ${cell.x + MOAT_INNER} ${cell.y + 8} ${cell.z + MOAT_INNER} minecraft:air`);
+  let column = null;
+  if (pillar && mobCell) {
+    const dx = mobCell.x - cell.x, dz = mobCell.z - cell.z;
+    const len = Math.hypot(dx, dz) || 1;
+    column = { x: cell.x + Math.round(2 * dx / len), z: cell.z + Math.round(2 * dz / len) };
+    await rcon.command(`fill ${column.x} ${cell.y} ${column.z} ${column.x} ${cell.y + 2} ${column.z} minecraft:stone`);
+  }
+  return { ok: solid.length === 0, solid, ring: [lo, hi], depth: MOAT_DEPTH, column };
+}
+
 // ── THE WORLD'S OWN HOSTILES ────────────────────────────────────────────────────────────────────────
 // `gamerule spawn_mobs false` stops new spawns only; existing hostiles in loaded chunks are purged here
 // (Law 25). Purged by explicit type, never `type=!player`: animals, villagers, item frames, armour
@@ -446,6 +599,24 @@ const AMBIENT_HOSTILES = [
 ];
 // Wider than AGGRO_RANGE on purpose, so nothing the world owns can walk in mid-wave.
 const PURGE_RADIUS = AGGRO_RANGE * 2;
+
+// THE WILD-MOB CHECK: the round's control is that every hostile near it is this tool's. Counted, never assumed
+// (Law 23), inside WILD_CHECK_RADIUS of the fight cell — wider than any aggro range the bot honours, so a mob
+// that could walk into the fight is counted; a mob in some other body's chunks far off is not this round's.
+const WILD_CHECK_RADIUS = 64;
+// countWildHostiles(rcon, cell) → { total, named: ['zombie×2', …] } of untagged hostiles within the radius.
+async function countWildHostiles(rcon, cell) {
+  const at = `x=${cell.x + 0.5},y=${cell.y},z=${cell.z + 0.5},distance=..${WILD_CHECK_RADIUS}`;
+  let total = 0;
+  const named = [];
+  for (const type of AMBIENT_HOSTILES) {
+    const reply = (await rcon.command(`execute if entity @e[type=${type},tag=!${ARENA_TAG},${at}]`) || '');
+    const m = /count:\s*(\d+)/i.exec(reply);
+    const count = m ? parseInt(m[1], 10) : (/passed/i.test(reply) ? 1 : 0);
+    if (count) { total += count; named.push(`${type}×${count}`); }
+  }
+  return { total, named };
+}
 
 // Returns how many were standing there (Law 6).
 async function purgeAmbientHostiles(rcon, cell) {
@@ -520,10 +691,15 @@ async function awaitStandingWatch(botName, waitMs = WATCH_WAIT_MS) {
 // may end the waiting and may not decide the outcome (Law 26). A fourth break, the stall: engagement is
 // read as an exchange of damage off the server, never proximity or the bot's own claim (Law 26).
 // `stallMs = 0` disables it.
-async function observeFight(rcon, botName, ceilingMs, stallMs = 0) {
+async function observeFight(rcon, botName, ceilingMs, stallMs = 0, buddyNames = []) {
   // Counts deaths IN THIS ROUND.
   await ensureDeathCounter(rcon);
   await rcon.command(`scoreboard players set ${botName} ${DEATH_OBJECTIVE} 0`);
+  const buddies = [];
+  for (const name of buddyNames) {
+    await rcon.command(`scoreboard players set ${name} ${DEATH_OBJECTIVE} 0`);
+    buddies.push({ name, hpStart: null, hpEnd: null, minHp: Infinity, deaths: 0 });
+  }
   const t0 = Date.now();
   const until = t0 + ceilingMs;
   let hpStart = null, hpEnd = null, minHp = Infinity;
@@ -550,6 +726,14 @@ async function observeFight(rcon, botName, ceilingMs, stallMs = 0) {
     if (field.count === mobsStart) mobHpLowIntact = Math.min(mobHpLowIntact, field.totalHealth);
 
     deaths = (await readDeaths(rcon, botName)) || 0;
+    for (const buddy of buddies) {
+      const bv = await readBotVitals(rcon, buddy.name);
+      if (bv.known) {
+        if (buddy.hpStart === null) buddy.hpStart = bv.health;
+        buddy.hpEnd = bv.health; buddy.minHp = Math.min(buddy.minHp, bv.health);
+      }
+      buddy.deaths = (await readDeaths(rcon, buddy.name)) || 0;
+    }
     if (!v.known) { unreadable++; await sleep(400); continue; }
     if (hpStart === null) hpStart = v.health;
     hpEnd = v.health;
@@ -565,8 +749,9 @@ async function observeFight(rcon, botName, ceilingMs, stallMs = 0) {
     if (deaths >= 1 || !v.alive) { botDied = true; break; }
     // 3s floor: a summoned mob takes a tick or two to exist.
     if (field.count === 0 && Date.now() - t0 > 3000) { fieldCleared = true; break; }
-    // THE BOT'S OWN REPORT, checked LAST — the observation outranks the claim (Law 26).
-    if (traceReadable) {
+    // THE BOT'S OWN REPORT, checked LAST — the observation outranks the claim (Law 26). With more bodies the fight is
+    // over when the field empties or the first body dies, not when one of them reports its own wave closed.
+    if (traceReadable && !buddies.length) {
       const reported = combatLens.completedBattlesSince(t0, { bot: botName });
       if (reported.length) { reportedBattle = reported[reported.length - 1]; break; }
     }
@@ -591,6 +776,7 @@ async function observeFight(rcon, botName, ceilingMs, stallMs = 0) {
     ? round2(mobHpStart - mobHpLowIntact) : null;
 
   return {
+    buddies: buddies.map((b) => ({ ...b, minHp: b.minHp === Infinity ? null : b.minHp })),
     botDied, fieldCleared,
     // Carried BESIDE the other outcomes, never folded into one of them.
     stalled, engagedMs: engagedAt === null ? null : engagedAt - t0,
@@ -689,7 +875,10 @@ async function runWave(scout, rcon, args, n) {
   const origin = await sweepOrigin(scout, rcon, args, `wave ${n}`);
   if (!origin.ok) return { run: false, reason: origin.reason, cause: origin.cause };
 
-  const sited = await siteArena(scout, origin.cell, want, args.range, args.lift);
+  // `--same-ground`: every round of this run is fought on the first round's arena, so the search is paid once.
+  const sited = (args.sameGround && args.sitedGround)
+    || await siteArena(scout, origin.cell, want, args.range, args.lift, !!args.opposed);
+  if (args.sameGround && sited.cells.length) args.sitedGround = sited;
   if (!sited.cells.length) return { run: false, reason: sited.detail, cause: 'terrain', band: sited.band, refused: sited.refused };
 
   // Every gate standBot owns runs at the cell the fight is on. `at` is overridden: the sweep's answer is
@@ -698,21 +887,62 @@ async function runWave(scout, rcon, args, n) {
   if (!stand.ok) return { run: false, reason: stand.reason, cause: stand.cause || 'bench' };
   const { cell, biome, ambient } = stand;
 
+  // The moat goes in after the body stands and before any mob exists, so no summon lands in the trench.
+  if (args.moat > 0) {
+    const moat = await carveMoat(rcon, cell, args.moat, sited.cells[0], args.pillar, args.bare);
+    if (!moat.ok) return { run: false, cause: 'bench', reason: `the moat did not take — floor still solid at ${moat.solid.join(' ')}`, biome };
+    log('round', `  moat carved ${moat.ring[0]}–${moat.ring[1]} cells round ${fmt(cell)}, ${moat.depth} deep — the opponent is in sight and no walk reaches it` +
+      (moat.column ? `; cover column at (${moat.column.x},${cell.y}..${cell.y + 2},${moat.column.z})` : ''));
+  }
+
+  if (args.pool) {
+    for (const c of sited.cells) await rcon.command(`fill ${c.x - 2} ${c.y - 3} ${c.z - 2} ${c.x + 2} ${c.y - 1} ${c.z + 2} minecraft:water`);
+    log('round', `  pool sunk under ${sited.cells.length} mob cell(s), 5 wide and 3 deep`);
+  }
+
+  // EVERY ROUND OPENS ON THE SAME BODY: the kit is laid again (a round spends blocks and arrows hit) and the body is
+  // healed to full, both read back, so no round inherits the last one's wounds or pocket.
+  if (args.kit) {
+    const k = await kitBot(rcon, args.bot, args.kit);
+    if (!k.ok) return { run: false, cause: 'bench', biome, reason: `${args.bot} is missing ${k.missing.join(', ')} after the re-kit` };
+  }
+  const healed = await healBot(rcon, args.bot);
+  if (!healed.ok) return { run: false, cause: 'bench', biome, reason: `the body would not heal to full (hp ${healed.health}) — the round would open wounded` };
+  if (Number.isFinite(args.hp) && args.hp < 20) {
+    const hurt = await woundBot(rcon, args.bot, args.hp);
+    if (!hurt.ok) return { run: false, cause: 'bench', biome, reason: `the body would not take the wound to ${args.hp} hp (hp ${hurt.health})` };
+  }
+
+  for (const [i, name] of (args.buddies || []).entries()) {
+    const b = await placeBuddy(rcon, args, name, cell, i + 1);
+    if (!b.ok) return { run: false, cause: b.cause, biome, reason: b.reason };
+  }
+
+  // THE CONTROL, LAST THING BEFORE THE SUMMON: every hostile the world holds is removed (the teleport and the scout
+  // have loaded new chunks, and their mobs with them), then the fight's surroundings are counted empty.
+  await purgeAmbientHostiles(rcon, null);
+  const wildBefore = await countWildHostiles(rcon, cell);
+  if (wildBefore.total) {
+    return { run: false, cause: 'bench', biome,
+      reason: `the control is polluted — ${wildBefore.named.join(', ')} still within ${WILD_CHECK_RADIUS}b of ${fmt(cell)} after the purge (nothing was summoned)` };
+  }
+
   // The sited cells are spent IN ORDER across the groups, spread across the same bearings a single-species
   // wave would use.
   const placed = [];
   const unarmed = [];
   const stacked = new Map();   // cell key → how many mobs have already been summoned onto it
+  const anger = args.provoke ? await angerNbt(rcon, args.bot) : '';
   let next = 0;
   for (const g of wave) {
     // ── ONLY CELLS THE BOT CAN ACTUALLY SEE THIS MOB FROM ───────────────────────────────────────────
-    // Filtered per species: `aggroRangeFor` is architect_config's one route (Law 16). The filter measures
+    // Filtered per species: `engageRangeFor` is architect_config's one route (Law 16). The filter measures
     // the same shape the gate does: the real 3-D drop from the cell the body stands on, not the flat x/z
     // distance, as a cylinder matching the gate's own shape (Law 16 — one measure of range).
     const dropTo = (c) => ((cell && typeof cell.y === 'number' && typeof c.y === 'number') ? (c.y - cell.y) : 0);
     const flatTo = (c) => (typeof c.distance === 'number' ? c.distance : Infinity);
     const gapTo = (c) => (Number.isFinite(flatTo(c)) ? Math.hypot(flatTo(c), dropTo(c)) : Infinity);
-    const radius = aggroRangeFor(g.mob) - AGGRO_SITE_MARGIN;
+    const radius = engageRangeFor(g.mob) - AGGRO_SITE_MARGIN;
     const inRange = sited.cells.filter(c =>
       flatTo(c) <= radius && Math.abs(dropTo(c)) <= AGGRO_VERTICAL_RANGE - AGGRO_SITE_MARGIN);
     // No cell inside the radius is a TERRAIN answer (Law 25) — falls through to the full list and lets
@@ -726,7 +956,7 @@ async function runWave(scout, rcon, args, n) {
       // Lets the first mob WALK OFF the cell before the second arrives.
       if (already > 0) await sleep(STACKED_SUMMON_GAP_MS);
       stacked.set(key, already + 1);
-      const r = await summonAt(rcon, g.mob, c, g.hand);
+      const r = await summonAt(rcon, g.mob, c, g.hand, anger);
       // The 3-D gap, matching the presence gate's own measure.
       if (r.ok) placed.push({ mob: g.mob, cell: c, distance: round2(gapTo(c)), armed: r.armed });
       // A mob asked to carry something and not carrying it is a DIFFERENT OPPONENT (Law 25).
@@ -760,15 +990,15 @@ async function runWave(scout, rcon, args, n) {
   }
 
   // PRESENCE, CHECKED AFTER THE SUMMON AND BEFORE THE CLOCK: is the bot close enough for a fight to be
-  // possible at all. A round failing this is NOT RUN, not a timeout. Per species: `aggroRangeFor`,
+  // possible at all. A round failing this is NOT RUN, not a timeout. Per species: `engageRangeFor`,
   // architect_config's one route (Law 16), measured as a cylinder matching the gate's own shape.
   const atSummon = await readBotVitals(rcon, args.bot);
   const gapTo = p => Math.hypot(p.cell.x + 0.5 - atSummon.position.x, p.cell.y - atSummon.position.y, p.cell.z + 0.5 - atSummon.position.z);
   const seenBy = (p) => Math.abs(p.cell.y - atSummon.position.y) <= AGGRO_VERTICAL_RANGE &&
-    Math.hypot(p.cell.x + 0.5 - atSummon.position.x, p.cell.z + 0.5 - atSummon.position.z) <= aggroRangeFor(p.mob);
+    Math.hypot(p.cell.x + 0.5 - atSummon.position.x, p.cell.z + 0.5 - atSummon.position.z) <= engageRangeFor(p.mob);
   const unseen = atSummon.known && atSummon.position
-    ? placed.map(p => ({ p, gap: gapTo(p), radius: aggroRangeFor(p.mob), seen: seenBy(p) })).filter(x => !x.seen)
-    : placed.map(p => ({ p, gap: Infinity, radius: aggroRangeFor(p.mob), seen: false }));
+    ? placed.map(p => ({ p, gap: gapTo(p), radius: engageRangeFor(p.mob), seen: seenBy(p) })).filter(x => !x.seen)
+    : placed.map(p => ({ p, gap: Infinity, radius: engageRangeFor(p.mob), seen: false }));
   // ANY mob out of its own radius fails the round, not just the nearest one (Law 25).
   if (unseen.length) {
     await clearArena(rcon);
@@ -776,17 +1006,37 @@ async function runWave(scout, rcon, args, n) {
     return { run: false, cause: 'terrain', reason: `${unseen.length} of ${placed.length} mob(s) outside the radius the bot honours for them: ${named} — it would measure a fight the bot cannot see`, biome };
   }
 
+
+  const waveAt = Date.now();
   const outcome = await observeFight(rcon, args.bot, args.ceilingSeconds * 1000,
-    (args.stallSeconds || 0) * 1000);
+    (args.stallSeconds || 0) * 1000, args.buddies || []);
+  // `--hold=<sec>`: the field stands that much longer after the wave resolves, so what the bot does with a mob it
+  // left standing (a mob no route reaches, shooting on) is seen; every wave it reports in that time is listed.
+  let heldWaves = null;
+  if (args.hold > 0 && !outcome.botDied && !outcome.fieldCleared) {
+    await sleep(args.hold * 1000);
+    heldWaves = combatLens.completedBattlesSince(waveAt, { bot: args.bot })
+      .map(b => ({ outcome: b.outcome, rel: round2((b.at - waveAt) / 1000) }));
+    const v = await readBotVitals(rcon, args.bot);
+    outcome.hpAfterHold = v.known ? v.health : null;
+  }
+  // Read again at the end: a wild hostile there now may have been in the fight, so the round is not a clean result.
+  const wildAfter = await countWildHostiles(rcon, cell);
   await clearArena(rcon);
+  // Each body's own side of the fight, off its own trace, beside the server's numbers.
+  const tallies = (args.buddies || []).length
+    ? Object.fromEntries([args.bot, ...args.buddies].map((id) => [id, combatLens.fightTallySince(id, waveAt)]))
+    : null;
   return {
-    run: true, placed: placed.length, biome, cell,
+    run: true, placed: placed.length, biome, cell, tallies,
+    polluted: wildAfter.total ? wildAfter.named : null,
     wave: waveLabel(wave),
     ambientPurged: ambient,
     rangeAsked: sited.rangeAsked, rangeGot: sited.rangeGot,
     liftAsked: sited.liftAsked, liftGot: sited.liftGot, liftFellBack: sited.liftFellBack,
     // Read off the body at the moment the wave opened.
     standY: cell.y,
+    heldWaves,
     ...outcome,
   };
 }
@@ -861,7 +1111,11 @@ async function cleanupOnly() {
 // (Law 16). Returns { ok:false, why }; never throws.
 async function openArena({ quiet = false } = {}) {
   const scout = createScout({
-    host: '127.0.0.1', port: 25565, version: require('@thinking/architect_config').SERVER_MINECRAFT_VERSION, username: SCOUT_NAME,
+    // This seat's own server, as its file says: a copy on the second seat must not reach the main seat's world.
+    host: '127.0.0.1', port: require('@utils/server_settings').serverPort(require('@utils/workstation').needServerDir()), version: require('@thinking/architect_config').SERVER_MINECRAFT_VERSION, username: SCOUT_NAME,
+    // The arena is sited on the fleet's own world: inside the spawn-protected square the body reads bedrock, so
+    // no arena may stand there.
+    fleetView: true,
     onReady: () => log('scout', 'connected'),
     onEnd: why => log('scout', `down — ${why}`),
     log: (lvl, m) => log('scout', m),
@@ -873,13 +1127,18 @@ async function openArena({ quiet = false } = {}) {
   if (!await waitForScout(scout)) { scout.end(); return { ok: false, why: 'the scout never spawned — is the server up?' }; }
 
   let rcon;
-  try { rcon = await rconLink.open(rconLink.readServerProperties(), () => log('rcon', 'link lost')); }
+  try { rcon = await rconLink.open(rconLink.readServerProperties(), () => { log('rcon', 'link lost: the server is gone, no round can run, stopping now'); process.exit(1); }); }
   catch (e) { scout.end(); return { ok: false, why: `cannot reach the server over RCON (${e.code || e.message})` }; }
 
   // Park the scout in spectator: cannot fall, die, or take a mob's attention.
   await rcon.command(`gamemode spectator ${SCOUT_NAME}`);
   const world = await applyWorld(rcon, WORLD);
+  if (!/false/.test(world.spawning)) {
+    rcon.close(); scout.end();
+    return { ok: false, why: `the world would not stop spawning mobs (${world.spawning || 'no answer'}) — every round would be fought among wild ones` };
+  }
   if (!quiet) {
+    log('world', `${world.spawning} — no wild mob spawns while this runs; every hostile in a round is summoned here.`);
     log('world', `${world.time}, ${world.difficulty}, daylight cycle ${world.cycle} — ` +
       `asked for ${WORLD.time}/${WORLD.difficulty}. Skeletons and zombies do not burn here.`);
     // Named as a FAULT when griefing is on.
@@ -903,6 +1162,9 @@ async function openArena({ quiet = false } = {}) {
     // Terminates with whoever raised it (Law 8); runs even on a failure path.
     async close() {
       try { await rcon.command(`kill @e[tag=${ARENA_TAG}]`); } catch (_) {}
+      // The world is handed back spawning as it was found.
+      const was = /true/.test(world.spawningBefore) ? 'true' : /false/.test(world.spawningBefore) ? 'false' : null;
+      if (was) { try { await rcon.command(`gamerule spawn_mobs ${was}`); } catch (_) {} }
       rcon.close();
       scout.end();
     },
@@ -942,16 +1204,32 @@ async function main() {
     for (let n = 1; n <= args.rounds; n++) {
       const r = await runWave(scout, rcon, args, n);
       rounds.push(r);
-      if (!r.run) { log('round', `${n}: NOT RUN — ${r.reason}`); exitCode = 2; continue; }
+      if (!r.run) {
+        log('round', `${n}: NOT RUN — ${r.reason}`);
+        exitCode = 2;
+        // A body unfit to fight stays unfit: the next round would spend its whole watch wait to hear the same refusal.
+        if (r.cause === 'bot') { log('round', `stopping: ${args.rounds - n} round(s) left unrun.`); break; }
+        continue;
+      }
       log('round', `  → ${headline(r)} · bot hp ${r.hpStart}→${r.hpEnd} (low ${r.minHp}) · ` +
-        `mobs ${r.mobsStart}→${r.mobsEnd}, ${r.mobDamageDealt} damage dealt · ${(r.ms / 1000).toFixed(1)}s`);
+        `mobs ${r.mobsStart}→${r.mobsEnd}, ${r.mobDamageDealt} damage dealt · ${(r.ms / 1000).toFixed(1)}s` +
+        // The bot's own word for how its wave ended, beside the server's numbers (Law 26).
+        `${r.reportedBattle ? ` · the bot's wave outcome: ${r.reportedBattle.outcome}` : ''}` +
+        `${r.polluted ? ` · ⚠ POLLUTED — wild ${r.polluted.join(', ')} within ${WILD_CHECK_RADIUS}b at the end` : ' · no wild hostile near it'}`);
+      for (const b of r.buddies || []) log('round', `  ${b.name} hp ${b.hpStart}→${b.hpEnd} (low ${b.minHp}), ${b.deaths} death(s)`);
+      if (r.tallies) for (const [who, t] of Object.entries(r.tallies)) log('round', `  ${who}: ${JSON.stringify(t)}`);
+      if (r.heldWaves) {
+        log('round', `  held ${args.hold}s more with the field standing: ${r.heldWaves.length} wave(s) reported — ` +
+          `${r.heldWaves.map(w => `${w.outcome}@${w.rel}s`).join(', ') || 'none'} · bot hp at the end ${r.hpAfterHold}`);
+      }
       if (n < args.rounds) await sleep(2000);
     }
 
     const ran = rounds.filter(r => r.run);
     log('verdict', `${ran.length}/${args.rounds} round(s) run vs ${waveLabel(args.wave)} — ` +
       `${ran.filter(r => r.fieldCleared).length} cleared · ${ran.filter(r => r.botDied).length} death(s) · ` +
-      `${ran.filter(r => r.run && !r.fieldCleared && !r.botDied).length} timed out`);
+      `${ran.filter(r => r.run && !r.fieldCleared && !r.botDied).length} timed out` +
+      `${ran.some(r => r.polluted) ? ` · ${ran.filter(r => r.polluted).length} POLLUTED by wild hostiles` : ''}`);
     // The bench says WHAT happened; the journal says why (Law 16).
     log('done', `Why it went that way: node Auren_Bot/monitoring/trace_monitor.js --combat --bot=${args.bot}`);
     return exitCode;
@@ -973,7 +1251,7 @@ module.exports = {
   siteMobCells, siteArena, summonAt, equipmentNbt, reachabilityFor,
   readBotVitals, readDeaths, readArenaMobs, readBiome,
   placeBot, kitBot, healBot, clearArena, applyWorld, waitForScout,
-  openArena, cleanupOnly, runWave,
+  openArena, cleanupOnly, runWave, carveMoat,
   // The opening sequence and the gate in front of it, both testable without a server.
   standBot, rangeFitsAggro, SITE_BAND_SLACK,
 };

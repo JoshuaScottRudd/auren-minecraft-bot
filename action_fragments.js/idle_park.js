@@ -30,9 +30,7 @@ const TAG = 'idle_park';
 function _homeBlueprint() { return require('@kernel/bot_mandate').homeBlueprint(); }
 
 // THE PARK VANTAGE IS THE SAME ARITHMETIC FOR EVERY SPECIES: `anchor.y + 1` is the cell the builder
-// itself stands in, so it is never a block to be placed. On a contractor's house that cell is inside an
-// enclosed, lit room; on a headframe or a laydown yard it is open ground — the honest difference between
-// the three homes.
+// itself stands in, so it is never a block to be placed. On a headframe or a laydown yard it is open ground.
 //
 // THE FLOOR IS THE ADMISSION TEST, NOT THE FINISHED BUILDING: the question is whether there is a cell of
 // this house a body can stand in, not whether the building is complete. Anchor 0 lays the ground floor
@@ -83,12 +81,62 @@ function _homeAnchor(bot, home) {
 const IDLE_CAUSE_TEXT = {
   none_outstanding: 'no work outstanding — the board is empty',
   all_gated:        'work outstanding but ALL of it held at the gates — waiting, not finished',
-  none_for_species: 'nothing on the board this species may claim',
   claimed_by_peers: 'every job this magnet attracts is claimed by a peer',
   // NOT THE SAME STATE AS `claimed_by_peers`: orders are OPEN and several bodies may still take them, but
   // every unit of what they ask for is already pledged by a peer out fetching it.
   pledged_by_peers: 'every job this magnet attracts is already pledged in full by peers out working',
+  // battle_stations' night recall: the active job was one the night holds, so the body comes home first and
+  // the heartbeat asks the board for night work from here.
+  night_recall:     'recalled home at night — the job it held waits for dawn',
 };
+
+// ── AN IDLE BODY NEVER STANDS WHERE ITS HOME STILL PLACES A BLOCK ──
+// Many idle bodies at one stand spill into the cells beside it, and in a home those are the stations the builder
+// still has to set; the builder waits a cell out and never asks a body to move (build_executor.waitForCellClear),
+// so an idle crowd would hold the build forever (Law 19: the placement constraint binds every agent). Every pass,
+// a parked body whose feet or head lie in a solid cell of its home's blueprint (blueprint_survey.getProtectedBlocks,
+// built or not) steps to the nearest cell within STEP_ASIDE_REACH whose feet and head are outside every such cell,
+// over a standable floor and free of peers. Returns the cell stepped to, or null when the body stood clear.
+const STEP_ASIDE_REACH = 4;
+async function _stepOffOwedCells(bot, home) {
+  const owed = buildingIntegrity.getProtectedBlocks(home);
+  if (!owed) return null;
+  const k = (x, y, z) => `${x},${y},${z}`;
+  const feet = bot.entity.position.floored();
+  // The hitbox, not the centre: a body centred beside a cell still stands in it when its edge crosses the line.
+  const { BODY_HALF_WIDTH } = require('@utils/calculators/jump_calculator');
+  const p = bot.entity.position;
+  const inOwed = [-BODY_HALF_WIDTH, BODY_HALF_WIDTH].some(ox => [-BODY_HALF_WIDTH, BODY_HALF_WIDTH].some(oz => {
+    const x = Math.floor(p.x + ox), z = Math.floor(p.z + oz);
+    return owed.has(k(x, feet.y, z)) || owed.has(k(x, feet.y + 1, z));
+  }));
+  if (!inOwed) return null;
+  const peers = Object.values(bot.entities).filter(e => e && e !== bot.entity && e.type === 'player' && e.position)
+    .map(e => e.position.floored());
+  const air = (b) => !!b && b.boundingBox === 'empty';
+  let best = null;
+  for (let dx = -STEP_ASIDE_REACH; dx <= STEP_ASIDE_REACH; dx++) {
+    for (let dz = -STEP_ASIDE_REACH; dz <= STEP_ASIDE_REACH; dz++) {
+      for (const dy of [0, 1, -1]) {
+        const x = feet.x + dx, y = feet.y + dy, z = feet.z + dz;
+        if (owed.has(k(x, y, z)) || owed.has(k(x, y + 1, z))) continue;
+        if (peers.some(p => p.x === x && p.z === z && Math.abs(p.y - y) <= 1)) continue;
+        const floor = bot.blockAt(new Vec3(x, y - 1, z));
+        if (!floor || !classifyFloor(bot, floor)) continue;
+        if (!air(bot.blockAt(new Vec3(x, y, z))) || !air(bot.blockAt(new Vec3(x, y + 1, z)))) continue;
+        const d = Math.abs(dx) + Math.abs(dz) + Math.abs(dy);
+        if (!best || d < best.d) best = { x, y, z, d };
+      }
+    }
+  }
+  if (!best) {
+    watcher.warn(TAG, `standing in an owed cell of ${home} at (${feet.x},${feet.y},${feet.z}) and no free cell within ${STEP_ASIDE_REACH} — staying`);
+    return null;
+  }
+  watcher.summary(TAG, `STEP_ASIDE from (${feet.x},${feet.y},${feet.z}) — a cell ${home} still places — to (${best.x},${best.y},${best.z})`);
+  await locomotion.goTo({ x: best.x, y: best.y, z: best.z, exact: true, leg: 'travel', purpose: 'idle_step_aside' });
+  return best;
+}
 
 function _standing(payload) {
   const cause = payload?.idle_cause;
@@ -125,6 +173,7 @@ module.exports = {
         watcher.summary(TAG, `parking at ${parkKey} anchor (${park.x},${park.y},${park.z}) — clear of the build footprint`);
         await locomotion.goToStand(parkAnchor, { exact: false });   // park ON the anchor's stand cell, tolerant (not exact); goTo owns its own abandonment (Law 15)
       }
+      await _stepOffOwedCells(bot, parkKey);
     }
 
     // Arm the re-check LAST — bot is parked, chain is ending, heartbeat owns re-entry (Law 4).

@@ -3,14 +3,11 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/prox
 // Joins the server as an ordinary player and bridges it to this terminal: every line typed here goes to
 // open chat, and everything the world says comes back up the same terminal.
 //
-// The foreman reads chat at the wire (`player_chat`), not the console-level event a `/say` also raises, so
-// reaching it requires holding a player slot — which is what this does. The name it joins under decides
-// whose crew it commands (every contractor belongs to the name that asked for it), so it is read from the
-// server's ops list (Law 16), with bots and the desk filtered out by roster. A
-// name holds one connection, so this refuses to join while that person is already in the game.
+// It holds a player slot as a person would. The name it joins under is read from the server's ops list
+// (Law 16), with bots and the foreman filtered out by roster, so it can run server commands. A name holds
+// one connection, so this refuses to join while that person is already in the game.
 //
-// It has no vocabulary of its own — every line goes to chat verbatim, since the foreman's vocabulary has
-// exactly one owner (`foreman_vocabulary`, Law 16, Law 25). Ask the desk itself: type `foreman help`. A
+// It has no vocabulary of its own — every line goes to chat verbatim (the foreman no longer hears chat). A
 // leading `/` is a server command, and under an op's name this is a full console as well as a mouth.
 //
 // Run (the server must be UP; the fleet need not be):
@@ -35,12 +32,12 @@ paths.registerAliases();
 process.env.BOT_ID = process.env.BOT_ID || 'proxy_human';
 
 const { guardExternalSync } = require('@utils/external_library_guard');
-const { BOT_SENIORITY, FOREMAN_NAME, FOREMAN_PREFIX } = require('@thinking/architect_config');
+const { BOT_SENIORITY, FOREMAN_NAME } = require('@thinking/architect_config');
 
 // `--stand=biome` reads ground with the same scanner the bots survey with, judged against the same
 // acceptable-biome set the fleet gates on (Law 16); the scanner reports, this file chooses (placeInBiome).
 const { getBiomeName } = require('@perception/biome_scanner');
-const { personSpotTest, landingFloor } = require('@utils/person_spot');
+const { landingSpotTest, landingFloor } = require('@utils/landing_spot');
 const watcher = require('@kernel/watcher');
 const { armSpawnProtection, spawnProtectionBox } = require('@perception/spawn_protection');
 
@@ -78,14 +75,14 @@ const QUIET = has('quiet');
 const MAX_CHAT_LINE = 240;
 
 // Vanilla's chat spam limit kicks a client that outpaces this, which a pasted block of commands can do
-// even though typing never would; foreman_channel paces its own outbound half separately.
+// even though typing never would.
 const MS_BETWEEN_LINES = 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // WHOSE NAME
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-// Anyone on the ops list who is not a roster bot or the desk is a person, read off the list so a
+// Anyone on the ops list who is not a roster bot or the foreman is a person, read off the list so a
 // gamertag change needs no edit here.
 function humanOps() {
   const file = path.join(SERVER_DIR, 'ops.json');
@@ -104,8 +101,7 @@ function chooseName() {
   const { ops, why } = humanOps();
   if (!ops.length) {
     console.error(`proxy_human: cannot tell whose name to wear — ${why}.\n`
-      + '  The name is not cosmetic: every contractor belongs to the person who asked for it, and a crew\n'
-      + '  raised under the wrong name cannot be commanded by the right one. Say who you are:\n'
+      + '  The name is not cosmetic: an op\'s name is what lets this seat run server commands. Say who you are:\n'
       + '    node Auren_Workshop/tools/proxy_human.js --as=<your minecraft name>\n');
     process.exit(1);
   }
@@ -226,8 +222,8 @@ bot.on('kicked', reason => {
 });
 
 // ── STANDING SOMEWHERE A BODY CAN ACTUALLY BE PUT ───────────────────────────────────────────────────
-// The body is placed on ground `standingSpotNear` accepts, the same test the desk uses for a crew (Law
-// 16) — a crew is teleported to the person, so that cell seeds the run. It moves only when it must (search
+// The body is placed on ground `standingSpotNear` accepts, the same test the foreman uses for a crew (Law
+// 16). It moves only when it must (search
 // starts at radius 0), stays put and reports why on a failed search, and confirms every move by reading
 // the body's actual position back (Law 25, Law 26).
 const PLACEMENT_RADIUS = 12;
@@ -269,7 +265,7 @@ async function waitForChunk(reader, cell) {
 // ── HOW FAR CLEAR OF WORLD SPAWN A LANDING CELL HAS TO BE ───────────────────────────────────────────
 // The spawn-protected square refuses every break and placement by a non-op with no report, so a person
 // placed inside it stalls the crew silently. Clearance covers the base's footprint around the person, not
-// just the square, measured Chebyshev since the protected region is a square (person_spot.landingFloor).
+// just the square, measured Chebyshev since the protected region is a square (landing_spot.landingFloor).
 
 // ── WHERE THE PERSON MUST END ───────────────────────────────────────────────
 // `floorFrom` is the minimum Chebyshev distance the body must end at (the larger of the spawn-clearance
@@ -323,13 +319,13 @@ async function placeInBiome(reader, at) {
 
   // ── OUTWARD FROM THE LINE, AND THE FIRST SPOT THAT PASSES IS THE SPOT ──────
   // A spot is exactly three things: at least `from` blocks from world spawn (Chebyshev, minRadius), a 3x3
-  // floor with 2 clear above every cell (evaluateOpenBox, the same test the desk and arena use — Law 16),
+  // floor with 2 clear above every cell (evaluateOpenBox, the same test the foreman and arena use — Law 16),
   // and an acceptable biome at the feet (biome_scanner.getBiomeName). `ringScan` walks outward nearest-first
   // and stops at the first match, using UNLOADED to mark the edge of the map; the move is a plain /tp to
   // the ground it read. `evaluateOpenBox` finds each floor nearest the reference height (surfaceY), so a
-  // cave floor never beats grass above it. The spot test itself lives in person_spot, shared with
-  // voxel_snapshot's scanner tests (Law 16), and carries the desk's own too-high ceiling.
-  const isSpot = personSpotTest(reader, (x, y, z) => getBiomeName(bot, x, y, z), at.y);
+  // cave floor never beats grass above it. The spot test itself lives in landing_spot, shared with
+  // voxel_snapshot's scanner tests (Law 16), and carries the foreman's own too-high ceiling.
+  const isSpot = landingSpotTest(reader, (x, y, z) => getBiomeName(bot, x, y, z), at.y);
   const sweep = await ringScan(reader, { origin: { x: box.centerX, z: box.centerZ }, step: 1, minRadius: from }, isSpot);
   if (!sweep.found) {
     record(`--stand=biome found no spot ${from}+ blocks from world spawn in an acceptable biome with a clear `
@@ -476,7 +472,6 @@ async function standOnGround() {
   if (!spot.found) {
     record(`${USERNAME} is on ground no body can stand on and nothing better is within `
       + `${PLACEMENT_RADIUS} blocks — staying put. ${spot.why}`);
-    say('             the desk will refuse a crew here, and that refusal is the correct outcome.');
     return;
   }
   if (spot.distance === 0) {
@@ -497,7 +492,7 @@ async function standOnGround() {
 bot.once('spawn', () => {
   spawned = true;
   say(`proxy_human: in the world as ${USERNAME}. Type and press enter — every line goes into open chat.`);
-  say(`             say "${FOREMAN_PREFIX} help" to ask the desk what it answers to; ":quit" to leave.`);
+  say(`             ":quit" to leave.`);
   // Placement runs before the prompt is released, so a line typed or piped on the first turn cannot be
   // sent from the cell the server happened to choose.
   standOnGround()
@@ -510,7 +505,7 @@ bot.once('spawn', () => {
 
 // ── HEARING ──────────────────────────────────────────────────────────────────────────────────────
 // Read at the wire (player_chat), not the high-level event which cannot tell a player from the console —
-// the same distinction foreman_channel makes, so fleet and instrument are never merged.
+// so fleet and instrument are never merged.
 bot._client.on('player_chat', packet => {
   const raw = packet.plainMessage != null ? packet.plainMessage : packet.unsignedChatContent;
   if (typeof raw !== 'string' || raw.trim() === '') return;
@@ -520,7 +515,7 @@ bot._client.on('player_chat', packet => {
 });
 
 // The server's own voice — deaths, joins, /say, command output. Shown by default, since a run driven from
-// here has nowhere else to report them; --quiet is for when only the desk is worth reading.
+// here has nowhere else to report them; --quiet is for when only chat is worth reading.
 if (!QUIET) {
   bot.on('messagestr', (text, position) => {
     if (position === 'chat') return;                  // already carried by player_chat above

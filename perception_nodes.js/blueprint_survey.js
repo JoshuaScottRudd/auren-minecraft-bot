@@ -57,7 +57,9 @@ function isAir(name) {
 //
 // 'unloaded' is its own verdict, not air: an unsensed chunk must not be read as a confident diff
 // (Invariant B / Law 13).
-function classifyVoxel(bot, x, y, z, rawExpType, externalTypes) {
+// `accepts` (a blueprint's voxel_accepts: type → the other blocks that stand for it) answers a cell holding one of
+// those as correct: the cane field's soil is dirt, and sand or grass under cane is soil the crop grows on as well.
+function classifyVoxel(bot, x, y, z, rawExpType, externalTypes, accepts = null) {
   const expType = TYPE_ALIASES[rawExpType] || rawExpType;
 
   // A blueprint-declared external voxel is owned by a foreign subsystem, never placed or dug here — the
@@ -73,7 +75,26 @@ function classifyVoxel(bot, x, y, z, rawExpType, externalTypes) {
   if (isAir(actName)) {
     return { verdict: expType === 'air' ? 'correct' : 'missing', expType, actName };
   }
-  if (expType === 'air') return { verdict: 'extraneous', expType, actName };
+  // WATER IS NEVER DUG. A cell the plan fills reads missing: placing the block displaces the water, as the farm's
+  // place pass does. Running water in a cell the plan leaves open is fed from elsewhere and a body passes through it,
+  // so the cell is open as planned. A source there is extraneous: the dig step displaces it (build_executor).
+  if (actName === 'water' && expType !== 'water') {
+    if (expType !== 'air') return { verdict: 'missing', expType, actName };
+    if (!require('@utils/gravity_utils').isWaterSource(bot, x, y, z)) return { verdict: 'correct', expType, actName };
+  }
+  // A torch in a cell the plan leaves open is the torch network's light (lighting_integrity), never a block to clear.
+  if (expType === 'air') return { verdict: /torch$/.test(actName) ? 'correct' : 'extraneous', expType, actName };
+  if (accepts && accepts[expType] && accepts[expType].includes(actName)) return { verdict: 'correct', expType, actName };
+  // A NATURAL FLOOR IS ANY GROUND ALREADY STANDING (site_geometry.isGround: stone, gravel, an ore, a placed cobblestone),
+  // so the floor under a field's water is never dug to be laid again; only a missing floor is filled.
+  if (expType === 'natural_block' && require('@utils/site_geometry').isGround(bot.blockAt(new Vec3(x, y, z)))) {
+    return { verdict: 'correct', expType, actName };
+  }
+  // A water cell is built when it holds a source. Water that has only run into it moves: it carries a dropped item off
+  // along the current, and a body is never routed through it (pathfinding_utils.isStillWater). It is poured again.
+  if (expType === 'water' && actName === 'water' && !require('@utils/gravity_utils').isWaterSource(bot, x, y, z)) {
+    return { verdict: 'missing', expType, actName };
+  }
 
   if (group_to_item && group_to_item[expType]) {
     const isMember = Array.isArray(group_to_item[expType]) && group_to_item[expType].includes(actName);
@@ -89,6 +110,7 @@ async function scanBuilding(bot, pasted) {
   const pace = require('@utils/execution_yield').makeExecutionPacer();
   const expected = new Map();
   const externalTypes = pasted.external_types || new Set();
+  const accepts = pasted.accepts || null;
   for (const b of (pasted.voxels || [])) {
     await pace();
     const k = `${b.x},${b.y},${b.z}`;
@@ -107,8 +129,9 @@ async function scanBuilding(bot, pasted) {
     await pace();
     const ai        = expRec.anchor_index;
     const [x, y, z] = k.split(',').map(Number);
-    const { verdict, expType, actName } = classifyVoxel(bot, x, y, z, expRec.type, externalTypes);
+    const { verdict, expType, actName } = classifyVoxel(bot, x, y, z, expRec.type, externalTypes, accepts);
     const isGroupToken = !!(group_to_item && group_to_item[expType]);
+    // A mismatch's dig step names the block it clears (type) and the block the cell is for (wanted).
     // The wanted state rides on the PLACE step only, as an instruction to the placer; correctness is
     // still decided by block type alone (Law 27).
     const withState = expRec.state ? { state: expRec.state } : {};
@@ -129,12 +152,12 @@ async function scanBuilding(bot, pasted) {
         break;
       case 'group_mismatch':
         mismatched++;
-        digSteps.push({ action: 'dig', place: { x, y, z }, type: actName, anchor_index: ai, reason: 'group_mismatch' });
+        digSteps.push({ action: 'dig', place: { x, y, z }, type: actName, anchor_index: ai, reason: 'group_mismatch', wanted: expType });
         placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'group_mismatch', actual: actName, expected_group: expType, ...withState });
         break;
       case 'mismatch':
         mismatched++;
-        digSteps.push({ action: 'dig', place: { x, y, z }, type: actName, anchor_index: ai, reason: 'mismatch' });
+        digSteps.push({ action: 'dig', place: { x, y, z }, type: actName, anchor_index: ai, reason: 'mismatch', wanted: expType });
         placeSteps.push({ action: 'place', place: { x, y, z }, type: expType, anchor_index: ai, reason: 'mismatch', actual: actName, ...withState });
         break;
     }
@@ -171,8 +194,8 @@ async function scanBuilding(bot, pasted) {
 
 // ── Geometry: blueprint-relative → world coordinates ──
 
-// A blueprint is placed exactly the way it is authored — no rotation logic exists; a facing that
-// matters is a facing the operator states explicitly, never one derived by a site search.
+// A blueprint is placed the way it is authored, turned only by the turn its locked origin carries (below); a facing
+// that matters is stated by the blueprint or the siting rule, never derived by a reader.
 
 // ── transpose_origin: the common point every voxel offset is measured from ──
 // Not a centre and not a place in the world — wherever the blueprint's author put the anchor. One
@@ -180,13 +203,45 @@ async function scanBuilding(bot, pasted) {
 //
 //     world cell = transpose_origin + (voxel offset - the blueprint's own origin)
 
+// ── A LOCKED SITE MAY FACE ANY OF FOUR WAYS ─────────────────────────────────────────────────────────────
+// `transpose_origin.turn` is how many quarter turns clockwise, seen from above, the blueprint stands from the way it
+// is authored (0 or absent: as authored; 1: what faced east faces south). The turn rides on the origin itself, so every
+// reader that passes a locked origin along places the blueprint turned with no argument of its own (Law 16): its
+// voxels, anchors and attach points turn about the transpose origin, and a voxel's facing state turns with them.
+const TURNS = [0, 1, 2, 3];
+const COMPASS = ['north', 'east', 'south', 'west'];
+function turnOf(origin) {
+  const t = origin && origin.turn;
+  if (t === undefined) return 0;
+  if (!TURNS.includes(t)) throw new Error(`[blueprint_survey] CODING VIOLATION: transpose_origin.turn is ${JSON.stringify(t)}; a turn is 0, 1, 2 or 3 quarter turns clockwise.`);
+  return t;
+}
+// rotateXZ(turn, dx, dz) → [dx, dz] turned `turn` quarter turns clockwise (east → south → west → north).
+function rotateXZ(turn, dx, dz) {
+  if (turn === 1) return [-dz, dx];
+  if (turn === 2) return [-dx, -dz];
+  if (turn === 3) return [dz, -dx];
+  return [dx, dz];
+}
+function turnState(turn, state) {
+  if (!turn) return { ...state };
+  const out = { ...state };
+  const i = COMPASS.indexOf(out.facing);
+  if (i >= 0) out.facing = COMPASS[(i + turn) % 4];
+  if (turn % 2 === 1 && (out.axis === 'x' || out.axis === 'z')) out.axis = out.axis === 'x' ? 'z' : 'x';
+  return out;
+}
+// placeOffset(origin, center, p) → the world cell of blueprint point p ([x,y,z], authored against `center`).
+function placeOffset(origin, center, p) {
+  const [rx, rz] = rotateXZ(turnOf(origin), p[0] - center.x, p[2] - center.z);
+  return { x: origin.x + rx, y: origin.y + (p[1] - center.y), z: origin.z + rz };
+}
+
 function transposeVoxel(worldOrigin, blueprintOrigin, v) {
   return {
-    x: worldOrigin.x + (v[0] - blueprintOrigin.x),
-    y: worldOrigin.y + (v[1] - blueprintOrigin.y),
-    z: worldOrigin.z + (v[2] - blueprintOrigin.z),
+    ...placeOffset(worldOrigin, blueprintOrigin, v),
     type: v[3],
-    ...(v[4] ? { state: { ...v[4] } } : {}),
+    ...(v[4] ? { state: turnState(turnOf(worldOrigin), v[4]) } : {}),
   };
 }
 
@@ -194,7 +249,7 @@ function transposeVoxel(worldOrigin, blueprintOrigin, v) {
 // a width: the origin is not symmetric within the footprint). The one definition of a blueprint's reach
 // in each compass direction (Law 16); every caller that reserves ground, checks flatness, or rejects an
 // overlap asks here. Derived from the voxels, never authored separately.
-function footprintExtent(building) {
+function footprintExtent(building, turn = 0) {
   const voxels = collectAllVoxels(building);
   if (voxels.length === 0) {
     throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${building?.name || 'unknown'}" has no voxels, so it has no footprint. footprintExtent requires a blueprint with geometry.`);
@@ -208,6 +263,9 @@ function footprintExtent(building) {
     if (dz < minDZ) minDZ = dz;
     if (dz > maxDZ) maxDZ = dz;
   }
+  // A turned site's reach: the authored box's corners turned (`turn`, as on transpose_origin).
+  const [ax, az] = rotateXZ(turnOf({ turn }), minDX, minDZ), [bx, bz] = rotateXZ(turnOf({ turn }), maxDX, maxDZ);
+  [minDX, maxDX, minDZ, maxDZ] = [Math.min(ax, bx), Math.max(ax, bx), Math.min(az, bz), Math.max(az, bz)];
   return {
     min_dx: minDX, max_dx: maxDX, min_dz: minDZ, max_dz: maxDZ,
     width:  maxDX - minDX + 1,
@@ -243,12 +301,7 @@ function transposeAttachPoints(building, transposeOrigin) {
   const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
   const out = {};
   for (const ap of building.attach_points) {
-    const p = ap.position;
-    out[ap.id] = {
-      x: transposeOrigin.x + (p[0] - blueprintCenter.x),
-      y: transposeOrigin.y + (p[1] - blueprintCenter.y),
-      z: transposeOrigin.z + (p[2] - blueprintCenter.z),
-    };
+    out[ap.id] = placeOffset(transposeOrigin, blueprintCenter, ap.position);
   }
   return out;
 }
@@ -265,15 +318,7 @@ function transposeAnchorsForCandidate(building, transposeOrigin) {
     throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${building?.name || 'unknown'}" has no anchors array.`);
   }
   const blueprintCenter = building.transpose_origin || { x: 0, y: 0, z: 0 };
-  return building.anchors.map(a => {
-    const pos = a.position;
-    const r = { dx: pos[0] - blueprintCenter.x, dz: pos[2] - blueprintCenter.z };
-    return {
-      x: transposeOrigin.x + r.dx,
-      y: transposeOrigin.y + (pos[1] - blueprintCenter.y),
-      z: transposeOrigin.z + r.dz,
-    };
-  });
+  return building.anchors.map(a => placeOffset(transposeOrigin, blueprintCenter, a.position));
 }
 
 // Returns the blueprint's anchor positions transposed to world coordinates. Same coordinate math as
@@ -307,7 +352,7 @@ function getWorldAttachPoints(blueprintName, conferenceRoomKey) {
 // One transpose→world-key-set pathway (Law 16), two callers with opposite air policies:
 //   getProtectedBlocks → SOLID voxels only (navigator's dig penalty must not touch the blueprint's own
 //                        blocks).
-//   getFootprintCells  → EVERY declared voxel incl. interior air (torch_integrity's overlap guard).
+//   getFootprintCells  → EVERY declared voxel incl. interior air (the ground a structure claims).
 // Returns null when the blueprint has no locked center yet.
 //
 // `bot` (optional) turns this from a PLAN read into a SENSED read: without it, every solid voxel the
@@ -334,7 +379,7 @@ function worldVoxelKeys(blueprintName, conferenceRoomKey, { includeAir, bot = nu
     const world = transposeVoxel(transposeOrigin, blueprintCenter, raw);
     if (!includeAir && world.type === 'air') continue;
     if (bot) {
-      const { verdict } = classifyVoxel(bot, world.x, world.y, world.z, world.type, externalTypes);
+      const { verdict } = classifyVoxel(bot, world.x, world.y, world.z, world.type, externalTypes, building.voxel_accepts || null);
       if (verdict !== 'correct' && verdict !== 'unloaded') continue;   // nothing built here to damage
     }
     set.add(`${world.x},${world.y},${world.z}`);
@@ -469,8 +514,8 @@ function transposeLaneBox(building, transposeOrigin, box, what) {
     throw new Error(`[blueprint_survey] CODING VIOLATION: blueprint "${building.name}" lane ${what} must be {min:[x,y,z], max:[x,y,z]} with min <= max. Got: ${JSON.stringify(box)}`);
   }
   const bc = building.transpose_origin || { x: 0, y: 0, z: 0 };
-  const at = c => ({ x: transposeOrigin.x + (c[0] - bc.x), y: transposeOrigin.y + (c[1] - bc.y), z: transposeOrigin.z + (c[2] - bc.z) });
-  return { min: at(box.min), max: at(box.max) };
+  const a = placeOffset(transposeOrigin, bc, box.min), b = placeOffset(transposeOrigin, bc, box.max);
+  return { min: { x: Math.min(a.x, b.x), y: a.y, z: Math.min(a.z, b.z) }, max: { x: Math.max(a.x, b.x), y: b.y, z: Math.max(a.z, b.z) } };
 }
 
 // getWorldLanes — every lane of every LOCKED blueprint, in world coordinates:
@@ -580,14 +625,15 @@ async function survey(bot, blueprintName, conferenceRoomKey, opts) {
 
   // Blueprint-declared non-structural voxels — scanBuilding skips them (see external_types contract).
   const externalTypes = new Set(building.external_voxel_types || []);
-  const pasted = { building_name: blueprintName, voxels, voxel_count: voxels.length, external_types: externalTypes };
+  const pasted = { building_name: blueprintName, voxels, voxel_count: voxels.length, external_types: externalTypes, accepts: building.voxel_accepts || null };
 
   const scanStart = Date.now();
   // No catch: a caught failure here would collapse to the same null scanBuilding returns for "nothing
   // left to do", reporting a crashed scan as a completed build. A throw is a coding violation, not an
   // environmental outcome — the one genuine world condition (unloaded chunks) returns, never throws
   // (Law 13).
-  const result = await scanBuilding(bot, pasted);
+  const kept = await keptReading(bot, blueprintName, conferenceRoomKey, pasted);
+  const result = kept ? kept.result : await scanBuilding(bot, pasted);
   const scanMs = Date.now() - scanStart;
 
   return {
@@ -602,7 +648,75 @@ async function survey(bot, blueprintName, conferenceRoomKey, opts) {
     footprint,
     transpose_origin:     transposeOrigin,
     anchor_count:     Array.isArray(building.anchors) ? building.anchors.length : 0,
+    read_by:          kept ? 'keeper' : 'body',
   };
+}
+
+// ── THE KEEPER'S READING IS THE ONLY READING ──────────────────────────────────────────────────────────────
+// The integrity keeper diffs every sited structure against the world it holds, for the whole fleet
+// (integrity_keeper_worker.js, subject 'structures'). A body whose crew has a keeper (keeper_verdicts.required)
+// takes that reading and never its own, so every body judges a structure from one reading. It ends the run when the
+// keeper cannot answer: no fresh verdict, a structure it does not keep or does not hold whole, or a change this body
+// heard in one of the structure's cells that the keeper has not read within CATCH_UP_MS. A body without a keeper
+// reads for itself (null here).
+const CATCH_UP_MS = 5000;            // the keeper posts every read a change caused within its 1 s beat plus the read itself
+const HEARD_KEEP_MS = 60000;
+const _heardAt = new Map();          // cell "x,y,z" → when this body last heard that block change kind
+const _listening = new WeakSet();
+function listen(bot) {
+  if (_listening.has(bot) || !bot.world || typeof bot.world.on !== 'function') return;
+  _listening.add(bot);
+  bot.world.on('blockUpdate', (old, now) => {
+    if (!now || !now.position || (old && old.name === now.name)) return;
+    const t = Date.now();
+    _heardAt.set(`${now.position.x},${now.position.y},${now.position.z}`, t);
+    if (_heardAt.size > 4096) for (const [k, at] of _heardAt) if (t - at > HEARD_KEEP_MS) _heardAt.delete(k);
+  });
+}
+async function keptReading(bot, blueprintName, conferenceRoomKey, pasted) {
+  const keeper = require('@kernel/keeper_verdicts');
+  if (!keeper.required()) return null;
+  listen(bot);
+  const voxels = pasted.voxels;
+  const stopped = () => new Promise(() => {});   // keeper.fail has ended the run; this line goes no further
+  let heard = 0;
+  for (const v of voxels) heard = Math.max(heard, _heardAt.get(`${v.x},${v.y},${v.z}`) || 0);
+  if (heard && !(await keeper.readAfter('structures', heard, CATCH_UP_MS))) {
+    keeper.fail(`the keeper has not read a change this body heard in ${conferenceRoomKey} within ${CATCH_UP_MS / 1000} s`);
+    return stopped();
+  }
+  const verdict = keeper.get('structures');
+  if (!verdict) return stopped();
+  const roomKey = conferenceRoomKey.includes('|') ? conferenceRoomKey : require('@kernel/bot_mandate').buildingRoomKey(conferenceRoomKey);
+  let entry = verdict.structures && verdict.structures[roomKey];
+  const refusal = !entry ? `the keeper keeps no ${roomKey}`
+    : entry.held !== true ? `the keeper does not hold ${roomKey} whole from its station`
+    : entry.blueprint !== blueprintName ? `the keeper reads ${roomKey} as ${entry.blueprint}, this body as ${blueprintName}` : null;
+  if (refusal) { keeper.fail(refusal); return stopped(); }
+  // A change this body made is in its own copy the moment it swings, and in the keeper's only once the server's word
+  // reaches the foreman: a keeper read posted between the two (caused by the cell before) still shows the old block.
+  // A step on a cell this body heard change, which its own copy already reads as planned, waits for a keeper read
+  // posted after now; still unread when CATCH_UP_MS is out, the keeper has missed the change and the run ends.
+  const ahead = (e) => (e.all_complete ? [] : e.steps).filter((st) => {
+    const k = `${st.place.x},${st.place.y},${st.place.z}`;
+    if (!_heardAt.has(k)) return false;
+    const v = voxels.find(c => c.x === st.place.x && c.y === st.place.y && c.z === st.place.z);
+    return v && classifyVoxel(bot, v.x, v.y, v.z, v.type, pasted.external_types, pasted.accepts).verdict === 'correct';
+  });
+  const until = Date.now() + CATCH_UP_MS;
+  for (let behind = ahead(entry); behind.length; behind = ahead(entry)) {
+    const asked = Date.now();
+    if (asked >= until || !(await keeper.readAfter('structures', asked, until - asked))) {
+      const c = behind[0].place;
+      keeper.fail(`the keeper still reads (${c.x},${c.y},${c.z}) in ${roomKey} as ${behind[0].type} ${CATCH_UP_MS / 1000} s after this body heard it change to what the plan wants`);
+      return stopped();
+    }
+    const next = keeper.get('structures');
+    entry = next && next.structures && next.structures[roomKey];
+    if (!entry || entry.held !== true) { keeper.fail(`the keeper stopped holding ${roomKey} whole while this body waited for it to read a change`); return stopped(); }
+  }
+  // A copy: a caller may sort or trim its steps, and the held verdict is every reader's.
+  return { result: entry.all_complete ? null : structuredClone({ steps: entry.steps, stats: entry.stats, summary: entry.summary }) };
 }
 
 module.exports = {
@@ -613,6 +727,10 @@ module.exports = {
   isAir,
   footprintExtent,   // the one definition of a blueprint's XZ reach, as offsets from its transpose_origin
   transposeVoxel,
+  turnOf,          // a locked origin's quarter turns (transpose_origin.turn)
+  rotateXZ,
+  turnState,
+  placeOffset,
   transposeVoxelsForCandidate,
   transposeAnchorsForCandidate,
   transposeAttachPoints,

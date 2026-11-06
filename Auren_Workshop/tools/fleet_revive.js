@@ -357,7 +357,7 @@ async function preflight(botIds, { world = null, live = true, blueprint = 'headf
     if (!listening) {
         refusals.push(`nothing is listening on ${gamePort} — a continue reuses the running server and will not `
             + `start one for you, because starting a server picks a WORLD and that is the one choice a continue `
-            + `may not make silently. Start it first: node start_auren.js --start continue --crew contractor --soak 0`);
+            + `may not make silently. Start it first: node start_auren.js --start continue --test world`);
         return { ok: false, refusals, findings };
     }
 

@@ -117,6 +117,8 @@ module.exports = {
             watcher.summary(TAG, `💀 DIED (death ${deaths} of this watch) — the trial ends here. Ending the watch and releasing the signal; the body is NOT respawned by this fragment.`);
           }
         } else {
+          // A fight this body left unresolved (a peer's claim took the mob) closed and the same loop turns on: the watch stands again.
+          if (outcome === 'clear' && previous !== null && previous !== 'clear') crewLog.post(TAG, 'sentry', { state: 'standing' });
           // No entity resolved — differs to the trace reader, not to the watch, which is still waiting.
           if (++quietPasses % QUIET_LOG_EVERY === 0) {
             watcher.summary(TAG, `👁️ Standing watch — ${quietPasses} quiet pass(es), no aggro (last: ${outcome}).`);

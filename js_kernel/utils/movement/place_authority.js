@@ -106,6 +106,12 @@ async function _place(bot, pos, anchor, face, itemName, tag, opts) {
   if (!item) {
     return { ok: false, after: null, reason: `no ${itemName} in inventory` };
   }
+  // A falling block (an anvil, sand) goes in only on a block below that holds it up: on any other face it falls
+  // the moment it is placed, onto whatever stands under it.
+  const { fallsWithoutBelow, holdsUp } = require('@utils/gravity_utils');
+  if (fallsWithoutBelow(opts.block || itemName) && !holdsUp(bot.blockAt(new Vec3(pos.x, pos.y - 1, pos.z)))) {
+    return { ok: false, after: bot.blockAt(pos), reason: `${opts.block || itemName} falls: nothing under (${pos.x},${pos.y - 1},${pos.z}) holds it up` };
+  }
   if (!bot.heldItem || bot.heldItem.name !== itemName) {
     const equipped = await guardExternal(tag, `equip ${itemName}`, async () => {
       // Free when nothing is open: an open container window makes bot.equip fail with a message that

@@ -27,12 +27,14 @@ const locomotion = require('@locomotion/locomotion_dispatcher');
 
 const { normalizeBlockName, BLOCK_REACH } = require('@utils/fragment_utils');
 const { MIN_PLACEMENT_DIST } = require('@utils/pathfinding_utils');
-// One process-wide 500 ms clock, shared with the dig and drive primitives; the engaging/escaping
+// The gate shared with the dig and drive primitives, asked on every call; the engaging/escaping
 // bypass keeps combat's own arms from re-entering it.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { stepHorizontal } = require('@utils/movement/drive');
 const { microCenter } = require('@utils/movement/motion_primitives');
-const { isAir, dist3, classifyFloor } = require('@utils/movement/terrain_predicates');
+const { isAir, dist3 } = require('@utils/movement/terrain_predicates');
+// The stand and reach metrics, shared with the integrity keeper's thread (utils/stand_reach).
+const { EYE_FACTOR, standEye, nearestFaceDist, reachFromStand, resolveStandableAnchor } = require('@utils/stand_reach');
 
 const STEP_WAIT_MS = 200;
 const sleep = ms => new Promise(res => setTimeout(res, ms));
@@ -41,15 +43,13 @@ const sleep = ms => new Promise(res => setTimeout(res, ms));
 // at or past this it is a penalised dig or a stalled placeBlock, named in the phase summary.
 const SLOW_PLACE_MS = 2000;
 
-// EYE_FACTOR — vanilla eye height as a fraction of entity height (eye = feet + height*0.9).
-const EYE_FACTOR = 0.9;
-
 const INTERACTABLE_NAMES = new Set([
   'chest', 'trapped_chest', 'barrel', 'furnace', 'blast_furnace', 'smoker', 'crafting_table', 'anvil', 'stonecutter',
   'hopper', 'brewing_stand', 'cartography_table', 'loom', 'enchanting_table', 'lectern', 'grindstone', 'bell'
 ]);
 function isInteractable(name) {
   return INTERACTABLE_NAMES.has(name)
+    || /_bed$/.test(name)
     || /_door$/.test(name)
     || /_trapdoor$/.test(name)
     || /_fence_gate$/.test(name);
@@ -72,8 +72,11 @@ const ATTACH_DIRS = [
 function findAttachable(bot, pos, blockName = null) {
   let interactableFallback = null;
   const sitsOnly = !!blockName && require('@kernel/support_plan').sitsOnly(blockName);
+  // A torch stands on a floor or hangs on a wall, never under a ceiling.
+  const torch = !!blockName && /torch$/.test(blockName);
   for (const { d, face } of ATTACH_DIRS) {
     if (sitsOnly && d.y !== -1) continue;
+    if (torch && d.y === 1) continue;
     const neighborPos = pos.plus(d);
     const block = bot.blockAt(neighborPos);
     if (!block || isAir(block.name)) continue;
@@ -121,26 +124,24 @@ function botOccupiesCell(bot, pos) {
          (p.z + hw) > pos.z && (p.z - hw) < (pos.z + 1);
 }
 
-// standEye — the bot's eye position when microCentered on the stand block; every dig/place
-// microCenters first, so reach measured from here is deterministic (see assertReachable).
-function standEye(bot, stand) {
-  return { x: stand.x + 0.5, y: stand.y + (bot.entity.height || 1.8) * EYE_FACTOR, z: stand.z + 0.5 };
-}
-
-// nearestFaceDist — distance from an eye point to the nearest point of the unit cube at pos,
-// matching how the server range-checks a block interaction (eye to surface, not eye to center).
-function nearestFaceDist(eye, pos) {
-  const nx = Math.max(pos.x, Math.min(eye.x, pos.x + 1));
-  const ny = Math.max(pos.y, Math.min(eye.y, pos.y + 1));
-  const nz = Math.max(pos.z, Math.min(eye.z, pos.z + 1));
-  return Math.sqrt((eye.x - nx) ** 2 + (eye.y - ny) ** 2 + (eye.z - nz) ** 2);
-}
-
-// reachFromStand — deterministic server-accurate reach from the microCentered stand block to a
-// target voxel; the one reach metric (Law 16) shared by mining anchor-assignment and the in-loop
-// reach gate below. pos may be a Vec3 or a plain {x,y,z}.
-function reachFromStand(bot, stand, pos) {
-  return nearestFaceDist(standEye(bot, stand), pos);
+// standInReachOf(bot, pos) → { x, y, z } feet cell nearest the body, within two blocks of `pos`, that a body stands
+// on (solid floor, feet and head open, no fluid) with `pos` in BLOCK_REACH; null when none. A vein chased block by
+// block walks here for a block out of reach of where it stands.
+function standInReachOf(bot, pos) {
+  const { isFluid } = require('@utils/gravity_utils');
+  const here = bot.entity.position;
+  let best = null, bestD = Infinity;
+  for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) for (let dy = -2; dy <= 1; dy++) {
+    const c = new Vec3(pos.x + dx, pos.y + dy, pos.z + dz);
+    if (c.equals(pos)) continue;
+    const floor = bot.blockAt(c.offset(0, -1, 0)), feet = bot.blockAt(c), head = bot.blockAt(c.offset(0, 1, 0));
+    if (!floor || !feet || !head || floor.boundingBox !== 'block' || isFluid(floor.name)) continue;
+    if (feet.boundingBox !== 'empty' || head.boundingBox !== 'empty' || isFluid(feet.name) || isFluid(head.name)) continue;
+    if (reachFromStand(bot, c, pos) > BLOCK_REACH) continue;
+    const d = c.distanceSquared(here);
+    if (d < bestD) { best = { x: c.x, y: c.y, z: c.z }; bestD = d; }
+  }
+  return best;
 }
 
 // assertReachable — Law 13 reach gate. Reach from the microCentered stand is deterministic, so a
@@ -182,45 +183,6 @@ function evaluatePlacement(bot, step, stand) {
   if (!attach) return { ok: false, reason: 'no_attach_point', pos, neighbors: describeNeighborhood(bot, pos) };
 
   return { ok: true, pos, anchor: attach.anchor, face: attach.face, underFeet: false };
-}
-
-// resolveStandableAnchor — given a plot/anchor FLOOR cell, returns a standable stand to work
-// from: the anchor's own feet if standable, else the nearest standable cell within reach.
-// Returns { floor, feet, alternate } or null when nothing standable reaches the plot. Reuses
-// classifyFloor and reachFromStand (Law 16 — one standability metric, one reach metric).
-// opts.fallback === false restricts to the anchor's own floor or nothing, for a blueprint whose
-// anchors are built by each other (wheat_tine_row: a missing stand means the row behind hasn't
-// laid it yet).
-function resolveStandableAnchor(bot, anchorFloor, opts = {}) {
-  const reach = opts.reach || BLOCK_REACH;
-  const af = new Vec3(anchorFloor.x, anchorFloor.y, anchorFloor.z);
-  const standableAt = (fx, fy, fz) => !!classifyFloor(bot, bot.blockAt(new Vec3(fx, fy, fz)));
-  const feetOf = (fx, fy, fz) => ({ x: fx, y: fy + 1, z: fz });
-  // Primary: the anchor's own floor. If it is still standable nothing moved — work from it.
-  if (standableAt(af.x, af.y, af.z)) {
-    return { floor: { x: af.x, y: af.y, z: af.z }, feet: feetOf(af.x, af.y, af.z), alternate: false };
-  }
-  if (opts.fallback === false) return null;
-  // Fallback: nearest standable floor in an expanding ring (±1 in Y for a stepped bank) whose
-  // feet-eye still reaches the anchor cell.
-  for (let r = 1; r <= 2; r++) {
-    let best = null, bestD = Infinity;
-    for (let dx = -r; dx <= r; dx++) {
-      for (let dz = -r; dz <= r; dz++) {
-        if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;   // ring perimeter only
-        for (const dy of [0, 1, -1]) {
-          const fx = af.x + dx, fy = af.y + dy, fz = af.z + dz;
-          if (!standableAt(fx, fy, fz)) continue;
-          const feet = feetOf(fx, fy, fz);
-          if (reachFromStand(bot, feet, af) > reach) continue;      // must reach the plot from here
-          const d = dx * dx + dz * dz + Math.abs(dy);
-          if (d < bestD) { bestD = d; best = { floor: { x: fx, y: fy, z: fz }, feet, alternate: true }; }
-        }
-      }
-    }
-    if (best) return best;
-  }
-  return null;
 }
 
 // findStandableNeighbor — a cardinal cell beside stand with solid support below and air at
@@ -289,7 +251,7 @@ async function sidestepFooting(bot, stand, footingDig, footingPlace, ops) {
 // contract). Per-block mechanics (digOne/placeOne) and item policy (resolveItem/isOptional) are
 // injected so mining and building share the control flow without merging their domains.
 async function repairAtAnchor(bot, job, ops) {
-  const { stand, steps, label } = job;
+  const { stand, steps, label } = job;   // job.relocated: see offStand below
   const { digOne, placeOne, resolveItem, isOptional, tag } = ops;
   const maxPlaceAttempts = ops.maxPlaceAttempts || 3;
 
@@ -322,8 +284,11 @@ async function repairAtAnchor(bot, job, ops) {
   // arrive, `from` becomes the cell the body stopped in and every step is measured from there: a step in
   // reach is worked, a step out of reach is deferred, and the caller's next pass walks further on the floor
   // this pass laid.
+  // A relocated stand (job.relocated: the anchor's own floor was not standable, resolveStandableAnchor chose a
+  // nearby one) is worked the same way from the start: it was chosen to reach the anchor's floor, not every cell
+  // the anchor owns, so a cell out of its reach is deferred to the pass that stands on the anchor itself.
   let from = stand;
-  let offStand = false;
+  let offStand = !!job.relocated;
   const outOfReach = (pos) => offStand && reachFromStand(bot, from, pos) > BLOCK_REACH;
   async function ensureAtAnchor() {
     const feet = bot.entity.position.floored();
@@ -563,4 +528,4 @@ async function settle({ rescan, work, label, tag }) {
   return { ...totals, cycles, stop, remaining: steps.length, remaining_steps: steps };
 }
 
-module.exports = { settle, SETTLE_MAX_CYCLES, repairAtAnchor, evaluatePlacement, findAttachable, describeNeighborhood, isEnclosedCorner, botOccupiesCell, reachFromStand, standEye, nearestFaceDist, resolveStandableAnchor, findStandableNeighbor, ATTACH_DIRS, isInteractable };
+module.exports = { settle, SETTLE_MAX_CYCLES, repairAtAnchor, evaluatePlacement, findAttachable, describeNeighborhood, isEnclosedCorner, botOccupiesCell, reachFromStand, standInReachOf, standEye, nearestFaceDist, resolveStandableAnchor, findStandableNeighbor, ATTACH_DIRS, isInteractable };

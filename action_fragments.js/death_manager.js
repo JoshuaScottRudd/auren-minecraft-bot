@@ -16,9 +16,7 @@
 // happen is reported as a failure and the judge replans from where the body actually is.
 //
 // Only the destination is species-dependent; both acts are identical for every species, so the branch
-// lives in recoveryPoint alone. A contractor's ladder is its own sited house, then the human who summoned
-// it, then world spawn. The homesteader's ladder is the three tiers below, every one anchored on the
-// headframe.
+// lives in recoveryPoint alone: the three tiers below, every one anchored on the crew's home structure.
 //
 // ACT 1 is also callable on its own, as `reviveBody`: a body that died and was stopped comes back as a
 // corpse whose spawn gate the client library consumes without firing, so the death signal never reaches
@@ -45,7 +43,6 @@
 
 const watcher = require('@kernel/watcher');
 const { routeToJudge } = require('@utils/signal_utils');
-const { guardExternal } = require('@utils/external_library_guard');
 
 const TAG = 'death_manager';
 
@@ -57,7 +54,7 @@ const SPAWN_SPOT_MAX_DISTANCE = 48;
 
 // The two acts and the predicate are shared with every other place a body is stood up
 // (`js_kernel/body_recovery`): a natural death (this file), a continue's preflight, a launch onto dead
-// playerdata, and a human's `foreman get` landing on a corpse (Law 16 — one definition of standing a body
+// playerdata, and the foreman's crew raise landing on a corpse (Law 16 — one definition of standing a body
 // up).
 //
 // What stays here is the policy: where a recovered body goes. That is two ladders, one per species.
@@ -66,8 +63,8 @@ const { isDead, reviveBody, teleportTo, anchorZeroPoint, ARRIVAL_TOLERANCE } = r
 
 // ── THE THIRD TIER LEAVES THE SPAWN-PROTECTED SQUARE, NOT JUST "STAY PUT" ────────────────────────────
 // A vanilla respawn with no bed lands at world spawn, the centre of the one square where this fleet can
-// neither break nor place. The desk refuses to launch a crew within PERSON_CLEAR_OF_SPAWN of world spawn
-// (foreman.js); this tier holds the same clearance on the way back from a death, measured by the same
+// neither break nor place. The foreman refuses to launch a crew within BASE_CLEAR_OF_SPAWN of world spawn
+// (utils/get_crew); this tier holds the same clearance on the way back from a death, measured by the same
 // module.
 //
 // The site is found, never assumed: find_buildingspot.locate is the fleet's one site scan and already
@@ -76,7 +73,7 @@ const { isDead, reviveBody, teleportTo, anchorZeroPoint, ARRIVAL_TOLERANCE } = r
 // put, and the verdict says it is standing in the square (Law 25), instead of reading like an ordinary
 // fallthrough.
 const { isSpawnProtectedAt, worldSpawnPoint, chebyshevFromWorldSpawn } = require('@perception/spawn_protection');
-const { PERSON_CLEAR_OF_SPAWN } = require('@thinking/architect_config');
+const { BASE_CLEAR_OF_SPAWN } = require('@thinking/architect_config');
 
 // How far past the clearance the search ORIGIN is set. The scan grows outward from its origin, so an origin
 // sitting exactly on the line returns candidates on both sides of it and half of them fail the clearance
@@ -111,7 +108,7 @@ async function noHome(bot, why) {
   }
   const findSpot = require('@action/find_buildingspot.js');
   const { building, dims } = findSpot.loadBlueprintDims('spawn_spot');
-  const reach = PERSON_CLEAR_OF_SPAWN + CLEAR_SEARCH_MARGIN;
+  const reach = BASE_CLEAR_OF_SPAWN + CLEAR_SEARCH_MARGIN;
   const result = await findSpot.locate(bot, {
     blueprintName: 'spawn_spot',
     building,
@@ -126,13 +123,13 @@ async function noHome(bot, why) {
     return { kind: 'world_spawn', at: null, why: `${why}, AND THE BODY IS STANDING IN THE SPAWN-PROTECTED SQUARE — no clear site was found to move it to (${result?.reason || 'no candidate'}), so every dig and placement it attempts from here will be refused` };
   }
   const out = chebyshevFromWorldSpawn(bot, c);
-  if (out < PERSON_CLEAR_OF_SPAWN) {
-    return { kind: 'world_spawn', at: null, why: `${why}, AND THE BODY IS STANDING IN THE SPAWN-PROTECTED SQUARE — the nearest site found is only ${out}b out, inside the ${PERSON_CLEAR_OF_SPAWN}b clearance` };
+  if (out < BASE_CLEAR_OF_SPAWN) {
+    return { kind: 'world_spawn', at: null, why: `${why}, AND THE BODY IS STANDING IN THE SPAWN-PROTECTED SQUARE — the nearest site found is only ${out}b out, inside the ${BASE_CLEAR_OF_SPAWN}b clearance` };
   }
   return {
     kind: 'clear_of_spawn',
     at: { x: c.x, y: c.y + 1, z: c.z },
-    why: `${why}; the respawn put the body inside the spawn-protected square, so leaving it comes before any work — this site is ${out}b out, past the ${PERSON_CLEAR_OF_SPAWN}b clearance the desk requires of a person`,
+    why: `${why}; the respawn put the body inside the spawn-protected square, so leaving it comes before any work — this site is ${out}b out, past the ${BASE_CLEAR_OF_SPAWN}b clearance the foreman requires of a base`,
   };
 }
 
@@ -143,40 +140,6 @@ async function noHome(bot, why) {
 // say "no" still carries a reason (Law 25).
 async function recoveryPoint(bot) {
   const { readTransposeOrigin } = require('@utils/fragment_utils');
-
-  // ── THE CONTRACTOR'S LADDER — ITS OWN HOUSE, FIRST AND ALWAYS ─────────────────────────────────
-  // Two rungs; the estate's three do not apply, since a contractor may never see a headframe. The locked
-  // site is the home, not the built house: the site is the fact, and the structure is work in progress on
-  // top of it. Its safety is inherited from find_buildingspot's siting predicate (flat, clear, standable
-  // ground with nothing overhead), the same discipline the headframe tier runs on, so no second opinion is
-  // taken here (Law 16).
-  //
-  // The house outranks the owner, and the owner outranks nothing at all: once a fixed address exists it
-  // wins, since a person is a moving destination and the house is not. Before a house is sited, the person
-  // who asked for the contractor is its only home. Read live, not the position remembered from birth
-  // (Invariant B — a stale owner position is exactly what this ladder avoids). An unreachable read falls
-  // to world spawn.
-  if (require('@kernel/bot_mandate').isContractor()) {
-    const house = readTransposeOrigin('contractor_house');
-    if (house && typeof house.x === 'number') {
-      return {
-        kind: 'contractor_house',
-        at: { x: house.x, y: house.y + 1, z: house.z },
-        why: `its own house is sited at (${house.x},${house.y},${house.z}) — home whether or not it is built yet`,
-      };
-    }
-    const owner = require('@kernel/bot_mandate').currentOwner();
-    const read = await guardExternal(TAG, `rcon read of ${owner}'s position`,
-      () => require('../js_kernel/utils/rcon_link').entityPos(owner));
-    if (read.ok && read.value) {
-      return {
-        kind: 'owner',
-        at: read.value,
-        why: `no house is sited yet, so home is ${owner} — standing where they stand, which is ground a person is already occupying`,
-      };
-    }
-    return noHome(bot, `no contractor house is sited yet and ${owner} could not be located (${read.ok ? 'not in the world' : read.reason}) — nothing to come back to`);
-  }
 
   // The mandate owns this crew's recovery home; the missing-home report names that same structure
   // so recovery and diagnosis use one species-specific answer (Law 16).

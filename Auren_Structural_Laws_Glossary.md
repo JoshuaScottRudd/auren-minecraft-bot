@@ -50,7 +50,7 @@ that pairing in the fleet.
 
 | Role phrase in the laws | Current implementation |
 |---|---|
-| the party answerable for a spawned unit's acts | `js_kernel/bot_mandate.js` — `BOT_MODE` + `BOT_OWNER`; a contractor without an owner is refused at startup, a homesteader with one is refused (it answers to nobody) |
+| the party answerable for a spawned unit's acts | `js_kernel/bot_mandate.js` — `BOT_MODE`; a crew answers to no player: the foreman raises the crew its run page names |
 | the stamp naming who answers for a placed thing | the owner written into each station / building row by `perception_nodes.js/station_registry.js` |
 | clearing what a unit knows, at one party's own scope | `js_kernel/wipe_system.js` — the `wipe` operator verb; takes **no argument naming whose things**, reads the owner off this process's own mandate, so a foreign row cannot be spelled (Law 27) |
 | clearing shared memory at the widest scope | `js_kernel/flush_system.js` — the `flush` operator verb, resetting `corporate_headquarters*.json` whole; correct only from the terminal, where the whole fleet is one person's responsibility |

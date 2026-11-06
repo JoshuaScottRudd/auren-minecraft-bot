@@ -8,8 +8,8 @@
 const record = require('../foreman_record');
 const alarmBlock = require('@utils/alarm_block');
 
-// ONE CALL, TWO DESTINATIONS, A LOGGER, NOT TWO PATHWAYS (Law 16). The console half is the desk's live
-// window — the one a person watches while standing in the world, and the one the probe reads — written
+// ONE CALL, TWO DESTINATIONS, A LOGGER, NOT TWO PATHWAYS (Law 16). The console half is the foreman's live
+// window — the one a person watches while the run goes — written
 // explicitly because naming the unit above would silence the watcher's own echo. The record half is what
 // outlives the window.
 function log(msg) {

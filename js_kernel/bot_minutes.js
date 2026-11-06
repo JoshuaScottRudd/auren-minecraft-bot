@@ -46,6 +46,9 @@ let _jobs = 0;
 const _byToken = new Map();
 // Walking done while a job was held, in milliseconds — the part of `working` spent getting to the work.
 let _walkMs = 0;
+// Time held by ore trips (walk_share_calculator.ORE_TRIPS), in milliseconds: part of `working`, and left out of the
+// clock the walking share is judged on, as their walking is (`_walkMs` never takes it).
+let _oreTripMs = 0;
 
 const KINDS = Object.freeze(['startup', 'working', 'idle']);
 
@@ -64,7 +67,8 @@ function _closeSpan(atMs) {
         row.ms += heldMs; row.spans++;
         _byToken.set(_span.label, row);
     }
-    const closed = { kind: _span.kind, label: _span.label, heldMs, walkMs: _span.walkMs || 0 };
+    if (_span.ore) _oreTripMs += heldMs;
+    const closed = { kind: _span.kind, label: _span.label, heldMs, walkMs: _span.walkMs || 0, ore: _span.ore || null };
     _span = null;
     return closed;
 }
@@ -93,8 +97,17 @@ function _emit(closed, atMs) {
 
 // One line per finished job: how its time split between walking and working. The limit is judged once,
 // at the end of the run, over every job of every body (the foreman's verdict, off each body's clock).
+// An ore trip's line is the ore it picked up for the time it held the body, not its walking share.
 function _emitWalkShare(closed) {
     const watcher = require('@kernel/watcher');
+    if (closed.ore) {
+        const items = Object.entries(closed.ore);
+        const ore = items.reduce((n, [, c]) => n + c, 0);
+        const perMin = closed.heldMs > 0 ? (ore * 60000 / closed.heldMs).toFixed(2) : 'none';
+        watcher.summary('ore_trip', `ore_trip job=${closed.label} held=${_fmt(closed.heldMs)} walk=${_fmt(closed.walkMs)}`
+            + ` ore=${ore} items=${items.length ? items.map(([i, c]) => `${i}:${c}`).join(',') : 'none'} per_min=${perMin}`);
+        return;
+    }
     const { walkShare, WALK_LIMIT_PCT } = require('@utils/calculators/walk_share_calculator');
     const s = walkShare(closed.walkMs, closed.heldMs);
     const line = `walk_share job=${closed.label} held=${_fmt(closed.heldMs)} walk=${_fmt(s.walk_ms)} work=${_fmt(s.work_ms)}`
@@ -111,7 +124,7 @@ function _publishClock() {
     if (!botId) return;
     const hq = require('@kernel/corporate_headquarters');
     const chair = hq.readBoardroomChair(botId, {}) || {};
-    chair.work_clock = { working_ms: _total.working, walk_ms: _walkMs, updated_at: _now() };
+    chair.work_clock = { working_ms: _total.working - _oreTripMs, walk_ms: _walkMs, updated_at: _now() };
     hq.writeBoardroomChair(botId, chair);
     link.sendUpdate();
 }
@@ -122,7 +135,15 @@ function walked(ms, category) {
     if (!_span || _span.kind !== 'working' || _span.label !== category || !(ms > 0)) return;
     const inSpan = Math.min(ms, Math.max(0, _now() - _span.atMs));
     _span.walkMs = (_span.walkMs || 0) + inSpan;
-    _walkMs += inSpan;
+    if (!_span.ore) _walkMs += inSpan;
+}
+
+// picked — this body picked up `count` of `item` (item_book, on the server's collect packet). An ore trip counts
+// the ore it picks up (architect_config.SURVEY_ORE_ITEM) toward its ore_trip line.
+function picked(item, count) {
+    if (!_span || !_span.ore || !(count > 0)) return;
+    if (!require('@thinking/architect_config').SURVEY_ORE_ITEM.test(item)) return;
+    _span.ore[item] = (_span.ore[item] || 0) + count;
 }
 
 // open — the body's life starts counting. Called once, from the one place that starts the planning
@@ -143,7 +164,8 @@ function dispatch(token) {
     if (_openedAtMs == null) return;          // never opened — record nothing
     const at = _now();
     const closed = _closeSpan(at);
-    _span = { kind: 'working', label: token || 'unnamed', atMs: at };
+    _span = { kind: 'working', label: token || 'unnamed', atMs: at,
+        ...(require('@utils/calculators/walk_share_calculator').isOreTrip(token) ? { ore: {} } : {}) };
     // EMIT BEFORE THE COUNTER MOVES, so `jobs` on a line means jobs finished as of this line, not jobs
     // finished plus the one that just started. A count that includes an event the line is not about
     // cannot be summed against anything.
@@ -218,4 +240,4 @@ function snapshot() {
     };
 }
 
-module.exports = { open, dispatch, idle, close, walked, snapshot, KINDS, TAG };
+module.exports = { open, dispatch, idle, close, walked, picked, snapshot, KINDS, TAG };

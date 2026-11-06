@@ -54,6 +54,7 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
         stalls: [],
         sprints: [],
         rearms: [],
+        waves: [],
         guards: [],            // shield up/down pairs
         openGuard: null,
         bearings: [],          // every compass change the commander posted, in order, across all mobs
@@ -200,6 +201,13 @@ function reduceEngagements({ seg = [], bot: botFilter = null } = {}) {
         break;
       case 'rearm':
         b.rearms.push({ at: t, from: ev.fields.from || null, to: ev.fields.to || null, why: ev.fields.why || null });
+        break;
+      // battle_stations' one line per wave: how one arrival of the gate ended.
+      case 'wave':
+        b.waves.push({ at: t, outcome: ev.fields.outcome || null, source: ev.fields.source || null,
+          taken: crewLog.num(ev.fields, 'taken'), cleared: crewLog.num(ev.fields, 'cleared'), lost: crewLog.num(ev.fields, 'lost'),
+          dequeued: crewLog.num(ev.fields, 'dequeued'), passes: crewLog.num(ev.fields, 'passes'),
+          hp_open: crewLog.num(ev.fields, 'hp_open'), hp: crewLog.num(ev.fields, 'hp') });
         break;
       default:
         break;   // a verb this reducer does not model yet — counted in `lines`, never guessed at
@@ -380,6 +388,13 @@ function runEngagement({ seg = [], traceName = '?', bot: botFilter = null, verbo
     if (b.rearms.length) {
       out.section('rearms');
       out.table(['at', 'from', 'to', 'why'], b.rearms.map((r) => [at(r.at), r.from, r.to, r.why]));
+    }
+
+    if (b.waves.length) {
+      out.section('waves');
+      out.table(['at', 'gap_from_last', 'outcome', 'source', 'taken', 'cleared', 'lost', 'dequeued', 'passes', 'hp_open', 'hp'],
+        b.waves.map((w, i) => [at(w.at), i ? seconds(w.at - b.waves[i - 1].at) : null, w.outcome, w.source,
+          w.taken, w.cleared, w.lost, w.dequeued, w.passes, w.hp_open, w.hp]));
     }
 
     if (b.stalls.length) {

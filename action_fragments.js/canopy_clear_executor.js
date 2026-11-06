@@ -1,22 +1,20 @@
-// fragment: canopy_clear_executor (action / base-canopy clearing)
-// purpose: The engine of the proactive tree-clear pathway — fells wild trees standing within
-//          TREE_CLEAR_RADIUS of an opted-in surface blueprint's transpose_origin, ordered closest to that
-//          center, so the camera framing around the base/farm stays clear. One verb: fell one wild tree
-//          inside a blueprint's clear radius (Law 0).
+// fragment: canopy_clear_executor (action / site tree clearing)
+// purpose: fells the wild trees standing on a structure's site before it is built (site_clear_trees,
+//          assessors/shared.siteTreesJob), nearest the site's centre first. One verb: fell one wild tree
+//          inside a site's box (Law 0).
 //
 // A dedicated executor, not harvest_executor: harvest fells to satisfy a log deficiency through its
-// inside-to-outside supply ladder; this fells to keep a radius clear for film regardless of log need, at
-// the lowest priority. Same felling primitive (tree_feller.fell — Law 16), different trigger and scope.
+// inside-to-outside supply ladder; this fells to clear a site regardless of log need. Same felling
+// primitive (tree_feller.fell — Law 16), different trigger and scope.
 //
 // magnet.where carries the center because a transpose_origin is immutable once set_buildspot locks it, so
-// the value copied onto the magnet at post time is still correct at run time. job_board's gate (a log
-// within radius of the center) only posts this while a tree still stands in range, so the executor stops
-// being dispatched once the ring is clear.
+// the value copied onto the magnet at post time is still correct at run time. The board only posts this
+// while a tree still stands in the box, so the executor stops being dispatched once the site is clear.
 //
 // One tree per dispatch: tree_feller.fell clears one whole connected tree, then routes to recursive_judge
-// so the board re-plans and re-posts clear_canopy for the next tree while the gate still finds one. A
-// futile pass (nothing in range reachable) concedes to idle_park instead of re-dispatching an identical
-// zero-progress fell, so the lowest-priority film job never churns the judge into a stuck-loop halt (Law 13).
+// so the board re-plans and re-posts for the next tree while one stands. A futile pass (nothing in range
+// reachable) concedes to idle_park instead of re-dispatching an identical zero-progress fell, so the job
+// never churns the judge into a stuck-loop halt (Law 13).
 
 'use strict';
 
@@ -24,7 +22,6 @@ const watcher = require('@kernel/watcher');
 const treeFeller = require('@api/tree_feller');
 const locomotion = require('@locomotion/locomotion_dispatcher');
 const portableJudge = require('@kernel/portable_judge');
-const { TREE_CLEAR_RADIUS } = require('@thinking/architect_config');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
 
 const TAG = 'canopy_clear_executor';
@@ -60,28 +57,23 @@ module.exports = {
     const botId = process.env.BOT_ID || 'default';
     const magnet = hq.readBoardroomChair(botId, {})?.magnet;
     const where = magnet?.where;
-    // The ring is the asker's, not the fleet's: the camera wants a clear ring around a base, and a
-    // downloaded building wants its own footprint plus the margin a leaf can overhang it by. The radius
-    // travels on the job; TREE_CLEAR_RADIUS is the default for the asker that names none — the camera,
-    // whose ring IS that constant (Law 16: one verb over a number).
+    // The box is the site's: its footprint plus the margin a leaf can overhang it by, travelling on the job.
     const box = magnet?.box || null;
-    const radius = Number.isFinite(magnet?.radius) ? magnet.radius : TREE_CLEAR_RADIUS;
-    // How far out the region actually reaches, for the "am I standing in it" test below. A box states it
-    // per side; a ring states it once.
-    const reach = box
-      ? Math.max(Math.abs(box.min_dx), box.max_dx, Math.abs(box.min_dz), box.max_dz)
-      : radius;
+    if (!box) {
+      throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a site clear names its box (assessors/shared.siteTreesJob); this magnet carries none.`);
+    }
+    // How far out the region actually reaches, for the "am I standing in it" test below.
+    const reach = Math.max(Math.abs(box.min_dx), box.max_dx, Math.abs(box.min_dz), box.max_dz);
     if (!where || typeof where.x !== 'number') {
       // The blueprint center didn't ride the magnet (base unlocked between post and dispatch) —
       // environmental/timing, not a bug. Concede to idle; the next sweep re-plans from live state.
       return _routeIdle('no blueprint center on magnet — nothing to clear');
     }
 
-    // Fells one wild tree inside the blueprint's clear ring, worked closest-to-center first. The zone
-    // uses the same square (Chebyshev radius) job_board's gate counts trees in, so the two agree on
-    // what "in range" means.
+    // Fells one wild tree inside the site's box, worked closest-to-center first. The zone is the same box
+    // the board counts trees in, so the two agree on what "in range" means.
     //
-    // No preferWood here: this verb's goal is an empty ring, so species is meaningless to it.
+    // No preferWood here: this verb's goal is an empty site, so species is meaningless to it.
     // Supply-side felling wants one species (harvest_executor's log ladder passes the flag); clearing
     // wants the nearest trunk.
     const center = { x: where.x, z: where.z };
@@ -94,7 +86,15 @@ module.exports = {
     const feet = bot.entity.position.floored();
     const away = Math.max(Math.abs(feet.x - center.x), Math.abs(feet.z - center.z));
     if (away > reach) {
-      const trip = await locomotion.goTo({ x: where.x, y: where.y, z: where.z, leg: 'work' });
+      // A centre inside closed ground (the waste pit's own box) is refused before any route is searched; the walk
+      // aims at the first open cell on the line from the centre back toward the body.
+      const { closedBy } = require('@locomotion/navigator');
+      const goal = { x: where.x, y: where.y, z: where.z };
+      for (let k = 1; k <= away && closedBy(goal); k++) {
+        goal.x = Math.round(where.x + (feet.x - where.x) * k / away);
+        goal.z = Math.round(where.z + (feet.z - where.z) * k / away);
+      }
+      const trip = await locomotion.goTo({ ...goal, leg: 'work' });
       if (!trip?.arrived) {
         return _routeIdle(`could not reach the site to clear it (${away} blocks out, reach ${reach}) — replanning`);
       }
@@ -103,23 +103,14 @@ module.exports = {
     // A SITE'S TREES ARE THE ONES ITS CENSUS COUNTED. The board holds a site's phase open on
     // shared.standingSiteTrees, which reads every log in the box at any height; the feller's own scan reads
     // the surface only. So a site job fells a trunk off that same census, nearest the centre first, and a
-    // log the census counts is a log this job goes to (Law 16). A ring with no box keeps the feller's scan.
-    let target = null;
-    if (box) {
-      const { standingSiteTrees, freeSiteTrees, inBox } = require('@thinking/assessors/shared');
-      // A job's hole is ground inside its box that belongs to something else (a building's grounds
-      // exclude its own footprint, whose logs may be the building). A trunk inside a column a peer
-      // holds is theirs, at any height — the footprint the foreman grants the claim by.
-      const hole = magnet?.hole || null;
-      const free = freeSiteTrees(await standingSiteTrees(bot, where, box) || [])
-        .filter(p => !(hole && inBox(hole, where, p)));
-      const d = (p) => Math.max(Math.abs(p.x - center.x), Math.abs(p.z - center.z));
-      target = free.sort((a, b) => d(a) - d(b))[0] || null;
-      // With a hole in the box the feller's own scan could land inside it, so no census trunk is no fell.
-      if (!target && hole) return _routeIdle('every trunk in the grounds is felled or held by a peer');
-    }
+    // log the census counts is a log this job goes to (Law 16). A trunk inside a column a peer holds is
+    // theirs, at any height — the footprint the foreman grants the claim by.
+    const { standingSiteTrees, freeSiteTrees } = require('@thinking/assessors/shared');
+    const free = freeSiteTrees(await standingSiteTrees(bot, where, box) || []);
+    const d = (p) => Math.max(Math.abs(p.x - center.x), Math.abs(p.z - center.z));
+    const target = free.sort((a, b) => d(a) - d(b))[0] || null;
     const result = await treeFeller.fell(bot, target, {
-      canopyZone: { mode: 'inside', center, box, radius },
+      canopyZone: { mode: 'inside', center, box },
       preferNear: { x: where.x, y: where.y, z: where.z },
     });
 
@@ -135,8 +126,8 @@ module.exports = {
       return routeToJudge(TAG, { ...payload, readable });
     }
 
-    // No clearable tree in range → concede (the gate stops posting once the ring is truly clear; a
+    // No clearable tree in range → concede (the gate stops posting once the site is truly clear; a
     // transient can't-reach must not churn the judge on the lowest-priority job).
-    return _routeIdle(`no clearable tree in range (${result?.reason || 'unknown'})`);
+    return _routeIdle(`no clearable tree in range (${result?.reason || 'unknown'}) gate_log=${magnet?.gate_log || 'none'}`);
   }),
 };

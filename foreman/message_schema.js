@@ -15,7 +15,8 @@ const { guardExternalSync } = require('../js_kernel/utils/external_library_guard
 // Bot → Foreman:
 //   'register'          — bot announces itself on first connect (payload: boardroom_chair, logistics_stations)
 //   'hq_delta'          — boardroom chair + logistics station map + fleet structure entries, a partial
-//                         HQ state update (payload: boardroom_chair, logistics_stations, building_conference)
+//                         HQ state update (payload: boardroom_chair, logistics_stations, building_conference,
+//                         mining_cells when they changed since this body last sent them)
 //   'claim_request'     — bot wants exclusive hold on a world object ('anchor:…', 'tree:…', 'cell:…' —
 //                         locks the object, not the bot; payload: { key }). Arbiter flavor (a); taxonomy
 //                         in foreman_brain.js.
@@ -41,6 +42,9 @@ const { guardExternalSync } = require('../js_kernel/utils/external_library_guard
 //                         for the fleet's one item book (payload: { entries }; foreman/item_book.js names
 //                         each entry kind). No reply.
 //
+//   'combat_note'       — one body's live combat state (payload: { sent_at, claim, seen, pos, duty, working, ward }; custom_api/combat_board).
+//                         Relayed at once to every other body, not gathered and not merged into HQ.
+//
 // Operator → Foreman (fleet_control, headless surface):
 //   'operator_command'  — a console verb arriving over the socket instead of the foreman's TTY (payload:
 //                         { verb: 'start' | 'stop' | 'flush' | 'wipe' | … }). Same validation, same
@@ -49,8 +53,9 @@ const { guardExternalSync } = require('../js_kernel/utils/external_library_guard
 //
 // Foreman → Bot:
 //   'registered'        — foreman acknowledges the bot
-//   'hq_broadcast'      — every other bot's boardroom chair, the merged logistics station map, and the
-//                         merged fleet structures (payload: bot_boardroom, logistics_stations, building_conference)
+//   'hq_broadcast'      — every other bot's boardroom chair, the merged logistics station map, the
+//                         merged fleet structures and the survey book (payload: bot_boardroom, logistics_stations,
+//                         building_conference, survey_book)
 //   'claim_granted'     — object claim approved, bot may proceed
 //   'claim_rejected'    — object claim denied, another bot holds it
 //   'planning_granted'  — the ENTRY TOKEN: this bot is inside the planning gate; sent immediately when
@@ -60,6 +65,18 @@ const { guardExternalSync } = require('../js_kernel/utils/external_library_guard
 //   'planning_queued'   — the token is held; this bot is in the line (payload: { ahead, holder, requestId,
 //                         held_ms } — bodies served before it counting the holder, who holds the token,
 //                         and for how long so far).
+//   'keeper_verdict'    — the integrity keeper's verdict on one subject, sent when it changes and on
+//                         registering (payload: { subject, verdict }; foreman/integrity_keeper.js)
+//   'keeper_where'      — a body asks where the keeper's body is, before its planning turn takes any verdict
+//                         (payload: { requestId }; keeper_verdicts.verifyAuthority)
+//   'keeper_here'       — the foreman's answer: its own claim (payload: { requestId, raised, present, position,
+//                         station } — positions floored cells or null)
+//   'decoration_locate' — a body asks where the nearest biome of a whitelisted decorative dye source lies
+//                         (payload: { requestId, item, from }; custom_api/sector_finder, foreman/decoration_locate),
+//                         or, from the walk test module while one is on, the biome it names (payload: { requestId,
+//                         biome, from }; action_fragments.js/test_module)
+//   'decoration_located'— the foreman's answer from the server's `locate biome` (payload: { requestId, item, found:
+//                         { biome, x, y, z, distance } | null, reason })
 //   'command'           — operator console verb broadcast to every bot (payload: { verb: 'start' |
 //                         'stop' | 'flush' | 'wipe' | … })
 
@@ -75,38 +92,38 @@ const VALID_TYPES = new Set([
   'fleet_crash',
   'log',
   'item_book',
+  'combat_note',
   'operator_command',
   'registered',
   'hq_broadcast',
+  'keeper_verdict',
+  'keeper_where',
+  'keeper_here',
+  'decoration_locate',
+  'decoration_located',
   'claim_granted',
   'claim_rejected',
   'planning_granted',
   'planning_queued',
   'command',
   'command_result',
-  // The in-game door's vocabulary: a verb and its verdict, a question about who is out there and whose
-  // they are, and a standing requirement with its answer — nothing else is spoken on that door
-  // (onIngameConnection).
+  // The read door's vocabulary: one question about who is out there, and its answer (onIngameConnection).
   'fleet_query',
   'fleet_state',
-  // A request travels as its own type: a verb is a command delivered to bodies now, a request is a fact
-  // written down that no body is told about (Law 10).
-  'request_command',
-  'request_result',
 ]);
 
 // ── how a building room is addressed (shared contract) ───────────────────────
-// A building_confrence_room key is `<room>|<owner>` — the structure, then whose base it belongs to, so
-// two owners' crews never contend for one structure slot.
+// A building_confrence_room key is `<room>|<crew>` — the structure, then the crew whose base it belongs to,
+// so two crews' bases in one world never contend for one structure slot.
 //
-// Suffixed, matching station_registry.stationKey: a keycard, not a check. The owner half comes from the
+// Suffixed, matching station_registry.stationKey: a keycard, not a check. The crew half comes from the
 // writing process's own mandate (bot_mandate.buildingRoomKey), so a bot cannot form a key belonging to
 // another crew (Law 27).
 //
-// The read is not narrowed by owner: find_buildingspot.getExistingFootprints walks every entry in the
+// The read is not narrowed by crew: find_buildingspot.getExistingFootprints walks every entry in the
 // room and rejects overlaps against all of them, so crews still refuse to site on top of each other's
 // buildings. Read everyone's, write only your own — the split station_registry runs between its raw map
-// and its owner-gated `mine`.
+// and its crew-gated `mine`.
 const BUILDING_ROOM_SEPARATOR = '|';
 
 // roomKeyName(key) → the structure half of a suffixed key (everything before the last `|`). Every
@@ -118,26 +135,24 @@ function roomKeyName(key) {
   return at === -1 ? s : s.slice(0, at);
 }
 
-// roomKeyOwner(key) → whose base this is, or null for a key with no owner suffix. Null is the commons,
-// the same reading station_registry gives an unowned entry: it belongs to nobody in particular and no
-// human's `wipe` may take it (Law 13).
-function roomKeyOwner(key) {
+// roomKeyCrew(key) → the crew whose base this is, or null for a key with no crew suffix.
+function roomKeyCrew(key) {
   const s = String(key || '');
   const at = s.lastIndexOf(BUILDING_ROOM_SEPARATOR);
   return at === -1 ? null : (s.slice(at + 1) || null);
 }
 
 // ── fleet-structure merge rule (shared contract) ─────────────────────────────
-// The fleet holds one of each structure PER OWNER — one home per base. A building_confrence_room
+// The fleet holds one of each structure PER CREW — one home per base. A building_confrence_room
 // entry is "established" once set_buildspot stamped locked_at; when two bots' entries collide
 // (split-brain reconnect, crash recovery), the FIRST writer wins — freshness (stations' LWW) would let a
 // later duplicate spot beat the original home. Lives in this file because bot and foreman must apply the
 // IDENTICAL rule or their merged views diverge (Law 16). Deterministic on ties (Law 19): coordinate
 // string.
 //
-// The owner in the key is what makes first-writer-wins correct: two crews belonging to two humans hold
-// different keys and never collide, so the rule arbitrates only a single crew's own split-brain, where
-// the earlier lock genuinely is the home.
+// The crew in the key is what makes first-writer-wins correct: two crews hold different keys and never
+// collide, so the rule arbitrates only a single crew's own split-brain, where the earlier lock genuinely is
+// the home.
 // ── tombstones, and why a delete cannot work here ────────────────────────────
 // A wiped building is replaced by a tombstone, never removed from the map: the merge loop reads INCOMING
 // keys, so an absent key is no-news and the remembered entry stays. Every bot re-broadcasts its whole
@@ -149,6 +164,23 @@ function roomKeyOwner(key) {
 // establishes the new one. First-writer-wins still governs lock against lock, the split-brain case above.
 function isBuildingTombstone(e) {
   return !!(e && typeof e === 'object' && e.removed_at);
+}
+
+// mergeFresherRows(target, incoming) -> whether target changed. The merge of a keyed map whose rows each carry
+// an `updated_at` stamp: per key the fresher row stands, an incoming row winning a tie. A removal is a row
+// with `removed_at`, merged by the same rule, so this never deletes a key. Station map and survey book,
+// on the bot and on the foreman alike (Law 16).
+function mergeFresherRows(target, incoming) {
+  if (!incoming || typeof incoming !== 'object') return false;
+  let changed = false;
+  for (const [id, entry] of Object.entries(incoming)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const cur = target[id];
+    if (cur && (cur.updated_at || 0) > (entry.updated_at || 0)) continue;
+    target[id] = entry;
+    changed = true;
+  }
+  return changed;
 }
 
 function pickBuildingEntry(current, incoming) {
@@ -223,78 +255,23 @@ function parseEnvelope(raw) {
 const OPERATOR_VERBS = new Set([
   'start',          // begin the autonomous planning loop
   'stop',           // stop the bots cleanly (foreman + server stay up)
-  'flush',          // cold-reset corporate HQ — EVERY owner's, fleet-wide
-  'wipe',           // clear ONE owner's places — their stations and their buildings, nobody else's
+  'flush',          // cold-reset corporate HQ — every crew's, fleet-wide
+  'wipe',           // clear the connected crew's places — its stations and its buildings, nobody else's
   'surveylayout',   // dry-run base-layout pre-flight; locks nothing
   'sentry',         // combat in isolation — the planning recursion stays off
   'move',           // one live locomotion leg to an authored cell — the test verb, no recursion
   'respawn',        // send the respawn packet to a dead body — the ONLY route in from outside the process
   'shutdown',       // end the run: bots exit, the world the foreman started is stopped and saved, the foreman exits
-  'teleport',       // bring the asker to the crew's alpha anchor — the cell the bodies work and idle around
+  'camera-save',    // keep the flying seat's position and facing as a numbered camera (js_kernel/utils/camera_spots)
+  'camera-list',    // say the numbered cameras
+  'camera-forget',  // drop one numbered camera
 ]);
 
-// INGAME_VERBS — the subset a human speaking inside the world may say, a strict subset of the set above,
-// asserted at load below (Law 13).
-//
-// Enforced by the hub, not by the desk — the only thing speaking on the in-game door today. A check
-// inside the desk would be the desk promising to behave, where the two-listener design exists precisely
-// because a guarantee resting on a sender's honesty is not one (Law 23). runOperatorVerb refuses a verb
-// outside this set when the OBSERVED origin is INGAME — a fact about which socket accepted the
-// connection, not anything the sender said about itself.
-//
-// `flush` is not in it; `wipe` is: `flush` empties the SHARED fleet mirror — merged stations, merged
-// structures, every human's standing requests — reaching past the door's own promise ("only YOUR bots
-// hear it") into work other people are accountable for, so it stays at the operator's terminal. `wipe`
-// grants the same authority at the scope a player actually owns: their stations, their buildings, keyed
-// by their own name.
-const INGAME_VERBS = new Set([
-  'stop',           // the one interrupt — they stop and leave, immediately
-  'wipe',           // forget MY places, so I can move base
-  // Admissible here because it does nothing to the fleet: it moves the ASKER, and only the asker — the
-  // one verb in this file whose whole effect lands on the person who typed it, so there is no body to be
-  // surprised by it and no state left behind.
-  'teleport',       // take me to where the crew works
-]);
-
-for (const verb of INGAME_VERBS) {
-  if (!OPERATOR_VERBS.has(verb)) {
-    throw new Error(`message_schema: CODING VIOLATION (Law 13): INGAME_VERBS names '${verb}', which is not `
-      + `an operator verb (${[...OPERATOR_VERBS].join(' | ')}). The in-game door would accept a word the `
-      + 'fleet has no implementation for, and the refusal would arrive at a bot rather than at the door.');
-  }
-}
-
-// COMMAND_ORIGIN — where an operator verb entered the fleet, in the same file and for the same reason as
-// OPERATOR_VERBS: three OS processes must agree on it, and a vocabulary is data that travels while an
-// implementation stays put.
-//
-// The fleet holds two species: a HOMESTEADER answers to nobody, a CONTRACTOR is built for human use, and
-// the line between them cannot be drawn with a list of forbidden verbs — the same verb from the same bot
-// answers differently depending only on where the words came from. So origin travels with every command.
-//
-// Stamped only by what the foreman OBSERVED — which socket spoke — never copied from a claim the sender
-// makes about itself (Law 23). A bot receiving a command cannot verify the stamp, which is why the
-// stamping happens at the one place that can.
-const COMMAND_ORIGIN = Object.freeze({
-  TERMINAL: 'terminal',   // the operator's own console, or fleet_control acting on their behalf
-  INGAME:   'ingame',     // a human speaking inside the world, relayed by the doorman
-});
-const VALID_ORIGINS = new Set(Object.values(COMMAND_ORIGIN));
-
-// ── the in-game door is a second listener, which is what makes the origin observed, not claimed ────
-//
-// The origin table is only worth having if the stamp is a fact. On one socket it cannot be: every client
-// reaches the same listener, so the foreman would have nothing to read but a label the sender chose for
-// itself, and a sender able to name its own origin can name the privileged one (Law 23: an inbound field
-// is a claim, never a fact).
-//
-// Two listeners make it a fact with no check anywhere: the foreman stamps by which of its own servers
-// accepted the connection, something it observed, never something it was told. This is the Law 26
-// translator: the door is the interface a mind reaches the machine through, and the machine's guarantee
-// is that the door it came through is the one it came through.
+// ── the read door is a second listener, answering the fleet's state and carrying no verb ────────────
+// A tool reading a live fleet (foreman_door.query) knocks here, so a reader can never send a verb.
 //
 // An offset, not a port: the main port is an operator flag (`--port`), and a fixed second number would
 // collide with a fleet moved off the default while looking like it had simply gone deaf.
-const INGAME_DOOR_PORT_OFFSET = 1;
+const READ_DOOR_PORT_OFFSET = 1;
 
-module.exports = { createEnvelope, parseEnvelope, pickBuildingEntry, isBuildingTombstone, VALID_TYPES, OPERATOR_VERBS, INGAME_VERBS, COMMAND_ORIGIN, VALID_ORIGINS, INGAME_DOOR_PORT_OFFSET, BUILDING_ROOM_SEPARATOR, roomKeyName, roomKeyOwner };
+module.exports = { createEnvelope, parseEnvelope, mergeFresherRows, pickBuildingEntry, isBuildingTombstone, VALID_TYPES, OPERATOR_VERBS, READ_DOOR_PORT_OFFSET, BUILDING_ROOM_SEPARATOR, roomKeyName, roomKeyCrew };

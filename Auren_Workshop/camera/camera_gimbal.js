@@ -49,7 +49,9 @@ const shortestDeg = a => ((a + 180) % 360 + 360) % 360 - 180;
 
 // createGimbals({ bots, host, port, version, cfg, log }) → { available, get(bot), endAll() }
 // One gimbal per bot; each is named cfg.prefix + botName.
-function createGimbals({ bots, host, port, version, cfg, log, visualBlockers }) {
+// `bots` are the gimbals' keys, each aiming at the bot of its own name; `targets` names a different first subject for a key
+// (the scout seat's gimbal, keyed by the seat, aims at whichever bot the rig gives it through retarget).
+function createGimbals({ bots, targets = {}, host, port, version, cfg, log, visualBlockers }) {
   let mineflayer, Vec3 = null;
   try {
     bootstrapModulePath();
@@ -76,7 +78,7 @@ function createGimbals({ bots, host, port, version, cfg, log, visualBlockers }) 
     const username = `${cfg.prefix}${botName}`;
     const g = {
       username,
-      target: botName,
+      target: targets[botName] !== undefined ? targets[botName] : botName,
       ready: false,
       ended: false,
       bot: null,
@@ -245,6 +247,14 @@ function createGimbals({ bots, host, port, version, cfg, log, visualBlockers }) 
     // snap: drop the eased state so the NEXT tick points straight at the subject. The rig calls this on every
     // cut, so a cut is a teleport + an instant re-aim — a hard cut, never a pan into the new shot.
     snap: botName => { const g = gimbals.get(botName); if (g) g.acquired = false; },
+    // retarget: points a gimbal at another bot; the next tick snaps onto it, and its sightline reading starts over.
+    retarget: (key, botName) => {
+      const g = gimbals.get(key);
+      if (!g || g.target === botName) return;
+      g.target = botName; g.acquired = false;
+      g.occl = { known: false, clear: true, blockedBy: null, since: 0, streak: 0, at: 0 };
+      if (log) log(`${g.username} now aiming at ${botName}.`);
+    },
     endAll: () => {
       for (const g of gimbals.values()) {
         g.ended = true;

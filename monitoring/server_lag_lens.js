@@ -110,7 +110,7 @@ function runLag({ seg = [], traceName = '?', verbose = false } = {}) {
   out.kv('record', traceName);
 
   // When the server said it fell behind.
-  const consoleFile = lensPaths.bot('fleet_logs', 'console_server.log');
+  const consoleFile = path.join(require(lensPaths.bot('js_kernel/utils/record_homes')).RECORDS_DIR, 'console_server.log');
   const lags = [];
   if (fs.existsSync(consoleFile)) {
     for (const line of fs.readFileSync(consoleFile, 'utf8').split(/\r?\n/)) {
@@ -135,19 +135,19 @@ function runLag({ seg = [], traceName = '?', verbose = false } = {}) {
   const atLag = [];
   const atLagEvents = [];
   const atLagSeconds = new Map();
-  const desk = require('./foreman_lens').readForemanTrace();
-  const deskStart = desk.length ? desk[0].atMs : null;
-  for (const l of desk) {
+  const foremanLines = require('./foreman_lens').readForemanTrace();
+  const foremanStart = foremanLines.length ? foremanLines[0].atMs : null;
+  for (const l of foremanLines) {
     let m = AT_LAG_SECOND_RE.exec(l.raw);
     if (m) { atLagSeconds.set(m[1], m.slice(1).map((v, i) => (i === 0 || v === 'unread') ? v : +v)); continue; }
     m = AT_LAG_EVENT_RE.exec(l.raw);
     if (m) { atLagEvents.push([m[1], m[2], m[3], +m[4], m[5]]); continue; }
     m = AT_LAG_RE.exec(l.raw);
-    if (m) { atLag.push([(deskStart && l.atMs) ? +((l.atMs - deskStart) / 60000).toFixed(1) : null, +m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], +m[10]]); continue; }
+    if (m) { atLag.push([(foremanStart && l.atMs) ? +((l.atMs - foremanStart) / 60000).toFixed(1) : null, +m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], +m[10]]); continue; }
     m = DISK_SLOW_RE.exec(l.raw);
     if (m) { slow.push(+m[1]); continue; }
     m = WRITERS_RE.exec(l.raw);
-    if (m) readings.push({ wallSec: (deskStart && l.atMs) ? (l.atMs - deskStart) / 1000 : null, why: m[1], sec: +m[2], mb: +m[3], rate: +m[4], probe: +m[5], free: +m[6], top: m[7] });
+    if (m) readings.push({ wallSec: (foremanStart && l.atMs) ? (l.atMs - foremanStart) / 1000 : null, why: m[1], sec: +m[2], mb: +m[3], rate: +m[4], probe: +m[5], free: +m[6], top: m[7] });
   }
   out.section('disk');
   out.kv('slow_probes', slow.length);
@@ -188,7 +188,7 @@ function runLag({ seg = [], traceName = '?', verbose = false } = {}) {
     atLagEvents.filter(e => { const k = e.join('|'); if (eventSeen.has(k)) return false; eventSeen.add(k); return true; })
       .sort((a, b) => (a[0] < b[0] ? -1 : 1)).slice(0, verbose ? Infinity : ROWS * 3));
 
-  const jfrFile = lensPaths.bot('fleet_logs', 'server.jfr');
+  const jfrFile = path.join(require(lensPaths.bot('js_kernel/utils/record_homes')).RECORDS_DIR, 'server.jfr');
   const flight = fs.existsSync(jfrFile) ? flightEvents(jfrFile) : { unread: 'no_server_jfr' };
   const all = flight.rows || [];
   const onServer = all.filter(e => e.thread === SERVER_THREAD && e.name !== 'GarbageCollection');

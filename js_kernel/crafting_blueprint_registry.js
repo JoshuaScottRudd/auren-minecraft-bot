@@ -156,4 +156,44 @@ function smeltInputsFor(output) {
   return (r && Array.isArray(r.requires) && r.requires.includes('furnace')) ? r.inputs : null;
 }
 
-module.exports = { getRecipes, tryGetRecipe, recipeForToken, stationsRequiredFor, smeltInputsFor };
+// ── WHAT MINECRAFT MAKES MUST CARRY A RECIPE HERE ─────────────────────────────────────────────────
+// The book's absence of a recipe is how every walk calls a thing RAW (build_material_calculator.isRawMaterial),
+// so a made thing missing from the book is sent out to be gathered, and the gather comes back empty every
+// time. The game's own recipe list answers whether a thing is made: an item it crafts
+// that the book has no recipe for is a hole in the book, and the walk throws on it instead of gathering.
+//
+// FOUND THOUGH CRAFTABLE: a thing the world also hands over is not a hole. The block that unpacks into nine of
+// an item (coal_block → coal) does not make the item made; and every token the fleet's own lists name as found
+// (natural blocks and the gathered groups, what a producer yields, the mine's, the farm's, the hunt's, the smelter's, the stone a body
+// prospects) is gathered or produced by its own chain whatever the game can also craft it from.
+let _gameMade = null;
+function gameMade() {
+  if (_gameMade) return _gameMade;
+  const md = require('minecraft-data')(require('@thinking/architect_config').SERVER_MINECRAFT_VERSION);
+  _gameMade = new Set();
+  const inputsOf = (r) => new Set((r.inShape ? r.inShape.flat() : r.ingredients)
+    .map(x => (x !== null && typeof x === 'object' ? x.id : x)).filter(x => x != null));
+  const madeFrom = new Map(Object.entries(md.recipes).map(([id, vs]) => [Number(id), vs.map(inputsOf)]));
+  for (const [id, variants] of Object.entries(md.recipes)) {
+    const out = Number(id);
+    // A recipe that consumes its own output copies a found thing (a smithing template), and one that turns a
+    // packed block back into several of what it was packed from unpacks it (honey_block → honey_bottle,
+    // coal_block → coal); neither makes the thing.
+    const copies = (ins) => ins.has(out);
+    const unpacks = (r, ins) => r.result.count > 1 && [...ins].some(i => (madeFrom.get(i) || []).some(s => s.has(out)));
+    if (variants.some(r => { const ins = inputsOf(r); return !copies(ins) && !unpacks(r, ins); })) _gameMade.add(md.items[out].name);
+  }
+  return _gameMade;
+}
+function foundThoughCraftable(item) {
+  const fu = require('@utils/fragment_utils');
+  if (require('@kernel/producer_hooks').yieldedByProducer(item)) return true;
+  for (const g of [...GATHERED_GROUPS, 'logs', 'dirt', 'saplings', 'stone']) if ((group_to_item[g] || []).includes(item)) return true;
+  return [fu.underground_items, fu.farm_items, fu.hunt_items, fu.furnace_chain_items, fu.stone_items].some(set => set.has(item));
+}
+// mustCarryRecipe(item) → whether the game crafts `item` and it is not also found, so the book owes it a recipe.
+function mustCarryRecipe(item) {
+  return gameMade().has(item) && !foundThoughCraftable(item);
+}
+
+module.exports = { getRecipes, tryGetRecipe, recipeForToken, stationsRequiredFor, smeltInputsFor, mustCarryRecipe };

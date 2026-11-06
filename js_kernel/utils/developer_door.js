@@ -47,7 +47,7 @@ function enter(tool) {
   console.error('');
   console.error('  Auren has two doors. The one you want depends on what you are doing:');
   console.error('');
-  console.error('    PLAYING          node start_auren.js        then say "foreman get" in chat');
+  console.error('    PLAYING          node start_auren.js        the foreman raises the crew foreman_config names');
   console.error('    BUILDING ON IT   ' + DOOR_CMD + '     once, then every tool works');
   console.error('');
   console.error('  Developer mode turns on the workshop: the scripted runs, the benches, the combat');

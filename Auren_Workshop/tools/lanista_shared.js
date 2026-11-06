@@ -21,7 +21,8 @@ const { createScout } = require('../camera/camera_scout');
 // The construct's own aggro threshold, read here, never restated (Law 16). Both are imported;
 // `aggroRangeFor` is the one route for any per-mob question — the flat AGGRO_RANGE is 15, but
 // architect_config's per-species table honours some species (the skeleton family: 16) at a different range.
-const { AGGRO_RANGE, AGGRO_VERTICAL_RANGE, aggroRangeFor } = require('@thinking/architect_config');
+// `engageRangeFor` is how far a SEEN mob is taken: the radius, or a thrower's sight reach past it (a drowned: 24).
+const { AGGRO_RANGE, AGGRO_VERTICAL_RANGE, aggroRangeFor, engageRangeFor } = require('@thinking/architect_config');
 
 // ── Configuration ───────────────────────────────────────────────────────────────────────────────────
 
@@ -62,6 +63,6 @@ function log(stage, msg) { console.log(`[${stage.toUpperCase()}] ${msg}`); }
 
 module.exports = {
   rconLink, arena, pathfinding, createScout,
-  ARENA_TAG, SCOUT_NAME, SITING, WORLD, AGGRO_RANGE, AGGRO_VERTICAL_RANGE, aggroRangeFor,
+  ARENA_TAG, SCOUT_NAME, SITING, WORLD, AGGRO_RANGE, AGGRO_VERTICAL_RANGE, aggroRangeFor, engageRangeFor,
   sleep, fmt, round2, log,
 };

@@ -153,6 +153,12 @@ function maskStateId(bot) {
 // maskedBlockAt(bot, x, y, z) — the masked block for this cell, or null when the cell is not masked.
 function maskedBlockAt(bot, x, y, z) {
   if (!isSpawnProtected(bot, x, z)) return null;
+  return maskBlockAt(x, y, z);
+}
+
+// maskBlockAt(x, y, z) — the masked block at this cell, unconditionally: the one block every world-read mask hands out
+// (this square's, and hazard_zones').
+function maskBlockAt(x, y, z) {
   const p = _maskProto();
   const out = Object.assign(Object.create(Object.getPrototypeOf(p)), p);
   out.position = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z));
@@ -211,6 +217,7 @@ module.exports = {
   isSpawnProtectedAt,
   maskWorldReads,
   maskedBlockAt,
+  maskBlockAt,
   maskStateId,
   latchVersion,
   describeSpawnProtection,

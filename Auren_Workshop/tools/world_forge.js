@@ -256,7 +256,7 @@ async function vet(name) {
   const met = checks.every(c => c.pass);
   console.log(`\n  ${met ? '✅ MET every criterion' : '❌ MISSED — this is not the world'}`);
 
-  if (!has('down')) console.log(`\n${el()} the foreman is STILL RUNNING '${name}' (window 'auren desk') so the ground can be ` +
+  if (!has('down')) console.log(`\n${el()} the foreman is STILL RUNNING '${name}' (window 'auren foreman') so the ground can be ` +
     `looked at. Stop it with: node Auren_Workshop/fleet_control.js verb shutdown`);
 
   if (met) {

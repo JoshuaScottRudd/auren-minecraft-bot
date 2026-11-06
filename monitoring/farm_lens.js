@@ -1,20 +1,20 @@
 // Auren_Bot/monitoring/farm_lens.js
 // HOW THE FARM WENT — the wheat field's own reducer, kept apart from build_lenses' per-site scan because
-// the farm is sixteen row sites making ONE structure, tended as well as built, with progress carried in
+// the farm is tended as well as built, with progress carried in
 // lines no building writes: the census, the per-row tend report, the seed picks. build_lenses.runMilestones
 // prints this after the structures; `--farm` prints it alone.
 //
 // EVERY NUMBER IS READ OFF A LINE THE FLEET WROTE; nothing is inferred from a gap. The lines, and who writes them:
-//   ROWS SITED        set_buildspot        `Locked wheat_tine_row#k build site — transpose_origin (x,y,z)`
-//   GATED             job_board            `🚧 GATED <gate> (n): <why> → farm_tend#cluster [detail], …`
+//   ROWS SITED        set_buildspot        `Locked wheat_field build site — transpose_origin (x,y,z)`
+//   GATED             job_board            `🚧 GATED <gate> (n): <why> → farm_tend#<crop> [detail], …`
 //   CLAIMED           dispatcher           `Claimed [band] farm/farm_tend …` / `supply/wheat_seeds` / `supply/dirt`
-//   CENSUS            farming_integrity    `farm census "wheat_farm" — L/S row(s) laid of N · structure P/T placed, …`
+//   CENSUS            farming_integrity    `farm census "wheat_field" — L/S row(s) laid of N · structure P/T placed, …`
 //                                          and the `rows:` line beneath it — the farm's integrity scan
 //   TENDED            farm_executor        `farm_executor: <roomKey> struct(place=,dig=) cleared= tilled= planted= …`
 //   VISIT             farm_manager         `farm_manager: cluster visit serviced V plot(s) — worked=W refused=R`
 //   SEEDS             seed_picker          `Seed pick done: +N wheat_seeds in P/M punch(es) …`
 //   PREP              land_prep            hoe crafted/retrieved, seeds and bone meal pulled from a chest
-//   BUILT             job_board            `🏁 STRUCTURE BUILT: 'wheat_farm'` (+ STANDING / UN-BUILT)
+//   BUILT             job_board            `🏁 STRUCTURE BUILT: 'wheat_field'` (+ STANDING / UN-BUILT)
 // A milestone that has not happened is printed as a BOOLEAN FIELD set false in `farm_milestones`, never
 // omitted (Law 25); `farm_census_latest` prints the latest reading on every run regardless.
 //
@@ -64,15 +64,22 @@ const BUILT_RE = /🏁 STRUCTURE BUILT: '([^']+)'/;
 const STANDING_RE = /🏠 STRUCTURE STANDING AT FIRST SWEEP: '([^']+)'/;
 const UNBUILT_RE = /STRUCTURE UN-BUILT: '([^']+)'/;
 
-const FARM_JOB_IDS = ['farm_tend#cluster', 'farm_supply_dirt', 'farm_supply_seeds'];
+const FARM_JOB_IDS = ['farm_tend#', 'farm_supply_dirt', 'farm_supply_seeds', 'farm_supply_sugar_cane'];
 
-function farmNames() {
+// The species is the one whose alpha structure the record locks (architect_config.ALPHA_STRUCTURE); its FARM_FIELD
+// The species is read for its alpha; every crew farms the one FARM_FIELD. A record that locks no alpha reads as the homestead's.
+function farmNames(seg) {
   const cfg = require(require('./lens_paths').bot('Thinking_fragments/architect_config.js'));
-  return { structure: cfg.FARM_STRUCTURE, rowPrefix: cfg.FARM_BLUEPRINT_NAME, rows: cfg.FARM_ROOM_KEYS.length, alpha: 'headframe' };
+  const modeOf = Object.fromEntries(Object.entries(cfg.ALPHA_STRUCTURE).map(([mode, alpha]) => [alpha, mode]));
+  let mode = null;
+  for (const l of seg) { const m = l.raw && l.raw.match(LOCK_RE); if (m && modeOf[m[1]]) { mode = modeOf[m[1]]; break; } }
+  if (!mode) mode = cfg.BOT_MODES.HOMESTEADER;
+  const field = cfg.FARM_FIELD;
+  return { structure: field.structure, rowPrefix: field.keys[0], rows: field.keys.length, alpha: cfg.ALPHA_STRUCTURE[mode] };
 }
 
 function reduceFarm(seg, botFilter) {
-  const names = farmNames();
+  const names = farmNames(seg);
   const f = {
     names, maxRel: 0,
     sited: { count: 0, keys: new Set(), first: null, last: null, by: null },

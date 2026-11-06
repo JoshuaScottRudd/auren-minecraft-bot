@@ -25,7 +25,9 @@ const watcher = require(paths.bot('js_kernel/watcher.js'));
 
 // crew_log: the fleet's `VERB key=value` trace grammar (Law 16, Law 26) — this file's decisions use it too.
 const crewLog = require(paths.bot('custom_api/crew_log.js'));
+const activityLog = require(paths.bot('custom_api/activity_log.js'));
 const CFG = require('./camera_configure.js');
+const scoutFocus = require('./scout_focus.js');
 const { SERVER_ENDPOINT, SERVER_MINECRAFT_VERSION } = require(paths.bot('Thinking_fragments/architect_config.js'));
 const { createScout } = require('./camera_scout.js');
 const { createGimbals } = require('./camera_gimbal.js');
@@ -44,10 +46,14 @@ const opt = (name, dflt) => {
   return hit ? hit.split('=')[1] : dflt;
 };
 const { BOT_SENIORITY } = require(paths.bot('Thinking_fragments/architect_config.js'));
-// An empty --bots is a legitimate answer: a contractor run can have no crew yet.
+// An empty --bots is a legitimate answer: a run can have no crew yet.
 const BOTS = opt('bots', Object.keys(BOT_SENIORITY).join(',')).split(',').map(s => s.trim()).filter(Boolean);
 const CAMS = opt('cams', BOTS.map(b => `Cam_${b}`).join(',')).split(',').map(s => s.trim()).filter(Boolean);
 const LAUNCH_LOG_DIR = opt('launchlogs', '').replace(/^['"]|['"]$/g, '');
+// The scout seat (camera_configure scoutSeat): one more directed camera whose subject is whichever bot's activity
+// ranks highest on the operator's focus. It listens to every roster bot, camera or not.
+const SCOUT_CAM = opt('scoutcam', '');
+const ROSTER = Object.keys(BOT_SENIORITY);
 if (CAMS.length !== BOTS.length) {
   console.error('camera_rig: --cams must list one camera name per bot.');
   process.exit(1);
@@ -370,7 +376,8 @@ function extractEvent(line) {
     return { kind: 'cut', type: 'PLACE:delivery', at: xyz(line.match(/station (-?\d+)\|(-?\d+)\|(-?\d+)/)) };
   }
   if (sys === 'DISPATCHER') {
-    const j = line.match(/Claimed (P\d+ \S+)/);
+    // The whole claim (band, type/what, destination), read by the one shape the activity board also reads.
+    const j = line.match(activityLog.CLAIM_RE);
     if (j) return { kind: 'job', job: j[1] };
   }
   if (sys === 'JOB_BOARD' && PAREN.test(line)) {
@@ -379,31 +386,43 @@ function extractEvent(line) {
   return null;
 }
 
-// StoryTail: polls one bot's watcher_<Bot>.jsonl; a SHRINK (restart) replays from the new top.
-// Append-only file — a mid-write read catches only the last line, recovered next poll.
+// StoryTail: polls one bot's watcher_<Bot>.jsonl for the lines written since the last poll, reading only the new
+// bytes, so the scout seat can tail the whole roster. The first poll skips the history; a SHRINK (restart) replays
+// from the new top. Append-only file: a torn last line is held back until its newline arrives.
 class StoryTail {
   constructor(bot) {
     this.bot = bot;
     this.file = require(paths.bot('js_kernel/utils/record_homes')).traceFile(bot);
-    this.seen = null;
+    this.offset = null;
+    this.rest = '';
+  }
+  // history() → how many lines the file held when filming began (the startup note only).
+  history() {
+    try { return fs.readFileSync(this.file, 'utf8').split('\n').filter(Boolean).length; } catch (_) { return null; }
   }
   poll() {
-    let story;
+    let size;
+    try { size = fs.statSync(this.file).size; } catch (_) { return []; }
+    if (this.offset === null) { this.offset = size; return []; }
+    if (size < this.offset) { this.offset = 0; this.rest = ''; }
+    if (size === this.offset) return [];
+    let chunk;
     try {
-      const rows = fs.readFileSync(this.file, 'utf8').split('\n');
-      story = [];
-      for (const r of rows) {
-        if (!r) continue;
-        try { story.push(JSON.parse(r)); } catch (_) { /* torn tail — the next poll gets it whole */ }
-      }
+      const fd = fs.openSync(this.file, 'r');
+      try {
+        const buf = Buffer.alloc(size - this.offset);
+        fs.readSync(fd, buf, 0, buf.length, this.offset);
+        chunk = buf.toString('utf8');
+      } finally { fs.closeSync(fd); }
     } catch (_) { return []; }
-    if (this.seen === null || story.length < this.seen) {
-      const fresh = this.seen !== null;
-      this.seen = fresh ? 0 : story.length;
-      if (!fresh) return [];
+    this.offset = size;
+    const rows = (this.rest + chunk).split('\n');
+    this.rest = rows.pop();
+    const out = [];
+    for (const r of rows) {
+      if (!r.trim()) continue;
+      try { out.push(JSON.parse(r)); } catch (_) { /* a line that is not JSON is not a story line */ }
     }
-    const out = story.slice(this.seen);
-    this.seen = story.length;
     return out;
   }
 }
@@ -440,9 +459,7 @@ async function main() {
 
   // Nametags: hidden via a scoreboard team (see hideNametags).
   const FILM_TEAM = 'auren_no_nametags';
-  const FILM_TEAM_MAX_PASSES = 300;
   let filmTeamCreated = false;
-  let filmTeamPasses = 0;
 
   let scout = null;
   let scoutArmed = false;
@@ -450,7 +467,7 @@ async function main() {
   let scoutSettleUntil = 0;
   // One scout client answers both framing (where to stand) and witness (what happened) — Law 16.
   // Framing with no bot camera has no shot to place, so a crew of human-flown seats raises no scout.
-  if (CFG.scout.enable && ((FRAMING && BOTS.length > 0) || WITNESS)) {
+  if (CFG.scout.enable && ((FRAMING && (BOTS.length > 0 || SCOUT_CAM)) || WITNESS)) {
     scout = createScout({
       host: SERVER_ENDPOINT.host, port: SERVER_ENDPOINT.port, version: SERVER_MINECRAFT_VERSION, username: CFG.scout.username,
       scanSliceMs: CFG.scout.scanSliceMs,
@@ -508,7 +525,9 @@ async function main() {
   let gimbals = null;
   if (CFG.gimbal.enable && FRAMING) {
     gimbals = createGimbals({
-      bots: BOTS, host: SERVER_ENDPOINT.host, port: SERVER_ENDPOINT.port, version: SERVER_MINECRAFT_VERSION, cfg: CFG.gimbal,
+      bots: SCOUT_CAM ? [...BOTS, CFG.scoutSeat.gimbalKey] : BOTS,
+      targets: SCOUT_CAM ? { [CFG.scoutSeat.gimbalKey]: ROSTER[0] } : {},
+      host: SERVER_ENDPOINT.host, port: SERVER_ENDPOINT.port, version: SERVER_MINECRAFT_VERSION, cfg: CFG.gimbal,
       // Same blocker list the seeker places on (Law 16) — one definition of "blocked" for both.
       visualBlockers: VISUAL_BLOCKERS,
       log: msg => narrate('summary', 'gimbal', msg),
@@ -520,12 +539,13 @@ async function main() {
     }
   }
   // gimbalDetached: the see-through shot's deliberate release, treated identically to a missing gimbal (Law 16).
-  const gimbalLive = r => !!(gimbals && gimbals.isReady(r.bot) && r.gimbalBound && !r.gimbalDetached);
+  const gimbalLive = r => !!(gimbals && gimbals.isReady(r.gim) && r.gimbalBound && !r.gimbalDetached);
 
-  const rigs = BOTS.map((bot, i) => ({
-    bot, cam: CAMS[i],
+  // One tail per bot that anything films: the bot cameras' own bots, and with a scout seat the whole roster.
+  const tails = new Map([...BOTS, ...(SCOUT_CAM ? ROSTER : [])].map(b => [b, new StoryTail(b)]));
+  const newRig = (bot, cam, extra) => ({
+    bot, cam, gim: bot,
     stage: `cam_${bot.toLowerCase()}`,
-    tail: new StoryTail(bot),
     ready: false,
     botPos: null,            // RCON 1 Hz poll (cut timing + scout anchoring; never placement)
     job: '',
@@ -540,7 +560,16 @@ async function main() {
     lastSentMs: 0,
     gimbalBound: false,      // camera is /spectate-locked to its gimbal (so the gimbal owns the aim)
     gimbalDetached: false,   // …released ON PURPOSE for a see-through shot, which is a frozen tripod
-  }));
+    ...extra,
+  });
+  const rigs = BOTS.map((bot, i) => newRig(bot, CAMS[i]));
+  // The scout seat is a rig like the others whose `bot` changes: it starts on the senior bot, and at each pick the
+  // activity board (activity_log) and the focus (scout_focus) hand it another. `focus` is the span it is filming.
+  const scoutRig = SCOUT_CAM
+    ? newRig(ROSTER[0], SCOUT_CAM, { gim: CFG.scoutSeat.gimbalKey, stage: 'cam_scout', scoutSeat: true, focus: null })
+    : null;
+  if (scoutRig) rigs.push(scoutRig);
+  const board = scoutRig ? activityLog.createBoard() : null;
 
   // The witness: records the server's account of fights. Borrows the rcon link through an adapter
   // (rcon is reassigned on relink).
@@ -599,7 +628,7 @@ async function main() {
   const feetY = y => y - CFG.frame.eyeHeight;
   const sendCam = (r, pos, aim) => {
     if (gimbalLive(r)) {
-      return rcon.command(`tp ${gimbals.nameFor(r.bot)} ${pos.x.toFixed(1)} ${feetY(pos.y).toFixed(1)} ${pos.z.toFixed(1)}`);
+      return rcon.command(`tp ${gimbals.nameFor(r.gim)} ${pos.x.toFixed(1)} ${feetY(pos.y).toFixed(1)} ${pos.z.toFixed(1)}`);
     }
     return rcon.command(`tp ${r.cam} ${pos.x.toFixed(1)} ${feetY(pos.y).toFixed(1)} ${pos.z.toFixed(1)} ${aim.yaw.toFixed(1)} ${aim.pitch.toFixed(1)}`);
   };
@@ -644,7 +673,7 @@ async function main() {
         // Bare `/spectate` releases the console (the sender), not the camera — `execute as <cam>` is required.
         if (want === 'free') await rcon.command(`execute as ${r.cam} run spectate`);
         else if (want === 'bot') await rcon.command(`spectate ${r.bot} ${r.cam}`);
-        else await rcon.command(`spectate ${gimbals.nameFor(r.bot)} ${r.cam}`);
+        else await rcon.command(`spectate ${gimbals.nameFor(r.gim)} ${r.cam}`);
         r.specMode = want;
         r.gimbalDetached = (want !== 'gimbal');   // everything downstream still keys off gimbalLive()
       }
@@ -652,9 +681,9 @@ async function main() {
     // First person is a binding, not a position — nothing is teleported.
     if (!framing.firstPerson) await sendCam(r, framing.cam, r.shot.aim);
     // Gimbal snaps to the new aim at the cut.
-    if (gimbalLive(r) && !framing.firstPerson) gimbals.snap(r.bot);
+    if (gimbalLive(r) && !framing.firstPerson) gimbals.snap(r.gim);
     // Re-asserts the /spectate binding every cut (it can drop on respawn/chunk churn).
-    if (gimbalLive(r)) await rcon.command(`spectate ${gimbals.nameFor(r.bot)} ${r.cam}`);
+    if (gimbalLive(r)) await rcon.command(`spectate ${gimbals.nameFor(r.gim)} ${r.cam}`);
     r.lastSentMs = Date.now();
     const cost = framing.solveMs != null ? ` · ${framing.rays || 0} rays in ${framing.solveMs}ms` : '';
     narrate('summary', r.stage,
@@ -803,14 +832,53 @@ async function main() {
 
   // logTick: one crew_log line per rig per pass, not per fact — `flush` drains the buffer at the pass
   // boundary. Flushed outside the rig loop so one rig's flush doesn't split another's still-buffering line.
+  // Every bot's new lines feed the activity board first, then each rig filming that bot.
   async function logTick() {
-    for (const r of rigs) {
-      for (const line of r.tail.poll()) {
+    const now = Date.now();
+    for (const [bot, tail] of tails) {
+      for (const line of tail.poll()) {
+        if (board) for (const s of board.feed(bot, line, now)) recordActivity(s);
         const ev = extractEvent(line);
-        if (ev) await onEvent(r, ev, line);
+        if (!ev) continue;
+        for (const r of rigs) if (r.bot === bot) await onEvent(r, ev, line);
       }
     }
+    if (scoutRig) scoutPick(now);
     crewLog.flush();
+  }
+
+  // Each span the board opens or closes, on the rig's own record, so a reader can set the scout's picks beside the
+  // activities it chose between.
+  function recordActivity(s) {
+    crewLog.event('cam_scout', s.end == null ? 'open' : 'closed', {
+      subject: s.subject, bot: s.bot, kind: s.kind, ended: s.ended,
+      secs: s.end == null ? null : Math.round((s.end - s.start) / 1000),
+    });
+  }
+
+  // scoutPick: hands the scout seat to the bot doing the highest-ranked open activity (scout_focus.pick). A switch
+  // clears the shot, so the next slow tick frames the new bot the way it frames any camera's first shot.
+  function scoutPick(now) {
+    for (const s of board.expire(now)) recordActivity(s);
+    const focus = scoutFocus.readFocus();
+    const s = scoutFocus.pick(board.open(), focus, scoutRig.focus, now, CFG.scoutSeat.minDwellMs);
+    if (!s || (scoutRig.focus && scoutRig.focus.key === s.key)) return;
+    const from = scoutRig.focus;
+    scoutRig.focus = { key: s.key, kind: s.kind, bot: s.bot, since: now };
+    crewLog.event('cam_scout', 'focus', {
+      subject: s.subject, bot: s.bot, kind: s.kind, rank: focus.rank.indexOf(s.kind) + 1,
+      from: from ? from.kind : null, open: board.open().length,
+    });
+    if (s.bot === scoutRig.bot) return;   // the same bot on a new activity: the shot it holds already films it
+    narrate('summary', 'cam_scout',
+      `${SCOUT_CAM} → ${s.bot}: ${activityLog.KINDS[s.kind].label} (rank ${focus.rank.indexOf(s.kind) + 1} of ` +
+      `${focus.rank.length}${from ? `, after ${from.bot} ${from.kind}` : ''}; ${board.open().length} activities open).`);
+    // `specMode: 'switch'` answers no mode, so the next cut re-binds the camera whichever shot it takes.
+    Object.assign(scoutRig, {
+      bot: s.bot, botPos: null, job: '', shot: null, objective: null, legCost: null, lastBearingDeg: null,
+      exitSince: 0, lastEventMs: now, specMode: 'switch', pinWhy: `scout focus — ${s.kind}`,
+    });
+    if (gimbals) gimbals.retarget(scoutRig.gim, s.bot);
   }
 
   // holdTick: every shot is a locked tripod — re-asserts position/aim on a heartbeat, decides WHEN to cut.
@@ -854,7 +922,7 @@ async function main() {
       // ── SUBJECT LOST: the one fast cut, ignoring minHold — rate-limited by blockedMinHoldMs instead.
       // Exempt: an unarrived TRAVEL leg (hidden is normal there) and a SEE-THROUGH tripod (renders
       // through rock). Gimbal occlusion is recorded on a flip only (Invariant D: gimbal measures, rig speaks).
-      const gOcc = gimbalLive(r) && bp ? gimbals.occlusion(r.bot) : { known: false };
+      const gOcc = gimbalLive(r) && bp ? gimbals.occlusion(r.gim) : { known: false };
       const sight = !gOcc.known ? 'unknown' : (gOcc.clear ? 'clear' : 'blocked');
       if (sight !== r.lastSight) {
         r.lastSight = sight;
@@ -957,9 +1025,8 @@ async function main() {
   // Nametags are drawn into the frame by the client, so the fix is a scoreboard team
   // (`nametagVisibility never`), asserted every run (idempotent, Invariant B) and joined by @a —
   // including the spectators, so one camera doesn't catch another's name floating behind a bot.
-  // Pass counter stops one pass after the crew completes.
+  // Joined on every pass: a run with seats and no bot cameras is ready before its bots arrive.
   async function hideNametags() {
-    if (filmTeamPasses > FILM_TEAM_MAX_PASSES) return;
     if (!filmTeamCreated) {
       await rcon.command(`team add ${FILM_TEAM}`);           // already-exists answers, never throws
       await rcon.command(`team modify ${FILM_TEAM} nametagVisibility never`);
@@ -969,7 +1036,6 @@ async function main() {
         `Names are drawn into the frame by the client, so this is the only way they stay out of the footage.`);
     }
     await rcon.command(`team join ${FILM_TEAM} @a`);
-    filmTeamPasses = crewReadyPublished ? FILM_TEAM_MAX_PASSES + 1 : filmTeamPasses + 1;
   }
 
   async function slowTick() {
@@ -1054,8 +1120,8 @@ async function main() {
       }
 
       // Binds the gimbal: spectator first, then /spectate-locks the camera onto it.
-      if (r.ready && gimbals && gimbals.isReady(r.bot) && !r.gimbalBound) {
-        const gname = gimbals.nameFor(r.bot);
+      if (r.ready && gimbals && gimbals.isReady(r.gim) && !r.gimbalBound) {
+        const gname = gimbals.nameFor(r.gim);
         const gRes = await rcon.command(`data get entity ${gname} Pos`);
         if (POS_RE.test(gRes)) {                       // only bind once the gimbal has really spawned
           await rcon.command(`gamemode spectator ${gname}`);
@@ -1069,9 +1135,12 @@ async function main() {
       const m = res.match(POS_RE);
       if (m) r.botPos = { x: +m[1], y: +m[2], z: +m[3] };
 
-      // Startup pin: frames whatever chooseSubject picks so a camera never sits at its logout spot.
+      // Startup pin: frames whatever chooseSubject picks so a camera never sits at its logout spot. The scout seat
+      // comes through here after every change of subject too, with the pick as its trigger.
       if (r.ready && !r.shot && r.botPos) {
-        await cut(r, await framePick(r), 'startup pin — no announcement yet', 'startup');
+        const why = r.pinWhy;
+        r.pinWhy = null;
+        await cut(r, await framePick(r), why || 'startup pin — no announcement yet', why ? 'scout_focus' : 'startup');
       }
       if (r.botPos && Date.now() - r.lastEventMs > CFG.timing.droughtMs) {
         r.lastEventMs = Date.now();
@@ -1106,13 +1175,16 @@ async function main() {
     `up in ${[FRAMING ? 'FRAMING' : null, WITNESS ? 'WITNESS' : null].filter(Boolean).join(' + ')} mode. ` +
     'Decisions → watcher_camera_rig.json');
   if (FRAMING) {
-    for (const r of rigs) {
-      try {
-        const n = (JSON.parse(fs.readFileSync(r.tail.file, 'utf8')).story || []).length;
-        narrate('summary', r.stage, `story file ${path.basename(r.tail.file)} found (${n} lines of history — skipped; filming from now).`);
-      } catch (_) {
-        narrate('warn', r.stage, `story file ${path.basename(r.tail.file)} missing/unreadable — no announcements from ${r.bot} until its process runs.`);
-      }
+    for (const [bot, tail] of tails) {
+      const n = tail.history();
+      if (n != null) narrate('summary', 'camera_rig', `story file ${path.basename(tail.file)} found (${n} lines of history — skipped; filming from now).`);
+      else narrate(BOTS.includes(bot) ? 'warn' : 'summary', 'camera_rig', `story file ${path.basename(tail.file)} not there yet — nothing from ${bot} until its process runs.`);
+    }
+    if (scoutRig) {
+      const f = scoutFocus.readFocus();
+      narrate('summary', 'cam_scout',
+        `${SCOUT_CAM} listening to ${ROSTER.length} bots · focus (${f.source}${f.updatedAt ? ` ${f.updatedAt}` : ''}): ` +
+        `${f.rank.map((k, i) => `${i + 1}.${k}${f.off.includes(k) ? '(off)' : ''}`).join(' ')} · starts on ${scoutRig.bot}.`);
     }
   }
   const launcherLog = new LauncherLog(LAUNCH_LOG_DIR);

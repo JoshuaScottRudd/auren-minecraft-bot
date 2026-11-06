@@ -1,22 +1,13 @@
 'use strict';
-// foreman_door.js — the foreman's one way of reaching the fleet with an operator verb.
+// foreman_door.js — the read door: who is connected, what each body is doing, and what the world and the run are.
 //
-// `get` starts an OS process, which is fleet_control's job (Law 16 — one launcher). `start` and `exit`
-// are OPERATOR VERBS instead: routing those through fleet_control would stamp them TERMINAL, because
-// that is what fleet_control's socket is — the operator's console by another name — and the verb would
-// arrive at every bot in the fleet carrying console authority, the exact promotion the origin table
-// exists to prevent.
+// It asks one question, `query`, and carries no verb: a verb reaches the fleet through the terminal socket
+// (fleet_control). The tools that read a live fleet (bench_world, camera_warden, fleet_control) and the foreman's
+// own crew raise ask it here.
 //
-// THE ORIGIN IS DECIDED BY WHICH DOOR IS KNOCKED ON, NEVER BY A FIELD. This module knows only the
-// in-game door's address and cannot spell `terminal`: the foreman stamps the origin from which of its
-// own listeners accepted the socket, and this one only ever reaches the in-game listener (Law 23).
-//
-// ONE SHOT PER COMMAND, NEVER A HELD CONNECTION. A human says a thing, the fleet answers, the socket
-// closes. A long-lived socket would be a fourth kind of fleet client to keep alive, reconnect and
-// reason about, in a process whose whole job is to relay single sentences (Law 8 — what is raised is
-// taken down).
+// ONE SHOT PER QUESTION, NEVER A HELD CONNECTION: the fleet answers and the socket closes (Law 8).
 
-const { createEnvelope, parseEnvelope, INGAME_DOOR_PORT_OFFSET } = require('@foreman/message_schema');
+const { createEnvelope, parseEnvelope, READ_DOOR_PORT_OFFSET } = require('@foreman/message_schema');
 const { guardExternalSync } = require('@utils/external_library_guard');
 
 const TAG = 'foreman_door';
@@ -34,23 +25,14 @@ function requireWs() { return requireFromHomes('ws'); }
 
 const FOREMAN_PORT_DEFAULT = 3001;
 
+// The pair the run up in this copy took (port_book, on its run lock), unless FOREMAN_PORT names one.
 function doorPort() {
-  const base = parseInt(process.env.FOREMAN_PORT || String(FOREMAN_PORT_DEFAULT), 10);
-  return base + INGAME_DOOR_PORT_OFFSET;
+  const base = parseInt(process.env.FOREMAN_PORT, 10) || require('@utils/port_book').runForemanPort() || FOREMAN_PORT_DEFAULT;
+  return base + READ_DOOR_PORT_OFFSET;
 }
 
-// send(verb, args) → { ok, sent, skippedSpecies, reason, error }
-//
-// IT ALWAYS RESOLVES AND NEVER THROWS: the caller is a clerk answering a person standing in the world, so
-// every failure becomes a sentence. Each one is named — a door that is not there, a socket that broke, a
-// fleet that never answered — so a human is told where to look.
-//
-// THE TIMEOUT IS AN ANSWER, NOT A RETRY. A verb written to the socket and never acknowledged may well
-// have landed; re-sending it would mean a human's single sentence dispatching two `exit`s. The wait ends
-// with an honest no-answer report, and the human decides (Law 25).
-// ── ONE SOCKET, TWO QUESTIONS ────────────────────────────────────────────────────────────────────
-// `send` and `query` differ only in what they put on the wire and what they read back, so the
-// connect / timeout / close / never-throw machinery is written once and handed the pair (Law 16).
+// ── ONE SOCKET, ONE QUESTION ─────────────────────────────────────────────────────────────────────
+// The connect / timeout / close / never-throw machinery, handed what to put on the wire and what to read back.
 function _ask(outgoing, wantType, readPayload, timeoutMs) {
   const WebSocket = requireWs();
   const port = doorPort();
@@ -60,7 +42,7 @@ function _ask(outgoing, wantType, readPayload, timeoutMs) {
     // Closing a socket that is already gone is the library's business, not a decision this module makes.
     const closeQuietly = (ws) => guardExternalSync(TAG, `closing the door socket on ${port}`, () => ws.close());
 
-    const opened = guardExternalSync(TAG, `opening the in-game door on ${port}`,
+    const opened = guardExternalSync(TAG, `opening the read door on ${port}`,
       () => new WebSocket(`ws://127.0.0.1:${port}`));
     if (!opened.ok) {
       finish({ ok: false, error: `could not open the fleet door on ${port}: ${opened.reason}` });
@@ -94,23 +76,10 @@ function _ask(outgoing, wantType, readPayload, timeoutMs) {
   });
 }
 
-// ── WHAT CROSSES FROM THE FLEET'S VOCABULARY INTO THE DESK'S ─────────────────────────────────────────
-// One projection per answer, used by both roads below (the socket and the in-process desk), so the two
-// hand the desk the same shape (Law 16).
-//
-// `stopped` IS CARRIED BECAUSE A WIPE IS THE ONE VERB WHOSE OUTCOME IS NOT A DELIVERY COUNT. It is
-// performed by the foreman against the player's own file and reaches zero bots by design, so `sent`
-// cannot describe it; what the person needs to hear is how many of their crew were sent away. Each field
-// is named explicitly here, so a field crosses this boundary only when something in here reads it.
-function readCommandResult(p) {
-  return { sent: p.sent || 0, skippedSpecies: p.skippedSpecies || 0, skippedOwner: p.skippedOwner || 0,
-           reason: p.reason || null, stopped: p.stopped || 0 };
-}
-
 // `departed` is bots that registered and then left, kept out of `bots`: every caller of that array acts
-// on its members (hire, film, send a verb), and a departed bot among them is a ghost.
-// `buildings` is every live base the fleet holds, `<structure>|<owner>` → its site chairs. Read-only; the
-// desk asks it before siting, so a crew's existing base is handed back on request.
+// on its members (raise, film, send a verb), and a departed bot among them is a ghost.
+// `buildings` is every live base the fleet holds, `<structure>|<crew>` → its site chairs. Read-only; the
+// foreman asks it before siting, so a crew's existing base is handed back.
 function readFleetState(p) {
   return {
     bots: Array.isArray(p.bots) ? p.bots : [],
@@ -126,27 +95,11 @@ function readFleetState(p) {
   };
 }
 
-function readRequestResult(p) { return { ...p }; }
-
-// send(verb, args, asker) — an operator verb, on behalf of the player who spoke it.
-//
-// THE ASKER IS NOT OPTIONAL AND IS NOT DEFAULTED. The foreman refuses an in-game verb that names
-// nobody, since the unaddressed form means all of the asker's own bots and a missing asker names none
-// (Law 13).
-function send(verb, args = {}, asker = null, timeoutMs = 5000) {
-  return _ask(
-    createEnvelope('operator_command', 'foreman', { verb, args, asker }),
-    'command_result',
-    readCommandResult,
-    timeoutMs,
-  );
-}
-
-// query() — who is connected right now, and whose they are.
+// query() — who is connected right now.
 //
 // Answered fresh from the foreman's own registry each time (Invariant B): a cached tally would go wrong
 // the first time the operator stops one from the console. The registry's fact is CONNECTION, not life —
-// a bot that LEFT is not in it, a bot that merely DIED still is, holding its owner's slot until it comes
+// a bot that LEFT is not in it, a bot that merely DIED still is, holding its crew slot until it comes
 // back (death_manager's job).
 function query(timeoutMs = 5000) {
   return _ask(
@@ -157,42 +110,16 @@ function query(timeoutMs = 5000) {
   );
 }
 
-// request(action, args, asker) — place, withdraw, or read back a standing requirement.
+// local(hub) — the same question, answered by the foreman living in THIS process.
 //
-// A SEPARATE MESSAGE TYPE FROM `send`, not a new operator verb, because the two do different things to
-// different places. An operator verb is a COMMAND delivered to bodies — it reaches every bot the asker
-// owns and acts now. A request is a FACT written down — it reaches no body, changes no behaviour
-// directly, and is answered by whichever crew next measures its own needs. Folding it into the verb
-// path would put a fact through a machinery built to fan out commands (Law 0: one verb per thing).
-//
-// The asker travels for the same reason it does on `send`, and here it is load-bearing twice over: it
-// is both who spoke and WHOSE REQUIREMENT THIS IS, so a missing one is not a defaulted field but a
-// requirement belonging to nobody (Law 13).
-function request(action, args = {}, asker = null, timeoutMs = 5000) {
-  return _ask(
-    createEnvelope('request_command', 'foreman', { action, ...args, asker }),
-    'request_result',
-    readRequestResult,
-    timeoutMs,
-  );
-}
-
-// local(desk) — the same three calls, answered by the foreman living in THIS process.
-//
-// The desk and the hub share one process and one memory space, so this calls `desk` directly, with no
-// socket in between. Same signatures, same projections and same always-resolving promise as the socket
-// road, so nothing in the desk can tell which road it took. The origin is still not the desk's to name:
-// `desk.operator` stamps in-game inside the foreman. The socket road above stays for readers that are
-// other processes (run.js, the camera warden).
-function local(desk) {
+// The foreman's body and the hub share one process and one memory space, so this calls `hub` directly,
+// with no socket in between: the same projection and the same always-resolving promise as the socket road.
+// The socket road above stays for readers that are other processes (bench_world, the camera warden).
+function local(hub) {
   return {
-    send: (verb, args = {}, asker = null) =>
-      Promise.resolve({ ok: true, ...readCommandResult(desk.operator({ verb, args, asker })) }),
-    query: () => Promise.resolve({ ok: true, ...readFleetState(desk.fleetState()) }),
-    request: (action, args = {}, asker = null) =>
-      Promise.resolve({ ok: true, ...readRequestResult(desk.request({ action, ...args, asker })) }),
+    query: () => Promise.resolve({ ok: true, ...readFleetState(hub.fleetState()) }),
     doorPort,
   };
 }
 
-module.exports = { send, query, request, doorPort, local };
+module.exports = { query, doorPort, local };

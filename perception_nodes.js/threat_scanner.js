@@ -42,15 +42,32 @@ function isHostile(e) {
   }
   const kind = String(e.kind || '').toLowerCase();
   if (kind.includes('hostile')) return true;
-  const name = String(e.name || e.mobType || '').toLowerCase();
+  const name = String(e.name || e.displayName || '').toLowerCase();
   return HOSTILE_NAMES.has(name);
 }
 
+// Animals that kill the fleet's livestock. Not hostile to the bot, so isHostile leaves them out; the commander
+// admits one only where it threatens the herd (architect_config.PREDATOR_GUARD). A tamed one carries its owner on
+// its metadata (`owneruuid`, indexed through the live registry) and belongs to a player, so it is never one.
+const PREDATOR_NAMES = new Set(['wolf']);
+
+function isPredator(e, bot) {
+  if (!e || !e.position) return false;
+  const name = String(e.name || '').toLowerCase();
+  if (!PREDATOR_NAMES.has(name)) return false;
+  const keys = bot && bot.registry && bot.registry.entitiesByName && bot.registry.entitiesByName[name]
+    ? bot.registry.entitiesByName[name].metadataKeys : null;
+  const idx = Array.isArray(keys) ? keys.indexOf('owneruuid') : -1;
+  const owner = idx >= 0 && Array.isArray(e.metadata) ? e.metadata[idx] : null;
+  return !owner;
+}
+
 function hostileName(e) {
-  return String(e.name || e.mobType || 'unknown').toLowerCase();
+  return String(e.name || e.displayName || 'unknown').toLowerCase();
 }
 
 module.exports = {
   isHostile,
+  isPredator,
   hostileName,
 };

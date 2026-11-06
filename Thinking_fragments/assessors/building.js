@@ -12,7 +12,7 @@ const { blocksCompletion } = require('@utils/calculators/build_material_calculat
 const { countInInventory } = require('@utils/calculators/inventory_calculator');
 const { getBotInventory } = require('@utils/fragment_utils');
 const { homeChest } = require('@utils/fragment_utils');
-const { remainingRawForBuild, affordableNow } = require('@utils/calculators/build_material_calculator');
+const { remainingRawForBuild, affordableNow, blueprintToRawMaterials } = require('@utils/calculators/build_material_calculator');
 const { stationUsable } = require('@perception/station_registry');
 
 // peerPrepUnits(roomKey, anchorIndex) → { item: units } — the crafted units of this anchor a peer holds
@@ -32,12 +32,21 @@ function peerPrepUnits(roomKey, anchorIndex) {
     }
     return units;
 }
+
+// _sayAnchor(bpName, index) — the anchor the board builds next, said once per change (Law 6). Anchors build in
+// order, so the line also says every anchor before it owes nothing: the headframe clock closes on it
+// (monitoring/build_lenses, HEADFRAME_CLOCK.graded_anchor).
+const _anchorSaid = new Map();
+function _sayAnchor(bpName, index) {
+    if (index === null || _anchorSaid.get(bpName) === index) return;
+    _anchorSaid.set(bpName, index);
+    watcher.summary(TAG, `"${bpName}" next anchor ${index} — anchors before it owe nothing`);
+}
 const { isUnderground } = require('@utils/fragment_utils');
 
 // Tunables imported from architect_config, never restated (Law 16 — one source).
 const {
     JOB_TYPE,
-    BUILDING_REQUIREMENTS,
     TYPE_COORDINATES,
     TYPE_BLUEPRINT_PASTED,
     TYPE_STRUCTURE_COMPLETE,
@@ -47,6 +56,9 @@ const { TAG, deliverScope, supplyJob, siteTreeBox, siteTreePhaseDone, siteTreesJ
 const jobExclusions = require('@thinking/job_exclusions');
 // Each structure's verdict as this body last read it with the whole structure in sight (field → built).
 const _lastSeenBuilt = new Map();
+// What every structure still standing short asks for, item and raw alike, as of the last sweep: held back from the pit.
+let _structureNeed = {};
+function structureNeed() { return _structureNeed; }
 // ── SECTION 2 — Building (evaluates SECOND, Law 18) — pullNeeded + build job for first unsatisfied req ──
 async function assess({ excluded } = {}) {
     // The set every completeness test below is measured against: what the board says the fleet
@@ -54,43 +66,53 @@ async function assess({ excluded } = {}) {
     // is excluded — the safe reading.
     const optional = new Set(jobExclusions.names(excluded));
     const jobs = [];
-    let pullNeeded = {};
-    const surfaceNeeded = {};   // raw:totalPocketTarget — surface mats the build is short (logs)
     const bot = global.bot;
 
-    // Reads requested_work, not the config table directly: a contractor builds only rows asked for,
-    // running this same ladder once asked.
+    // Reads requested_work, not the config table directly: each species walks its own structures' ladders.
     const sorted = [...require('@thinking/requested_work').activeBuildingRequirements()]
         .sort((a, b) => (a.order || 0) - (b.order || 0));
     let firstUnsatisfied = null;
-    let materialsGated = false;
-    // ── BUILD IF ANYTHING CAN BE BUILT, ON THE LOWEST UNFINISHED ANCHOR ──────────
-    // materialsGated = post NO build job — set only when the lowest unfinished anchor has nothing the
-    // pool can pay for and nothing to dig. Short of some materials but able to place others, the build
-    // job posts and the shortfall order posts beside it: one bot places what the pool holds, the rest
-    // fetch the remainder. Anchor 2 never posts before anchor 1 owes nothing — `nextAnchor` is the
-    // FIRST owing anchor. Safety of the part-load: build_material_calculator.affordableNow.
-    let buildAnchorIndex = null;   // which anchor the structure job builds (per-anchor gating)
-    // ── HOW MANY BODIES THIS BUILD CAN HOLD, ON A PLEDGE-APPROVED PLAN ─────────
-    // Null on every blueprint without a labelled plan, and the job posts as it always does. On a
-    // labelled plan it is the count of cells whose support already stands — one pledge seat each
-    // (see placeableNow).
-    let buildPledgeSeats = null;
+    // ── THE ALPHA FIRST, THEN EVERY SUPPORT AT ONCE ──────────────────────────────
+    // Until the crew's alpha structure (bot_mandate.homeBlueprint) is built, the ladder is worked one rung at a time:
+    // the first unsatisfied structure only. Once it stands, every structure still owing work is a support of the
+    // crew's build, and each posts its own build job beside the others. `front` holds one record per structure
+    // worked this sweep, the first unsatisfied first:
+    //   anchorIndex     which anchor its build job builds (per-anchor gating)
+    //   pledgeSeats     HOW MANY BODIES IT CAN HOLD, ON A PLEDGE-APPROVED PLAN: null on every blueprint without a
+    //                   labelled plan, and the job posts as it always does; on a labelled plan the count of cells
+    //                   whose support already stands, one pledge seat each (see placeableNow)
+    //   heldByBodies    the bodies standing on every block it still owes (job_gates bodyGate)
+    //   materialsGated  post NO build job: set only when its lowest unfinished anchor has nothing the pool can pay
+    //                   for and nothing to dig. Short of some materials but able to place others, the build job
+    //                   posts and the shortfall order posts beside it: one bot places what the pool holds, the rest
+    //                   fetch the remainder. Anchor 2 never posts before anchor 1 owes nothing — `nextAnchor` is
+    //                   the FIRST owing anchor. Safety of the part-load: build_material_calculator.affordableNow.
+    //   surfaceNeeded   raw:gap of surface materials it is short (the order to the home chest)
+    //   pullNeeded      raw:gap of underground materials it is short (the mine's pull)
+    const alpha = require('@kernel/bot_mandate').homeBlueprint();
+    const front = [];
+    const needing = {};
     // Each structure's own built verdict, keyed by its field, read by job_board's built-change announcement
     // and by the built gate. Only the STRUCTURE_COMPLETE rung speaks for "built"; siting and pasting are
     // rungs on the way there.
     const built = {};
 
     // Condition gate: a `condition`-tagged requirement stays invisible until it holds; an unknown token
-    // defaults to stopped (Law 13). No live tokens currently use it; the gate stays ready for the next one.
+    // defaults to stopped (Law 13). main_build_complete: this body's chair holds the crew's main building built.
     const conditionMet = (cond) => {
         if (!cond) return true;
+        if (cond === 'main_build_complete') {
+            const { CREW_BUILD } = require('@thinking/architect_config');
+            const chair = require('@kernel/corporate_headquarters').readBoardroomChair(process.env.BOT_ID || 'default', {}) || {};
+            return !!(chair.built && chair.built[CREW_BUILD[require('@kernel/bot_mandate').currentMode()]] === true);
+        }
         return false;   // unknown condition → default stopped
     };
 
     for (const req of sorted) {
         if (!conditionMet(req.condition)) continue;
         let satisfied = false;
+        let w = null;   // this structure's record in `front`, when it is worked this sweep
 
         if (req.type === TYPE_COORDINATES) {
             const sb = hq.readBuildingChair(req.field, 'set_buildspot');
@@ -113,17 +135,42 @@ async function assess({ excluded } = {}) {
                     const bpName = req.blueprint_name || req.field;
                     const result = await buildingIntegrity.scan(bot, bpName, req.field);
                     // A structure this body cannot see whole is not judged: its verdict stays the one this
-                    // body last read with the structure in sight, and no build job is offered for it. One
-                    // never seen built holds the ladder there, posting nothing.
+                    // body last read with the structure in sight, and no build job is offered for it. Before the
+                    // alpha stands, one never seen built holds the ladder there, posting nothing; after, it holds
+                    // only itself.
                     if (result.unseen) {
                         built[req.field] = _lastSeenBuilt.get(req.field) === true;
-                        if (built[req.field]) continue;
+                        if (built[req.field] || built[alpha] === true) continue;
                         break;
                     }
                     satisfied = result.all_complete === true;
+                    if (!satisfied) {
+                        const whole = result.materials_needed || {};
+                        for (const rows of [whole, blueprintToRawMaterials(whole)]) {
+                            for (const [item, n] of Object.entries(rows)) if (typeof n === 'number' && n > 0) needing[item] = (needing[item] || 0) + n;
+                        }
+                    }
                     _lastSeenBuilt.set(req.field, satisfied);
+                    // This structure is worked this sweep: the ladder's first unsatisfied rung, or any once the alpha stands.
+                    w = !satisfied && (firstUnsatisfied === null || built[alpha] === true)
+                        ? { req, anchorIndex: null, pledgeSeats: null, heldByBodies: null, materialsGated: false, surfaceNeeded: {}, pullNeeded: {} }
+                        : null;
 
-                    if (!satisfied && firstUnsatisfied === null) {
+                    // ── EVERY BLOCK IT STILL OWES HOLDS A BODY UP ──
+                    // dig_authority never digs the last block under a body, so a structure whose whole remainder is such
+                    // digs has no step a builder can take until the body moves; the job is stamped for job_gates' body
+                    // gate, which holds it, instead of being offered to a builder that can only report it blocked.
+                    if (w) {
+                        const owed = result.steps || [];
+                        const { bodyHeldBy } = require('@utils/movement/dig_authority');
+                        const Vec3 = require('vec3');
+                        const holders = owed.map(st => st.action === 'dig' ? bodyHeldBy(bot, new Vec3(st.place.x, st.place.y, st.place.z)) : null);
+                        w.heldByBodies = owed.length && holders.every(Boolean)
+                            ? { bodies: [...new Set(holders)], cells: owed.map(st => `${st.place.x},${st.place.y},${st.place.z}`) }
+                            : null;
+                    }
+
+                    if (w) {
                         // Gate on the NEXT incomplete anchor, never the whole build — whole-build gating can
                         // deadlock when the total material need across all anchors exceeds the supply cap
                         // even though each anchor is individually affordable. "Next" excludes optional-only
@@ -143,11 +190,34 @@ async function assess({ excluded } = {}) {
                         // with ALL anchors unsensed this could mark the structure satisfied without the bot
                         // ever having come close enough to see it. Unsensed keeps it live → bot goes to
                         // look → chunk loads → real scan (Invariant B).
-                        const nextAnchor = hasAnchors ? result.anchor_status.find(a =>
-                            a.dig_count > 0 || a.unloaded_count > 0 ||
-                            Object.entries(a.materials_needed).some(([k, c]) => c > 0 && blocksCompletion(k, c, optional, isAvailable))
-                        ) : null;
-                        buildAnchorIndex = nextAnchor ? nextAnchor.anchor_index : null;
+                        const owes = (a) => a.dig_count > 0 || a.unloaded_count > 0 ||
+                            Object.entries(a.materials_needed).some(([k, c]) => c > 0 && blocksCompletion(k, c, optional, isAvailable));
+                        const nextAnchor = hasAnchors ? result.anchor_status.find(owes) : null;
+                        w.anchorIndex = nextAnchor ? nextAnchor.anchor_index : null;
+                        _sayAnchor(bpName, w.anchorIndex);
+                        // The job is the trip the plan declares from that anchor: its section, or the anchor alone.
+                        const trip = nextAnchor ? buildingIntegrity.tripBill(result, bpName, nextAnchor.anchor_index) : null;
+                        // ── SECTIONS THAT STAND APART ARE A SEAT EACH ──
+                        // A plan that says so (parallel_sections) posts every further trip still owing, in order, while the
+                        // pool pays for all of them together, up to the roster. Each trip is its own job id, so the dispatcher
+                        // gives it one body, and that body takes the next off the board when it is done.
+                        w.otherTrips = [];
+                        if (nextAnchor && blueprintRegistry.tryGetBuilding(bpName)?.parallel_sections) {
+                            const roster = Object.keys(require('@thinking/architect_config').BOT_SENIORITY).length;
+                            const seen = new Set([blueprintRegistry.sectionOf(bpName, nextAnchor.anchor_index)[0]]);
+                            const bill = { ...trip.whole };
+                            for (const a of result.anchor_status) {
+                                if (w.otherTrips.length + 1 >= roster) break;
+                                const head = blueprintRegistry.sectionOf(bpName, a.anchor_index)[0];
+                                if (seen.has(head) || !owes(a)) continue;
+                                seen.add(head);
+                                for (const [k, c] of Object.entries(buildingIntegrity.tripBill(result, bpName, a.anchor_index).whole)) {
+                                    if (typeof c === 'number') bill[k] = (bill[k] || 0) + c;
+                                }
+                                if (Object.keys(remainingRawForBuild(bill, pool)).length > 0) break;
+                                w.otherTrips.push(a.anchor_index);
+                            }
+                        }
                         // ── A PLEDGE-APPROVED PLAN POSTS ONE SEAT PER PLACEABLE CELL ──
                         // The label is the blueprint's, read through the one accessor that owns it, so the
                         // board, the manager and the executor cannot disagree about which plans this covers.
@@ -172,7 +242,7 @@ async function assess({ excluded } = {}) {
                             );
                             const payable = Object.values(affordableNow(placeableBill, pool, stationUsable)).reduce((n, c) => n + c, 0);
                             // Digs cost nothing to claim, so they are seats in their own right.
-                            buildPledgeSeats = Math.min(nextAnchor.placeable_now || 0, payable) + (nextAnchor.dig_count || 0);
+                            w.pledgeSeats = Math.min(nextAnchor.placeable_now || 0, payable) + (nextAnchor.dig_count || 0);
                         }
 
                         // Optional-only remainder doesn't gate: no anchor owing REQUIRED work = buildable
@@ -185,7 +255,7 @@ async function assess({ excluded } = {}) {
                         // INTERMEDIATES (32 planks offset a chest/door's planks), which raw
                         // materials_missing can't. Anchorless legacy blueprints → whole-build need.
                         const mm = hasAnchors
-                            ? (nextAnchor ? (nextAnchor.materials_needed || {}) : {})
+                            ? (trip ? trip.whole : {})
                             : (result.materials_needed || {});
                         // Optional materials don't gate — placed when available.
                         const remaining = Object.fromEntries(
@@ -218,25 +288,25 @@ async function assess({ excluded } = {}) {
                                 // own support already stands. Swapping the CUT keeps the Law 16 agreement
                                 // intact: building_manager.anchorBuildableNow reads the same field off the
                                 // same label, so the two gates still ask one question.
-                                const cut = buildPledgeSeats !== null
+                                const cut = w.pledgeSeats !== null
                                     ? lessPeerHeld(nextAnchor?.materials_needed_placeable)
-                                    : nextAnchor?.materials_needed_lowest_y;
+                                    : (trip?.section.length > 1 ? trip.placeable : trip?.coursed);
                                 const coursed = Object.fromEntries(
                                     Object.entries(cut || {})
                                         .filter(([k, c]) => typeof c === 'number' && c > 0 && !optional.has(k))
                                 );
                                 const canBuild = !!nextAnchor && (nextAnchor.dig_count > 0 || nextAnchor.unloaded_count > 0
                                     || Object.keys(affordableNow(coursed, pool, stationUsable)).length > 0);
-                                if (!canBuild) materialsGated = true;
+                                if (!canBuild) w.materialsGated = true;
                                 for (const [raw, count] of Object.entries(shortRaw)) {
-                                    if (isUnderground(raw)) pullNeeded[raw] = count;
-                                    else surfaceNeeded[raw] = count;   // deliver-amount = the gap (shortRaw)
+                                    if (isUnderground(raw)) w.pullNeeded[raw] = count;
+                                    else w.surfaceNeeded[raw] = count;   // deliver-amount = the gap (shortRaw)
                                 }
                                 // Route annotation (Law 6 — the split above is invisible otherwise).
                                 const routeOf = (k) => isUnderground(k) ? '→mine' : '→chest#1';
                                 const shortList = Object.entries(shortRaw).map(([k, v]) =>
                                     `${k}:${v} [${routeOf(k)}]`).join(', ');
-                                watcher.summary(TAG, `"${bpName}" anchor ${buildAnchorIndex} ` +
+                                watcher.summary(TAG, `"${bpName}" anchor ${w.anchorIndex} ` +
                                     `${canBuild ? 'building what the pool holds' : 'gated'} — order (short): ${shortList}`);
                             }
                         }
@@ -246,68 +316,84 @@ async function assess({ excluded } = {}) {
         }
 
         if (req.type === TYPE_STRUCTURE_COMPLETE) built[req.field] = satisfied;
+        if (w && !satisfied) front.push(w);
         if (!satisfied && firstUnsatisfied === null) {
             firstUnsatisfied = req;
         }
     }
 
+    _structureNeed = needing;
+
     // Coordinates/paster steps are the FOREMAN'S (Law 16 — one pathway): it sites the whole base before
     // any body exists, and `start_injector` records the handed site and refuses to start a body without
     // one — so this posts ONLY the STRUCTURE build. A coords/paster firstUnsatisfied means this body has
     // no base, which the start gate already refused, so nothing posts here.
-    // TREES FIRST (assessors/shared siteTreesJob — the same felling job the castle posts): while a trunk stands on
-    // the structure's footprint plus the leaf margin, the felling job posts in the build's place. Materials gate
-    // only the build, so the felling runs while the order below fills.
-    const treeSite = (firstUnsatisfied && firstUnsatisfied.type === TYPE_STRUCTURE_COMPLETE && bot && bot.findBlocks)
-        ? hq.readBuildingChair(firstUnsatisfied.field, 'set_buildspot')?.transpose_origin || null : null;
-    const treeBox = treeSite
-        ? siteTreeBox(firstUnsatisfied.blueprint_name || firstUnsatisfied.field)
-        : null;
-    // The build waits on the PHASE, not on the scan: an all-claimed site posts no new job but is still
-    // being felled, so the build must not start over a feller's head (see shared.siteTreesJob).
-    let treesStanding = false;
-    if (treeSite && !siteTreePhaseDone(firstUnsatisfied.field)) {
-        const treesSeats = await siteTreesJob(firstUnsatisfied.field, treeSite, treeBox);
-        jobs.push(...treesSeats);   // an ARRAY of seats now — one per standing trunk, capped at the roster
-        // Re-read AFTER the call: siteTreesJob is what closes the phase when it finds the site clear, so
-        // asking before it would hold the build for one needless sweep on the sweep that finishes felling.
-        treesStanding = !siteTreePhaseDone(firstUnsatisfied.field);
-    }
+    // Every structure in `front` posts its own felling, build job and share of the orders.
+    for (const w of front) {
+        const req = w.req;
+        // TREES FIRST (assessors/shared siteTreesJob — the same felling job the castle posts): while a trunk stands on
+        // the structure's footprint plus the leaf margin, the felling job posts in the build's place. Materials gate
+        // only the build, so the felling runs while the order below fills. The spawn proofing waits on no felling: its
+        // posts stand on trunkless columns, and each trip fells round its own posts (custom_api/post_clearing).
+        const treeSite = (bot && bot.findBlocks && req.field !== require('@thinking/architect_config').SPAWN_PROOFING)
+            ? hq.readBuildingChair(req.field, 'set_buildspot')?.transpose_origin || null : null;
+        const treeBox = treeSite
+            ? siteTreeBox(req.blueprint_name || req.field, treeSite)
+            : null;
+        // The build waits on the PHASE, not on the scan: an all-claimed site posts no new job but is still
+        // being felled, so the build must not start over a feller's head (see shared.siteTreesJob).
+        let treesStanding = false;
+        if (treeSite && !siteTreePhaseDone(req.field)) {
+            const treesSeats = await siteTreesJob(req.field, treeSite, treeBox);
+            jobs.push(...treesSeats);   // an ARRAY of seats now — one per standing trunk, capped at the roster
+            // Re-read AFTER the call: siteTreesJob is what closes the phase when it finds the site clear, so
+            // asking before it would hold the build for one needless sweep on the sweep that finishes felling.
+            treesStanding = !siteTreePhaseDone(req.field);
+        }
 
-    if (firstUnsatisfied && !materialsGated && !treesStanding && firstUnsatisfied.type === TYPE_STRUCTURE_COMPLETE) {
-        const bc = hq.readBuildingChair(firstUnsatisfied.field, 'set_buildspot')?.transpose_origin || null;
+        if (!w.materialsGated && !treesStanding) {
+            const bc = hq.readBuildingChair(req.field, 'set_buildspot')?.transpose_origin || null;
 
-        // Distinct job_id per anchor → two bots build two anchors at once via existing Phase-3 claims.
-        const withAnchor = buildAnchorIndex != null;
-        // ── ONE STRUCTURE, ONE BUILDER — UNLESS THE PLAN SAYS OTHERWISE ────────
-        // 'shared' dedups WHO builds a structure — a body pillaring up inside a 5×5×5 cube digs its own
-        // footing, and a second body in that cube stands on a block about to be mined from under it.
-        //
-        // A PLEDGE-APPROVED PLAN IS 'local' FOR THE SAME REASON `mine_dig_cell` IS: exclusivity moves
-        // DOWN a level, from the job to the cell. The foreman's `cell:` claim gives each voxel exactly
-        // one owner, so the magnet stops standing in for it, and many bodies holding the same magnet
-        // are many bodies placing many different blocks. 'shared' here would make the seats below a lie
-        // — the board advertising more than the dispatcher would admit.
-        //
-        // `need` IS CELLS AND `pledge_unit` IS ONE, which is what makes a seat a cell. Stated on the JOB,
-        // since it is a fact about this order, not a property of any material — see the pledge note in
-        // yield_pledge_calculator for why that is one system.
-        const pledged = buildPledgeSeats !== null && buildPledgeSeats > 0;
-        jobs.push({
-            id:   `build_${firstUnsatisfied.execute_key || firstUnsatisfied.field}${withAnchor ? `_anchor_${buildAnchorIndex}` : ''}`,
-            type: 'build',
-            what: firstUnsatisfied.execute_key || firstUnsatisfied.field,
-            where: bc,
-            ...(pledged ? { need: buildPledgeSeats, pledge_unit: 1 } : {}),
-            // Per-building rank: a requirement may name its own JOB_TYPE key (how the headframe
-            // outranks other structures); unnamed → default tier.
-            job_type: JOB_TYPE[firstUnsatisfied.job_type] ?? JOB_TYPE.building_structure,
-            claimed_by: null,
-            step: firstUnsatisfied.type,
-            structure: firstUnsatisfied.field,
-            scope: pledged ? 'local' : 'shared',
-            ...(withAnchor ? { anchor_index: buildAnchorIndex } : {}),
-        });
+            // Distinct job_id per anchor → two bots build two anchors at once via existing Phase-3 claims.
+            const withAnchor = w.anchorIndex != null;
+            // ── ONE STRUCTURE, ONE BUILDER — UNLESS THE PLAN SAYS OTHERWISE ────────
+            // 'shared' dedups WHO builds a structure — a body pillaring up inside a 5×5×5 cube digs its own
+            // footing, and a second body in that cube stands on a block about to be mined from under it.
+            //
+            // A PLEDGE-APPROVED PLAN IS 'local' FOR THE SAME REASON `mine_dig_cell` IS: exclusivity moves
+            // DOWN a level, from the job to the cell. The foreman's `cell:` claim gives each voxel exactly
+            // one owner, so the magnet stops standing in for it, and many bodies holding the same magnet
+            // are many bodies placing many different blocks. 'shared' here would make the seats below a lie
+            // — the board advertising more than the dispatcher would admit.
+            //
+            // `need` IS CELLS AND `pledge_unit` IS ONE, which is what makes a seat a cell. Stated on the JOB,
+            // since it is a fact about this order, not a property of any material — see the pledge note in
+            // yield_pledge_calculator for why that is one system.
+            const pledged = w.pledgeSeats !== null && w.pledgeSeats > 0;
+            // THE SEAT IS NAMED FOR ITS TRIP, NOT ITS NEXT ANCHOR: a section (blueprint_registry.sectionOf) is one trip that
+            // builds its anchors in turn, so once its first anchor is done a peer's board would post the next under a new
+            // id, the dispatcher's peer filter (by id) would not see the trip already holds it, and the second body would
+            // find the anchor locked and fail until recursive_judge kills it. The section's first anchor names it whole.
+            for (const anchorIndex of withAnchor ? [w.anchorIndex, ...(w.otherTrips || [])] : [null]) {
+            const tripKey = withAnchor ? blueprintRegistry.sectionOf(req.blueprint_name || req.field, anchorIndex)[0] : null;
+            jobs.push({
+                id:   `build_${req.execute_key || req.field}${withAnchor ? `_anchor_${tripKey}` : ''}`,
+                type: 'build',
+                what: req.execute_key || req.field,
+                where: bc,
+                ...(pledged ? { need: w.pledgeSeats, pledge_unit: 1 } : {}),
+                // Per-building rank: a requirement may name its own JOB_TYPE key (how the headframe
+                // outranks other structures); unnamed → default tier.
+                job_type: JOB_TYPE[req.job_type] ?? JOB_TYPE.building_structure,
+                claimed_by: null,
+                step: req.type,
+                structure: req.field,
+                scope: pledged ? 'local' : 'shared',
+                ...(w.heldByBodies ? { gates: { held_by_bodies: w.heldByBodies } } : {}),
+                ...(withAnchor ? { anchor_index: anchorIndex } : {}),
+            });
+            }
+        }
     }
 
     // Build-material ORDER: surface-raw shortfall → headframe chest as a restock-DELIVER job (reuses
@@ -325,18 +411,31 @@ async function assess({ excluded } = {}) {
     // pocket already holds, since the pocket is not fulfillment for a storage row; the bootstrap row
     // delivers INTO the pocket and so counts it.
     const poolChest = homeChest();
+    // ONE ORDER PER MATERIAL, WHOEVER ASKS: every structure in `front` short of a material adds its gap to the one
+    // order for it, named in `parts` by its blueprint; the first that asked leads it (its band, structure and anchor).
+    // Each gap was measured against the whole pool, so two structures drawing one shelf can order less than both
+    // take; the next sweep measures what the first left and orders the rest.
+    const surfaceNeeded = {};   // raw → { gap, parts, lead }
+    const pullNeeded = {};
+    for (const w of front) {
+        for (const [raw, gap] of Object.entries(w.surfaceNeeded)) {
+            const o = surfaceNeeded[raw] || (surfaceNeeded[raw] = { gap: 0, parts: [], lead: w });
+            o.gap += gap;
+            o.parts.push({ who: `blueprint:${w.req.field}`, amount: gap });
+        }
+        for (const [raw, gap] of Object.entries(w.pullNeeded)) pullNeeded[raw] = (pullNeeded[raw] || 0) + gap;
+    }
     // TWO DEFAULTS, BECAUSE THEY ARE TWO DIFFERENT ORDERS. A chest order restocks the fleet's shelf and
     // defaults to the chest band; a bootstrap order is the structure's own bill going into the builder's
     // pocket before any chest exists, and defaults to the blueprint band beside the build it serves.
     // A declared `supply_job_type` on the requirement still overrides both (the headframe does).
-    const supplyJobType      = JOB_TYPE[firstUnsatisfied?.supply_job_type] ?? JOB_TYPE.resource_chest_restock;
-    const bootstrapJobType   = JOB_TYPE[firstUnsatisfied?.supply_job_type] ?? JOB_TYPE.building_structure_supply;
     const postedOrders = [];   // for the confirmation log — the dynamic request must be visible (Law 6)
-    for (const [raw, gap] of Object.entries(surfaceNeeded)) {
+    for (const [raw, { gap, parts, lead }] of Object.entries(surfaceNeeded)) {
         if (gap <= 0) continue;
-        // The order is a SEPARATE job from its build: building_structure is night-gated but this defaults
-        // to resource_chest_restock (not gated) — fleet could gather at night for a wall unplaceable until
-        // dawn. Headframe's order is exempt by job type (building_headframe_supply) — the point of that exemption.
+        const supplyJobType      = JOB_TYPE[lead.req.supply_job_type] ?? JOB_TYPE.resource_chest_restock;
+        const bootstrapJobType   = JOB_TYPE[lead.req.supply_job_type] ?? JOB_TYPE.building_structure_supply;
+        // The order is a SEPARATE job from its build, gated on its own job type from dusk (job_gates): every building's
+        // order waits for dawn, and what is banked still builds.
         if (poolChest) {
             jobs.push(supplyJob({
                 id: `build_chest_${raw}`, what: raw, need: gap,
@@ -348,13 +447,15 @@ async function assess({ excluded } = {}) {
                 // destination names this crew's own home, read from the mandate so the label always
                 // matches whatever structure the crew actually raises (Law 16, same as downloaded_build.js).
                 destination: require('@kernel/bot_mandate').homeBlueprint(),
-                structure: firstUnsatisfied.field,
+                structure: lead.req.field,
+                // The anchor the bill is for: job_gates approves a shell anchor's bill at dusk and night.
+                ...(lead.anchorIndex != null ? { anchor_index: lead.anchorIndex } : {}),
                 job_type: supplyJobType,
                 claimed_by: null,
                 hold_goal: gap, at_destination: 0,
-                // ONE ASKER: the building. Delivering into a chest, so the body's own pocket is not part
-                // of the figure and the breakdown has a single term.
-                parts: [{ who: `blueprint:${firstUnsatisfied.field}`, amount: gap }],
+                // THE ASKERS: the buildings. Delivering into a chest, so the body's own pocket is not part
+                // of the figure and the breakdown has one term a building.
+                parts,
                 // surfaceNeeded is raw today → 'local'; predicate called anyway so a future craftable moves
                 // scope with it — hardcoded 'local' would silently authorise duplicate crafts (Law 25).
                 category: 'resource', action: 'deliver', scope: deliverScope(raw),
@@ -364,7 +465,8 @@ async function assess({ excluded } = {}) {
             jobs.push(supplyJob({
                 id: `build_supply_${raw}`, what: raw, need: gap,
                 where: null,
-                structure: firstUnsatisfied.field,
+                structure: lead.req.field,
+                ...(lead.anchorIndex != null ? { anchor_index: lead.anchorIndex } : {}),
                 // ── THE BILL RANKS WITH THE BUILD, NOT WITH THE BODY ────────
                 // WHERE a material is delivered is a routing detail; WHO is asking for it is the band,
                 // and the asker here is the blueprint either way, so this honours the requirement's own
@@ -386,7 +488,7 @@ async function assess({ excluded } = {}) {
                 // `80 = bot:pocket_carried 33 + blueprint:laydown_yard 47`.
                 parts: [
                     { who: `bot:pocket_carried_${raw}`, amount: countInInventory(raw, getBotInventory()) },
-                    { who: `blueprint:${firstUnsatisfied.field}`, amount: gap },
+                    ...parts,
                 ],
                 category: 'resource', scope: 'local',
             }));
@@ -405,7 +507,7 @@ async function assess({ excluded } = {}) {
     // from the mine — and the layer above is short by the sum either way.
     // It is the SHORTFALL, not the requirement: material the build already holds is in `everything`
     // and would be subtracted twice if the whole requirement were filed here.
-    const buildClaim = { ...pullNeeded, ...surfaceNeeded };
+    const buildClaim = { ...pullNeeded, ...Object.fromEntries(Object.entries(surfaceNeeded).map(([raw, o]) => [raw, o.gap])) };
 
     // The pull's asker is this structure's own bill (job_board places the tunnel seat where that bill stands).
     const pullAsker = { job_type: JOB_TYPE[firstUnsatisfied?.supply_job_type] ?? JOB_TYPE.building_structure_supply,
@@ -413,4 +515,4 @@ async function assess({ excluded } = {}) {
     return { jobs, pullNeeded, pullAsker, buildClaim, built };
 }
 
-module.exports = { name: 'building', assess };
+module.exports = { name: 'building', assess, structureNeed };

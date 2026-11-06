@@ -167,6 +167,33 @@ function completedBattlesSince(sinceEpochMs, { bot = null } = {}) {
   return battles.sort((a, b) => a.at - b.at);
 }
 
+// ── fightTallySince — one body's side of a fight since this instant ─────────────────────────────────
+// Blows taken by who dealt them, swings thrown by weapon, swings withheld for a friend, shield raises and the blows a
+// raised shield caught. Counts only what the bot's own trace states.
+function fightTallySince(botId, sinceEpochMs) {
+  const lines = readBotTrace(botId);
+  if (!lines) return null;
+  const tally = { strikes: {}, struck: {}, withheld: 0, raises: 0, hurts: 0, lost: 0, hurtBy: {}, shieldBlocks: 0, doors: {}, focus: {} };
+  for (const ev of crewEvents(lines)) {
+    if (ev.at < sinceEpochMs) continue;
+    if (ev.verb === 'strike') {
+      const w = ev.fields.with || '?'; tally.strikes[w] = (tally.strikes[w] || 0) + 1;
+      const mob = ev.subject ? ev.subject.name : '?'; tally.struck[mob] = (tally.struck[mob] || 0) + 1;
+    }
+    else if (ev.verb === 'aggro') { const v = ev.fields.via || '?'; tally.doors[v] = (tally.doors[v] || 0) + 1; }
+    else if (ev.verb === 'focus') { const v = ev.fields.why || '?'; tally.focus[v] = (tally.focus[v] || 0) + 1; }
+    else if (ev.verb === 'withheld') tally.withheld++;
+    else if (ev.verb === 'shield' && ev.fields.state === 'up') tally.raises++;
+    else if (ev.verb === 'hurt') {
+      const who = ev.subject ? ev.subject.name : (ev.fields.type || 'unattributed');
+      const lost = crewLog.num(ev.fields, 'lost') || 0;
+      tally.hurts++; tally.lost += lost; tally.hurtBy[who] = (tally.hurtBy[who] || 0) + 1;
+      if (ev.fields.shield_block_ms != null) tally.shieldBlocks++;
+    }
+  }
+  return tally;
+}
+
 // Every bot with a story file, for the no-filter case. The camera and foreman streams are excluded by
 // name: they are not bodies and carry no waves.
 function traceBots() {
@@ -231,7 +258,7 @@ function fightSpansFromTrace(seg, botName = null) {
 module.exports = {
   fightSpansFromTrace,
   watchState, watchStateFromEvents,
-  completedBattlesSince, battlesFromEvents,
+  completedBattlesSince, battlesFromEvents, fightTallySince,
   crewEvents, readBotTrace, traceBots,
   KILL_VERDICT, DETONATED_VERDICT,
 };

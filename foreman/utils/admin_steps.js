@@ -70,9 +70,9 @@ const OVERLAY = path.join(__dirname, '..', '..', 'Auren_Workshop', 'tools', 'rec
 
 // run(args) → { code, out } — a child node process, its output kept for the reason it gives. Resolves on the
 // child's EXIT: the camera windows it leaves standing inherit its output pipes, so those never close.
-function run(args) {
+function run(args, env = null) {
   return new Promise(resolve => {
-    const child = spawn(process.execPath, [OVERLAY, ...args], { cwd: path.join(__dirname, '..', '..'), windowsHide: true });
+    const child = spawn(process.execPath, [OVERLAY, ...args], { cwd: path.join(__dirname, '..', '..'), windowsHide: true, ...(env ? { env: { ...process.env, ...env } } : {}) });
     let out = '';
     child.stdout.on('data', d => { out += d.toString(); });
     child.stderr.on('data', d => { out += d.toString(); });
@@ -87,16 +87,17 @@ const tail = (out) => out.trim().split('\n').slice(-4).join(' | ');
 const RIG_READY = path.join(__dirname, '..', '..', 'js_kernel', 'camera_rig_ready.json');
 
 // The config says 'cameras' / 'film'; the overlay's own words are 'watch' / 'record'. Translated here, once.
-// `eye` asks for the seat a person flies whatever camera_configure says; `onSeats` is handed the seats the
-// rig armed, so the foreman can put the person flying one where the run is.
-function camerasStep({ record, count, fill, eye, onSeats }) {
+// `eye` asks for the seat a person flies whatever camera_configure says; `seats` names those seats for this run in
+// place of camera_configure's list (AUREN_SEATS); `onSeats` is handed the seats the rig armed, so the foreman can put
+// the person flying one where the run is.
+function camerasStep({ record, count, fill, eye, seats = null, onSeats }) {
   let result = null;
   return {
     name: record === 'off' ? 'the cameras are up' : `the cameras are up (${record})`,
     when: () => record !== 'off',
     act: async () => {
       result = await run(['raise', `--overlay=${record === 'film' ? 'record' : 'watch'}`, `--count=${count}`,
-        ...(fill ? [] : ['--fill=off']), ...(eye ? ['--architect'] : [])]);
+        ...(fill ? [] : ['--fill=off']), ...(eye ? ['--architect'] : [])], seats ? { AUREN_SEATS: seats.join(',') } : null);
       return result.code === 0 ? null : { give: `the camera overlay did not come up: ${tail(result.out)}` };
     },
     proof: async () => {
@@ -114,9 +115,17 @@ function camerasStep({ record, count, fill, eye, onSeats }) {
   };
 }
 
-async function stopCameras(why, log) {
-  const r = await run(['stop', `--why=${why}`]);
+async function stopCameras(why, log, deferWrap = false) {
+  const r = await run(['stop', `--why=${why}`, ...(deferWrap ? ['--defer-wrap'] : [])]);
   log(r.code === 0 ? 'cameras: down.' : `WARNING the camera overlay did not come down cleanly: ${tail(r.out)}`);
 }
 
-module.exports = { terminalsStep, clockStep, camerasStep, stopCameras };
+// The recorder owns the copy; the foreman owns when the finished run's evidence is ready.
+async function archiveRecording(log) {
+  const r = await run(['wrap']);
+  log(r.code === 0 ? 'recording: video and complete fleet logs saved together.'
+    : `WARNING recording archive failed: ${tail(r.out)}. Preserve loose footage and fleet logs before the next start.`);
+  return r.code === 0;
+}
+
+module.exports = { terminalsStep, clockStep, camerasStep, stopCameras, archiveRecording };

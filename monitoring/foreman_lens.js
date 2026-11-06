@@ -1,26 +1,15 @@
 // Auren_Bot/monitoring/foreman_lens.js
-// THE DESK'S RUN, READ BACK — who spoke to the foreman, what they were told, and what crossed on their word.
+// THE FOREMAN'S RUN, READ BACK — the beats it said to the world, and every crew raise it withheld.
 //
-// Reads the fleet's only conversation with a party it does not control: did a person get what they requested, what were they refused and how many times, did they give up, and did anything cross into the
-// fleet that should not have. A fleet lens answering these would carry two verbs (Law 0) and would also
-// be reading a stream it is not meant to see.
-//
-// THE UNIT IS A PERSON'S SESSION, NOT A RUN. A tally cannot say that ONE person was refused eleven
-// times — a person meeting the same refusal repeatedly is the desk failing to guide, and that failure is
-// invisible in any aggregate. The fold groups by speaker and keeps every turn in order, so a session
-// stays RECONSTRUCTABLE.
-//
-// Reads the desk's own trace in the records room, decoded through `custom_api/crew_log.parseAll` — the
-// SAME module the desk emits through — and the verbatim text through `foreman/foreman_record.decodeText`,
+// Reads the foreman's own record in the records room, decoded through `custom_api/crew_log.parseAll` — the
+// SAME module the foreman emits through — and the verbatim text through `foreman/foreman_record.decodeText`,
 // the same file that encoded it. No regex of its own for either (Law 26 — both ends of the interface, or
 // neither; Law 16 — one implementation).
 //
-// The desk's file holds exactly one session: every run start flushes `watcher_*.jsonl` wholesale, so
+// The foreman's file holds exactly one run: every run start flushes `watcher_*.jsonl` wholesale, so
 // there is no run boundary to segment on.
 //
-// Usage:  node Auren_Bot/monitoring/trace_monitor.js --foreman [--bot=PlayerName] [--all]
-//           --bot   narrow to one speaker (the flag is the monitor's, and here it names a PERSON)
-//           --all   full transcript per person, every line either party said
+// Usage:  node Auren_Bot/monitoring/trace_monitor.js --foreman
 
 'use strict';
 
@@ -33,11 +22,10 @@ paths.registerAliases();
 const crewLog = require('@api/crew_log');
 
 const { readForemanView } = require('./trace_read');
-const { ABSENT } = require('./report_formatting');
 // The one writer to stdout: data_out owns every space and every column width.
 const out = require('./data_out');
-// The decoder from the encoder's own file. Requiring the desk's module from the monitoring side is the
-// dependency running the legal direction — a reader may read the thing it reads; the desk must never
+// The decoder from the encoder's own file. Requiring the foreman's module from the monitoring side is the
+// dependency running the legal direction — a reader may read the thing it reads; the foreman must never
 // require a lens (monitoring/README's one-way rule).
 const { decodeText, TAG } = require(paths.bot('foreman/foreman_record'));
 
@@ -46,28 +34,28 @@ const recordHomes = require(paths.bot('js_kernel/utils/record_homes'));
 const TRACE_DIR = recordHomes.TRACE_DIR;
 
 // ── READING ──────────────────────────────────────────────────────────────────────────────────────
-// deskEvents(lines) → [{ at, verb, fields }]. A line without a readable stamp is SKIPPED, not defaulted:
-// every ordering below is on that clock, and a zero would sort a real turn to the head of the session and
-// put words in the wrong person's mouth (Law 13 — never default a missing field).
-function deskEvents(lines) {
-  const out = [];
+// recordEvents(lines) → [{ at, verb, fields }]. A line without a readable stamp is SKIPPED, not defaulted:
+// every ordering below is on that clock, and a zero would sort an event to the head of the run (Law 13 —
+// never default a missing field).
+function recordEvents(lines) {
+  const events = [];
   for (const l of lines) {
     if (!l.iso) continue;
     const at = Date.parse(l.iso);
     if (Number.isNaN(at)) continue;
     for (const ev of crewLog.parseAll(l.raw)) {
       if (ev.tag !== TAG) continue;
-      out.push({ at, verb: ev.verb, fields: ev.fields });
+      events.push({ at, verb: ev.verb, fields: ev.fields });
     }
   }
-  return out;
+  return events;
 }
 
 // announcements(lines) → [{ at, kind, structure, layer, of, text }] in the order said. `kind` is
 // 'structure' (a structure finished) or 'layer' (a layer released); the fields the other kind does not
 // carry are null. The run's milestones, which a timelapse cuts on.
 function announcements(lines) {
-  return deskEvents(lines)
+  return recordEvents(lines)
     .filter(e => e.verb === 'announced')
     .map(e => ({
       at: e.at,
@@ -79,194 +67,161 @@ function announcements(lines) {
     }));
 }
 
+// refusals(lines) → [{ at, code, detail }] in the order withheld.
+function refusals(lines) {
+  return recordEvents(lines)
+    .filter(e => e.verb === 'refused')
+    .map(e => ({ at: e.at, code: e.fields.code, detail: decodeText(e.fields.detail) }));
+}
+
+// keeperFields(lines) → [{ at, room, held, growing, mature, untilled, unsown, blocked, stranded }]: the integrity keeper's
+// fields verdict (foreman/integrity_keeper_worker), one row per field per reading it logged; it logs on a change.
+const KEEPER_FIELDS_RE = /integrity keeper: fields: (.*)$/;
+const FIELD_RE = /^(\S+) (?:(not held)|(\d+) growing, (\d+) mature, (\d+) untilled, (\d+) unsown, (\d+) blocked(, STRANDED)?)$/;
+function keeperFields(lines) {
+  const rows = [];
+  for (const l of lines) {
+    const m = KEEPER_FIELDS_RE.exec(l.raw || '');
+    if (!m || !l.iso) continue;
+    for (const part of m[1].split('; ')) {
+      const f = FIELD_RE.exec(part.trim());
+      if (!f) continue;
+      rows.push({ at: Date.parse(l.iso), room: f[1], held: !f[2], growing: f[3] ?? null, mature: f[4] ?? null,
+        untilled: f[5] ?? null, unsown: f[6] ?? null, blocked: f[7] ?? null, stranded: f[2] ? null : !!f[8] });
+    }
+  }
+  return rows;
+}
+
+// keeperPlans(lines) → [{ at, base_torches, mine_torches, structures, columns }]: each plans reading the integrity
+// keeper's thread logged, with the chunk columns it asked the foreman's body for.
+const KEEPER_PLANS_RE = /integrity keeper: plans read: (\d+) base torch\(es\), (\d+) mine torch\(es\) on their designs, (\d+) sited structure\(s\), (\d+) column\(s\) asked for/;
+function keeperPlans(lines) {
+  const rows = [];
+  for (const l of lines) {
+    const m = KEEPER_PLANS_RE.exec(l.raw || '');
+    if (!m || !l.iso) continue;
+    const [base_torches, mine_torches, structures, columns] = m.slice(1).map(Number);
+    rows.push({ at: Date.parse(l.iso), base_torches, mine_torches, structures, columns });
+  }
+  return rows;
+}
+
+// keeperNursery(lines) → [{ at, standing, stalks, ripe, tiles, piers, unheld, columns }]: the integrity keeper's cane
+// nursery readings (foreman/nursery_keeper), one per change in standing cane, open tiles or pier cells.
+const KEEPER_NURSERY_RE = /integrity keeper: nursery: (\d+) cane standing in (\d+) stalk\(s\) \((\d+) ripe\), (\d+) open tile\(s\), (\d+) pier cell\(s\), (\d+) of (\d+) column\(s\) unheld/;
+function keeperNursery(lines) {
+  const rows = [];
+  for (const l of lines) {
+    const m = KEEPER_NURSERY_RE.exec(l.raw || '');
+    if (!m || !l.iso) continue;
+    const [standing, stalks, ripe, tiles, piers, unheld, columns] = m.slice(1).map(Number);
+    rows.push({ at: Date.parse(l.iso), standing, stalks, ripe, tiles, piers, unheld, columns });
+  }
+  return rows;
+}
+
+// keeperMansion(lines) → [{ at, text }]: the integrity keeper's mansion lines (foreman/mansion_keeper), the plan kept and
+// each change in its cube count.
+const KEEPER_MANSION_RE = /integrity keeper: (mansion: .*)$/;
+function keeperMansion(lines) {
+  const rows = [];
+  for (const l of lines) {
+    const m = KEEPER_MANSION_RE.exec(l.raw || '');
+    if (m && l.iso) rows.push({ at: Date.parse(l.iso), text: m[1] });
+  }
+  return rows;
+}
+
+// keeperTreeFarm(lines) → [{ at, treed, open, blocked, unknown, cells, saturation, target, full }]: the integrity keeper's
+// tree farm readings (integrity_keeper_worker, the home band's map), one per change it said; sited false before the home is.
+const KEEPER_TREE_RE = /integrity keeper: tree farm: (?:home band (\d+) treed, (\d+) open, (\d+) blocked, (\d+) unknown of (\d+); saturation (none|\d+%) of (\d+)%(, FULL)?|(not sited))/;
+function keeperTreeFarm(lines) {
+  const rows = [];
+  for (const l of lines) {
+    const m = KEEPER_TREE_RE.exec(l.raw || '');
+    if (!m || !l.iso) continue;
+    if (m[9]) { rows.push({ at: Date.parse(l.iso), sited: false }); continue; }
+    const [treed, open, blocked, unknown, cells] = m.slice(1, 6).map(Number);
+    rows.push({ at: Date.parse(l.iso), sited: true, treed, open, blocked, unknown, cells, saturation: m[6] === 'none' ? null : parseInt(m[6], 10), target: +m[7], full: !!m[8] });
+  }
+  return rows;
+}
+
 function readForemanTrace(dir) {
   return readForemanView(dir || TRACE_DIR);
 }
 
-// ── THE FOLD ─────────────────────────────────────────────────────────────────────────────────────
-// reduceForeman(lines, { person }) → the structured record, for a machine caller. Rendering lives below
-// and takes this as its argument: a machine-facing lens RETURNS and a human-facing one renders, never one
-// function doing both (monitoring/README's first rule).
-//
-// A TURN OPENS ON `heard` AND NOTHING ELSE. Everything the desk does is downstream of somebody speaking,
-// so any event arriving before the first `heard` for a person belongs to no turn — it is recorded as
-// `orphans`, never folded into the next one: attaching it to a turn it did not belong to would fabricate
-// a cause-and-effect the record does not contain (Law 25).
-function reduceForeman(lines, opts = {}) {
-  const events = deskEvents(lines);
-  const people = new Map();
-  const orphans = [];
-
-  const forPerson = (who) => {
-    if (!people.has(who)) {
-      people.set(who, { who, turns: [], firstAt: null, lastAt: null, refusals: new Map(), crossings: 0 });
-    }
-    return people.get(who);
-  };
-
-  for (const e of events) {
-    // An announcement is said to the world, not in a person's session; `announcements()` reads those.
-    if (e.verb === 'announced') continue;
-    const who = e.fields.who;
-    if (!who) { orphans.push(e); continue; }
-    if (opts.person && who.toLowerCase() !== String(opts.person).toLowerCase()) continue;
-
-    const p = forPerson(who);
-    if (p.firstAt === null) p.firstAt = e.at;
-    p.lastAt = e.at;
-
-    if (e.verb === 'heard') {
-      p.turns.push({
-        at: e.at,
-        said: decodeText(e.fields.text),
-        readAs: null, refusal: null, crossings: [], replies: [],
-      });
-      continue;
-    }
-
-    const turn = p.turns[p.turns.length - 1];
-    if (!turn) { orphans.push(e); continue; }
-
-    switch (e.verb) {
-      case 'read_as':
-        turn.readAs = e.fields.verb;
-        break;
-      case 'refused':
-        turn.refusal = { code: e.fields.code, said: decodeText(e.fields.said) };
-        p.refusals.set(e.fields.code, (p.refusals.get(e.fields.code) || 0) + 1);
-        break;
-      case 'relayed':
-        turn.crossings.push({ door: e.fields.door, action: e.fields.action, detail: decodeText(e.fields.detail), answer: null });
-        p.crossings += 1;
-        break;
-      case 'fleet_said': {
-        // Attached to the crossing it answers — the LAST one still unanswered, because the desk awaits
-        // each door call before making the next. A verdict with no crossing above it is a coding fault in
-        // the desk's own wiring, kept where a reader will see it.
-        const open = [...turn.crossings].reverse().find(c => c.answer === null);
-        if (open) open.answer = { ok: e.fields.ok === 'yes', reason: e.fields.reason || null };
-        // The action token is snake_case because it is PRINTED in the `crossings` table: a three-word
-        // phrase in a value cell is the lens narrating again. The fold is otherwise
-        // untouched — same branch, same placement, same fields.
-        else turn.crossings.push({ door: ABSENT, action: 'answer_with_no_crossing', detail: '', answer: { ok: e.fields.ok === 'yes', reason: e.fields.reason || null } });
-        break;
-      }
-      case 'said':
-        turn.replies.push(decodeText(e.fields.text));
-        break;
-      default:
-        // A verb this lens does not know is REPORTED, never dropped. The desk's vocabulary is declared in
-        // one file; a verb arriving here that is not in it means the two have parted company, and a
-        // silent skip is how a reader is told a session was complete when it was not (Law 6).
-        orphans.push(e);
-    }
-  }
-
-  return { people: [...people.values()], orphans, eventCount: events.length };
-}
-
 // ── RENDERING ────────────────────────────────────────────────────────────────────────────────────
 const clock = (ms) => new Date(ms).toISOString().slice(11, 19);
-const mins = (a, b) => (!a || !b ? ABSENT : `${((b - a) / 60000).toFixed(1)}m`);
-
-// ── OUTPUT IS DATA, NOT PROSE ─────────────────────────────────────────────
-// The person's words and the desk's words are VALUES — copied verbatim out of the record into a cell,
-// never summarised. Every fact is a field below: turns, refused, crossings, replies. `replies` counts
-// the lines and `--all` prints them.
-
-// One row per turn: the spine of decisions. `said` is the person's own text, copied.
-function turnRow(t) {
-  return [clock(t.at), t.readAs, t.refusal ? t.refusal.code : ABSENT,
-    t.crossings.length, t.replies.length, t.said];
-}
 
 function runForeman(opts = {}) {
-  const full = !!opts.verbose;
   const lines = readForemanTrace(opts.dir);
-  // The header NAMES ITS SOURCE, asked of the one module that answers it — never spelled here: one fact,
-  // one place, every caller asking (Law 16).
+  // The header NAMES ITS SOURCE, asked of the one module that answers it — never spelled here (Law 16).
   const source = path.relative(recordHomes.BOT_DIR, recordHomes.traceFile('foreman')).replace(/\\/g, '/');
   out.kv('lens', 'foreman');
   out.kv('record', source);
-  if (opts.bot) out.kv('person_filter', opts.bot);
 
   if (!lines.length) {
-    // ABSENCE IS NAMED AS A COUNT, NOT AS A QUIET RUN. The desk writes its first line at startup, so
-    // `lines 0` is a desk that never came up, and it is a different field from `speakers 0` below —
-    // which is a desk that came up and nobody spoke to (Law 25).
+    // ABSENCE IS NAMED AS A COUNT, NOT AS A QUIET RUN: the foreman writes its first line at startup, so
+    // `lines 0` is a foreman that never came up (Law 25).
     out.zero('lines');
-    return { people: [], orphans: [], eventCount: 0 };
+    return { announced: [], refused: [] };
   }
   out.kv('lines', lines.length);
 
-  const folded = reduceForeman(lines, { person: opts.bot });
-  out.kv('speakers', folded.people.length);
-  out.kv('events', folded.eventCount);
-  if (folded.people.length === 0) return folded;
+  const announced = announcements(lines);
+  const refused = refusals(lines);
+  out.kv('announced', announced.length);
+  out.kv('refused', refused.length);
 
-  for (const p of folded.people.sort((a, b) => a.firstAt - b.firstAt)) {
-    const refused = [...p.refusals.values()].reduce((n, x) => n + x, 0);
-    out.section('speaker');
-    out.kv('who', p.who);
-    out.kv('turns', p.turns.length);
-    out.kv('at_desk', mins(p.firstAt, p.lastAt));
-    out.kv('first_at', clock(p.firstAt));
-    out.kv('last_at', clock(p.lastAt));
-    out.kv('refused', refused);
-    out.kv('crossings', p.crossings);
-
-    out.table(['at', 'read_as', 'refusal_code', 'crossings', 'replies', 'said'], p.turns.map(turnRow));
-
-    // The refusal CODE and the desk's refusal text are both the record's own words.
-    const refusalRows = p.turns.filter(t => t.refusal)
-      .map(t => [clock(t.at), t.refusal.code, t.refusal.said]);
-    if (refusalRows.length) {
-      out.section('refusals');
-      out.table(['at', 'code', 'said'], refusalRows);
-    }
-
-    // A crossing with no verdict recorded is `fleet_ok` ABSENT — an unanswered door call, kept visible
-    // as a missing value.
-    const crossRows = [];
-    for (const t of p.turns) {
-      for (const c of t.crossings) {
-        crossRows.push([clock(t.at), c.door, c.action, c.detail,
-          c.answer ? c.answer.ok : null, c.answer ? c.answer.reason : null]);
-      }
-    }
-    if (crossRows.length) {
-      out.section('crossings');
-      out.table(['at', 'door', 'action', 'detail', 'fleet_ok', 'fleet_reason'], crossRows);
-    }
-
-    // THE FINDING THIS LENS EXISTS FOR, counted per person: one person meeting one refusal repeatedly is
-    // invisible in a fleet-wide tally, which is exactly why it is folded per speaker.
-    const repeated = [...p.refusals].filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]);
-    if (repeated.length) {
-      out.section('repeated_refusals');
-      out.table(['code', 'count'], repeated.map(([c, n]) => [c, n]));
-    }
-
-    // The desk's own words are the half a reader needs least often and most urgently — held behind --all
-    // so the default stays a spine of decisions, exactly as the fleet lenses hold their detail back.
-    if (full) {
-      const transcript = [];
-      for (const t of p.turns) {
-        transcript.push([clock(t.at), p.who, t.said]);
-        for (const r of t.replies) transcript.push([clock(t.at), 'foreman', r]);
-      }
-      out.section('transcript');
-      out.table(['at', 'who', 'text'], transcript);
-    }
+  if (announced.length) {
+    out.section('announced');
+    out.table(['at', 'kind', 'structure', 'layer', 'of', 'text'],
+      announced.map(a => [clock(a.at), a.kind, a.structure, a.layer, a.of, a.text]));
   }
-
-  // Never silently absorbed: an orphan means either the desk emitted before anyone spoke, or it emitted
-  // a verb its own vocabulary file does not declare. Both are worth a reader's eye, so the count and the
-  // verbs themselves are fields.
-  out.section('orphan_events');
-  out.kv('orphans', folded.orphans.length);
-  if (folded.orphans.length) out.list('verb', [...new Set(folded.orphans.map(o => o.verb))]);
-  return folded;
+  // A refusal's detail is the record's own words; it is printed behind --all, the code always.
+  if (refused.length) {
+    out.section('refused');
+    out.table(opts.verbose ? ['at', 'code', 'detail'] : ['at', 'code'],
+      refused.map(r => (opts.verbose ? [clock(r.at), r.code, r.detail] : [clock(r.at), r.code])));
+  }
+  // The keeper's fields readings: the last 12, every one behind --all.
+  const fields = keeperFields(lines);
+  out.kv('keeper_fields_readings', fields.length);
+  if (fields.length) {
+    out.section('keeper_fields');
+    out.table(['at', 'room', 'held', 'growing', 'mature', 'untilled', 'unsown', 'blocked', 'stranded'],
+      (opts.verbose ? fields : fields.slice(-12)).map(f => [clock(f.at), f.room, f.held, f.growing, f.mature, f.untilled, f.unsown, f.blocked, f.stranded]));
+  }
+  const mansion = keeperMansion(lines);
+  out.kv('keeper_mansion_readings', mansion.length);
+  if (mansion.length) {
+    out.section('keeper_mansion');
+    out.table(['at', 'text'], (opts.verbose ? mansion : mansion.slice(-12)).map(r => [clock(r.at), r.text]));
+  }
+  const trees = keeperTreeFarm(lines);
+  out.kv('keeper_tree_farm_readings', trees.length);
+  if (trees.length) {
+    out.section('keeper_tree_farm');
+    out.table(['at', 'sited', 'treed', 'open', 'blocked', 'unknown', 'cells', 'saturation_pct', 'target_pct', 'full'],
+      (opts.verbose ? trees : trees.slice(-12)).map(r => [clock(r.at), r.sited, r.treed ?? null, r.open ?? null, r.blocked ?? null, r.unknown ?? null, r.cells ?? null, r.saturation ?? null, r.target ?? null, r.full ?? null]));
+  }
+  const plans = keeperPlans(lines);
+  out.kv('keeper_plans_readings', plans.length);
+  if (plans.length) {
+    out.section('keeper_plans');
+    out.table(['at', 'base_torches', 'mine_torches', 'structures', 'columns'],
+      (opts.verbose ? plans : plans.slice(-6)).map(r => [clock(r.at), r.base_torches, r.mine_torches, r.structures, r.columns]));
+  }
+  const nursery = keeperNursery(lines);
+  out.kv('keeper_nursery_readings', nursery.length);
+  if (nursery.length) {
+    out.section('keeper_nursery');
+    out.table(['at', 'standing', 'stalks', 'ripe', 'tiles', 'piers', 'unheld', 'columns'],
+      (opts.verbose ? nursery : nursery.slice(-12)).map(r => [clock(r.at), r.standing, r.stalks, r.ripe, r.tiles, r.piers, r.unheld, r.columns]));
+  }
+  return { announced, refused, fields, mansion, plans, nursery };
 }
 
-module.exports = { runForeman, reduceForeman, deskEvents, announcements, readForemanTrace };
+module.exports = { runForeman, recordEvents, announcements, refusals, keeperFields, keeperMansion, keeperNursery, keeperPlans, readForemanTrace };

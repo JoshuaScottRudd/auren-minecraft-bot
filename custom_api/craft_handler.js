@@ -28,8 +28,8 @@ const { Vec3 } = require('vec3');
 const watcher = require('@kernel/watcher');
 const { group_to_item: OBJECT_GROUPS, BLOCK_REACH } = require('@utils/fragment_utils');
 const { routeToJudge } = require('@utils/signal_utils');
-// Entered through combatCheckpoint, never battleStations directly: one process-wide 500 ms clock
-// shared with the dig and drive primitives, with an engaging/escaping bypass so combat's own arms
+// Entered through combatCheckpoint, never battleStations directly: the gate shared with the dig and
+// drive primitives, asked on every call, with an engaging/escaping bypass so combat's own arms
 // cannot re-enter it.
 const { combatCheckpoint } = require('@api/battle_stations');
 const stationRegistry = require('@perception/station_registry');
@@ -123,9 +123,15 @@ function fillCoalsTag(bot) {
   }
 }
 
-function resolveGroupItem(bot, groupName) {
+// A species the order NAMED (birch_stairs asks birch) wins over what the pocket holds most of: the
+// held-most rule below is for an order that names only the group.
+function resolveGroupItem(bot, groupName, species = null) {
   const group = OBJECT_GROUPS[groupName];
   if (!group) return groupName;
+  if (species) {
+    const named = groupName === 'logs' ? `${species}_log` : `${species}_${groupName}`;
+    if (group.includes(named)) return named;
+  }
 
   const mcData = require('minecraft-data')(bot.version);
   let bestItem = group[0];
@@ -149,7 +155,7 @@ function resolveGroupItem(bot, groupName) {
       const logId = mcData.itemsByName[logName]?.id;
       const logCount = logId != null ? bot.inventory.count(logId) : 0;
       if (logCount <= bestLogs) continue;
-      const plankName = logName.replace(/_log$/, '_planks').replace(/^stripped_/, '');
+      const plankName = logName.replace(/_log$/, '_planks');
       if (group.includes(plankName)) { bestLogs = logCount; bestPlank = plankName; }
     }
     if (bestPlank) return bestPlank;   // any logs on hand → craft the species we can actually produce
@@ -161,7 +167,7 @@ function resolveGroupItem(bot, groupName) {
   // the plank species belongs in PLANK_DERIVED_GROUPS; a group missing from this set resolves to
   // group[0] instead and fails only live, with no load-time check yet.
   if (PLANK_DERIVED_GROUPS.has(groupName)) {
-    const plankItem = resolveGroupItem(bot, 'planks');
+    const plankItem = resolveGroupItem(bot, 'planks', species);
     const variantName = plankItem.replace(/_planks$/, `_${groupName}`);
     if (group.includes(variantName)) return variantName;
   }
@@ -239,7 +245,7 @@ function _resolveOne(bot, targetItem, allBlueprints, resolved, path, variantStat
 
     const stepItem = step.item;
     const originalGroup = OBJECT_GROUPS[stepItem] ? stepItem : null;
-    const resolvedItem = originalGroup ? resolveGroupItem(bot, stepItem) : stepItem;
+    const resolvedItem = originalGroup ? resolveGroupItem(bot, stepItem, variantState.species) : stepItem;
     const makesPerOp = Number.isFinite(step.makes) ? Math.max(1, step.makes) : 1;
 
     if (typeof resolvedItem !== 'string' || !Number.isFinite(makesPerOp)) {
@@ -259,7 +265,7 @@ function _resolveOne(bot, targetItem, allBlueprints, resolved, path, variantStat
 
     const fromItems = Array.isArray(step.from) ? step.from : [step.from];
     for (const dep of fromItems.filter(Boolean)) {
-      const depResolvedName = OBJECT_GROUPS[dep] ? resolveGroupItem(bot, dep) : dep;
+      const depResolvedName = OBJECT_GROUPS[dep] ? resolveGroupItem(bot, dep, variantState.species) : dep;
       let ingredientKey = dep;
       if (!(ingredientKey in ingredientsMap)) {
         const groupKey = Object.entries(OBJECT_GROUPS).find(([_g, items]) => items.includes(depResolvedName))?.[0];
@@ -320,6 +326,7 @@ function resolveBlueprint(bot, targetItem, quantity = 1) {
   const blueprintData = craftingRegistry.getRecipes();
 
   let actualTarget = targetItem;
+  let species = null;
   const directMatch = blueprintData[targetItem];
   if (!directMatch) {
     const alias = Object.entries(OBJECT_GROUPS).find(([_, list]) => list.includes(targetItem))?.[0];
@@ -330,13 +337,16 @@ function resolveBlueprint(bot, targetItem, quantity = 1) {
         watcher.summary(TAG, `Falling back to group alias for "${targetItem}" — "${alias}"`);
       }
       actualTarget = alias;
+      // The species the order names rides the whole walk: its planks and logs are that species too.
+      const named = targetItem.endsWith(`_${alias}`) ? targetItem.slice(0, -alias.length - 1) : null;
+      if (named && WOOD_VARIANTS[`${named}_planks`]) species = named;
     } else {
       throw new Error(`[${TAG}] CODING VIOLATION (Law 13): Cannot resolve target item: ${targetItem}`);
     }
   }
 
   const resolvedSequence = [];
-  resolveBlueprintRecursive(bot, actualTarget, blueprintData, resolvedSequence, new Set(), {}, quantity);
+  resolveBlueprintRecursive(bot, actualTarget, blueprintData, resolvedSequence, new Set(), { species }, quantity);
 
   const filtered = resolvedSequence.filter(step => step && step.item && step.target != null);
   for (const s of filtered) {

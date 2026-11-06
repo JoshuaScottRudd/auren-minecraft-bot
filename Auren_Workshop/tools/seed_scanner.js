@@ -543,7 +543,7 @@ async function runHunt() {
       console.log(`  The server is UP on '${world}' and the ground is the ground you asked for.`);
       console.log(`\n  Keep it (so a rollback can always come back to it):`);
       console.log(`      node Auren_Workshop/tools/seed_scanner.js keep --world=${world}`);
-      console.log(`  The foreman that started it is still running, in its window 'auren desk'.`);
+      console.log(`  The foreman that started it is still running, in its window 'auren foreman'.`);
       console.log(`  Or put the server back on the world it was on before the hunt: stop it with`);
       console.log(`      node Auren_Workshop/fleet_control.js verb shutdown`);
       console.log(`  then set level-name=${startedProps.level} in the server's server.properties.`);
@@ -559,7 +559,7 @@ async function runHunt() {
   console.log(`  That is not a failure of the hunt. Run it again for more seeds, or loosen one threshold`);
   console.log(`  (--max-relief=, --max-ocean=, --max-water=) once the record shows which one is doing the`);
   console.log(`  rejecting.`);
-  console.log(`\n  The server is UP on the last candidate '${world}', run by the foreman in its window 'auren desk'.`);
+  console.log(`\n  The server is UP on the last candidate '${world}', run by the foreman in its window 'auren foreman'.`);
   console.log(`  Put it back: stop it with  node Auren_Workshop/fleet_control.js verb shutdown`);
   console.log(`  then set level-name=${startedProps.level} in the server's server.properties.`);
   return 2;

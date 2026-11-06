@@ -35,10 +35,13 @@ const LISTED_MISMATCHES = 200;
 
 const holdings = new Map();      // place → Map(item → n)
 const flows = {};                // cause → item → n
+const flowsByJob = {};           // cause → job → item → n, the job the body's clerk stamped on the entry (`j`)
+let _job = 'unstamped';          // the job of the entry being booked
 const pickups = { world: {}, thrown: {}, unplaced: {}, death: {} };
 const gatheredByBot = {};        // bot → item → n, pickups from the world only
 const placedCells = new Map();   // 'x,y,z' → item
 const unplaced = new Map();      // 'x,y,z' → item, a fleet-placed block dug out and not yet collected
+const dugCells = new Map();      // 'x,y,z' → [bot, job, at_sec] of the first dig that opened the cell
 const throws = new Map();        // entity id → the throw's row
 const throwRows = [];
 const deaths = [];
@@ -63,6 +66,8 @@ function _move(item, n, from, to, cause) {
   t.set(item, (t.get(item) || 0) + n);
   flows[cause] = flows[cause] || {};
   bump(flows[cause], item, n);
+  const byJob = flowsByJob[cause] || (flowsByJob[cause] = {});
+  bump(byJob[_job] || (byJob[_job] = {}), item, n);
   counts.moves++;
 }
 const _where = (side, bot) => side === 'pocket' ? `pocket:${bot}` : side;
@@ -133,6 +138,7 @@ function record(bot, entries) {
   for (const e of entries) {
     if (!e || typeof e !== 'object') continue;
     counts.entries++;
+    _job = typeof e.j === 'string' && e.j ? e.j : 'unstamped';
     switch (e.k) {
       case 'm': {
         _move(e.i, e.n, _where(e.f, bot), _where(e.t, bot), e.c);
@@ -143,6 +149,7 @@ function record(bot, entries) {
       case 'd': {
         counts.digs++;
         const k = key(e.c);
+        if (!dugCells.has(k)) dugCells.set(k, [bot, _job, Math.round((Date.now() - _startedAt) / 1000)]);
         const item = placedCells.get(k);
         if (!item) break;
         placedCells.delete(k);
@@ -152,7 +159,7 @@ function record(bot, entries) {
       }
       case 'th': {
         const row = { thrown_by: bot, entity: e.e, item: e.i, count: e.n, came_to_rest: e.rest || null, landed_in_pit: !!e.in_pit,
-          last_seen: e.end, at_sec: Math.round((Date.now() - _startedAt) / 1000), picked_up_by: [] };
+          last_seen: e.end, why: e.why || null, at_sec: Math.round((Date.now() - _startedAt) / 1000), picked_up_by: [] };
         throwRows.push(row);
         if (e.e != null) throws.set(e.e, row);
         if (!e.in_pit) _move(e.i, e.n, 'pit', 'ground', 'throw_missed_pit');
@@ -199,6 +206,7 @@ function snapshot() {
     bots: [...bots].sort(),
     holdings: places,
     flows,
+    flows_by_job: flowsByJob,
     pickups,
     gathered_by_bot: gatheredByBot,
     throws: throwRows,
@@ -206,6 +214,7 @@ function snapshot() {
     audit,
     placed_cells_standing: placedCells.size,
     unplaced_not_collected: unplaced.size,
+    dug_cells: Object.fromEntries(dugCells),
   };
 }
 

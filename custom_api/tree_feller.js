@@ -11,7 +11,12 @@
 //   trees this signal chain already tried; harvest_executor carries the list).
 // opts.canopyZone: { mode:'inside'|'outside', center:{x,z}, radius } — scopes self-scan felling to
 //   the base camera zone or beyond it. Omitted = no scoping.
-// opts.preferNear: {x,y,z} — self-scan ranking origin, nearest-first. Omitted = rank from the bot.
+// opts.species: '<wood>_log' — self-scan fells only trees of that species (an order that names one); absent, any.
+// opts.preferNear: {x,y,z} — self-scan ring origin: the nearest ring to it with a tree is searched first, and inside
+//   that ring the tree nearest the body. Omitted = rings from the bot.
+//   Omitted or null = any tree.
+// opts.leg: 'work' — every walk of this felling is the work leg (the body is already out on its ground: a walk tree
+//   to tree is the task, not travel). Omitted = each walk keeps its own leg (travel).
 //
 // Returns: { success, minedCount, species, position }. If locomotion cannot reach the tree, goTo
 // abandons to recursive_judge (Law 15) and this invocation dies unresolved.
@@ -22,8 +27,8 @@
 const watcher = require('@kernel/watcher');
 const Vec3 = require('vec3');
 
-// Entered through combatCheckpoint, never battleStations directly — one process-wide 500 ms clock
-// shared with the dig and drive primitives, with an engaging/escaping bypass for combat's own arms.
+// Entered through combatCheckpoint, never battleStations directly — the gate shared with the dig
+// and drive primitives, asked on every call, with an engaging/escaping bypass for combat's own arms.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { performDig } = require('@utils/movement/dig_authority');
 const { microCenter } = require('@utils/movement/motion_primitives');
@@ -54,7 +59,8 @@ const REPOSITION_RADII = [5, 7, 3];  // how far (cells) to step when repositioni
 // reads as a hang to a human or the footage motion classifier.
 const FELL_PROGRESS_HEARTBEAT_MS = 6000;
 
-const LOG_REGEX = /(.*_)?log$/;
+// A stripped log is no tree's: it stands only in a built structure, and its wood makes no planks a body can craft.
+const LOG_REGEX = /^(?!stripped_)(.*_)?log$/;
 const LEAF_REGEX = /(.*_)?leaves$/;
 const CLIPPABLE_VEG_REGEX = /^(tall_grass|short_grass|fern)$/;
 
@@ -367,6 +373,17 @@ function findSkirtCell(bot, log) {
   return best ? { x: best.x, y: best.y, z: best.z } : null;
 }
 
+// A STAND REACHED AFLOAT HAS NOT REACHED THE TREE: no dig is made afloat (dig_authority.bobbing), so the body is
+// walked onto the skirt cell's floor, and a skirt it cannot get its feet on is a tree this body did not reach and
+// passes over, the same rule ground_shave keeps for its tiles.
+async function aground(bot, dispatcher, skirt) {
+  const { bobbing } = require('@utils/movement/dig_authority');
+  if (!bobbing(bot)) return { arrived: true };
+  const res = await dispatcher.goToStand(new Vec3(skirt.x, skirt.y - 1, skirt.z), { purpose: 'ground_stand' });
+  if (res && res.arrived && !bobbing(bot)) return { arrived: true };
+  return { arrived: false, reason: 'afloat_at_stand' };
+}
+
 // Gives the navigator the skirt cell as goal, not the solid trunk. Returns { arrived }; a boxed-in
 // trunk (no skirt) reports not-arrived so the caller moves on.
 async function standAtTreeBase(bot, dispatcher, base) {
@@ -381,10 +398,10 @@ async function standAtTreeBase(bot, dispatcher, base) {
   // support), so the shortcut is forced onto a genuine, horizontally-offset skirt cell (Law 25).
   const onTrunkColumn = feet.x === base.x && feet.z === base.z;
   const hDist = Math.hypot(feet.x - skirt.x, feet.z - skirt.z);
-  if (!onTrunkColumn && hDist <= 1.5 && Math.abs(feet.y - skirt.y) <= 1) return { arrived: true };
+  if (!onTrunkColumn && hDist <= 1.5 && Math.abs(feet.y - skirt.y) <= 1) return aground(bot, dispatcher, skirt);
   const startedAt = Date.now();
   const res = await dispatcher.goTo({ x: skirt.x, y: skirt.y, z: skirt.z });
-  if (res && res.arrived) return { arrived: true };
+  if (res && res.arrived) return aground(bot, dispatcher, skirt);
   ledgerUnreached(bot, base, skirt, feet, res, Date.now() - startedAt);
   return { arrived: false, reason: 'nav_failed' };
 }
@@ -411,14 +428,23 @@ function ledgerUnreached(bot, base, skirt, from, res, heldMs) {
 }
 
 // Object lock (arbiter flavor a — physical exclusivity, foreman_brain.js taxonomy): claimed by base
-// block, through target_claims, the one claim-reach-release walk trees/stone/grass share (Law 16).
-const treeKeyOf = (pos) => `tree:${pos.x},${pos.y},${pos.z}`;
+// block and top log, through target_claims, the one claim-reach-release walk every resource shares (Law 16).
+// The key holds the 5x5 column from the base to the top (@utils/resource_footprint).
+// spotOf names a tree's place the way a failed-tree list does (opts.excludeTrees); it is not a claim key.
+const spotOf = (pos) => `tree:${pos.x},${pos.y},${pos.z}`;
 
 // treeRootOf — the lowest log of the tree a log belongs to (collectTreeLogs' flood fill). A tree is claimed
 // under its root, so a hanging log a peer's felling is about to take is the same claim as that peer's trunk.
 function treeRootOf(bot, pos) {
   const logs = collectTreeLogs(bot, pos, (name) => LOG_REGEX.test(name));
   return logs.reduce((low, l) => (!low || l.y < low.y ? l : low), null) || pos;
+}
+// treeKeyOf — the claim key of the tree a log belongs to: its root and the height of its top log.
+function treeKeyOf(bot, pos) {
+  const logs = collectTreeLogs(bot, pos, (name) => LOG_REGEX.test(name));
+  const root = logs.reduce((low, l) => (!low || l.y < low.y ? l : low), null) || pos;
+  const top = logs.reduce((high, l) => Math.max(high, l.y), root.y);
+  return `tree:${root.x},${root.y},${root.z},${top}`;
 }
 
 // A SKY LOG IS CHASED: a log hanging in the air is cut from a pillar raised on the ground under it
@@ -430,10 +456,10 @@ function treeRootOf(bot, pos) {
 const PEER_FELLING_RADIUS = 8;   // blocks, sideways, from a peer's claimed trunk: a big oak's spread
 const RESTAND_MAX = 3;           // new stands a fell takes under the logs its first stand could not reach
 function isPeersLog(pos) {
-  const { TREE_KEY_PREFIX, parseTreeFootprint } = require('@utils/tree_footprint');
+  const { boxOfKey } = require('@utils/resource_footprint');
   for (const key of require('@kernel/foreman_link').peerClaimKeys()) {
-    const f = key.startsWith(TREE_KEY_PREFIX) ? parseTreeFootprint(key) : null;
-    if (f && Math.hypot(f.x - pos.x, f.z - pos.z) <= PEER_FELLING_RADIUS) return true;
+    const box = key.startsWith('tree:') ? boxOfKey(key) : null;
+    if (box && Math.hypot((box.min.x + box.max.x) / 2 - pos.x, (box.min.z + box.max.z) / 2 - pos.z) <= PEER_FELLING_RADIUS) return true;
   }
   return false;
 }
@@ -446,21 +472,34 @@ const approachTree = (bot, dispatcher) => async (pos) => {
 // ── Candidate selection + unstick (self-scan mode) ───────────────────────────
 const DIRS8 = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
 
-// Ranks by distance only — species is decided elsewhere (`set_wood_preference`,
-// `downloaded_plan_registry.siteWood`), not by which trunk a body walks to.
+// Ranks by distance only: every species is felled, and only the build's primary wood is replanted
+// (sapling_planter), so the forest round the base turns to it over time.
 function rankByProximity(candidates, origin) {
   return candidates
     .map(c => ({ c, d2: (c.position.x - origin.x) ** 2 + (c.position.y - origin.y) ** 2 + (c.position.z - origin.z) ** 2 }))
     .sort((a, b) => a.d2 - b.d2);
 }
 
-// isWetStump — a log with water beside or above it and no log on top of it. performDig refuses such a log
-// (dig_authority: a dig never opens a face onto water), and with nothing above it there is no trunk to take
-// either, so it is no tree to any body: a search passes over it.
-function isWetStump(bot, p) {
-  const above = bot.blockAt(new Vec3(p.x, p.y + 1, p.z));
-  if (above && LOG_REGEX.test(above.name)) return false;
-  return require('@utils/pathfinding_utils').opensOntoWater(bot, p.x, p.y, p.z);
+// isWetTree — a tree any of whose logs would let water flow when cut (pathfinding_utils.opensOntoWater, the
+// prevent-flow rule). Every log of the tree is read (collectTreeLogs) when the scan offers it, before a claim
+// or a walk, so felling never makes a flow and a body is never sent to a tree it may not finish: a search
+// passes over it.
+function isWetTree(bot, p) {
+  const { opensOntoWater } = require('@utils/pathfinding_utils');
+  return collectTreeLogs(bot, p, (name) => LOG_REGEX.test(name)).some(l => opensOntoWater(bot, l.x, l.y, l.z));
+}
+
+// passedOverWhy — why a search walks past a log without claiming it, or null when it would claim it:
+//   peer_felling  within reach of a tree a peer is felling now (isPeersLog)
+//   tried         on the caller's failed-tree list (opts.excludeTrees)
+//   wet           cutting it would let water flow (isWetTree)
+// The one answer to "would a fell take this tree", read by the search, so a felling never offers a tree
+// it would not take.
+function passedOverWhy(bot, pos, excludeTrees) {
+  if (isPeersLog(pos)) return 'peer_felling';
+  if (excludeTrees && (excludeTrees.has(spotOf(treeRootOf(bot, pos))) || excludeTrees.has(spotOf(pos)))) return 'tried';
+  if (isWetTree(bot, pos)) return 'wet';
+  return null;
 }
 
 // Walks the ranked trees nearest-first: claim each, try its skirt, stop at the first one reached. The
@@ -468,14 +507,19 @@ function isWetStump(bot, p) {
 // Claim-before-walk stops two bots converging on one tree. Returns { pick|null, peerHeld, spent, ... }.
 async function selectReachableTree(bot, dispatcher, ranked, excludeTrees) {
   const approach = approachTree(bot, dispatcher);
+  const passed = { peer_felling: 0, tried: 0, wet: 0 };
   const walk = await claimFirst(ranked.map(r => r.c), {
-    keyOf: c => treeKeyOf(treeRootOf(bot, c.position)),
-    skip: (c, key) => !!(excludeTrees && (excludeTrees.has(key) || excludeTrees.has(treeKeyOf(c.position)))) || isWetStump(bot, c.position) || isPeersLog(c.position),
+    keyOf: c => treeKeyOf(bot, c.position),
+    skip: (c) => {
+      const why = passedOverWhy(bot, c.position, excludeTrees);
+      if (why) passed[why]++;
+      return !!why;
+    },
     approach: c => approach(c.position),
   });
   const boxed = walk.failures.no_skirt || 0;
   const tally = { peerHeld: walk.peerHeld, boxed, pathFailed: walk.unreachable - boxed, spent: walk.skipped,
-    examined: walk.examined };
+    examined: walk.examined, passed };
   return walk.pick
     ? { pick: { chosenPos: walk.pick.position, chosenName: walk.pick.name, treeKey: walk.key }, ...tally }
     : { pick: null, ...tally };
@@ -542,8 +586,8 @@ function buildWoodTest(protectedSet) {
     || (!!protectedSet && protectedSet.has(`${p.x},${p.y},${p.z}`));
 }
 
-// Scopes wild felling to the base's camera zone — the same "inside base" boundary torch_integrity and
-// threat_scanner use (Law 16). zone.mode:
+// Scopes wild felling to the base's camera zone — the same "inside base" boundary
+// threat_scanner uses (Law 16). zone.mode:
 //   'inside'  → keep only trees within the zone (clear the canopy).
 //   'outside' → keep only trees beyond it (log supply that never re-touches the cleared base).
 // No zone / no locked base center → no scoping.
@@ -591,17 +635,18 @@ const zoneLabel = (zone) => {
 // reads one ring and a body in a clearing reads as far as the clearing goes.
 // Returns the pick (or null) and the tally the ledger line and the caller's verdict are read from.
 async function searchRings(bot, dispatcher, o) {
-  const { protectedSet, zone, origin, excludeTrees } = o;
+  const { protectedSet, zone, origin, excludeTrees, species } = o;
   const surfaceFilter = require('@perception/surface_filter');
   // Unguarded: a swallowed throw here would read as "no trees" and not "cannot see" (Law 13).
   const rings = surfaceFilter.openRings(bot, {
     type: 'object_group_or_direct',
-    targets: ['logs'],
+    targets: [species || 'logs'],
     exclude: buildWoodTest(protectedSet),
     center: origin,
     reach: zoneReach(zone, origin),
   });
-  const t = { pick: null, ring: null, seen: 0, inZone: 0, examined: 0, peerHeld: 0, boxed: 0, pathFailed: 0, spent: 0, nearest: [] };
+  const t = { pick: null, ring: null, seen: 0, inZone: 0, examined: 0, peerHeld: 0, boxed: 0, pathFailed: 0, spent: 0, nearest: [],
+    passed: { peer_felling: 0, tried: 0, wet: 0 } };
   for (let ring = await rings.next(); ring; ring = await rings.next()) {
     const trees = ring.objectives.filter(
       c => c && c.position && ['x', 'y', 'z'].every(k => typeof c.position[k] === 'number'));
@@ -609,11 +654,15 @@ async function searchRings(bot, dispatcher, o) {
     const candidates = applyCanopyZone(trees, zone);
     t.inZone += candidates.length;
     if (!candidates.length) continue;
-    const ranked = rankByProximity(candidates, origin);
+    // THE RING IS THE ORIGIN'S, THE ORDER INSIDE IT THE BODY'S: rings open outward from the origin, so the
+    // ground nearest it clears first; within the open ring the tree beside the body comes first, so one body's
+    // fells follow each other round the ring instead of crossing the yard between them.
+    const ranked = rankByProximity(candidates, bot.entity.position);
     if (t.nearest.length < REPOSITION_CLUSTER) t.nearest.push(...ranked.slice(0, REPOSITION_CLUSTER - t.nearest.length));
     const sel = await selectReachableTree(bot, dispatcher, ranked, excludeTrees);
     t.examined += sel.examined; t.peerHeld += sel.peerHeld; t.boxed += sel.boxed;
     t.pathFailed += sel.pathFailed; t.spent += sel.spent;
+    for (const why of Object.keys(t.passed)) t.passed[why] += sel.passed[why];
     if (sel.pick) { t.pick = sel.pick; t.ring = ring; break; }
   }
   t.cost = rings.cost();
@@ -626,12 +675,14 @@ async function searchRings(bot, dispatcher, o) {
 //   ring      the ring the picked tree was in; dist is the flat distance from the body to that tree
 //   rings / sections / scan_ms   what was read to get there
 //   seen / in_zone / examined    trees read, trees the zone admits, trees put the claim-and-walk question
+//   spent     trees passed over without a claim; peer_felling / tried / wet split it by passedOverWhy
+//   all_claimed   every tree in the zone was a peer's: held by its claim or beside a tree it is felling
 //   search_ms includes the walks to trees that were tried
 function ledgerSearch(t, zone, from, startedAt) {
   const outcome = t.pick ? 'picked'
     : t.seen === 0 ? 'none_seen'
     : t.inZone === 0 ? 'none_in_zone'
-    : (t.peerHeld > 0 && t.boxed + t.pathFailed === 0) ? 'all_claimed' : 'none_reached';
+    : (contended(t) && t.boxed + t.pathFailed + t.passed.tried + t.passed.wet === 0) ? 'all_claimed' : 'none_reached';
   const p = t.pick && t.pick.chosenPos;
   watcher.summary('tree_search',
     `search outcome=${outcome} zone=${zoneLabel(zone)} ring=${t.ring ? t.ring.index : '-'}`
@@ -639,22 +690,19 @@ function ledgerSearch(t, zone, from, startedAt) {
     + ` rings=${t.cost.rings} sections=${t.cost.read} scan_ms=${t.cost.ms}`
     + ` seen=${t.seen} in_zone=${t.inZone} examined=${t.examined} peer_held=${t.peerHeld} boxed=${t.boxed}`
     + ` path_failed=${t.pathFailed} spent=${t.spent} search_ms=${Date.now() - startedAt}`
-    + ` tree=${p ? `(${p.x},${p.y},${p.z})` : '-'} species=${t.pick ? t.pick.chosenName : '-'}`);
+    + ` tree=${p ? `(${p.x},${p.y},${p.z})` : '-'} species=${t.pick ? t.pick.chosenName : '-'}`
+    + ` peer_felling=${t.passed.peer_felling} tried=${t.passed.tried} wet=${t.passed.wet}`);
 }
+// A tree a peer holds or is felling is contention, not failure: this body is surplus to the work available.
+const contended = (t) => t.peerHeld + t.passed.peer_felling > 0;
 
 // ── Main API ───────────────────────────────────────────────────────────────
 // fell(bot)              — search for the closest tree, approach, fell
 // fell(bot, target)      — approach this trunk position and fell
 //
-// Every tree is a candidate whatever its species; species is a sort key a caller could opt into on top
-// of distance, never a filter here (owned by `set_wood_preference`).
-
-// Thin pass-through to the wood-preference fragment, which owns storage and read (Law 16). Returns
-// null until wood_preference_lock has run ("no preference"). Lazy require.
-function getPreferredWoodSpecies() {
-  const pref = require('@action/set_wood_preference').readWoodPreference();
-  return pref ? pref.species : null;
-}
+// AN ORDER THAT NAMES A SPECIES FELLS THAT SPECIES (opts.species): it is paid only by the logs it names, so another
+// species' tree is a walk and a felling for nothing. With none in reach the caller escalates by that species
+// (sector_finder). An order for any log takes the nearest tree whatever its species.
 
 // fell(bot, target, opts) — approach, fell, with options
 // De-confliction is claim-before-walk: the tree is locked at selection, not on arrival.
@@ -662,7 +710,9 @@ async function fell(bot, target, opts = {}) {
   const protectedSet = opts.protectedBlocks || loadBlueprintProtected(bot);
   const excludeTrees = (Array.isArray(opts.excludeTrees) && opts.excludeTrees.length)
     ? new Set(opts.excludeTrees) : null;
-  const dispatcher = require('@locomotion/locomotion_dispatcher');
+  // opts.leg names every walk of this felling (the walk ledger's leg): 'work' once the body is out on its ground.
+  const nav = require('@locomotion/locomotion_dispatcher');
+  const dispatcher = opts.leg ? { ...nav, goTo: (g) => nav.goTo({ ...g, leg: g.leg || opts.leg }) } : nav;
 
   let chosenPos, chosenName, treeKey;
 
@@ -674,7 +724,7 @@ async function fell(bot, target, opts = {}) {
       return { success: false, reason: 'target_is_blueprint', position: pos };
     }
     watcher.summary(TAG, `Claiming and approaching trunk at (${pos.x},${pos.y},${pos.z})`);
-    const walk = await claimFirst([pos], { keyOf: c => treeKeyOf(treeRootOf(bot, c)), approach: approachTree(bot, dispatcher), maxUnreachable: 1 });
+    const walk = await claimFirst([pos], { keyOf: c => treeKeyOf(bot, c), approach: approachTree(bot, dispatcher), maxUnreachable: 1 });
     if (walk.peerHeld) {
       watcher.summary(TAG, `Tree at (${pos.x},${pos.y},${pos.z}) held by a peer — abandoning target`);
       return { success: false, reason: 'tree_claimed_by_peer', position: pos };
@@ -691,14 +741,12 @@ async function fell(bot, target, opts = {}) {
 
   } else {
     // ── Self-scan mode: claim the closest FREE tree, then approach it ───
-    // Ranking origin: prefer the caller's coordinate (opts.preferNear — e.g. the headframe center) so
-    // clearing works outward from the build; fall back to the bot for efficient log supply. The rings
-    // open from the same point, so "the nearest ring" and "the nearest tree" mean one thing.
+    // Ring origin: the caller's coordinate (opts.preferNear — the yard), so clearing works outward from it;
+    // the bot when none is given. Inside a ring the tree nearest the body is taken (searchRings).
     const rankOrigin = (opts.preferNear && typeof opts.preferNear.x === 'number') ? opts.preferNear : bot.entity.position;
 
-    // No species term here — a body walks to the nearest trunk. Species is a placement rule owned by
-    // `set_wood_preference` / `downloaded_plan_registry.siteWood`, which reads `getPreferredWoodSpecies`.
-    const ask = { protectedSet, zone: opts.canopyZone, origin: rankOrigin, excludeTrees };
+    // A body walks to a trunk in the nearest ring to the origin, whatever its species.
+    const ask = { protectedSet, zone: opts.canopyZone, origin: rankOrigin, excludeTrees, species: opts.species || null };
     let from = bot.entity.position.floored();
     let startedAt = Date.now();
     let found = await searchRings(bot, dispatcher, ask);
@@ -720,7 +768,7 @@ async function fell(bot, target, opts = {}) {
       if (found.inZone === 0) return { success: false, reason: 'no_trees_found' };
       // Contention is not failure: a peer-held tree means this body is surplus to the work available;
       // an entombed/depleted forest is a different event for the loop detector (Law 13).
-      return { success: false, reason: found.peerHeld > 0 ? 'all_trees_claimed' : 'no_reachable_free_tree' };
+      return { success: false, reason: contended(found) ? 'all_trees_claimed' : 'no_reachable_free_tree' };
     }
     chosenPos = found.pick.chosenPos; chosenName = found.pick.chosenName; treeKey = found.pick.treeKey;
   }
@@ -781,4 +829,10 @@ async function fell(bot, target, opts = {}) {
   };
 }
 
-module.exports = { fell, getPreferredWoodSpecies };
+// isBuildWoodFor(bot) → (position) => true for a log the search never offers (buildWoodTest over the protected
+// set), for a caller that must exclude the same logs the search does.
+function isBuildWoodFor(bot) {
+  return buildWoodTest(loadBlueprintProtected(bot));
+}
+
+module.exports = { fell, passedOverWhy, isBuildWoodFor };

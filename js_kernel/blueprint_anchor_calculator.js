@@ -21,23 +21,25 @@
 // targets are NOT listed in `voxels` — they are every in-box cell of the cube that no voxel names, derived
 // where they are needed (`cubeCells`), so the plan does not carry the whole grid as entries.
 //
-// ── THE BODY ENTERS FROM UNDERNEATH THE BOX, AND NOTHING ELSE ABOUT THE GROUND IS PLANNED ───────────────
-// There is no crawlspace, no stair and no basement shape in the plan. A body is sent to the cell directly BENEATH a
-// column's stand, feet ENTRY_FEET_BELOW under layer 0 so its head is just under the box, and navigation finds its
-// own way there: a straight diagonal stair cut from the surface, then a tunnel under the box. Whatever that leaves
-// is the basement — made by how navigation moves, not drawn (Law 27).
+// ── THE BODY ENTERS FROM UNDERNEATH THE BOX, THROUGH THE BASEMENT ───────────────────────────────────────
+// Under every column of cubes lies one more cube: the mine's old cell (underground_cell, mining_cell_graph), on the
+// column's own grid, whole even where the column's cubes hang past the box. Its floor is 5 under layer 0, its room 3
+// and 4 under, its roof 1 and 2 under, so a basement can be wider than the blueprint over it. A body stands in the room under
+// its column's stand, ENTRY_FEET_BELOW under layer 0, and the climb cuts the roof. Navigation finds its own way there,
+// a stair from the surface and whatever it digs under the box; digging is allowed.
 //
 // ── THE STAND ───────────────────────────────────────────────────────────────────────────────────────
-// One stand column per column of cubes, chosen inside the blueprint's box, nearest the cell's centre first. A
-// column cell is refused as a stand column when any of its blueprint blocks cannot be restored on the descent: a
-// block that needs a block BELOW it (on the descent the cell below is the bot's head, and air), a block that falls,
-// or a two-block piece (door, bed, tall plant). The feet stand on the cube's second layer, so the eye is 2.62 above
-// the cube's base and every cell of a 5×5×5 cube is inside BLOCK_REACH from the centre column.
+// A column's stand column is always the centre of its cube, so a body stands in the middle of its basement cell and
+// every cell of the 5×5×5 cube is inside BLOCK_REACH: the feet stand on the cube's second layer, the eye 2.62 above the
+// cube's base. A block in the shaft that cannot go in overhead (it needs a block below, or falls) is placed on the
+// descent after its support, from under the support, since a place needs no line of sight
+// (build_column_executor.descentOrder). restorableOverhead names those blocks.
 //
 // ── THE GRID OFFSET ─────────────────────────────────────────────────────────────────────────────────
-// Cubes start at blueprint layer 0 — the box's own bottom fixes it, so there is no vertical offset. Horizontally all
-// 25 offsets are tried and ranked: fewest columns (fewest passes to seal), then fewest columns with no usable stand
-// column, then fewest two-cell pieces split across cubes, then fewest cubes.
+// Cubes start at blueprint layer 0 — the box's own bottom fixes it, so there is no vertical offset. Horizontally only
+// the offsets that put every column's centre inside the box are tried (some always does), and they are ranked: fewest
+// columns (fewest passes to seal), then fewest shaft blocks that need support, then fewest two-cell pieces split across
+// cubes, then fewest cubes. A cube past the box's side holds at most two columns of cells outside it.
 // A double chest split across cubes is ordered, not refused: the right half is placed first as a single chest and
 // the left half joins it (facing_aim's chest rule), so the left half's anchor lists the right half's anchor in
 // `after`. A door or bed split across cubes needs no order (the second half comes with the first) and is counted.
@@ -46,20 +48,20 @@
 
 const CUBE = 5;
 const STAND_FEET_LAYER = 1;           // within the cube; eye = base + 1 + 1.62
-// Where a body stands to enter a column: feet two cells under blueprint layer 0, head in the cell directly beneath
-// the box. It is the body's own height, not a basement's — the cells a body occupies while it is still outside.
-const ENTRY_FEET_BELOW = 2;
+// Where a body stands to enter a column: feet on the basement cell's floor, four cells under blueprint layer 0.
+const ENTRY_FEET_BELOW = 4;
 const EYE_HEIGHT = 1.62;
-const NEEDS_BELOW_OR_FALLS = /(_carpet|_pressure_plate|^torch$|^rail$|_rail$|_door$|_bed$|flower_pot|^potted_|_sign$|^lantern$|^soul_lantern$|_button$|^anvil$|^chipped_anvil$|^damaged_anvil$|^sand$|^red_sand$|^gravel$|_concrete_powder$|^scaffolding$|^redstone_wire$|^repeater$|^comparator$|^snow$|^tall_grass$|^large_fern$|_sapling$|^campfire$|^soul_campfire$)/;
+const NEEDS_BELOW_OR_FALLS = /(_carpet|_pressure_plate|^torch$|^rail$|_rail$|_door$|_bed$|flower_pot|^potted_|_sign$|^lantern$|^soul_lantern$|^copper_lantern$|_button$|^anvil$|^chipped_anvil$|^damaged_anvil$|^sand$|^red_sand$|^gravel$|_concrete_powder$|^scaffolding$|^redstone_wire$|^repeater$|^comparator$|^snow$|^tall_grass$|^large_fern$|_sapling$|^campfire$|^soul_campfire$)/;
 const DIRS = { north: [0, -1], south: [0, 1], east: [1, 0], west: [-1, 0] };
 const CW = { north: 'east', east: 'south', south: 'west', west: 'north' };
 
-// standable — a column cell whose every blueprint block can be restored overhead on the descent.
+// restorableOverhead — a block that can go in overhead on the descent with no support placed first.
 // A button, lantern or campfire refuses only when it rests on the floor (face=floor / hanging=false).
-function restorableOverhead(block, state) {
+function restorableOverhead(aged, state) {
+  const block = require('@utils/fragment_utils').unaged(aged);
   const s = state || {};
   if (/_button$/.test(block)) return s.face !== 'floor';
-  if (block === 'lantern' || block === 'soul_lantern') return s.hanging === 'true';
+  if (block === 'lantern' || block === 'soul_lantern' || block === 'copper_lantern') return s.hanging === 'true';
   return !NEEDS_BELOW_OR_FALLS.test(block);
 }
 
@@ -104,27 +106,17 @@ function layoutAt(voxels, dims, ox, oz) {
     if (!col.cells.has(cell)) col.cells.set(cell, []);
     col.cells.get(cell).push(v);
   }
-  let noStand = 0;
+  let shaftNeeds = 0;
   for (const col of columns.values()) {
     const x0 = col.cx * CUBE - ox, z0 = col.cz * CUBE - oz;
-    const centre = [x0 + 2, z0 + 2];
-    const candidates = [];
-    for (let x = x0; x < x0 + CUBE; x++) {
-      for (let z = z0; z < z0 + CUBE; z++) {
-        if (x < 0 || z < 0 || x >= dims.w || z >= dims.l) continue;
-        candidates.push([x, z, Math.hypot(x - centre[0], z - centre[1])]);
-      }
-    }
-    candidates.sort((a, b) => a[2] - b[2] || a[0] - b[0] || a[1] - b[1]);
-    const ok = candidates.find(([x, z]) => (col.cells.get(`${x},${z}`) || []).every(v => restorableOverhead(v[3], v[4])));
-    col.stand = ok ? [ok[0], ok[1]] : null;
+    col.stand = [x0 + 2, z0 + 2];
     col.box = { x0, z0 };
-    if (!ok) noStand++;
+    shaftNeeds += (col.cells.get(col.stand.join()) || []).filter(v => !restorableOverhead(v[3], v[4])).length;
   }
   const pairs = pairsOf(voxels);
   const split = pairs.filter(([a, b]) => cubeOf(a).join() !== cubeOf(b).join());
   const cubes = [...columns.values()].reduce((n, c) => n + c.top + 1, 0);
-  return { ox, oz, columns, noStand, pairs, split, cubes, cubeOf };
+  return { ox, oz, columns, shaftNeeds, pairs, split, cubes, cubeOf };
 }
 
 // groundFloorLayer(voxels) → { layer, share } — the blueprint layer that sits AT the natural ground height: the
@@ -161,9 +153,24 @@ function cubeCells(anchor, dims) {
 function computeAnchors(voxels, dims) {
   const { BLOCK_REACH } = require('@utils/fragment_utils');
   const tried = [];
-  for (let ox = 0; ox < CUBE; ox++) for (let oz = 0; oz < CUBE; oz++) tried.push(layoutAt(voxels, dims, ox, oz));
-  tried.sort((a, b) => a.columns.size - b.columns.size || a.noStand - b.noStand || a.split.length - b.split.length || a.cubes - b.cubes);
+  const centresInBox = (span, o) => {
+    for (let c = Math.floor(o / CUBE); c <= Math.floor((span - 1 + o) / CUBE); c++) {
+      const mid = c * CUBE - o + 2;
+      if (mid < 0 || mid >= span) return false;
+    }
+    return true;
+  };
+  for (let ox = 0; ox < CUBE; ox++) {
+    for (let oz = 0; oz < CUBE; oz++) if (centresInBox(dims.w, ox) && centresInBox(dims.l, oz)) tried.push(layoutAt(voxels, dims, ox, oz));
+  }
+  tried.sort((a, b) => a.columns.size - b.columns.size || a.shaftNeeds - b.shaftNeeds || a.split.length - b.split.length || a.cubes - b.cubes);
   const best = tried[0];
+  // A bed's foot in a cube and its head in a shaft could never be placed: the head's cell is the body's way out.
+  for (const [foot, head, kind] of best.pairs) {
+    if (kind === 'bed' && best.columns.get(`${best.cubeOf(foot)[0]},${best.cubeOf(foot)[2]}`) && best.columns.get(`${Math.floor((head[0] + best.ox) / CUBE)},${Math.floor((head[2] + best.oz) / CUBE)}`).stand.join() === `${head[0]},${head[2]}`) {
+      throw new Error(`[blueprint_anchor_calculator] CODING VIOLATION: a bed at (${foot.slice(0, 3)}) lays its head in a stand shaft at (${head}); no offset of this box avoids it, and the descent has no way to place it.`);
+    }
+  }
 
   const byCube = new Map();
   for (const v of voxels) {
@@ -237,15 +244,14 @@ function computeAnchors(voxels, dims) {
   const summary = {
     cube: CUBE,
     offset: { x: best.ox, z: best.oz },
-    offsets_tried: tried.map(t => ({ x: t.ox, z: t.oz, columns: t.columns.size, no_stand: t.noStand, split_pairs: t.split.length, cubes: t.cubes })),
+    offsets_tried: tried.map(t => ({ x: t.ox, z: t.oz, columns: t.columns.size, shaft_needs: t.shaftNeeds, split_pairs: t.split.length, cubes: t.cubes })),
     columns: best.columns.size,
     anchors: anchors.length,
     empty_anchors: anchors.filter(a => a.voxels.length === 0).length,
     cube_layers: Math.max(...anchors.map(a => a.layer)) + 1,
     voxels_per_anchor: { min: counts[0], median: counts[counts.length >> 1], max: counts[counts.length - 1] },
     anchors_with_5_or_fewer: counts.filter(n => n > 0 && n <= 5).length,
-    columns_without_a_stand: best.noStand,
-    stands_off_centre: cols.filter(c => c.stand && (c.stand[0] !== c.box.x0 + 2 || c.stand[1] !== c.box.z0 + 2)).length,
+    shaft_blocks_needing_support: best.shaftNeeds,
     two_cell_pieces: best.pairs.length,
     split_across_cubes: splitKinds,
     ordered_chest_pairs: anchors.reduce((n, a) => n + a.after.length, 0),
@@ -259,4 +265,9 @@ function computeAnchors(voxels, dims) {
   return { anchors, columns, summary };
 }
 
-module.exports = { computeAnchors, restorableOverhead, cubeCells, groundFloorLayer, CUBE, ENTRY_FEET_BELOW };
+// basementOver(dims, offset) → how far the basement's cells reach past the box on each side.
+function basementOver({ w, l }, { x, z }) {
+  return { west: x, north: z, east: (CUBE - ((w + x) % CUBE)) % CUBE, south: (CUBE - ((l + z) % CUBE)) % CUBE };
+}
+
+module.exports = { computeAnchors, basementOver, restorableOverhead, cubeCells, groundFloorLayer, CUBE, ENTRY_FEET_BELOW };

@@ -40,6 +40,7 @@ const { collectAllVoxels, transposeAttachPoints } = require('@perception/buildin
 
 const HEADFRAME_BLUEPRINT = 'headframe';
 const STAIRCASE_BLUEPRINT = 'architect_staircase_final';
+const LANDING_BLUEPRINT = 'architect_staircase_landing';
 // Attach-point letters. 'A' is the inbound/top joint every piece exposes; 'B' is the
 // staircase's outbound/bottom joint that the next copy's A attaches to.
 const INBOUND_ID  = 'A';
@@ -85,8 +86,8 @@ function blueprintVoxels(building) {
   return collected.map(({ raw }) => raw);
 }
 
-// Translate one voxel by a world origin. Pure translation -- heading is fixed east, so
-// there is no rotation (Law 19). Facing strings ride along unchanged.
+// Translate one voxel by a world origin. Pure translation: a turned staircase is turned once, in its blueprint
+// (turnedStair), before any copy is placed.
 function translateVoxel(v, origin) {
   const out = [origin.x + v[0], origin.y + v[1], origin.z + v[2], v[3]];
   if (v[4]) out.push(v[4]);
@@ -109,7 +110,7 @@ function placeVoxelsAt(building, origin) {
 // proven safe and locked.
 // ----------------------------------------------------------------------------
 // ── WHICH SITE THE SHAFT HANGS FROM (architect_config.SHAFT_HEAD) ─────────────────────────────────────
-// A homestead's shaft descends from the headframe's attach A; a builder's is its own `mineshaft` site,
+// A homestead's shaft descends from the headframe's attach A; a builder's is its own `shallow_shaft` site,
 // whose transpose_origin is the top joint directly, with no headframe attach point involved.
 // Every reader of "where is the mine" asks these three, so the two shapes are one question (Law 16).
 function shaftStructure() {
@@ -138,8 +139,82 @@ function loadSite() {
   return {
     transposeOrigin: site.transpose_origin,        // {x,y,z} -- the shaft's site origin in the world
     headAWorld:  shaftTop(site),
+    turn:        siteTurn(site),
     surfaceY:    site.staircase.surfaceY,
     lowestSafeY: site.staircase.lowestSafeY,
+    descent:     siteDescent(site),
+  };
+}
+
+// siteDescent(site) → { lowestSafeY, route } of the whole descent a locked site carries: the shallow shaft and, where
+// siting found a route, the deep shaft below it.
+function siteDescent(site) {
+  const deep = site.staircase.deep;
+  return deep ? { lowestSafeY: deep.lowestSafeY, route: deep.route } : { lowestSafeY: site.staircase.lowestSafeY, route: [] };
+}
+
+// ── THE STAIRCASE FACES THE WAY ITS SHAFT HEAD FACES ──────────────────────────────────────────────────────
+// The staircase is authored descending east. A shaft head locked with a turn (transpose_origin.turn, blueprint_survey)
+// descends that many quarter turns clockwise from east, the whole staircase turned once about its transpose origin:
+// voxels, facing states, anchors, attach points and light points. Every reader takes the turn from the shaft's site.
+function siteTurn(site) {
+  return require('@perception/blueprint_survey').turnOf(site && site.transpose_origin);
+}
+const turnedStairs = new Map();   // turn -> the turned staircase; the blueprint is fixed for the process
+function turnedStair(turn) {
+  if (turnedStairs.has(turn)) return turnedStairs.get(turn);
+  const stair = loadBuildings()[STAIRCASE_BLUEPRINT];
+  if (!stair) throw new Error(`[mining_blueprinter] CODING VIOLATION: "${STAIRCASE_BLUEPRINT}" not found in building_blueprints.json.`);
+  const { rotateXZ, turnState, turnOf } = require('@perception/blueprint_survey');
+  const t = turnOf({ turn });
+  const r = (p) => { const [x, z] = rotateXZ(t, p[0], p[2]); return [x, p[1], z]; };
+  const out = {
+    stair, turn: t,
+    voxels: blueprintVoxels(stair).map(v => { const out = [...r(v), v[3]]; if (v[4]) out.push(turnState(t, v[4])); return out; }),
+    anchors: (stair.anchors || []).map(a => r(a.position)),
+    attach: (id) => r(attachPoint(stair, id)),
+    attachPoints: (stair.attach_points || []).map(p => ({ id: p.id, position: r(p.position), authored: p.position })),
+    lights: (stair.light_points || []).map(p => ({ position: r(p.position), wall: r(p.wall) })),
+  };
+  turnedStairs.set(turn, out);
+  return out;
+}
+
+// ── A SHAFT TURNS ON A LANDING ────────────────────────────────────────────────────────────────────────────
+// turnedLanding(turn, side) → the landing piece for a flight heading `turn`, leaving to its 'right' (one quarter turn
+// clockwise, as authored) or 'left' (authored mirrored in z). Attach points carry position only, so the new heading is
+// stated here, beside the mirror that decides it.
+const LANDING_SIDES = Object.freeze({ right: 1, left: 3 });
+const turnedLandings = new Map();
+function turnedLanding(turn, side) {
+  if (!LANDING_SIDES[side]) throw new Error(`[mining_blueprinter] CODING VIOLATION: a landing turns 'right' or 'left', not ${JSON.stringify(side)}.`);
+  const key = `${turn}|${side}`;
+  if (turnedLandings.has(key)) return turnedLandings.get(key);
+  const landing = loadBuildings()[LANDING_BLUEPRINT];
+  if (!landing) throw new Error(`[mining_blueprinter] CODING VIOLATION: "${LANDING_BLUEPRINT}" not found in building_blueprints.json.`);
+  const { rotateXZ } = require('@perception/blueprint_survey');
+  const r = (p) => { const [x, z] = rotateXZ(turn, p[0], side === 'left' ? -p[2] : p[2]); return [x, p[1], z]; };
+  const out = {
+    voxels: blueprintVoxels(landing).map(v => [...r(v), v[3]]),
+    anchors: (landing.anchors || []).map(a => r(a.position)),
+    out: r(attachPoint(landing, OUTBOUND_ID)),
+    heading: (turn + LANDING_SIDES[side]) % 4,
+  };
+  turnedLandings.set(key, out);
+  return out;
+}
+
+// placePiece(origin, heading, side) → one piece of the descent at a world origin: a flight, or with `side` a landing.
+// { voxels, anchors, minY, next: { origin, heading } }, in world cells, `next` being where the piece after it starts.
+function placePiece(origin, heading, side = null) {
+  const shape = side ? turnedLanding(heading, side) : turnedStair(heading);
+  const out = side ? shape.out : shape.attach(OUTBOUND_ID);
+  const voxels = shape.voxels.map(v => translateVoxel(v, origin));
+  return {
+    voxels,
+    anchors: shape.anchors.map(p => ({ x: origin.x + p[0], y: origin.y + p[1], z: origin.z + p[2] })),
+    minY: Math.min(...voxels.map(v => v[1])),
+    next: { origin: { x: origin.x + out[0], y: origin.y + out[1], z: origin.z + out[2] }, heading: side ? shape.heading : heading },
   };
 }
 
@@ -148,14 +223,14 @@ function loadSite() {
 // east (heading fixed), so z is across it (+z south, -z north); a purely-x attach
 // would grow east/west. Cell-side geometry lives HERE (Law 16) so mining_cell_graph consumes
 // ready-made {id, rel, outward} and holds no staircase-blueprint knowledge of its own.
-function staircaseSideAttaches() {
-  const stair = loadBuildings()[STAIRCASE_BLUEPRINT];
-  if (!stair) throw new Error(`[mining_blueprinter] CODING VIOLATION: "${STAIRCASE_BLUEPRINT}" not found in building_blueprints.json.`);
-  const pts = (stair.attach_points || []).filter(p => p.id !== INBOUND_ID && p.id !== OUTBOUND_ID);
-  return pts.map(p => {
-    const rel = p.position;
-    const outward = rel[2] > 0 ? 'south' : rel[2] < 0 ? 'north' : rel[0] > 0 ? 'east' : 'west';
-    return { id: p.id, rel, outward };
+// On a turned staircase the authored outward turns with it (`turn`, as the shaft's site carries it).
+function staircaseSideAttaches(turn = 0) {
+  const ts = turnedStair(turn);
+  const COMPASS = ['north', 'east', 'south', 'west'];
+  return ts.attachPoints.filter(p => p.id !== INBOUND_ID && p.id !== OUTBOUND_ID).map(p => {
+    const a = p.authored;
+    const authored = a[2] > 0 ? 'south' : a[2] < 0 ? 'north' : a[0] > 0 ? 'east' : 'west';
+    return { id: p.id, rel: p.position, outward: COMPASS[(COMPASS.indexOf(authored) + ts.turn) % 4] };
   });
 }
 
@@ -179,10 +254,10 @@ function staircaseSideAttaches() {
 //                     (the anchored stationary builder needs them to pick stand spots).
 //   occupiedCells  Map "x,y,z" -> type. EVERY cell the staircase defines (air + solid) =
 //                  the exact prism find_buildingspot must hazard-check.
-//   step           {x,y,z} per-copy translation (B - A).
+//   step           {x,y,z} the first flight's per-copy translation (B - A).
 //   minVoxY        staircase's lowest voxel Y (relative). bottomY: world Y of deepest voxel.
 // ----------------------------------------------------------------------------
-function projectStaircase({ headAWorld, lowestSafeY }) {
+function projectStaircase({ headAWorld, lowestSafeY, turn = 0, route = [] }) {
   if (!headAWorld || typeof headAWorld.x !== 'number' || typeof headAWorld.y !== 'number' || typeof headAWorld.z !== 'number') {
     throw new Error('[mining_blueprinter] CODING VIOLATION: projectStaircase requires headAWorld {x,y,z}.');
   }
@@ -190,12 +265,9 @@ function projectStaircase({ headAWorld, lowestSafeY }) {
     throw new Error('[mining_blueprinter] CODING VIOLATION: projectStaircase requires numeric lowestSafeY.');
   }
 
-  const buildings = loadBuildings();
-  const stair = buildings[STAIRCASE_BLUEPRINT];
-  if (!stair) throw new Error(`[mining_blueprinter] CODING VIOLATION: "${STAIRCASE_BLUEPRINT}" not found in building_blueprints.json.`);
-
-  const stairIn  = attachPoint(stair, INBOUND_ID);  // staircase top joint  (0,0,0)
-  const stairOut = attachPoint(stair, OUTBOUND_ID); // staircase bottom joint (3,-3,0)
+  const ts = turnedStair(turn);
+  const stairIn  = ts.attach(INBOUND_ID);  // staircase top joint  (0,0,0)
+  const stairOut = ts.attach(OUTBOUND_ID); // staircase bottom joint (3,-3,0) as authored, turned with the shaft
 
   // Per-copy translation: place the child's inbound (A) on the parent's outbound (B).
   const step = { x: stairOut[0] - stairIn[0], y: stairOut[1] - stairIn[1], z: stairOut[2] - stairIn[2] };
@@ -205,44 +277,38 @@ function projectStaircase({ headAWorld, lowestSafeY }) {
 
   // Anchor stand-spots (relative to transpose origin), transposed per copy below. Missing anchors
   // is a coding violation -- the anchored stationary builder needs stand spots.
-  const stairAnchors = Array.isArray(stair.anchors) ? stair.anchors.map(a => a.position) : [];
+  const stairAnchors = ts.anchors;
   if (stairAnchors.length === 0) {
     throw new Error(`[mining_blueprinter] CODING VIOLATION: "${STAIRCASE_BLUEPRINT}" has no anchors -- the anchored builder needs stand spots.`);
   }
 
-  const stairVox = blueprintVoxels(stair);
+  const stairVox = ts.voxels;
   const minVoxY = Math.min(...stairVox.map(v => v[1]));
 
-  // Copy n origin = the world point where copy n's transpose origin sits. Copy 0's inbound (A)
-  // lands on headAWorld, so copy 0 origin = headAWorld - stairIn; each further copy adds step.
-  const originFor = (n) => ({
-    x: headAWorld.x - stairIn[0] + n * step.x,
-    y: headAWorld.y - stairIn[1] + n * step.y,
-    z: headAWorld.z - stairIn[2] + n * step.z,
-  });
-
-  // How many whole copies fit with their deepest voxel at/above lowestSafeY. May be 0
-  // (site too shallow for even one copy). projectStaircase reports that as an empty result
-  // -- a legitimate DATA outcome for the candidate-scan path (find_buildingspot rejects it).
-  // The locked-site path (generateStaircase) treats 0 copies as a coding violation, since
-  // find_buildingspot already proved the depth before locking.
-  let repeatCount = 0;
-  while (originFor(repeatCount).y + minVoxY >= lowestSafeY) {
-    repeatCount++;
-    if (repeatCount > 1024) throw new Error('[mining_blueprinter] CODING VIOLATION: staircase repeat count exceeded 1024 -- bad site depth.');
-  }
-
-  // Build segments, enforcing the overlap-agreement rule across copies. occupiedCells maps a
-  // claimed world cell to its block type: a second copy claiming the same cell with a
-  // DIFFERENT type is a disagreement (oscillation) -> throw; the SAME type is deduped so
-  // the cell lives in exactly one segment (the shallower copy that claimed it first).
+  // Copy 0's inbound (A) lands on headAWorld; each piece after it starts where the last one ends. `route` names the
+  // pieces that are landings: [{ at: piece index, side }]. Only whole pieces whose deepest voxel stays at/above
+  // lowestSafeY are emitted. May be none (site too shallow for even one copy). projectStaircase reports that as an
+  // empty result -- a legitimate DATA outcome for the candidate-scan path (find_buildingspot rejects it). The
+  // locked-site path (generateStaircase) treats 0 copies as a coding violation, since find_buildingspot already
+  // proved the depth before locking.
+  //
+  // Each piece is checked against the overlap-agreement rule. occupiedCells maps a claimed world cell to its block
+  // type: a second piece claiming the same cell with a DIFFERENT type is a disagreement (oscillation) -> throw; the
+  // SAME type is deduped so the cell lives in exactly one segment (the shallower piece that claimed it first).
+  const landings = new Map(route.map(r => [r.at, r.side]));
+  const start = { x: headAWorld.x - stairIn[0], y: headAWorld.y - stairIn[1], z: headAWorld.z - stairIn[2] };
   const occupiedCells = new Map();
   const segments = [];
-  for (let n = 0; n < repeatCount; n++) {
-    const origin = originFor(n);
+  let at = { origin: start, heading: ts.turn };
+  let bottom = start.y + minVoxY;
+  for (let n = 0; ; n++) {
+    if (n > 1024) throw new Error('[mining_blueprinter] CODING VIOLATION: staircase repeat count exceeded 1024 -- bad site depth.');
+    const side = landings.get(n) || null;
+    const piece = placePiece(at.origin, at.heading, side);
+    if (piece.minY < lowestSafeY) break;
+    bottom = piece.minY;
     const placed = [];
-    for (const v of stairVox) {
-      const wv = translateVoxel(v, origin);
+    for (const wv of piece.voxels) {
       const key = `${wv[0]},${wv[1]},${wv[2]}`;
       const prev = occupiedCells.get(key);
       if (prev !== undefined) {
@@ -254,25 +320,24 @@ function projectStaircase({ headAWorld, lowestSafeY }) {
       occupiedCells.set(key, wv[3]);
       placed.push(wv);
     }
-    const id = makeSegmentId(origin);
-    const anchors = stairAnchors.map(p => ({ x: origin.x + p[0], y: origin.y + p[1], z: origin.z + p[2] }));
+    const id = makeSegmentId(at.origin);
     segments.push({
       id,
       type: 'staircase',
-      world_position: origin,
+      piece: side ? 'landing' : 'flight',
+      turn: at.heading,
+      world_position: at.origin,
       voxel_count: placed.length,
-      anchors,
-      summary: `staircase ${id} y=${origin.y}..${origin.y + minVoxY}`,
+      anchors: piece.anchors,
+      summary: `staircase ${id} y=${at.origin.y}..${piece.minY}`,
       voxels: placed,
     });
+    at = piece.next;
   }
 
   // bottomY = deepest voxel Y across all emitted copies; for an empty result, the floor the
   // first (unbuilt) copy WOULD reach -- so callers can report how shallow the site is.
-  const bottomY = segments.length > 0
-    ? segments[segments.length - 1].world_position.y + minVoxY
-    : originFor(0).y + minVoxY;
-  return { segments, occupiedCells, step, minVoxY, bottomY, repeatCount };
+  return { segments, occupiedCells, step, minVoxY, bottomY: bottom, repeatCount: segments.length };
 }
 
 // ----------------------------------------------------------------------------
@@ -288,7 +353,10 @@ function generateStaircase() {
   const bc = site.transposeOrigin;
   const headAWorld = site.headAWorld;
 
-  const { segments, step, bottomY } = projectStaircase({ headAWorld, lowestSafeY: site.lowestSafeY });
+  const { segments, step, bottomY, minVoxY } = projectStaircase({ headAWorld, turn: site.turn, ...site.descent });
+  // TWO SHAFTS, ONE DESCENT: a piece of the straight run to the iron band is the shallow shaft's, every piece below it the
+  // deep shaft's, which no reader digs until a material opens it (mining_integrity.setDeepOpen).
+  for (const seg of segments) seg.part = seg.piece === 'flight' && seg.world_position.y + minVoxY >= site.lowestSafeY ? 'shallow' : 'deep';
   if (segments.length < 1) {
     throw new Error(`[mining_blueprinter] CODING VIOLATION: locked site (headframe A y=${headAWorld.y}, lowestSafeY=${site.lowestSafeY}) is not deep enough for one staircase copy -- find_buildingspot should have rejected it before set_buildspot locked it.`);
   }
@@ -304,9 +372,31 @@ function generateStaircase() {
       lowestSafeY: site.lowestSafeY,
     },
     total_voxels: totalVoxels,
+    turn: site.turn,
     staircase_segments: segments,
     summary: `Generated ${segments.length} staircase copy(ies) (${totalVoxels} voxels), attach-point tiled (step ${step.x},${step.y},${step.z}) from headframe attach A (y=${headAWorld.y}) down to y=${bottomY}, within the proven-safe depth (lowestSafeY=${site.lowestSafeY}).`,
   };
+}
+
+// stairLamps(segments) → the staircase's wall torches, each { source, attach } in world cells: the light points the
+// staircase blueprint declares (light_points: the cell the torch stands in, the block it hangs on), on every
+// TORCH_NETWORK.stair_every-th copy counted from the top, and on the bottom copy, so the foot of a staircase of any
+// depth is lit. `segments` are projectStaircase's, top copy first.
+function stairLamps(segments, turn = 0) {
+  const stair = turnedStair(turn).stair;
+  if (!Array.isArray(stair.light_points) || stair.light_points.length === 0) {
+    throw new Error(`[mining_blueprinter] CODING VIOLATION: "${STAIRCASE_BLUEPRINT}" declares no light_points; the staircase is lit only where its blueprint says.`);
+  }
+  const every = require('@thinking/architect_config').TORCH_NETWORK.stair_every;
+  const out = [];
+  const flights = segments.filter(seg => seg.piece !== 'landing');
+  flights.forEach((seg, n) => {
+    if (n % every !== 0 && n !== flights.length - 1) return;
+    const o = seg.world_position;
+    const at = (p) => ({ x: o.x + p[0], y: o.y + p[1], z: o.z + p[2] });
+    for (const p of turnedStair(seg.turn).lights) out.push({ source: at(p.position), attach: at(p.wall) });
+  });
+  return out;
 }
 
 if (require.main === module) {
@@ -318,8 +408,8 @@ if (require.main === module) {
 }
 
 module.exports = {
-  shaftStructure, shaftChair, shaftTop,
+  shaftStructure, shaftChair, shaftTop, siteTurn, siteDescent,
   makeSegmentId, comparePriority, loadBuildings,
   attachPoint, blueprintVoxels, placeVoxelsAt,
-  projectStaircase, generateStaircase, staircaseSideAttaches,
+  projectStaircase, placePiece, generateStaircase, staircaseSideAttaches, stairLamps,
 };

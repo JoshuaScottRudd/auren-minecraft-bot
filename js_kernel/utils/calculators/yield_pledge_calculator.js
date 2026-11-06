@@ -107,4 +107,21 @@ function staysOut(span, owed, site) {
     return before === null || owed.owed_s < before;
 }
 
-module.exports = { PLEDGE_BLOCK, tripYieldFor, carriesPledge, pledgeFor, pledgedAgainst, stillOpen, seatsFor, walkOwed, staysOut };
+// tripSize(bot, magnet, site) — whether this body's trip for a delivery order has paid for its walk: the flat distance
+// from where it stands (at the material) to the order's station, at its own measured pace (walkOwed), against the
+// walking and the working its own clock holds for the order, read at `site` (staysOut).
+// → { walk, walk_s, elapsed_s, walked_s, owed_s, measured, stays }.
+function tripSize(bot, magnet, site) {
+    const at = bot.entity.position;
+    const [sx, , sz] = String(magnet.station_id).split('|').map(Number);
+    if (!Number.isFinite(sx) || !Number.isFinite(sz)) {
+        throw new Error(`[yield_pledge_calculator] CODING VIOLATION (Law 13): station_id "${magnet.station_id}" does not begin with x|y|z, `
+            + 'so the walk back to it cannot be measured.');
+    }
+    const walk = Math.round(Math.hypot(at.x - sx, at.z - sz));
+    const span = require('@kernel/bot_minutes').snapshot().open_span;
+    const owed = walkOwed(walk, require('@locomotion/locomotion_dispatcher').walkPace(), span);
+    return { walk, ...owed, stays: staysOut(span, owed, site) };
+}
+
+module.exports = { PLEDGE_BLOCK, tripYieldFor, carriesPledge, pledgeFor, pledgedAgainst, stillOpen, seatsFor, walkOwed, staysOut, tripSize };

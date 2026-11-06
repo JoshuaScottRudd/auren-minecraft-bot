@@ -33,10 +33,10 @@ let _ws = null;
 let _botId = null;
 let _foremanUrl = null;
 let _connected = false;
-let _reconnectTimer = null;
 
 let _pendingClaim = null;
 let _bodyCellTimer = null;
+let _lastMineCells = '';           // the mine's units as last sent; sent again only when they differ
 
 // Planning token (plan-phase mutex — arbiter flavor b, foreman_brain.js
 // taxonomy). Never rejected: the bot parks until 'planning_granted' arrives,
@@ -45,8 +45,6 @@ let _pendingPlanning = null;       // { resolve, answer } parked until planning_
 let _planningEntry = null;         // the entry number this body is inside the planning gate on | null
 let _planningPhase = null;
 let _planningRequestId = 0;
-
-const RECONNECT_INTERVAL_MS = 5000;
 
 // Each bot publishes only its body cell so peers avoid it in A* and yield at
 // doorways; broadcasts only when the cell changes, so a parked bot is silent.
@@ -67,6 +65,12 @@ function getBotId() {
   return _botId;
 }
 
+// sendCombatNote(payload) — one note on the combat road (custom_api/combat_board).
+function sendCombatNote(payload) {
+  if (!isConnected()) return;
+  _ws.send(JSON.stringify(createEnvelope('combat_note', _botId, payload)));
+}
+
 // Sends this bot's boardroom chair (magnet + chest locks), logistics station
 // registry (chests/furnaces + in-flight orders), and building conference
 // (established buildspots) to the foreman for broadcast (Law 6).
@@ -81,12 +85,16 @@ function sendUpdate() {
   const buildings = hqModule.readOffice('building_confrence_room') || {};
   // Salvage is a live per-bot entity-table scan, not shareable state, so no
   // death-pile field travels on this envelope (Law 23).
-  const envelope = createEnvelope('hq_delta', _botId, {
+  const payload = {
     boardroom_chair: chair,
     logistics_stations: stations,
     building_conference: buildings,
-  });
-  _ws.send(JSON.stringify(envelope));
+    survey_book: hqModule.readConfRoomFlag('exploration_confrence_room', 'survey_book', {}) || {},
+  };
+  // The mine's units travel only when they changed: the integrity keeper paints every body's.
+  const cells = JSON.stringify(hqModule.readConfRoomFlag('mining_confrence_room', 'cells', {}) || {});
+  if (cells !== _lastMineCells) { payload.mining_cells = JSON.parse(cells); _lastMineCells = cells; }
+  _ws.send(JSON.stringify(createEnvelope('hq_delta', _botId, payload)));
 }
 
 // Mirror held claims into this bot's boardroom chair so peers see what this
@@ -312,6 +320,58 @@ function _onPlanningGranted(payload) {
   resolve();
 }
 
+// ── WHERE IS THE KEEPER: ONE ASK, ONE ANSWER ──────────────────────────────────────────────────────────────
+// askKeeperWhere() → the foreman's claim { raised, present, position, station }, or null for a body with no
+// foreman (alone, no keeper exists). The answer is bounded by the same watch as the planning gate's own
+// request: a foreman that does not answer is silence, and silence ends the run (Law 30).
+let _keeperAskId = 0;
+const _keeperAsks = new Map();      // requestId → { resolve, answer }
+// hasForeman() → whether this body works under a foreman (false for a body run alone).
+function hasForeman() { return !!_foremanUrl; }
+
+function askKeeperWhere() {
+  if (!_foremanUrl) return Promise.resolve(null);
+  if (!isConnected() || _stoodDown) return new Promise(() => {});
+  const requestId = ++_keeperAskId;
+  return new Promise((resolve) => {
+    _keeperAsks.set(requestId, { resolve, answer: timeoutCrash.watch('keeper_where', "the foreman has not said where the keeper's body is", _planningState) });
+    _ws.send(JSON.stringify(createEnvelope('keeper_where', _botId, { requestId })));
+  });
+}
+function _onKeeperHere(payload) {
+  const ask = _keeperAsks.get(payload && payload.requestId);
+  if (!ask) throw new Error('foreman_link: keeper_here answers no ask this body made');
+  _keeperAsks.delete(payload.requestId);
+  ask.answer.done();
+  ask.resolve(payload);
+}
+
+// ── WHERE IS THE NEAREST DECORATION BIOME: ONE ASK, ONE ANSWER ────────────────────────────────────────────────
+// askDecorationLocate(item, p) → the foreman's answer from position p { item, found, reason } (foreman/decoration_locate),
+// or null for a body with no foreman. askModuleLocate(biome, p) is the same ask for the walk test module's biome.
+// Bounded by the same watch as the keeper's ask: silence ends the run (Law 30).
+let _locateAskId = 0;
+const _locateAsks = new Map();      // requestId → { resolve, answer }
+
+function _askLocate(what, fields, p) {
+  if (!_foremanUrl) return Promise.resolve(null);
+  if (!isConnected() || _stoodDown) return new Promise(() => {});
+  const requestId = ++_locateAskId;
+  return new Promise((resolve) => {
+    _locateAsks.set(requestId, { resolve, answer: timeoutCrash.watch('decoration_locate', `the foreman has not said where the nearest biome for ${what} is`, _planningState) });
+    _ws.send(JSON.stringify(createEnvelope('decoration_locate', _botId, { requestId, ...fields, from: { x: p.x, y: p.y, z: p.z } })));
+  });
+}
+const askDecorationLocate = (item, p) => _askLocate(item, { item }, p);
+const askModuleLocate = (biome, p) => _askLocate(`biome:${biome}`, { biome }, p);
+function _onDecorationLocated(payload) {
+  const ask = _locateAsks.get(payload && payload.requestId);
+  if (!ask) throw new Error('foreman_link: decoration_located answers no ask this body made');
+  _locateAsks.delete(payload.requestId);
+  ask.answer.done();
+  ask.resolve(payload);
+}
+
 function releasePlanningToken() {
   memoryWorkspace.leave();
   _planningPhase = null;
@@ -353,23 +413,55 @@ function abandonComputationWorkspace() {
   if (_planningPhase !== null) releasePlanningToken();
 }
 
+// ── A BODY IN LINE STILL ANSWERS AN ATTACK ──────────────────────────────────────────────────────────
+// While this body waits for the planning gate, for either phase, `check` runs once a second. It is the combat
+// gate (battle_stations.combatCheckpoint): on a threat it leaves the line (abandonComputationWorkspace), fights,
+// and hands the body to the judge; with nothing to fight it returns and the body keeps its place.
+const LINE_WATCH_MS = 1000;
+let _lineWatch = null;
+function watchWhileInLine(check) {
+  if (_lineWatch) return;
+  _lineWatch = timeoutCrash.every('foreman_link', 'check once a second that this body is safe while it waits in line for the planning gate', () => {
+    if (!_pendingPlanning || _stoodDown) return;
+    check();
+  }, LINE_WATCH_MS);
+  if (_lineWatch.unref) _lineWatch.unref();
+}
+
 // Publishes this bot's body cell (feet voxel) into its boardroom chair on a
 // 1s tick; peers read it from the merged boardroom (Law 16).
+//
+// The same tick publishes the pocket's count of every SIGNED-OUT item (architect_config.SIGNED_OUT_ITEMS) when it
+// changes. The chair's inventory is otherwise written only at this body's own sweep, and the crew counts its one
+// bucket off every chair (inventory_lens.forChestRequest): a bucket taken from a chest between sweeps would be in
+// no chest and on no chair, and a peer's sweep in that gap would craft another.
 function startBodyCellPublisher(bot) {
   if (_bodyCellTimer) return;
   let lastCellKey = null;
-  _bodyCellTimer = timeoutCrash.every('foreman_link', 'publish the cell this body stands in to its boardroom chair when it changes', () => {
+  let lastSignedKey = null;
+  const signedForms = [...new Set(Object.values(require('@thinking/architect_config').SIGNED_OUT_ITEMS).flat())];
+  _bodyCellTimer = timeoutCrash.every('foreman_link', 'publish the cell this body stands in, and the signed-out items it holds, to its boardroom chair when either changes', () => {
     const pos = bot?.entity?.position;
     if (!pos) return;
     const cell = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
     const cellKey = `${cell.x},${cell.y},${cell.z}`;
-    if (cellKey === lastCellKey) return;
+    const items = bot.inventory ? bot.inventory.items() : [];
+    const signed = Object.fromEntries(signedForms.map(f => [f, items.filter(i => i.name === f).reduce((n, i) => n + i.count, 0)]));
+    const signedKey = JSON.stringify(signed);
+    if (cellKey === lastCellKey && signedKey === lastSignedKey) return;
     lastCellKey = cellKey;
 
     const hqModule = require('@kernel/corporate_headquarters');
     const botId = _botId || process.env.BOT_ID || 'default';
     const chair = hqModule.readBoardroomChair(botId, {}) || {};
     chair.body_cell = { ...cell, updated_at: Date.now() };
+    if (signedKey !== lastSignedKey) {
+      lastSignedKey = signedKey;
+      chair.inventory = { ...(chair.inventory || {}) };
+      for (const [form, count] of Object.entries(signed)) {
+        if (count > 0) chair.inventory[form] = count; else delete chair.inventory[form];
+      }
+    }
     hqModule.writeBoardroomChair(botId, chair);
     sendUpdate();
   }, BODY_CELL_INTERVAL_MS);
@@ -491,7 +583,7 @@ function _attemptConnect() {
   if (!_foremanUrl) return;
 
   const opened = guardExternalSync('foreman_link', `new WebSocket(${_foremanUrl})`, () => new WebSocket(_foremanUrl));
-  if (!opened.ok) { _scheduleReconnect(); return; }
+  if (!opened.ok) { _neverReached(opened.reason); return; }
   _ws = opened.value;
 
   _ws.on('open', () => {
@@ -511,12 +603,12 @@ function _attemptConnect() {
       boardroom_chair: chair || {},
       logistics_stations: stations,
       building_conference: buildings,
+      survey_book: hqModule.readConfRoomFlag('exploration_confrence_room', 'survey_book', {}) || {},
       mode: require('@kernel/bot_mandate').currentMode(),
-      // Owner travels beside mode: the foreman routes a human's command on
-      // both and can read neither elsewhere. Null means homesteader.
-      owner: require('@kernel/bot_mandate').currentOwner(),
     });
     _ws.send(JSON.stringify(envelope));
+    // A new connection may be a new foreman: the mine's units go again on the next update.
+    _lastMineCells = '';
   });
 
   _ws.on('message', (raw) => {
@@ -532,7 +624,9 @@ function _attemptConnect() {
   // This socket closing means the foreman PROCESS is gone (its in-world body
   // loss is handled separately, by foreman.js). A fleet with no arbiter must
   // not keep working unarbitrated, so this body stops; restart comes from
-  // start_auren.js, which raises a fresh crew.
+  // start_auren.js, which raises a fresh crew. A socket that never opened ends
+  // this body too: the foreman raises its hub before any body, so a body that
+  // cannot reach it has no proof the run is safe to start (Law 13).
   _ws.on('close', () => {
     const wasConnected = _connected;
     _connected = false;
@@ -579,7 +673,7 @@ function _attemptConnect() {
       return;
     }
 
-    _scheduleReconnect();
+    _neverReached('the socket closed before it opened');
   });
 
   _ws.on('error', (err) => {
@@ -587,15 +681,10 @@ function _attemptConnect() {
   });
 }
 
-function _scheduleReconnect() {
-  if (_reconnectTimer) return;
-  _reconnectTimer = setTimeout(() => {
-    _reconnectTimer = null;
-    if (!_connected && _foremanUrl) {
-      watcher.summary('foreman_link', 'Attempting reconnect to foreman...');
-      _attemptConnect();
-    }
-  }, RECONNECT_INTERVAL_MS);
+function _neverReached(why) {
+  watcher.error('foreman_link', `⛔ This body could not reach the foreman at ${_foremanUrl} (${why}). `
+    + 'There is no retry: the foreman raises its hub before any body, so this is investigated, not waited out.');
+  require('@utils/body_end').endBody('the foreman could not be reached', { code: 1 });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -611,6 +700,22 @@ function _handleMessage(msg) {
         watcher.warn('foreman_link', `Registration rejected: ${msg.payload.reason}`);
         _connected = false;
       }
+      break;
+
+    case 'combat_note':
+      require('@api/combat_board').receive(msg.bot_id, msg.payload);
+      break;
+
+    case 'keeper_here':
+      _onKeeperHere(msg.payload);
+      break;
+
+    case 'decoration_located':
+      _onDecorationLocated(msg.payload);
+      break;
+
+    case 'keeper_verdict':
+      require('@kernel/keeper_verdicts').receive(msg.payload.subject, msg.payload.verdict);
       break;
 
     case 'hq_broadcast': {
@@ -645,12 +750,9 @@ function _handleMessage(msg) {
       if (buildings && typeof buildings === 'object') {
         hqModule.mergeBroadcastBuildings(buildings);
       }
-      // Standing requests (what each human asked for) are adopted whole, not
-      // merged — the foreman is their sole author (Invariant D). A crew
-      // narrows the map to its own rows when it reads.
-      const requests = msg.payload.standing_requests;
-      if (requests && typeof requests === 'object') {
-        require('@kernel/request_ledger').mergeBroadcast(requests);
+      // The survey book: fresher row per key (survey_book.mergeBroadcast).
+      if (msg.payload.survey_book && typeof msg.payload.survey_book === 'object') {
+        require('@perception/survey_book').mergeBroadcast(msg.payload.survey_book);
       }
       // `death_piles`, if an older peer still sends it, is ignored (see the
       // hq_delta builder above).
@@ -707,16 +809,13 @@ function _handleMessage(msg) {
       // Forwarded unchanged from the operator; the verb's own case validates it (Law 3: this is
       // transport, it does not inspect the cargo).
       const args = msg.payload.args || {};
-      // Origin (where the command entered the fleet) passes through
-      // untouched, never defaulted — only the foreman can state it truthfully (Law 23).
-      const origin = msg.payload.origin;
       const operatorCommands = require('@kernel/operator_commands');
       if (!operatorCommands.VERBS.has(verb)) {
         watcher.warn('foreman_link', `Ignoring command with unknown verb '${verb}'.`);
         break;
       }
-      watcher.summary('foreman_link', `Executing foreman command '${verb}' (origin: ${origin}).`);
-      operatorCommands.execute(verb, args, origin).catch((e) => {
+      watcher.summary('foreman_link', `Executing foreman command '${verb}'.`);
+      operatorCommands.execute(verb, args).catch((e) => {
         watcher.error('foreman_link', `Command '${verb}' failed: ${e && e.stack ? e.stack : String(e)}`);
       });
       break;
@@ -732,10 +831,6 @@ function _handleMessage(msg) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function disconnect() {
-  if (_reconnectTimer) {
-    clearTimeout(_reconnectTimer);
-    _reconnectTimer = null;
-  }
   if (_bodyCellTimer) {
     timeoutCrash.stop(_bodyCellTimer);
     _bodyCellTimer = null;
@@ -776,7 +871,12 @@ function awaitFirstBroadcast(timeoutMs) {
 }
 
 module.exports = {
+  sendCombatNote,
   connect,
+  askKeeperWhere,
+  askDecorationLocate,
+  askModuleLocate,
+  hasForeman,
   awaitFirstBroadcast,
   disconnect,
   isConnected,
@@ -795,6 +895,7 @@ module.exports = {
   withComputationWorkspace,
   abandonComputationWorkspace,
   startBodyCellPublisher,
+  watchWhileInLine,
   getPeerBodyCells,
   recordStartupPosition,
   forwardLog,

@@ -30,7 +30,10 @@ const building      = require('@thinking/assessors/building');
 const supply        = require('@thinking/assessors/supply');
 const furnace       = require('@thinking/assessors/furnace');
 const compost       = require('@thinking/assessors/compost');
+const treeFarm      = require('@thinking/assessors/tree_farm');
+const ranching      = require('@thinking/assessors/ranching');
 const housekeeping  = require('@thinking/assessors/housekeeping');
+const homeStations  = require('@thinking/assessors/home_stations');
 
 // exploration posts no job: a crew is brought to where a person stands, so a base sited in another
 // chunk would overrule that placement. Biome hunting for surface material still runs, through
@@ -38,17 +41,15 @@ const housekeeping  = require('@thinking/assessors/housekeeping');
 // base_layout posts no job either: the foreman sites and locks the base before any body exists, and
 // hands it over at birth; `start_injector` records it and refuses to start a body that has none
 // (`lock_all_buildspots.recordHandedSite`).
-const woodPreference= require('@thinking/assessors/wood_preference');
 const hunger        = require('@thinking/assessors/hunger');
 const farming       = require('@thinking/assessors/farming');
 const lighting      = require('@thinking/assessors/lighting');
-const canopy        = require('@thinking/assessors/canopy');
-const grounds       = require('@thinking/assessors/grounds');
 const respawn       = require('@thinking/assessors/respawn');
 const groundSalvage = require('@thinking/assessors/ground_salvage');
-const contractorHouse = require('@thinking/assessors/contractor_house');
+const survey        = require('@thinking/assessors/survey');
+const tandem        = require('@thinking/assessors/tandem');
 // A DOWNLOADED building's whole ladder in one assessor — trees, scrape, columns, seal. It is a STRUCTURE
-// assessor like `building` and `contractorHouse`, and it publishes the same `built` verdict, so it runs
+// assessor like `building`, and it publishes the same `built` verdict, so it runs
 // where they do: with the other structure assessors, ahead of `supply`, the first reader of a structure's claim.
 const downloadedBuild = require('@thinking/assessors/downloaded_build');
 
@@ -60,26 +61,22 @@ const downloadedBuild = require('@thinking/assessors/downloaded_build');
 const GATE = respawn;
 
 // EVALUATE — stable → urgent (Law 18). The order assessments RUN in.
-// contractorHouse sits beside `building` in both orders because it answers the same question about a
-// different structure. Its position among the others decides nothing about what is claimed — the band
-// and the rung do that — so what it must not do is drift AWAY from `building`, where a later reader
-// would stop recognising the two as one kind of work.
 // THE STRUCTURE ASSESSORS RUN AHEAD OF `supply`, AND THAT IS A DATA-FLOW ORDER. Each structure's build
 // claim is recomputed every sweep and accumulated as the loop runs, so an assessor that SUBTRACTS a claim
-// must run after the one that DECLARES it: building (headframe) → farming (the farm) → contractorHouse,
+// must run after the one that DECLARES it: building (headframe) → farming (the farm) → downloadedBuild,
 // and all three before supply, the first reader of the claim. farming declares no claim of its own, so its
 // position changes none of its answers. Nothing here ranks anything and nothing here withholds anything —
 // which structure a body serves first is STRUCTURE_PRIORITY, read in job_ranking.
 const EVALUATE_ORDER = [
-    hunger, mining, building, farming, contractorHouse, downloadedBuild, supply, furnace, compost, housekeeping,
-    woodPreference, lighting, canopy, grounds, groundSalvage,
+    hunger, mining, building, farming, downloadedBuild, supply, furnace, compost, treeFarm, housekeeping, homeStations,
+    lighting, tandem, ranching, groundSalvage, survey,
 ];
 
 // ASSEMBLE — urgent → stable (Law 18). The order jobs are CONCATENATED in, which survives into the
 // printed board because the display sort is stable. It breaks no ties: equals are picked at random.
 const ASSEMBLE_ORDER = [
-    hunger, groundSalvage, woodPreference, supply,
-    housekeeping, furnace, compost, building, contractorHouse, downloadedBuild, mining, farming, lighting, canopy, grounds,
+    hunger, groundSalvage, supply,
+    housekeeping, homeStations, furnace, compost, treeFarm, building, downloadedBuild, mining, survey, farming, lighting, tandem, ranching,
 ];
 
 // 1. THE CONTRACT. An assessor that exports the wrong shape would throw deep inside the sweep, on a

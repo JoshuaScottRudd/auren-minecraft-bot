@@ -36,7 +36,6 @@
 //   RESTATED, NOT COUNTED                              WHY
 //   `struct(place=P,dig=D)`                            farm_executor restating anchored_repair's digs
 //   `<site> <anchor> stationary: dig=D place=P`        build_executor restating the same
-//   `shaft N deep, sealed N`                           stone_prospect restating the descent as a depth
 //   `Jump bearing: A axial, O oblique, D diagonal`     the same presses `prejump(s)` already carries
 //
 // ── WHAT THE TRACE CANNOT ANSWER ────────────────────────────────────────────────────────────────────
@@ -146,32 +145,18 @@ const FARM_ROW_RE = /cleared=(\d+) tilled=(\d+) planted=(\d+) harvested=(\d+)/;
 const FUSED_RE = /fused this trip — (\d+) run\(s\) over (\d+) cell\(s\), (\d+) prejump\(s\)/;
 const PATH_EDGES_RE = /A\* path: \d+ step\(s\) \[([^\]]*)\]/;
 const HEALTH_RE = /food (\d+)\/(\d+)[^\n]*hp ([\d.]+)\/([\d.]+)/;
-// The three lines that RESTATE an act already counted. Read only so the reader can see the restatement
+// The lines that RESTATE an act already counted. Read only so the reader can see the restatement
 // sitting beside the count and check that it was not summed in.
 const STRUCT_RESTATE_RE = /struct\(place=(\d+),dig=(\d+)\)/;
-// ANCHORED ON THE EMITTING TAG, because this one line is echoed twice more by the judge (once as the
-// fragment's `Readable:` and once as its reported success), and an unanchored pattern reads a 4-shaft
-// run as 12. Measured: 12 matches for 4 shafts, 147 blocks against the 49 actually descended. It is the
-// only counted-or-restated line in this lens that the judge repeats, and it is here in the restated
-// table precisely because `Dug down to` already owns those digs one block at a time.
-const SHAFT_RESTATE_RE = /\[STONE_PROSPECT_EXECUTOR\][^\n]*shaft (\d+) deep, sealed (\d+)/;
 const BEARING_RESTATE_RE = /Jump bearing: (\d+) axial, (\d+) oblique, (\d+) diagonal/;
 const PILLARED_RESTATE_RE = /Pillared up to y=(-?\d+) using/;
 
 // ── EVERY JUMP PRESS IS 0.05, AND A PILLAR STEP IS A JUMP ──────────────────────────────────────────
 // A jump costs TEN TIMES what breaking a block costs, so the jump census decides this whole lens and
 // `prejump(s)` alone does not carry it. `scaffold_movement.pillarStep` holds `jump` for exactly one
-// crest per block it places, which makes a pillar step a jump press by construction — and the shaft
-// crew climbs out of every hole it digs one placement per block of depth. Measured on this trace:
+// crest per block it places, which makes a pillar step a jump press by construction. Measured on this trace:
 // 237 prejumps against 58 further presses from pillaring, a fifth of the bill sitting outside the
 // counter the navigator publishes.
-//
-// `sealed N` is the climb's OWN count of placements made — the ascent as measured, not the shaft depth
-// planned. Tag-anchored for the judge-echo reason above.
-// Reads the climb's count out of BOTH shapes it is written in — the success line's `sealed 12)` and the
-// short-climb warn's `sealed 5 of 12` — because a climb that ran out of filler still pressed jump for
-// every block it did place, and a pattern that only knew the happy shape would price that trip at zero.
-const SEALED_RE = /\[STONE_PROSPECT_EXECUTOR\][^\n]*\bsealed (\d+)[)\s]/;
 // Jump presses this lens does NOT count, because no line publishes them: `drive`'s single-step climb
 // outside a fused run, `fillWaterColumnBelow` and `antiDrown` (both HOLD jump for a span, so neither is
 // even a countable act), and the combat driver's hop. The fleet never fought on this trace and the water
@@ -188,7 +173,7 @@ const blankBot = () => ({
   hpSamples: 0, hpMin: null, hpLost: 0, hpRegained: 0, hpPrev: null,
   foodMin: null, foodSamples: 0,
   attacks: 0,
-  restatedStructDigs: 0, restatedShaftDepth: 0, restatedBearingPresses: 0, restatedPillarLines: 0,
+  restatedStructDigs: 0, restatedBearingPresses: 0, restatedPillarLines: 0,
 });
 
 const addDig = (b, source, n) => {
@@ -217,7 +202,6 @@ const SRC_FARM_CLEAR = 'farm_executor_canopy';
 const SRC_FARM_CROP = 'farm_executor_harvest';
 const SRC_PREJUMP = 'drive_run_prejump';
 const SRC_CARVE_PILLAR = 'navigator_pillar_step';
-const SRC_SHAFT_SEAL = 'stone_prospect_seal_climb';
 
 // ── reduceHunger({ seg, bot }) — the machine-facing half. Counts, never renders. ────────────────────
 function reduceHunger({ seg = [], bot: botFilter = null } = {}) {
@@ -278,11 +262,6 @@ function reduceHunger({ seg = [], bot: botFilter = null } = {}) {
       addJump(b, SRC_PREJUMP, +m[3]);
     }
 
-    if ((m = r.match(SEALED_RE))) {
-      addJump(b, SRC_SHAFT_SEAL, +m[1]);
-      b.places += +m[1];
-    }
-
     if ((m = r.match(PATH_EDGES_RE))) {
       b.pathLines++;
       for (const part of m[1].split(',')) {
@@ -307,7 +286,6 @@ function reduceHunger({ seg = [], bot: botFilter = null } = {}) {
     }
 
     if ((m = r.match(STRUCT_RESTATE_RE))) b.restatedStructDigs += +m[2];
-    if ((m = r.match(SHAFT_RESTATE_RE))) b.restatedShaftDepth += +m[1];
     if ((m = r.match(BEARING_RESTATE_RE))) b.restatedBearingPresses += +m[1] + +m[2] + +m[3];
     if (PILLARED_RESTATE_RE.test(r)) b.restatedPillarLines++;
   }
@@ -462,7 +440,6 @@ function runHunger({ seg = [], traceName = '?', bot: botFilter = null } = {}) {
   out.table(['bot', 'line', 'value'],
     [...per.entries()].flatMap(([bot, b]) => [
       [bot, 'farm_executor_struct_dig', b.restatedStructDigs],
-      [bot, 'stone_prospect_shaft_depth', b.restatedShaftDepth],
       [bot, 'jump_bearing_presses', b.restatedBearingPresses],
       [bot, 'navigator_pillared_up_lines', b.restatedPillarLines],
     ]));

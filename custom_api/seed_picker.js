@@ -21,22 +21,24 @@
 // identical-outcome kill never false-fires on back-to-back picks.
 //
 // Success means the errand ran, not that the order filled (see MAX_GRASS_PUNCHES): spending the
-// punch budget is the deliverable, so a trip that punched its fifteen and drew no seeds returns
+// punch budget is the deliverable, so a trip that punched its budget and drew no seeds returns
 // success and goes and dumps. `reason` classifies only a trip that could not punch: 'no_grass' |
 // 'unreachable' | 'short', null on success. harvest_executor sends the futile case to idle
 // instead of re-dispatching an identical gather that the judge would false-kill as a loop.
 
 const watcher = require('@kernel/watcher');
 const Vec3 = require('vec3');
-// Entered through combatCheckpoint — the one process-wide 500 ms clock, shared with the dig and
-// drive primitives, with an engaging/escaping bypass so combat's own arms cannot re-enter it (its
+// Entered through combatCheckpoint — the gate shared with the dig and drive primitives, asked on
+// every call, with an engaging/escaping bypass so combat's own arms cannot re-enter it (its
 // own header holds the full contract).
 const { combatCheckpoint } = require('@api/battle_stations');
 const { collectNearby } = require('@api/drop_collector.js');
-const { performDig } = require('@utils/movement/dig_authority');
+const { performDig, bobbing } = require('@utils/movement/dig_authority');
 const exploration = require('@api/exploration_api');
+const finder = require('@api/sector_finder');
 const { guardExternal } = require('@utils/external_library_guard');
 const { claimFirst, releaseTarget } = require('@utils/target_claims');
+const { beyondGatherReach, readTransposeOrigin } = require('@utils/fragment_utils');
 
 const TAG = 'seed_picker';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -45,12 +47,12 @@ const GRASS = ['short_grass', 'tall_grass', 'fern'];
 const GRASS_SET = new Set(GRASS);
 const REACH = 4.5;                 // melee break reach, from the eyes
 const MELEE_SCAN_RADIUS = 4;       // cube half-extent for the in-reach grass scan
-// The punch cap is flat and the order size does not touch it: exactly 15 grass punches regardless
-// of how many seeds land, keeping one dispatch a small bounded errand instead of an open-ended
-// search. Seeds are a farm input with a probabilistic drop, so "gather N" is a goal the world may
-// simply decline to grant on this trip. At ~1/8 the cap yields ~2 seeds a trip — many small
-// bounded trips beat one unbounded one.
-const MAX_GRASS_PUNCHES = 15;
+// The punch cap is flat and the order size does not touch it: no more than 50 grass punches, and no more than
+// MAX_SEEDS_PER_CLAIM seeds asked of one pick, keeping one claim a bounded errand instead of an open-ended
+// search. Seeds are a farm input with a probabilistic drop, so "gather N" is a goal the world may simply decline
+// to grant. At ~1/8 the cap yields ~6 seeds; harvest_executor ends the claim after one pick.
+const MAX_GRASS_PUNCHES = 50;
+const MAX_SEEDS_PER_CLAIM = 5;
 
 function countSeeds(bot) {
   return (bot.inventory?.items?.() || [])
@@ -122,10 +124,18 @@ async function pick(bot, opts = {}) {
   const failedHere = new Set();
   const finished = () => countSeeds(bot) >= targetTotal || punches >= maxPunches;
 
-  // One visit: every tuft within reach of where the body stands, then the drops it left.
+  // One visit: every tuft within reach of where the body stands, then the drops it left. A BODY AFLOAT PUNCHES
+  // NOTHING (dig_authority.bobbing, which refuses the dig and drops the signal): the visit ends and the ring search
+  // walks the body to grass from dry ground, as survey_executor and tree_feller walk theirs.
   const punchHere = async () => {
+    if (bobbing(bot)) {
+      const at = bot.entity.position.floored();
+      watcher.summary(TAG, `afloat at (${at.x},${at.y},${at.z}) — no punch from the water; walking to grass from dry ground`);
+      return;
+    }
     while (!finished()) {
       await combatCheckpoint(bot, 'seed_pick');
+      if (bobbing(bot)) break;   // a body that slipped into the water mid-visit ends the visit here
 
       const walk = await claimFirst(grassInReach(bot, peerHeld, failedHere), { keyOf: grassKeyOf });
       for (const key of walk.peerHeldKeys) peerHeld.add(key);
@@ -159,19 +169,31 @@ async function pick(bot, opts = {}) {
   // The grass where the body stands first. Then surface_filter's rings, 16 blocks wide, outward from there:
   // a ring's tufts are offered to the navigator whole, the body punches where it arrives, and what is left
   // of the ring is offered again until the ring is spent or cannot be reached; then the next ring. The pick
-  // ends on its punch budget, its order, or the last loaded ring. A world whose every ring holds no grass
-  // is walked out of once (exploration_api) and its rings read again from there.
+  // ends on its punch budget, its order, or the last loaded ring within GATHER_REACH of home. Before a home is
+  // sited, a world whose every ring holds no grass is walked out of once (exploration_api) and read again. With a
+  // home sited, the fleet's one escalation (sector_finder, category `grass`): the body stands at a book sector
+  // recording grass and reads its rings again from there; with no page left it scans the next frontier sector and
+  // the pick ends.
   await punchHere();
-  const filter = { type: 'object_group_or_direct', targets: GRASS };
-  let seen = 0, visits = 0, unreached = 0, ringsRead = 0;
+  const homeBound = !!readTransposeOrigin(require('@kernel/bot_mandate').homeBlueprint());
+  let seen = 0, visits = 0, unreached = 0, ringsRead = 0, escalated = null;
   for (let pass = 0; pass < 2 && !finished(); pass++) {
+    // No tuft past GATHER_REACH of home is offered, except from a book sector's stand.
+    const tooFar = finder.atStand(bot) ? () => false : beyondGatherReach();
+    // A tuft whose punch dig_authority refuses (water beside it) is never offered: the body is not walked to a stand
+    // beside water for a punch it cannot make. The refusal's own test, asked at selection (Law 17).
+    const besideWater = (p) => require('@utils/pathfinding_utils').opensOntoWater(bot, p.x, p.y, p.z);
+    const filter = { type: 'object_group_or_direct', targets: GRASS, exclude: (p) => tooFar(p) || besideWater(p) };
     const rings = surfaceFilter.openRings(bot, filter);
     for (let ring = await rings.next(); ring; ring = finished() ? null : await rings.next()) {
       let left = ring.objectives.filter(o => o && o.position && ['x', 'y', 'z'].every(k => typeof o.position[k] === 'number'));
       seen += left.length;
       while (left.length && !finished()) {
         surfaceFilter.offer(bot, filter, left, 'grass', `ring ${ring.index}, ${ring.inner}-${ring.outer} blocks out, ${left.length} offered`);
-        const approach = await dispatcher.goTo({ candidates_ref: 'surface_filter', candidates_count: left.length, candidates_kind: 'grass' });
+        // On its ground (past the first tuft, or at a book page's stand), the walk tuft to tuft is the pick itself: the
+        // `work` leg. The walk out to the grass and home stays travel.
+        const onGround = visits > 0 || finder.atStand(bot);
+        const approach = await dispatcher.goTo({ candidates_ref: 'surface_filter', candidates_count: left.length, candidates_kind: 'grass', ...(onGround ? { leg: 'work' } : {}) });
         // Movement gave up (its domain, Law 15): nothing left in this ring is reachable.
         if (!approach || !approach.arrived) { unreached += left.length; break; }
         visits++;
@@ -189,10 +211,15 @@ async function pick(bot, opts = {}) {
     }
     ringsRead += rings.cost().rings;
     if (seen > 0 || pass > 0) break;
-    watcher.summary(TAG, 'No grass in any loaded ring — asking exploration to walk me to a grass biome.');
-    await exploration.seek(bot, {});
+    if (!homeBound) {
+      watcher.summary(TAG, 'No grass in any loaded ring — asking exploration to walk me to a grass biome.');
+      await exploration.seek(bot, {});
+      continue;
+    }
+    const step = await finder.escalate(bot, { item: 'wheat_seeds', categories: finder.categoriesFor({ blocks: GRASS }) });
+    if (!step.moved) { escalated = step.reason; break; }
   }
-  watcher.summary(TAG, `ring_search material=grass rings=${ringsRead} seen=${seen} visits=${visits} unreached=${unreached} punches=${punches} of=${maxPunches}`);
+  watcher.summary(TAG, `ring_search material=grass rings=${ringsRead} seen=${seen} visits=${visits} unreached=${unreached} punches=${punches} of=${maxPunches} escalated=${escalated || '-'}`);
   if (!finished()) {
     if (seen === 0 && punches === 0) concedeReason = 'no_grass';
     else if (visits === 0 && punches === 0) concedeReason = 'unreachable';
@@ -202,7 +229,7 @@ async function pick(bot, opts = {}) {
   const total = countSeeds(bot);
   const collected = total - startCount;
 
-  // Spending the punch budget is success: the deliverable is the fifteen punches, not N seeds
+  // Spending the punch budget is success: the deliverable is the punch budget, not N seeds
   // (Law 25 — the asker owns the criterion), so a trip that punched its budget and came back with
   // nothing still succeeds and still ends at a chest (harvest_executor drops off after every
   // gather, unconditionally). Budget-spent is checked before the seed target for this reason. Only
@@ -216,7 +243,7 @@ async function pick(bot, opts = {}) {
   const reason = success ? null : (concedeReason || (collected > 0 ? 'short' : 'no_grass'));
   watcher.summary(TAG, `Seed pick done: +${collected} wheat_seeds in ${punches}/${maxPunches} punch(es) (total ${total}) — `
     + `${spentBudget ? 'punch budget spent, taking the haul home' : gotEnough ? 'order filled early' : `stopped short: ${reason}`}.`);
-  return { success, collected, total, reason };
+  return { success, collected, total, reason, punches };
 }
 
-module.exports = { pick };
+module.exports = { pick, MAX_GRASS_PUNCHES, MAX_SEEDS_PER_CLAIM };

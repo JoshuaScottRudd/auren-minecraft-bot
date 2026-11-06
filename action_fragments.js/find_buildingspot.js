@@ -38,10 +38,11 @@ const {
 const siteGeometry = require('@utils/site_geometry');
 
 // Settle-able biome set (plains + forest), same set exploration uses to stop seeking (Law 16).
-const { ACCEPTABLE_BIOMES } = require('@thinking/architect_config');
+const { settles } = require('@thinking/architect_config');
 
 // Shared scan pacer (Law 16, Law 19) so the uncapped search never stalls the tick.
 const { makeExecutionPacer } = require('@utils/execution_yield');
+const { readSurface, wetNear } = require('@utils/footprint_survey');   // no site where water can reach (architect_config.WATER_CLEARANCE)
 
 // ── Tuning constants — surface scan ──────────────────────────────────────────
 // BUFFER_BLOCKS (navigation clearance ring) is imported from building_site_overlays (Law 16).
@@ -94,7 +95,12 @@ function rowExtent(spot, blueprintName) {
 }
 
 function getExistingFootprints(clearance = BUFFER_BLOCKS) {
-  const room = hq.readOffice('building_confrence_room', {});
+  return footprintsOf(hq.readOffice('building_confrence_room', {}), clearance);
+}
+
+// footprintsOf(room, clearance) — the same boxes from a building room already in hand (the integrity keeper's thread
+// holds the plans, not HQ).
+function footprintsOf(room, clearance) {
   const boxes = [];
   for (const [key, entry] of Object.entries(room)) {
     if (!entry || typeof entry !== 'object') continue;
@@ -102,7 +108,7 @@ function getExistingFootprints(clearance = BUFFER_BLOCKS) {
     if (!spot?.transpose_origin || typeof spot.transpose_origin.x !== 'number') continue;
     const blueprintName = entry?.blueprint_paster?.building_name || roomKeyName(key);
     const building = blueprintRegistry.tryGetBuilding(blueprintName);
-    const extent = building ? blueprintSurvey.footprintExtent(building) : rowExtent(spot, blueprintName);
+    const extent = building ? blueprintSurvey.footprintExtent(building, blueprintSurvey.turnOf(spot.transpose_origin)) : rowExtent(spot, blueprintName);
     boxes.push(footprintBox(spot.transpose_origin.x, spot.transpose_origin.z, extent, clearance, key));
   }
   return boxes;
@@ -248,12 +254,14 @@ const REJECTION_LABELS = {
   overhead_blocked:   'overhead blocked',
   overlaps_existing:  'overlaps existing building',
   not_dirt_ground:    'ground not dirt-groupable',
+  water_near:         'water within reach',
 };
 const STAIRCASE_REJECTION_LABELS = {
   too_shallow:     'staircase too shallow',
   unsafe_descent:  'unsafe descent',
   biome_mismatch:  'wrong biome',
   no_attach_point: 'no attach point',
+  cave_air:        'descent meets a cave',
 };
 
 // formatRejectionBreakdown — turns a { reason: count } tally into one sorted, human-labeled clause
@@ -333,7 +341,7 @@ async function locate(bot, opts) {
     const candidates = [];
     let checked = 0;
     // Every reason evaluateCandidate can return needs a key here, or it silently reads as dead (Law 6).
-    const rejections = { chunk_unloaded: 0, too_uneven: 0, overhead_blocked: 0, overlaps_existing: 0, not_dirt_ground: 0 };
+    const rejections = { chunk_unloaded: 0, too_uneven: 0, overhead_blocked: 0, overlaps_existing: 0, not_dirt_ground: 0, water_near: 0 };
     // Tree-farm mode: histogram of block names at rejected floor cells, for a "what the ground was" summary.
     const notDirtBlockCounts = {};
 
@@ -350,12 +358,12 @@ async function locate(bot, opts) {
     // ── Staircase overlay bookkeeping (require_shaft mode only) ───────────────
     // staircaseCache dedupes the descent check per (x,z) column; the rest feed the watcher.story explanation.
     const staircaseCache = new Map();
-    const staircaseRejections = { too_shallow: 0, unsafe_descent: 0, biome_mismatch: 0, no_attach_point: 0 };
+    const staircaseRejections = { too_shallow: 0, unsafe_descent: 0, biome_mismatch: 0, no_attach_point: 0, cave_air: 0 };
     let staircaseSpotsChecked = 0;
 
     // ── Biome gate (require_shaft mode only) ──────────────────────────────────
-    // Rejects a staircase candidate outside ACCEPTABLE_BIOMES — the same set exploration uses (Law 16).
-    const biomeGate = requireShaft ? ACCEPTABLE_BIOMES : null;
+    // Rejects a staircase candidate in a banned biome — the same list exploration uses (Law 16).
+    const biomeGate = requireShaft ? settles : null;
 
     // checkStaircaseAt — evaluate (and cache) the diagonal descent for a candidate site, keyed by (x,z).
     function checkStaircaseAt(transposeOrigin) {
@@ -373,6 +381,7 @@ async function locate(bot, opts) {
 
     // Shared pacer for every voxel-heavy loop below (Law 19).
     const pace = makeExecutionPacer();   // Time bounds a slice regardless of the footprint's size.
+    const wet = wetNear(await readSurface(bot, pace));
     let reachedRadius = 0;
     const scanStart = Date.now();
     const scanSecs = () => ((Date.now() - scanStart) / 1000).toFixed(1);
@@ -394,6 +403,9 @@ async function locate(bot, opts) {
         // Flat clear ground (+ safe diagonal descent for require_shaft, + plantable-ground gate for the tree farm).
         const r1 = evaluateCandidate(bot, cx, cz, extent, dims.h, refY, existingBoxes, requireDirtGround);
         if (r1.reason !== 'chunk_unloaded') ringAllUnloaded = false; // any readable cell keeps the ring "loaded"
+        if (r1.valid && wet(cx + extent.min_dx, cx + extent.max_dx, cz + extent.min_dz, cz + extent.max_dz)) {
+          r1.valid = false; r1.reason = 'water_near';
+        }
 
         if (r1.valid) {
           let cand = null;
@@ -402,14 +414,16 @@ async function locate(bot, opts) {
             const { staircase } = checkStaircaseAt(transposeOrigin);
             if (staircase.ok) {
               cand = makeCandidate(cx, cz, extent, r1.groundY);
-              cand.staircase = { lowestSafeY: staircase.lowestSafeY, surfaceY: staircase.surfaceY, depthReached: staircase.depthReached, safeCopies: staircase.safeCopies, haltReason: staircase.haltReason || null };
+              cand.staircase = { lowestSafeY: staircase.lowestSafeY, surfaceY: staircase.surfaceY, depthReached: staircase.depthReached, safeCopies: staircase.safeCopies, haltReason: staircase.haltReason || null, deep: staircase.deep };
             }
           } else {
             cand = makeCandidate(cx, cz, extent, r1.groundY);
           }
           if (cand) {
             const dist = Math.hypot(cx - refX, cz - refZ);
-            if (!best || dist < best.dist) best = { cand, dist };
+            // A shaft's site with a route for the deep shaft beats a nearer one without; among equals, the nearer.
+            const routed = !requireShaft || !!cand.staircase.deep;
+            if (!best || (routed && !best.routed) || (routed === best.routed && dist < best.dist)) best = { cand, dist, routed };
           }
         } else {
           if (rejections[r1.reason] !== undefined) rejections[r1.reason]++;
@@ -433,7 +447,8 @@ async function locate(bot, opts) {
 
       reachedRadius = r;
       // Nearest-match stop (Dijkstra): once ring radius reaches best.dist, no farther cell can beat it.
-      if (best && r >= best.dist) break ringLoop;
+      // A site with no deep route looks SHAFT_TURNS.route_search_beyond further for one.
+      if (best && r >= best.dist + (best.routed ? 0 : require('@thinking/architect_config').SHAFT_TURNS.route_search_beyond)) break ringLoop;
       consecutiveUnloadedRings = (r > 0 && ringAllUnloaded) ? consecutiveUnloadedRings + 1 : 0;
       // Loaded frontier — unloaded chunks in every direction for UNLOADED_RING_STOP rings running.
       if (consecutiveUnloadedRings >= UNLOADED_RING_STOP) break ringLoop;
@@ -520,7 +535,7 @@ async function locate(bot, opts) {
         `Inspected: ${checked} surface cell(s) out to ring radius ${reachedRadius} in ${scanSecs()}s, ${staircaseSpotsChecked} staircase site(s) for '${blueprintName}' gated to the settle-able (plains/forest) biome set. ` +
         `Nearest match (flat surface + safe diagonal staircase): transpose_origin=(${selected.transpose_origin.x},${selected.transpose_origin.y},${selected.transpose_origin.z}), ` +
         `footprint=${selected.footprint.width}x${selected.footprint.length}, descends to Y=${selected.staircase.lowestSafeY} ` +
-        `(surface Y=${selected.staircase.surfaceY}, depth ${selected.staircase.depthReached}, ${selected.staircase.safeCopies} safe copy(ies)); ` +
+        `(surface Y=${selected.staircase.surfaceY}, depth ${selected.staircase.depthReached}, ${selected.staircase.safeCopies} safe copy(ies), no cave air); ` +
         `${distFromOrigin.toFixed(1)} block(s) from origin.${groundNote} Rejected: ${formatRejectionBreakdown(staircaseRejections, {}, STAIRCASE_REJECTION_LABELS)}.`;
     } else {
       successSummary = `Inspected: ${checked} cell(s) out to ring radius ${reachedRadius} in ${scanSecs()}s for '${blueprintName}'. Nearest match: flat, clear spot at (${selected.transpose_origin.x},${selected.transpose_origin.y},${selected.transpose_origin.z}); ${distFromOrigin.toFixed(1)} block(s) from origin.${groundNote} Rejected: ${formatRejectionBreakdown(rejections)}.`;
@@ -543,5 +558,6 @@ module.exports = {
   locate,
   loadBlueprintDims,
   getExistingFootprints,
+  footprintsOf,
   footprintBox,
 };

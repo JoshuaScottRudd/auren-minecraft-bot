@@ -11,7 +11,7 @@
 // and the trip spends by it (build_column_executor). The board and the preparation ask `heldBlocks`,
 // `fromBuildWood`, `shortWith` and `takeOrder` of the POOL, so the gate that posts a cube and the withdrawal
 // that stocks it count the same blocks (Law 16). A cube trip asks `inHand` for each block it stands. Every
-// pillar step asks `ready` before it picks a block (scaffold_movement). The waste pit asks `dirtIsSurplus`.
+// pillar step asks `ready` before it picks a block (scaffold_movement).
 //
 // The ORDER a pillar or bridge spends blocks in is fragment_utils' throwaway order, planks first.
 
@@ -27,10 +27,6 @@ const TAG = 'trash';
 const PLANKS_PER_LOG = 4;
 // The stand-in block while no plank and no log is held.
 const STAND_IN = 'dirt';
-// The chests keep STANDBY_DIRT of the stand-in on top of what the building asks, while they hold fewer than
-// STANDBY_LOGS logs to make trash of.
-const STANDBY_LOGS = 64;
-const STANDBY_DIRT = 128;
 
 const PLANK_NAMES = new Set(group_to_item.planks);
 const LOG_NAMES = group_to_item.logs.filter(name => !name.startsWith('stripped_'));
@@ -42,11 +38,13 @@ function isTrashBlock(name) {
 }
 
 // The names in the order trash is spent: planks and logs of a wood the building is not made of, then the
-// building's own. `buildWood` absent means no building has a claim on any species.
+// building's own: its primary `buildWood` and the accent beside it (architect_config.BUILD_WOOD). `buildWood`
+// absent means no building has a claim on any species.
 function woodOrder(buildWood) {
-  const spare = LOG_NAMES.filter(log => !buildWood || !log.startsWith(`${buildWood}_`));
-  const own = LOG_NAMES.filter(log => buildWood && log.startsWith(`${buildWood}_`));
-  return { spare, own };
+  const { BUILD_WOOD } = require('@thinking/architect_config');
+  const woods = buildWood ? [buildWood, BUILD_WOOD.accent] : [];
+  const ownLog = log => woods.some(w => log.startsWith(`${w}_`));
+  return { spare: LOG_NAMES.filter(log => !ownLog(log)), own: LOG_NAMES.filter(ownLog) };
 }
 
 // heldBlocks(counts, buildWood) → { spare, own, dirt }: trash blocks in a {item: count} map, a log counted as
@@ -286,15 +284,4 @@ async function ready(bot) {
   if (split.reason) watcher.warn(TAG, `Split of ${log} for a pillar step made ${split.made} plank(s): ${split.reason}.`);
 }
 
-// dirtIsSurplus() — may a pocket's spare dirt go to the waste pit? True once the chests hold what the building
-// still asks of it, plus the standby while logs are scarce. A building whose need has not been read yet
-// answers false: an unread need is not a need of zero (Law 25).
-function dirtIsSurplus() {
-  const wanted = require('@thinking/assessors/downloaded_build').stillOrdered(STAND_IN);
-  if (wanted === null) return false;
-  const lens = require('@kernel/inventory_lens');
-  const standby = lens.inChests('logs') >= STANDBY_LOGS ? 0 : STANDBY_DIRT;
-  return lens.inChests(STAND_IN) >= wanted + standby;
-}
-
-module.exports = { PLANKS_PER_LOG, STAND_IN, isTrashBlock, heldBlocks, inPocket, fromBuildWood, shortWith, takeOrder, pillarNames, inHand, keptInHand, makePlanks, sweepCraftArea, ready, dirtIsSurplus };
+module.exports = { PLANKS_PER_LOG, STAND_IN, isTrashBlock, heldBlocks, inPocket, fromBuildWood, shortWith, takeOrder, pillarNames, inHand, keptInHand, makePlanks, sweepCraftArea, ready };

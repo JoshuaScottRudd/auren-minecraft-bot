@@ -82,20 +82,10 @@ the sentence back before it starts.
 - **`builder`** (the default): a crew of up to 20 that builds a downloaded building from nothing. The
   foreman sites the building and brings the crew in itself. **The building is not in this repository** —
   see the next section.
-- **`homesteader`**: a crew of 2 that answers to nobody. It builds a headframe over its mineshaft and a
-  farm. The foreman sites the base and brings them in, and anyone in the world can also ask for them with
-  `foreman get homesteader`. They have no ear at all: talking to one does nothing.
-- **`contractor`**: nobody is brought in. A person in the world asks in chat, and a crew of 2 that works
-  for them is brought to where they stand:
+- **`homesteader`**: a crew of 2 that answers to nobody. It builds a headframe over its shallow shaft and a
+  farm. The foreman sites the base and brings them in.
 
-```
-foreman get contractor     a crew of 2 that works for you
-foreman help               the words it knows
-foreman stop               send your contractors home
-```
-
-  A contractor hears its owner in chat: say a bot's name and then what you want. The owner is stamped
-  into the bot at birth and every order is filtered on it.
+Neither crew has an ear, and neither does the foreman: talking to them in chat does nothing.
 
 ### Building a downloaded building
 
@@ -114,9 +104,12 @@ Then put `<name>` in `builder.build` in `foreman_config.js`, and the path of the
 can gather in survival: one kind of wood, stone, dirt, glass and a little iron. Other blocks are swapped
 for the nearest of those or left out, and `<name>.build_plan.md` lists every swap.
 
-The default names `overgrown_survival_castle`, which is
-[BiggyDiggy7's "Overgrown Survival Castle"](https://abfielder.com/Products/ProductDetails.php?id=2159) on
-abfielder.com. Without a plan, the foreman stops, says where it looked, and prints the plan command.
+The default names `medieval_house_with_full_interior_from_abfielder`, which is xMsBean's "Medieval House
+With Full Interior" on abfielder.com. Without a plan, the foreman stops, says where it looked, and prints
+the plan command.
+
+A builder crew always builds on peaceful and works through the night. A homesteader crew works on
+`homesteader.difficulty` (`normal` or `hard`), where monsters spawn, so darkness closes its outdoor work.
 
 **Everything the foreman needs is in one file: `foreman_config.js`,** at the top level beside this
 README — local or remote, your server folder, the address, the port. Everything in this project reads it.
@@ -169,8 +162,8 @@ same either way, and `node developer_mode.js off` puts it back.
 - **"something is already using port 3001"** — a foreman is still running from last time. Close it.
 - **"Auren cannot reach your server's console"** — the server was started before `server.properties`
   last changed. Restart the server and start Auren again. Nothing launched, so there is nothing to clean up.
-- **A bot says it did not start because it is not standing with you** — it was raised, it could not be
-  brought to you, and it refused to plan a base somewhere you did not choose. Usually the console: see the
+- **A bot says it did not start because it is not on its cell** — it was raised, it could not be placed
+  on the base's landing cell, and it refused to plan a base anywhere else. Usually the console: see the
   line above.
 - **Joins and stands still** — usually ground it cannot work: no wood in reach, or spawn-protected. It
   re-plans and gets the same answer. The trace says which, and so will I if you send it.
@@ -183,7 +176,7 @@ same either way, and `node developer_mode.js off` puts it back.
 
 | | |
 |---|---|
-| `start_auren.js` | the one way in — the desk and the referee |
+| `start_auren.js` | the one way in — the foreman and the referee |
 | `foreman_config.js` | where your server is. The only file you might need to edit |
 | `developer_mode.js` | the door to the workbench, if you ever want it. Off until you say otherwise |
 | `start_bot.js` | one bot on its own — what the above is built from. The referee has no script of its own: it runs inside the foreman |
@@ -193,7 +186,7 @@ same either way, and `node developer_mode.js off` puts it back.
 | `perception_nodes.js/` | the sensing |
 | `js_kernel/` | shared machinery: state store, trace writer, calculators |
 | `custom_api/` | the layer between the bot's vocabulary and Minecraft's |
-| `foreman/` | the one process outside the bots: job arbitration, the fleet's memory, and the desk you hire from |
+| `foreman/` | the one process outside the bots: job arbitration, the fleet's memory, and the body that sites the base and raises the crew |
 | `monitoring/` | the readers of what a run wrote. Behind the door; nothing the bot runs depends on it |
 | `Auren_Workshop/` | my own equipment, all of it, behind the door — see the section below |
 | `Auren_Structural_Laws.md` | the rules all of it obeys |

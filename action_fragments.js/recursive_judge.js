@@ -7,7 +7,8 @@
 //
 // Routing: signal FROM a manager → job_board (skip loop detection); FROM an executor with a manager
 // stamp → loop-check → that manager; unstamped → loop-check → job_board. Cognition escalation (3
-// loops) overrides any stamp and also routes to job_board.
+// loops) overrides any stamp and also routes to job_board. While foreman_config `module` names a test, every
+// route to job_board goes to test_module instead (test_module.plannerTarget).
 //
 // Compares fragment name + success/fail + readable (normalized lowercase). Managers decide whether a
 // task is done; this fragment only detects and stops loops (ephemeral memory only).
@@ -204,6 +205,10 @@ async function handleSignal(signalType, signal) {
   // routes (Law 3). `outboundId` is stamped onto all five exits below via depart(); the rest of the
   // outbound envelope is rebuilt fresh.
   const outboundId = sequencer.examine(payload);
+  // THE PLANNER'S DOOR: job_board, or the test module while foreman_config `module` names one, so a test skips
+  // planning by this one explicit route and every check above and below still judges it. Call-time require, the
+  // module's own load cycle.
+  const planner = require('@action/test_module').plannerTarget();
   const depart = (outPayload) => {
     const stamped = sequencer.stamp(outPayload, outboundId);
     return signalBus.route(stamped.to, stamped);
@@ -235,8 +240,8 @@ async function handleSignal(signalType, signal) {
 
     const forgivingPayload = {
       from: 'recursive_judge',
-      to: 'job_board',
-      task: 'job_board',
+      to: planner,
+      task: planner,
     };
     return depart(forgivingPayload);
   }
@@ -268,8 +273,8 @@ async function handleSignal(signalType, signal) {
 
     const cognitionPayload = {
       from: 'recursive_judge',
-      to: 'job_board',
-      task: 'job_board',
+      to: planner,
+      task: planner,
     };
 
     return depart(cognitionPayload);
@@ -333,11 +338,11 @@ async function handleSignal(signalType, signal) {
   // Manager signals release the job to job_board; loop detection above still applies to a manager.
   if (MANAGERS.has(from)) {
     watcher.summary('recursive_judge',
-      `Manager "${from}" reporting: "${readable}". Routing to job_board for new job.`);
+      `Manager "${from}" reporting: "${readable}". Routing to ${planner} for new job.`);
     const outPayload = {
       from: 'recursive_judge',
-      to: 'job_board',
-      task: 'job_board',
+      to: planner,
+      task: planner,
     };
     return depart(outPayload);
   }
@@ -362,12 +367,12 @@ async function handleSignal(signalType, signal) {
     return depart(outPayload);
   }
 
-  watcher.summary('recursive_judge', '→ job_board');
+  watcher.summary('recursive_judge', `→ ${planner}`);
 
   const outPayload = {
     from: 'recursive_judge',
-    to: 'job_board',
-    task: 'job_board',
+    to: planner,
+    task: planner,
   };
 
   return depart(outPayload);

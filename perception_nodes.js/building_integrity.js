@@ -340,6 +340,26 @@ function materialsForAnchor(scanResult, anchorIndex) {
   return aggregateMaterialsNeeded(anchorSteps);
 }
 
+// THE BILL ONE TRIP CARRIES for the job led by `anchorIndex` (blueprint_registry.sectionOf), summed off this scan's
+// anchor_status. `whole` is everything the trip's anchors still owe and sizes the order. `coursed` is what the trip
+// stages and what the board asks affordability of: a declared section stages its whole bill, since one trip builds
+// every anchor in it; a lone anchor stages its lowest owing course, as it always has. The board and the manager
+// both read it here, so they ask one question (Law 16). `placeable` is what the trip's anchors could place first, with
+// nothing owed under it: a torch on a post not yet standing is not in it, however many torches are held.
+function tripBill(scanResult, blueprintName, anchorIndex) {
+  const section = require('@kernel/blueprint_registry').sectionOf(blueprintName, anchorIndex);
+  const status = scanResult?.anchor_status || [];
+  const sum = (field) => {
+    const out = {};
+    for (const i of section) {
+      for (const [k, c] of Object.entries(status[i]?.[field] || {})) if (typeof c === 'number') out[k] = (out[k] || 0) + c;
+    }
+    return out;
+  };
+  const whole = sum('materials_needed');
+  return { section, whole, coursed: section.length > 1 ? whole : sum('materials_needed_lowest_y'), placeable: sum('materials_needed_placeable') };
+}
+
 function getState() { return _lastScan; }
 
 // Geometry helpers live in blueprint_survey now (one definition, Law 16). Re-exported here so the
@@ -351,7 +371,7 @@ const {
 } = blueprintSurvey;
 
 module.exports = {
-  scan, materialsForBatch, materialsForAnchor, getState,
+  scan, materialsForBatch, materialsForAnchor, tripBill, getState,
   getWorldAnchors, transposeAttachPoints, transposeVoxelsForCandidate, transposeAnchorsForCandidate,
   getWorldAttachPoints, getProtectedBlocks, getAllProtectedBlocks, getFootprintCells, getAllFootprintCells, collectAllVoxels,
   resolveVoxelAnchor, placeableNow,

@@ -67,7 +67,11 @@ function readCells() {
   const cells = hq.readConfRoomFlag(ROOM, CELLS_FLAG, {});
   return (cells && typeof cells === 'object' && !Array.isArray(cells)) ? cells : {};
 }
-function writeCells(cells) { hq.writeConfRoomFlag(ROOM, CELLS_FLAG, cells); }
+// The register's one writer, counted: a reader that keeps something worked out from every unit asks whether it changed
+// (cellsGeneration) instead of reading the whole field on every diff.
+let _cellsGeneration = 0;
+function writeCells(cells) { _cellsGeneration++; hq.writeConfRoomFlag(ROOM, CELLS_FLAG, cells); }
+const cellsGeneration = () => _cellsGeneration;
 function getCell(id) { return readCells()[id] || null; }
 function markCellComplete(id) {
   const cells = readCells();
@@ -101,27 +105,31 @@ function recordCellRemaining(id, remaining) {
 // side attaches (C/D). Floors are DERIVED from the locked descent, never hardcoded: the
 // staircase's 3-Y side-attach steps land at a phase that depends on surface Y, so pick the
 // dug copy whose cell floor best straddles the iron peak (STRADDLE_FLOOR_Y) as prime, then
-// take every-other copy bracketing it (6 apart → non-overlapping 5-tall cells) as the
-// below/straddle/above floors. Each floor emits two markers (its C south seed + D north seed),
+// take the copies bracketing it as the below/straddle/above floors: the next copy for a strip
+// tunnel (3 apart, sharing a roof), every other copy for a 5-tall cell (6 apart). Each floor emits two markers (its C south seed + D north seed),
 // each that floor's ring origin (prime) — registerNeighbors grows the rest.
 //
 // Progressive lighting (Law 13): a floor is seeded ONLY once its staircase copy is dug (built
 // registry). Seeding a floor whose copy is still solid rock would register a cell walled in on
 // all sides — not "unloaded", so it would path toward it and fail. job_board only posts dig_cell
 // once the whole descent is excavated, so in practice all target floors light together.
-function getDeepestSegmentMarkers(heldIds = null) {
+// THE DEEP SHAFT'S FLOORS (deepY, a floor from architect_config.DEEP_ORES): the same rule on the deep shaft's flights,
+// bracketing that floor. A landing holds no attach, and each flight's attaches read its own heading.
+function getDeepestSegmentMarkers(heldIds = null, deepY = null) {
   // NO GUARD ON THE STAIRCASE GENERATOR, HERE OR BELOW IN THIS FILE. It is ours, and answering `[]` on a
   // throw reads downstream as "no floors to seed" — the cell graph then grows nothing and reports a
   // quiet, plausible nothing for the rest of the run (Law 13; Law 25 — a default is not a measurement).
   const plan = generateStaircase();
-  const sideAttaches = staircaseSideAttaches();
-  const segments = plan.staircase_segments || [];
+  const sideAttaches = staircaseSideAttaches(plan.turn);
+  const part = deepY === null ? 'shallow' : 'deep';
+  const segments = plan.staircase_segments.filter(seg => seg.part === part && seg.piece === 'flight');
   if (!segments.length || !sideAttaches.length) return [];
 
   // The registry is this body's own; a shaft a peer dug is known from the world, through the integrity
   // scan's verdict, so every body seeds every floor once the descent is excavated.
   const built = hq.readConfRoomFlag(ROOM, 'built_segments', {}) || {};
-  const excavated = !!require('@perception/mining_integrity').getState()?.shaft_excavated;
+  const verdict = require('@perception/mining_integrity').getState();
+  const excavated = !!(deepY === null ? verdict?.shaft_excavated : verdict?.deep_excavated);
   const attachYOffset = sideAttaches[0].rel[1];           // side attaches share y = −2 (cell floor)
   const floorY = (seg) => seg.world_position.y + attachYOffset;
 
@@ -129,22 +137,27 @@ function getDeepestSegmentMarkers(heldIds = null) {
   // copies; the built gate below decides which of the bracketing floors actually emit).
   let primeIdx = -1, best = Infinity;
   segments.forEach((seg, i) => {
-    const d = Math.abs(floorY(seg) - STRADDLE_FLOOR_Y);
+    const d = Math.abs(floorY(seg) - (deepY === null ? STRADDLE_FLOOR_Y : deepY));
     if (d < best) { best = d; primeIdx = i; }
   });
-  const floorIdxs = [primeIdx - 2, primeIdx, primeIdx + 2].filter(i => i >= 0 && i < segments.length);
+  // FLOORS AS CLOSE AS THE UNIT ALLOWS. Purpose: a floor's lines can end at any cave or fluid, so the more floors the
+  // staircase holds the more ore the mine can reach (3 apart reaches about 55% more than 6 apart, for about 7-10% more
+  // digging per ore; Documentation/ore_census_snapshots.md). A strip tunnel is floor, two of air and a roof (stripVoxels):
+  // one copy up (3 Y) its floor IS this tunnel's roof, and both units hold that block solid, so the floors share it and
+  // no body digs it. A 5-tall cell needs every other copy (6 Y) to keep its own.
+  const rung = stripLayout() ? 1 : 2;
+  const floorIdxs = [primeIdx - rung, primeIdx, primeIdx + rung].filter(i => i >= 0 && i < segments.length);
 
   // A BODY THAT WANTS TO MINE IS ALWAYS GIVEN SOMETHING TO MINE. When every unit on every floor lit so far is
-  // dug, blocked or held by a peer (heldIds), the next floor up is lit — the staircase copy two above the
-  // highest one, its attaches either side of the shaft — and the trunks start over from there; and so on up
-  // to the top of the staircase. A floor whose trunks cannot run out opens no branches, so it fills and the
+  // dug, blocked or held by a peer (heldIds), the next floor up is lit, one rung above the highest, its attaches
+  // either side of the shaft, and the trunks start over from there; and so on up to the top of the staircase. A floor whose trunks cannot run out opens no branches, so it fills and the
   // floor above it opens.
   const cells = Object.values(readCells()).filter(c => c && c.anchor);
   const spent = (i) => {
     const on = cells.filter(c => c.anchor.y === floorY(segments[i]));
     return on.length > 0 && on.every(c => c.complete || c.blocked || (heldIds && heldIds.has(c.id)));
   };
-  const up = segments.length > 1 && segments[0].world_position.y > segments[segments.length - 1].world_position.y ? -2 : 2;
+  const up = (segments.length > 1 && segments[0].world_position.y > segments[segments.length - 1].world_position.y ? -1 : 1) * rung;
   let top = floorIdxs.reduce((a, b) => (floorY(segments[a]) >= floorY(segments[b]) ? a : b), floorIdxs[0]);
   while (floorIdxs.length && floorIdxs.every(spent)) {
     const next = top + up;
@@ -158,7 +171,7 @@ function getDeepestSegmentMarkers(heldIds = null) {
     const seg = segments[i];
     if (!built[seg.id] && !excavated) continue;
     const o = seg.world_position;
-    for (const s of sideAttaches) {
+    for (const s of staircaseSideAttaches(seg.turn)) {
       markers.push({ world: [o.x + s.rel[0], o.y + s.rel[1], o.z + s.rel[2]], outward: s.outward });
     }
   }
@@ -240,7 +253,7 @@ function scanCell(bot, anchor, shape = null) {
         }
         if (isFluid(block.name)) {
           const reason = /lava/.test(block.name) ? 'lava' : 'water';
-          return { safe: false, halt_reason: reason, picket_voxels: [] };
+          return { safe: false, halt_reason: reason, picket_voxels: [], at: { x, y, z } };
         }
         if (isGravityBlock(block.name) && followGravityColumn(bot, x, y, z) === 'CONDUIT') {
           return { safe: false, halt_reason: 'gravity_fluid_conduit', picket_voxels: [] };
@@ -310,6 +323,15 @@ function generateCell(anchor, shape = null) {
 // many trunk blocks lie before it. The fan picks where a trip STARTS (the cells' own selection, nearest the
 // floor's prime first); from there the trip keeps to that one line (lineContinuation) until its pickaxes run out
 // or the line ends at a cave, a hazard or the staircase.
+//
+// A STOPPED TRUNK HANDS THE LEAD TO ITS SIDE ROWS (handBack). Purpose: a cave or fluid ends one tunnel and not the floor,
+// so a floor's ore past an obstruction is reached by going round it, with nothing built through it. The branches of the
+// trunk's last row walk out as they always do, and as each of their segments is finished it tests the trunk's own
+// direction at every third block. The first safe one, on each side, starts a new trunk that way (origin there, k0 0,
+// its way out recorded), and that trunk opens rows and hands back in turn. Only the trunk's direction is tried, because
+// any other runs along rows already dug. Selection stays the same nearest-the-prime fan, so the way round nearest the
+// shaft is dug first. A trunk stopped before its first row has no row to hand to. Numbers:
+// Documentation/ore_census_snapshots.md.
 const STRIP_SEG = 4;
 const BRANCH_EVERY = 3;
 const SIDES_OF = { north: ['east', 'west'], south: ['east', 'west'], east: ['north', 'south'], west: ['north', 'south'] };
@@ -330,7 +352,7 @@ function stripVoxels(rec) {
     const opening = rec.kind === 'trunk' && (rec.k0 + i) % BRANCH_EVERY === 0;
     for (const s of sides) {
       const sx = x + s.x, sz = z + s.z;
-      if (opening) {
+      if (opening || (rec.doors || []).some(o => o.i === i && DIR_VEC[o.dir] === s)) {
         put(sx, a.y, sz, 'structural_fill'); put(sx, a.y + 1, sz, 'air'); put(sx, a.y + 2, sz, 'air'); put(sx, a.y + 3, sz, 'structural_fill');
       } else {
         put(sx, a.y + 1, sz, 'structural_fill'); put(sx, a.y + 2, sz, 'structural_fill');
@@ -345,7 +367,7 @@ function stripVoxels(rec) {
 function stripNeighbours(rec) {
   const d = DIR_VEC[rec.dir];
   const a = rec.anchor;
-  const next = { anchor: { x: a.x + d.x * STRIP_SEG, y: a.y, z: a.z + d.z * STRIP_SEG }, shape: { kind: rec.kind, dir: rec.dir, k0: (rec.k0 || 0) + STRIP_SEG, origin: rec.origin || a } };
+  const next = { anchor: { x: a.x + d.x * STRIP_SEG, y: a.y, z: a.z + d.z * STRIP_SEG }, shape: { kind: rec.kind, dir: rec.dir, k0: (rec.k0 || 0) + STRIP_SEG, origin: rec.origin || a, way: rec.way, returns: rec.returned ? undefined : rec.returns } };
   if (rec.kind === 'branch') return [next];
   const out = [next];
   for (let i = 1; i <= STRIP_SEG; i++) {
@@ -384,6 +406,18 @@ function caveAir(bot, anchor, shape) {
   return open;
 }
 
+// alreadyPlanned(anchor, shape) → true when every tunnel block of this segment is another registered tunnel's: two rows
+// grown from two trunks meet head on, and the line ends there rather than walking the other's tunnel.
+function alreadyPlanned(anchor, shape) {
+  const id = makeSegmentId(anchor);
+  const planned = new Set();
+  for (const rec of Object.values(readCells())) {
+    if (!rec || !rec.anchor || !isStrip(rec) || rec.id === id || rec.blocked) continue;
+    for (const v of stripVoxels(rec)) if (v[3] === 'air') planned.add(`${v[0]},${v[1]},${v[2]}`);
+  }
+  return stripVoxels({ ...shape, anchor }).every(v => v[3] !== 'air' || planned.has(`${v[0]},${v[1]},${v[2]}`));
+}
+
 // lineContinuation(rec) → the registered record of the segment that carries rec's own line straight on (same kind,
 // same direction), or null when none is registered. A trip keeps to one line: the fan picks where it starts.
 // lineKey(rec) → the arbiter key of the tunnel rec belongs to: its origin segment, kind and direction.
@@ -392,28 +426,117 @@ function lineKey(rec) {
 }
 // wayOut(rec) → the anchors a body leaves rec's tunnel by, nearest first: a branch's mouth (the trunk block its
 // first segment opens from), then the origin of the trunk that mouth lies on, which is the foot of the shaft's
-// stairs. A trunk gives its own origin. Walked in reverse, the same points are the way in.
+// stairs. A trunk gives its own origin, and one a row handed the lead to then gives that row's way out. A mouth lying
+// on two trunks of one column belongs to the nearer origin behind it. Walked in reverse, the same points are the way in.
 function wayOut(rec) {
   if (!isStrip(rec)) return [];
   const o = rec.origin || rec.anchor;
-  if (rec.kind === 'trunk') return [{ x: o.x, y: o.y, z: o.z }];
+  if (rec.kind === 'trunk') return [{ x: o.x, y: o.y, z: o.z }, ...(rec.way || [])];
   const d = DIR_VEC[rec.dir];
   const mouth = { x: o.x - d.x, y: o.y, z: o.z - d.z };
-  const out = [mouth];
+  let trunk = null, nearest = Infinity;
   for (const c of Object.values(readCells())) {
     if (!c || c.kind !== 'trunk' || !c.anchor) continue;
     const t = c.origin || c.anchor, td = DIR_VEC[c.dir];
-    const onLine = mouth.y === t.y && (td.x !== 0
-      ? mouth.z === t.z && (mouth.x - t.x) * td.x >= 0
-      : mouth.x === t.x && (mouth.z - t.z) * td.z >= 0);
-    if (onLine) { out.push({ x: t.x, y: t.y, z: t.z }); break; }
+    const along = (mouth.x - t.x) * td.x + (mouth.z - t.z) * td.z;
+    const onLine = mouth.y === t.y && (td.x !== 0 ? mouth.z === t.z : mouth.x === t.x);
+    if (onLine && along >= 0 && along < nearest) { trunk = c; nearest = along; }
   }
-  return out;
+  return trunk ? [mouth, ...wayOut(trunk)] : [mouth];
 }
 function lineContinuation(rec) {
   if (!isStrip(rec)) return null;
   return getCell(makeSegmentId(stripNeighbours(rec)[0].anchor));
 }
+
+// unitLamps(rec) → the wall torches a registered unit's design puts in it, each { source, attach }: the cell the
+// torch stands in and the block it hangs on. A strip segment lights its line's doorway block and every
+// TORCH_NETWORK.tunnel_every blocks after (line blocks 1, 13, 25...), at head height on the first side wall
+// SIDES_OF names; a trunk's lit blocks never fall on a branch opening (those are the multiples of BRANCH_EVERY).
+// A 5×5×5 cell lights the light points its blueprint declares.
+function unitLamps(rec) {
+  const a = rec.anchor;
+  if (isStrip(rec)) {
+    const every = require('@thinking/architect_config').TORCH_NETWORK.tunnel_every;
+    const d = DIR_VEC[rec.dir], s = DIR_VEC[SIDES_OF[rec.dir][0]];
+    const out = [];
+    for (let i = 1; i <= STRIP_SEG; i++) {
+      if (((rec.k0 || 0) + i - 1) % every !== 0) continue;
+      const x = a.x + d.x * i, z = a.z + d.z * i;
+      out.push({ source: { x, y: a.y + 2, z }, attach: { x: x + s.x, y: a.y + 2, z: z + s.z } });
+    }
+    return out;
+  }
+  const cell = loadBuildings()[CELL_BLUEPRINT_NAME];
+  if (!cell || !Array.isArray(cell.light_points) || cell.light_points.length === 0) {
+    throw new Error(`[mining_cell_graph] CODING VIOLATION: blueprint "${CELL_BLUEPRINT_NAME}" declares no light_points; a cell is lit only where its blueprint says.`);
+  }
+  const at = (p) => ({ x: a.x + p[0], y: a.y + p[1], z: a.z + p[2] });
+  return cell.light_points.map(p => ({ source: at(p.position), attach: at(p.wall) }));
+}
+
+// ── THE MINE'S LIGHT IS PROVEN ON ITS DESIGN, AT LOAD ─────────────────────────────────────────────────
+// The mine's torches stand where its design puts them and no reading checks them in a run, so the design itself is
+// lit here by the game's light rule (light_calculator) before any body digs: a staircase of every depth from 4 to 15
+// copies with its stairLamps, a strip trunk whose branches run every length from 1 to 7 segments with their
+// unitLamps, and one 5×5×5 cell with its own, each in solid rock. A stand cell (open, with open above and a floor
+// below) at block light TORCH_NETWORK.lit_above or under is where a hostile spawns, and one is a coding violation:
+// the spacing or a light point no longer lights the shape it is drawn on.
+function proveMineLight() {
+  const { TORCH_NETWORK } = require('@thinking/architect_config');
+  const { lightField, emissionOf } = require('@utils/calculators/light_calculator');
+  const { projectStaircase, stairLamps } = require('@perception/mining_blueprinter');
+  const K = (x, y, z) => `${x},${y},${z}`;
+  const prove = (what, air, lamps) => {
+    const blockAt = (x, y, z) => ({ name: air.has(K(x, y, z)) ? 'air' : 'stone' });
+    const stands = [...air].filter(k => { const [x, y, z] = k.split(',').map(Number); return air.has(K(x, y + 1, z)) && !air.has(K(x, y - 1, z)); });
+    const want = new Set(stands);
+    const lit = new Set();
+    for (const l of lamps) for (const [k] of lightField(blockAt, l.source, emissionOf('torch'), TORCH_NETWORK.lit_above, K, want)) lit.add(k);
+    const dark = stands.filter(k => !lit.has(k) && !lamps.some(l => K(l.source.x, l.source.y, l.source.z) === k));
+    if (dark.length) {
+      throw new Error(`[mining_cell_graph] CODING VIOLATION: ${what} lit by its design leaves ${dark.length} stand cell(s) at block light `
+        + `${TORCH_NETWORK.lit_above} or under, first (${dark[0]}); TORCH_NETWORK.stair_every / tunnel_every or a light_points entry no longer lights the shape.`);
+    }
+  };
+  for (let copies = 4; copies <= 15; copies++) {
+    const { segments } = projectStaircase({ headAWorld: { x: 0, y: 200, z: 0 }, lowestSafeY: 200 - 3 * copies - 3 });
+    const air = new Set();
+    for (const seg of segments) for (const v of seg.voxels) if (v[3] === 'air') air.add(K(v[0], v[1], v[2]));
+    prove(`a ${segments.length}-copy staircase`, air, stairLamps(segments));
+  }
+  const trunk = { anchor: { x: 0, y: 0, z: 0 }, kind: 'trunk', dir: 'south', k0: 0 };
+  const units = [];
+  for (let rec = trunk; units.filter(u => u.kind === 'trunk').length < 7;) {
+    units.push(rec);
+    const [next, ...branches] = stripNeighbours(rec);
+    branches.forEach((b, j) => {
+      let r = { ...b.shape, anchor: b.anchor };
+      for (let n = 0; n <= (units.length + j) % 7; n++) { units.push(r); const [on] = stripNeighbours(r); r = { ...on.shape, anchor: on.anchor }; }
+    });
+    rec = { ...next.shape, anchor: next.anchor };
+  }
+  const air = new Set();
+  for (const u of units) {
+    for (const v of stripVoxels(u)) if (v[3] === 'air') air.add(K(v[0], v[1], v[2]));
+    air.add(K(u.anchor.x, u.anchor.y + 1, u.anchor.z)); air.add(K(u.anchor.x, u.anchor.y + 2, u.anchor.z));
+  }
+  prove('a strip trunk with its branches', air, units.flatMap(unitLamps));
+  // A row that handed back: the trunk stops past its first row, the row's second block starts the new trunk.
+  const stopped = { anchor: { x: 0, y: 0, z: 0 }, kind: 'trunk', dir: 'south', k0: 0 };
+  const row = { anchor: { x: 1, y: 0, z: 3 }, kind: 'branch', dir: 'east', k0: 0, doors: [{ i: 2, dir: 'south' }] };
+  const shoot = { anchor: { x: 3, y: 0, z: 3 }, kind: 'trunk', dir: 'south', k0: 0 };
+  const handed = [stopped, row, { ...row, anchor: { x: 5, y: 0, z: 3 }, k0: 4, doors: [] }, shoot, { ...shoot, anchor: { x: 3, y: 0, z: 7 }, k0: 4 }];
+  const handedAir = new Set();
+  for (const u of handed) {
+    for (const v of stripVoxels(u)) if (v[3] === 'air') handedAir.add(K(v[0], v[1], v[2]));
+    handedAir.add(K(u.anchor.x, u.anchor.y + 1, u.anchor.z)); handedAir.add(K(u.anchor.x, u.anchor.y + 2, u.anchor.z));
+  }
+  prove('a strip row handing back to a new trunk', handedAir, handed.flatMap(unitLamps));
+  const cell = { anchor: { x: 0, y: 0, z: 0 } };
+  prove('a 5×5×5 cell', new Set(generateCell(cell.anchor).voxels.filter(v => v[3] === 'air').map(v => K(v[0], v[1], v[2]))), unitLamps(cell));
+}
+proveMineLight();
 
 // unitYield() → the blocks one new unit of the current layout digs out (its air voxels).
 function unitYield() {
@@ -525,7 +648,7 @@ function registerCellAt(bot, anchor, fan, stairDecls, prime = anchor, shape = nu
   if (cells[id]) return cells[id];
 
   const primeXYZ = { x: prime.x, y: prime.y, z: prime.z };
-  const shapeFields = isStrip(shape) ? { kind: shape.kind, dir: shape.dir, k0: shape.k0 || 0, origin: shape.origin || { x: anchor.x, y: anchor.y, z: anchor.z } } : {};
+  const shapeFields = isStrip(shape) ? { kind: shape.kind, dir: shape.dir, k0: shape.k0 || 0, origin: shape.origin || { x: anchor.x, y: anchor.y, z: anchor.z }, ...(shape.way ? { way: shape.way } : {}), ...(shape.returns ? { returns: shape.returns } : {}), ...(shape.door_of ? { door_of: shape.door_of } : {}) } : {};
   const stair = stairDecls || staircaseDeclarations();
   if (overlapsStaircase(anchor, stair, shape)) {
     const record = { id, anchor: { x: anchor.x, y: anchor.y, z: anchor.z }, complete: false, fan, prime: primeXYZ, ...shapeFields, blocked: 'staircase' };
@@ -539,9 +662,11 @@ function registerCellAt(bot, anchor, fan, stairDecls, prime = anchor, shape = nu
 
   const record = { id, anchor: { x: anchor.x, y: anchor.y, z: anchor.z }, complete: false, fan, prime: primeXYZ, ...shapeFields };
   if (!scan.safe) record.blocked = scan.halt_reason;
+  if (scan.halt_reason === 'lava') require('@perception/survey_book').noteLava(scan.at);
   else if (isStrip(shape)) {
     const open = caveAir(bot, anchor, shape);
     if (open > STRIP_CAVE_AIR) record.blocked = `cave (${open} open blocks round the tunnel)`;
+    else if (shape.kind === 'branch' && alreadyPlanned(anchor, shape)) record.blocked = 'joined';
   } else if (!onSpine(anchor, fan, primeXYZ)) {
     const breach = wallBreachCount(bot, anchor, shape);
     if (breach.open > breach.walls * CAVE_WALL_SHARE) record.blocked = `cave (${breach.open} of ${breach.walls} wall voxels open)`;
@@ -552,6 +677,12 @@ function registerCellAt(bot, anchor, fan, stairDecls, prime = anchor, shape = nu
   return record;
 }
 
+// adoptUnit(bot, rec) → this body's record of a unit a peer registered (a tagged tunnel's segment): registered here,
+// with the peer's fan, prime and shape, when this body's own register lacks it. Null while its ground is unread.
+function adoptUnit(bot, rec) {
+  return getCell(rec.id) || registerCellAt(bot, rec.anchor, rec.fan, null, rec.prime || rec.anchor, isStrip(rec) ? rec : null);
+}
+
 // seedCells (Phase 2.3) — register each floor's prime cell off its staircase side-attach
 // marker. anchor = marker.world + CELL_HALF along outward, at marker.y (the cell floor).
 //
@@ -559,8 +690,8 @@ function registerCellAt(bot, anchor, fan, stairDecls, prime = anchor, shape = nu
 // staircase's wall plane, so the distance from it to the center of the cell that SHARES that wall
 // is a half-extent (2), not the cell-to-cell pitch (4). registerNeighbors below is the caller that
 // legitimately steps CELL_SPACING, because there both ends really are cell centers.
-function seedCells(bot, heldIds = null) {
-  const markers = getDeepestSegmentMarkers(heldIds);
+function seedCells(bot, heldIds = null, deepY = null) {
+  const markers = getDeepestSegmentMarkers(heldIds, deepY);
   const stairDecls = staircaseDeclarations();
   let seeded = 0;
   const scanStart = Date.now();   // each registerCellAt runs the ~392-voxel scanCell — report the sweep cost
@@ -652,9 +783,21 @@ function byRingFromPrime() {
 // lowestThenNearest — the order growth is picked in: the lowest floor first, and on a floor the unit nearest
 // its prime, which is the unit nearest the shaft. Each floor fills as a fan out of the shaft before a body
 // is sent to the floor above it.
-function lowestThenNearest() {
+// A deep seat's order: the floor nearest the ore's, then the same.
+function lowestThenNearest(deepY = null) {
   const ring = byRingFromPrime();
+  if (deepY !== null) return (a, b) => (Math.abs(a.anchor.y - deepY) - Math.abs(b.anchor.y - deepY)) || ring(a, b);
   return (a, b) => (a.anchor.y - b.anchor.y) || ring(a, b);
+}
+
+// ── A SEAT DIGS ITS OWN SHAFT'S FLOORS ─────────────────────────────────────────────────────────────────
+// inBand(deepY) → the predicate of a unit a seat may be sent to: a shallow seat (deepY null) the units at or above the
+// shallow shaft's lowest floor, a deep seat those below it.
+function inBand(deepY = null) {
+  const plan = generateStaircase();
+  const rel = staircaseSideAttaches(plan.turn)[0].rel[1];
+  const line = Math.min(...plan.staircase_segments.filter(seg => seg.part === 'shallow').map(seg => seg.world_position.y + rel));
+  return deepY === null ? (c) => c.anchor.y >= line : (c) => c.anchor.y < line;
 }
 
 // selectMaintenanceCell — the cell twin of mining_integrity re-diffing built_segments: walk the
@@ -665,12 +808,12 @@ function lowestThenNearest() {
 // built path is repaired before the frontier extends (Law 17). Cost is a 125-block re-diff per
 // complete cell each sweep — the same all-built-each-scan cost the shaft pays. (Tunable later:
 // round-robin one cell/sweep if the completed field grows large enough that it bites.)
-function selectMaintenanceCell(bot, excludeIds = null) {
+function selectMaintenanceCell(bot, excludeIds = null, inSeatBand = () => true) {
   if (!bot || !bot.blockAt) return null;
   const miningIntegrity = require('@perception/mining_integrity');
   const cells = readCells();
   const complete = Object.values(cells).filter(
-    c => c.complete && !c.blocked && !(excludeIds && excludeIds.has(c.id))
+    c => c.complete && !c.blocked && !(excludeIds && excludeIds.has(c.id)) && inSeatBand(c)
   );
   complete.sort(byRingFromPrime());
   for (const c of complete) {
@@ -691,33 +834,112 @@ function selectMaintenanceCell(bot, excludeIds = null) {
 // first call. excludeIds skips cells a peer currently holds. Maintain-before-grow (the shaft's own
 // order, Law 17): the bot grazes a finished cell's walls while carving the next one, so the built
 // path must be kept intact as the field expands — repair first, extend second.
-function selectNextCell(bot, excludeIds = null) {
-  let cells = readCells();
-  if (Object.keys(cells).length === 0) {
-    seedCells(bot);
-    cells = readCells();
-  }
+function selectNextCell(bot, excludeIds = null, deepY = null) {
+  const inSeatBand = inBand(deepY);
+  // A deep floor's first seat seeds it; each band and each deep floor start once.
+  const seedKey = deepY === null ? 'shallow' : deepY;
+  if (!_seededBands.has(seedKey) && (deepY !== null || !Object.values(readCells()).some(inSeatBand))) seedCells(bot, null, deepY);
+  _seededBands.add(seedKey);
+  if (stripLayout()) handBack(bot);
   // Keep the path intact before extending it.
-  const maint = selectMaintenanceCell(bot, excludeIds);
+  const maint = selectMaintenanceCell(bot, excludeIds, inSeatBand);
   if (maint) return maint;
-  const found = nextGrowth(bot, excludeIds);
+  const found = nextGrowth(bot, excludeIds, deepY, inSeatBand);
   if (found) return found;
   // Nothing open to this body on the floors lit so far: light the next floor up (getDeepestSegmentMarkers) and
   // look again. A floor already registered seeds nothing new, so with the top of the staircase reached this ends.
-  const lit = getDeepestSegmentMarkers(excludeIds).length;
-  if (lit === _litMarkers) return null;
-  _litMarkers = lit;
+  const lit = getDeepestSegmentMarkers(excludeIds, deepY).length;
+  if (lit === _litMarkers.get(seedKey)) return null;
+  _litMarkers.set(seedKey, lit);
   const before = Object.keys(readCells()).length;
-  seedCells(bot, excludeIds);
+  seedCells(bot, excludeIds, deepY);
   if (Object.keys(readCells()).length === before) return null;
   watcher.summary('mining_cell_graph', `NEXT FLOOR UP lit — ${Object.keys(readCells()).length - before} new unit(s) registered.`);
-  return selectNextCell(bot, excludeIds);
+  return selectNextCell(bot, excludeIds, deepY);
 }
 
-let _litMarkers = 0;   // the markers seeded last time the lit floors ran out
+const _litMarkers = new Map();   // band -> the markers seeded last time its lit floors ran out
+const _seededBands = new Set();  // the bands this body has seeded
+
+// ── handBack: A STOPPED TRUNK'S ROWS RETURN TO ITS DIRECTION (see THE STRIP LAYOUT) ─────────────────────
+// Read from the register on every selection, so a stop is met the same whichever path recorded it: found at
+// registration, or at dispatch (markCellBlocked). A row segment with its column's ground unloaded is read again later.
+// A new trunk's door goes on the row only once that trunk's first segment is dug, since a door on a finished row reads
+// as damage and would pull a repair ahead of the trunk.
+function handBack(bot) {
+  const cells = readCells();
+  let changed = false;
+  for (const rec of Object.values(cells)) {
+    if (!rec || !rec.door_of || !rec.complete) continue;
+    const row = cells[rec.door_of.id];
+    if (row) row.doors = [...(row.doors || []), { i: rec.door_of.i, dir: rec.dir }];
+    delete rec.door_of;
+    changed = true;
+  }
+  for (const rec of Object.values(cells)) {
+    if (!rec || rec.kind !== 'trunk' || !rec.blocked || rec.handed) continue;
+    rec.handed = true;
+    changed = true;
+    const lastRow = Math.floor((rec.k0 || 0) / BRANCH_EVERY) * BRANCH_EVERY;
+    if (lastRow === 0) continue;
+    const o = rec.origin || rec.anchor, d = DIR_VEC[rec.dir];
+    for (const side of SIDES_OF[rec.dir]) {
+      const s = DIR_VEC[side];
+      let at = { x: o.x + d.x * lastRow + s.x, y: o.y, z: o.z + d.z * lastRow + s.z };
+      for (let seg = cells[makeSegmentId(at)]; seg && seg.kind === 'branch' && seg.dir === side; seg = cells[makeSegmentId(at)]) {
+        seg.returns = rec.dir;
+        at = stripNeighbours(seg)[0].anchor;
+      }
+    }
+    watcher.summary('mining_cell_graph', `TREE TRUNK STOPPED ${rec.dir} ${rec.id} (${rec.blocked}) — its rows at ${lastRow} blocks take the lead.`);
+  }
+  if (changed) writeCells(cells);
+  const waiting = Object.values(cells).filter(c => c && c.kind === 'branch' && c.returns && c.complete && !c.return_tried);
+  waiting.sort((a, b) => a.k0 - b.k0);
+  for (const seg of waiting) {
+    if (seg.returned || !seg.returns) continue;
+    const got = returnFrom(bot, seg);
+    if (got === 'unloaded') continue;
+    seg.return_tried = true;
+    if (got === 'returned') {
+      seg.returned = true;
+      let at = stripNeighbours(seg)[0].anchor;
+      for (let on = cells[makeSegmentId(at)]; on && on.kind === 'branch' && on.dir === seg.dir; on = cells[makeSegmentId(at)]) {
+        delete on.returns;
+        at = stripNeighbours(on)[0].anchor;
+      }
+    }
+    writeCells(cells);
+  }
+}
+
+// returnFrom(bot, seg) → 'returned' with a new trunk registered at the segment's first safe column, 'none', or 'unloaded'.
+// A column is every third block from the stopped trunk. One holding a row segment's anchor is passed, since a unit's id is
+// its anchor, and one where the row's own torch hangs on the door's wall is passed too.
+function returnFrom(bot, seg) {
+  const d = DIR_VEC[seg.dir], want = seg.returns;
+  const every = require('@thinking/architect_config').TORCH_NETWORK.tunnel_every;
+  const stairDecls = staircaseDeclarations();
+  for (let i = 1; i <= STRIP_SEG; i++) {
+    const out = 1 + seg.k0 + i;
+    if (out % BRANCH_EVERY !== 0 || (out - 1) % STRIP_SEG === 0) continue;
+    if ((seg.k0 + i - 1) % every === 0 && SIDES_OF[seg.dir][0] === want) continue;
+    const anchor = { x: seg.anchor.x + d.x * i, y: seg.anchor.y, z: seg.anchor.z + d.z * i };
+    if (getCell(makeSegmentId(anchor))) continue;
+    const shape = { kind: 'trunk', dir: want, k0: 0, origin: anchor, way: wayOut(seg), door_of: { id: seg.id, i } };
+    if (overlapsStaircase(anchor, stairDecls, shape)) continue;
+    const scan = scanCell(bot, anchor, shape);
+    if (scan.halt_reason === 'unloaded') return 'unloaded';
+    if (!scan.safe || caveAir(bot, anchor, shape) > STRIP_CAVE_AIR) continue;
+    registerCellAt(bot, anchor, seg.fan, stairDecls, seg.prime || seg.anchor, shape);
+    watcher.summary('mining_cell_graph', `TREE RETURN ${seg.dir} row ${seg.id} -> new trunk ${want} at (${anchor.x},${anchor.y},${anchor.z}), ${out} blocks out.`);
+    return 'returned';
+  }
+  return 'none';
+}
 
 // nextGrowth — the nearest open unit of the floors already lit, or null.
-function nextGrowth(bot, excludeIds = null) {
+function nextGrowth(bot, excludeIds = null, deepY = null, inSeatBand = () => true) {
 
   // Each body keeps its own register of the field, so a unit a peer already dug reads as open here. The world
   // settles it: a unit whose diff is fully sensed and clean (scanSegmentSteps → null) is marked complete and grows
@@ -726,10 +948,10 @@ function nextGrowth(bot, excludeIds = null) {
   let caughtUp = 0;
   for (let i = 0; i < CATCH_UP_MAX; i++) {
     const growth = Object.values(readCells()).filter(
-      c => !c.complete && !c.blocked && !(excludeIds && excludeIds.has(c.id))
+      c => !c.complete && !c.blocked && !(excludeIds && excludeIds.has(c.id)) && inSeatBand(c)
     );
     if (growth.length === 0) break;
-    growth.sort(lowestThenNearest());
+    growth.sort(lowestThenNearest(deepY));
     const c = growth[0];
     if (i === CATCH_UP_MAX - 1 || !bot || !bot.blockAt || miningIntegrity.scanSegmentSteps(bot, generateCell(c.anchor, c)) !== null) {
       if (caughtUp) watcher.summary('mining_cell_graph', `CAUGHT UP ${caughtUp} unit(s) a peer already dug — next open unit ${c.id}.`);
@@ -764,12 +986,12 @@ module.exports = {
   // persistence
   readCells, getCell, markCellComplete, markCellBlocked, recordCellRemaining,
   // geometry / scan / generation
-  scanCell, generateCell, cellWorkBox, getDeepestSegmentMarkers, isStrip, unitYield, lineContinuation, lineKey, wayOut, caveAir, STRIP_SEG, BRANCH_EVERY, STRIP_CAVE_AIR,
+  scanCell, generateCell, cellWorkBox, getDeepestSegmentMarkers, inBand, cellsGeneration, isStrip, unitYield, unitLamps, lineContinuation, lineKey, wayOut, caveAir, STRIP_SEG, BRANCH_EVERY, STRIP_CAVE_AIR,
   // the seed/blueprint-collision rule, exported so a probe can drive the REAL predicate offline
   // instead of a hand-copy of it (Law 6). A copied predicate is what lets a seeding offset and its
   // guard disagree unnoticed: both can be "verified", neither against the other.
   staircaseDeclarations, overlapsStaircase,
   // graph operations
-  seedCells, registerNeighbors, selectNextCell, selectMaintenanceCell, hasBuildableCell, noteAllHeldByPeers,
+  seedCells, registerNeighbors, selectNextCell, selectMaintenanceCell, hasBuildableCell, noteAllHeldByPeers, adoptUnit,
   getProtectedBlocks,
 };

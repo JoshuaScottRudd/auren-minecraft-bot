@@ -16,11 +16,16 @@
 //   node trace_monitor.js --route-cost [--bot=AurenBot] [traceFile]
 //   node trace_monitor.js --jumps [--bot=AurenBot] [traceFile]
 //   node trace_monitor.js --hunger [--bot=AurenBot] [traceFile]                   (exhaustion → bread/wheat)
+//   node trace_monitor.js --herding [--run=all] [--bot=AurenBot] [--all] [traceFile]  (one row per herd)
+//   node trace_monitor.js --activities [--run=all] [--bot=B] [--kind=K] [--all]   (one row per activity span)
 //   node trace_monitor.js --accounting [--all] [traceFile]                       (bot-minutes, items, structures)
 //   node trace_monitor.js --jobs [--bot=AurenBot] [--all] [traceFile]
 //   node trace_monitor.js --milestones [--bot=AurenBot] [--deadline=10m] [traceFile]
 //   node trace_monitor.js --farm [--bot=AurenBot] [--all] [traceFile]
 //   node trace_monitor.js --torch [--bot=AurenBot] [--deadline=10m] [traceFile]
+//   node trace_monitor.js --light [--bot=B] [--all]
+//   node trace_monitor.js --night [--bot=B] [--all]
+//   node trace_monitor.js --finder [--bot=B] [--all]
 //   node trace_monitor.js --compost [--bot=B] [--all]
 //   node trace_monitor.js --inventory [--bot=B] [--all]
 //   node trace_monitor.js --walking [--bot=B] [--all]
@@ -31,13 +36,15 @@
 //   node trace_monitor.js --lag
 //   node trace_monitor.js --outcome
 //   node trace_monitor.js --engagement [--bot=AurenBot] [--all]
-//   node trace_monitor.js --foreman [--bot=PlayerName] [--all]                    (--bot names a PERSON)
+//   node trace_monitor.js --foreman [--all]
 //   node trace_monitor.js --camera [--bot=AurenBot] [--all]
 //   node trace_monitor.js --witness [--bot=AurenBot] [--all]
 //   node trace_monitor.js --machine-load [--label=NAME] [--run-only]
 //   node trace_monitor.js --watch [--interval=5] [--exit-on-flag[=error,halt]] [--max-minutes=15] [--stream=dispatcher] [--errors-known=N]
 //   node trace_monitor.js --around=<1m1s|ISO> [--lines=25 | --window=60 | --before=..|--after=..] [--tag=T] [--bot=B]
 //   node trace_monitor.js --from=<4m> --to=<7m> [--bot=B] [--tag=T] [--grep=<regex>] [--level=error] [--run=latest|N|all]
+//
+//   any of the above + --records=<dir>   (another fleet's record folder)
 //
 // Default traceFile: fleet_logs/traces/watcher_fleet.jsonl. Per-bot files (watcher_<Id>.json) work too.
 // Exit codes: 0 clean · 2 flags found · 1 could not read trace.
@@ -52,6 +59,15 @@ require('module-alias')(require('path').resolve(__dirname, '..'));
 const fs = require('fs');
 const path = require('path');
 
+// ── WHICH FLEET'S RECORDS ────────────────────────────────────────────────────
+// By default every lens reads this fleet's own fleet_logs/. --records=<dir> reads another fleet's record
+// folder instead (each fleet runs from its own copy and keeps its own). Decided here, before anything
+// resolves the record room: record_homes reads AUREN_RECORDS_DIR once, when it is first loaded.
+{
+  const a = process.argv.find(x => x.startsWith('--records='));
+  if (a) process.env.AUREN_RECORDS_DIR = path.resolve(a.slice('--records='.length));
+}
+
 // ── Siblings this file calls ────────────────────────────────────────────────────────────────────────
 //   trace_read.js               substrate — parse, read, segment, episodes.
 //   report_formatting.js        summary statistic + line renderers.
@@ -61,10 +77,19 @@ const path = require('path');
 //   farm_lens.js                --farm, and the farm block of --milestones.
 //   locomotion_lenses.js        --pathfinding, --route-cost, --jumps.
 //   tree_search_lens.js         --trees.
+//   light_lens.js               --light.
+//   site_lens.js                --site.
+//   night_lens.js               --night.
+//   finder_lens.js              --finder.
 //   step_failure_lens.js        --steps.
+//   server_leaves_lens.js       --leaves.
 //   planning_gate_lens.js       --gate.
+//   furnace_lens.js             --furnace.
+//   tandem_lens.js              --tandem.
 //   server_lag_lens.js          --lag.
 //   hunger_lens.js               --hunger: a run priced in Minecraft exhaustion, converted to bread/wheat.
+//   herding_lens.js              --herding: every herd, claim to close — before, herd and after, in seconds and blocks.
+//   activity_lens.js             --activities: every ACTIVITY span (fight, squid hunt, herding, pen crossing…), exact start and end.
 //
 // This file: the signatures, the per-bot digest, the wake policy, the watch, and --activity/--story/
 // --progress/--around/--from over the same trace.
@@ -149,12 +174,26 @@ const PATHFINDING = has('pathfinding');
 const WALKING = has('walking');
 // --trees — every tree search: the ring a tree was taken in, what the reading cost, how it ended.
 const TREES = has('trees');
+// --light — the torch network: the paint lit and dark over the run, and every planned torch placed or refused.
+const LIGHT = has('light');
+// --site — where the base was sited (arrangement, plane, the shaft's facing) and every landing's refusal.
+const SITE = has('site');
+// --night — night recalls, deaths, and the gathers that end a claim on their punch count.
+const NIGHT = has('night');
+// --finder — the one escalation for what a body could not find (book walks, misses, frontier scans, loud errors), the
+// sector pages written, and every ink trip.
+const FINDER = has('finder');
 // --throughput — every material as a flow: gathered, placed, through the chests, and the stock's cover.
 const THROUGHPUT = has('throughput');
 // --steps — every step a body planned and did not complete: what stopped it, on which move, at which cell.
 const STEPS = has('steps');
+const LEAVES = has('leaves');
 // --gate — the planning gate: every entry and its exit, time inside, the line, any overlap.
 const GATE = has('gate');
+// --furnace — every batch: cooked, waited for a body, stood empty before the next load.
+const FURNACE = has('furnace');
+// --tandem — the night's guards and workers: duty, mobs handed across, kills and hurts by role.
+const TANDEM = has('tandem');
 // --lag — every time the server fell behind, and what its main thread was doing while it did.
 const LAG = has('lag');
 const ROUTECOST = has('route-cost');
@@ -166,6 +205,10 @@ const MILESTONES = has('milestones');
 const TORCH = has('torch');
 // --farm — the wheat field: rows sited, gated, laid, crop census, work done, seed trips.
 const FARM = has('farm');
+// --herding — every herd job: the animal, its result, time and walk blocks before, during and after the lead.
+const HERDING = has('herding');
+// --activities — every activity span the bodies reported, with exact start and end seconds (keyframes, the scout seat).
+const ACTIVITIES = has('activities');
 // --jobs — every job claimed, in order, with duration/verdict/gaps and time by job type.
 const JOBS = has('jobs');
 // --planning — the plan phase: thinking-fragment congestion, how long bots wait their turn.
@@ -195,7 +238,7 @@ const ITEMS = has('items');
 const ENGAGEMENT = has('engagement');
 // --camera — the camera's own run, off its own parallel trace: vantages chosen, why cuts fired.
 const CAMERA = has('camera');
-// --foreman — the desk's own record: who spoke to it, what was refused. `--bot` names a PERSON here.
+// --foreman — the foreman's own record: the beats it said and the crew raises it withheld.
 const FOREMAN = has('foreman');
 // --deadline=<Nm|Ns> — the asker's criterion, passed to build_lenses.runMilestones/runTorchClock.
 const MS_DEADLINE_SEC = (() => {
@@ -1121,8 +1164,13 @@ function runWatch() {
       freezeAt = null;   // a fresh bot line landed — fleet is alive, re-arm
     }
 
-    // Errors, judge-halts and deaths always wake (any idx). Every other signature stays baseline-relative.
+    // Errors, judge-halts and deaths always wake (any idx in the segment `--run` names, latest by default: a
+    // continue start appends, and the last run's errors are not this one's). Every other signature stays
+    // baseline-relative.
+    const scope = runScope(lines);
+    const segStart = scope.length ? scope[0].idx : 0;
     const news = detect(lines)
+      .filter(f => f.idx >= segStart)
       .filter(f => f.sig === 'error' || f.sig === 'halt' || f.sig === 'death' || f.idx >= knownLines)
       .filter(f => !reported.has(`${f.sig}:${f.bot}:${f.idx}`));
     knownLines = lines.length;
@@ -1204,9 +1252,16 @@ if (require.main === module) {
   else if (PATHFINDING) runLens(locomotionLenses.runPathfinding);
   else if (WALKING) runLens(require('./walking_lens').runWalking, { verbose });
   else if (TREES) runLens(require('./tree_search_lens').runTreeSearch, { verbose });
+  else if (LIGHT) runLens(require('./light_lens').runLight, { verbose, foreman: require('./trace_read').readForemanView(path.dirname(TRACE_FILE)) });
+  else if (SITE) runLens(require('./site_lens').runSite, { foreman: require('./trace_read').readForemanView(path.dirname(TRACE_FILE)) });
+  else if (NIGHT) runLens(require('./night_lens').runNight, { verbose });
+  else if (FINDER) runLens(require('./finder_lens').runFinder, { verbose });
   else if (THROUGHPUT) runLens(require('./throughput_lens').runThroughput, { verbose, bucketMin: parseInt(opt('bucket', '10'), 10) || 10 });
   else if (STEPS) runLens(require('./step_failure_lens').runSteps, { verbose });
+  else if (LEAVES) runLens(require('./server_leaves_lens').runLeaves, { tail: Number(opt('tail', '40')) || 40 });
   else if (GATE) runLens(require('./planning_gate_lens').runGate, { verbose });
+  else if (FURNACE) runLens(require('./furnace_lens').runFurnace, { verbose });
+  else if (TANDEM) runLens(require('./tandem_lens').runTandem);
   else if (LAG) runLens(require('./server_lag_lens').runLag, { verbose });
   else if (ROUTECOST) runLens(locomotionLenses.runRouteCost, { over: parseInt(opt('over', '60'), 10) || 60 });
   else if (JUMPS) runLens(locomotionLenses.runJumps);
@@ -1214,6 +1269,8 @@ if (require.main === module) {
   else if (MILESTONES) runLens(buildLenses.runMilestones, { deadlineSec: MS_DEADLINE_SEC, verbose });
   else if (TORCH) runLens(buildLenses.runTorchClock, { deadlineSec: MS_DEADLINE_SEC });
 else if (FARM) runLens(require('./farm_lens').runFarm, { verbose });
+  else if (ACTIVITIES) runLens(require('./activity_lens').runActivities, { verbose, kind: opt('kind', null) });
+  else if (HERDING) runLens(require('./herding_lens').runHerding, { verbose, foreman: require('./trace_read').readForemanView(path.dirname(TRACE_FILE)) });
   else if (JOBS) runLens(require('./job_timeline_lens').runJobTimeline, { verbose });
   else if (PLANNING) runLens(require('./planning_lens').runPlanning, { budgetSec: PLAN_BUDGET_SEC });
   else if (TOOLKIT) runLens(require('./job_timeline_lens').runToolkit, {});
@@ -1222,7 +1279,7 @@ else if (FARM) runLens(require('./farm_lens').runFarm, { verbose });
   else if (WARNINGS) runLens(require('./warnings_lens').runWarnings, { verbose });
   else if (WITNESS) { recordingLens('combat_witness_lens', '--witness').runWitness({ bot: BOT_FILTER, verbose }); process.exit(0); }
   else if (CAMERA) { recordingLens('camera_lens', '--camera').runCamera({ bot: BOT_FILTER, verbose }); process.exit(0); }
-  else if (FOREMAN) { require('./foreman_lens').runForeman({ bot: BOT_FILTER, verbose }); process.exit(0); }
+  else if (FOREMAN) { require('./foreman_lens').runForeman({ verbose }); process.exit(0); }
   else if (MACHINE_LOAD) {
     const record = has('run-only') ? require('./run_outcome_lens').readOutcome() : null;
     if (has('run-only') && !record) throw new Error('machine-load --run-only requires the finished run_outcome record.');
@@ -1243,7 +1300,7 @@ else if (FARM) runLens(require('./farm_lens').runFarm, { verbose });
     process.exit(0);
   }
   else if (COMPOST) runLens(chainLenses.runCompost, { verbose });
-  else if (ITEMS) { require('./item_book_lens').runItems({ bot: BOT_FILTER, verbose }); process.exit(0); }
+  else if (ITEMS) { require('./item_book_lens').runItems({ bot: BOT_FILTER, verbose, item: opt('item', null), dug: opt('dug', null) }); process.exit(0); }
   else if (INVENTORY) runLens(require('./inventory_lens').runInventory, { verbose });
   else if (ENGAGEMENT) runLens(require('./engagement_lens').runEngagement, { verbose });
   else if (ACTIVITY) runActivity();

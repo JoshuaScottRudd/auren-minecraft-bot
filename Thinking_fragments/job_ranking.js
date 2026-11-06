@@ -27,6 +27,7 @@ const {
     JOB_TYPE,
     JOB_CATEGORY_OF,
     JOB_STAGE_OF,
+    JOB_AHEAD_OF_SITES,
     CATEGORY_NAMES,
     CATEGORY_INDEX,
     PRE_BAND,
@@ -34,13 +35,15 @@ const {
     STAGES,
     STAGE_INDEX,
     STRUCTURE_PRIORITY,
+    STRUCTURE_GATED,
 } = require('@thinking/architect_config');
 
 // ── SITE RANK — THE THIRD NAME, A FRACTAL OF THE FIRST ──────────────────────────────────────────────
-// Within the build band, a body prefers the laydown yard, then the mineshaft, then the castle. It is the
-// same mechanism as the pre-band, one level in: an authored sequence read in order, not a tiebreak,
-// because the sites it orders are not equal. A site rank is a THIRD NAME, never a number, and nothing is
-// composed from the three.
+// Within the build band, a body prefers the crew's GATED structures in their order (the builder's laydown yard, then
+// its waste pit: STRUCTURE_GATED), then every SUPPORT alike (the pens, the fields, the mine and the proofing: every
+// structure of STRUCTURE_PRIORITY after the gated head but the build), then the build. A support is no more
+// preferred than another: each makes an intermediate material the build waits on. A site rank is a
+// THIRD NAME, never a number, and nothing is composed from the three.
 //
 // IT PREFERS AND NEVER PREVENTS. `selectBand` falls straight through to the next site when the preferred
 // one offers nothing claimable this sweep, so no body is left idle in front of work it could do (Law 27:
@@ -50,11 +53,22 @@ const {
 // does not is genuinely site-less (a standing shelf level) and yields to a named site. It is not an
 // error, so it does not throw, but `Infinity` keeps it from sorting ahead of the alpha structure by
 // accident of being unstamped.
+//
+// WORK THAT SERVES EVERY SITE AT ONCE RANKS AHEAD OF THEM ALL. A job type authored `ahead_of_sites` (the torch
+// network, which paints the ground between every building) stands before the alpha structure in its band.
 function measureSiteRank(job) {
+    if (job && JOB_AHEAD_OF_SITES.has(job.job_type)) return -1;
     if (!job || typeof job.structure !== 'string' || !job.structure) return Infinity;
-    const order = STRUCTURE_PRIORITY[require('@kernel/bot_mandate').currentMode()] || [];
-    const at = order.indexOf(job.structure);
-    return at === -1 ? Infinity : at;
+    const mode = require('@kernel/bot_mandate').currentMode();
+    const order = STRUCTURE_PRIORITY[mode] || [], gated = STRUCTURE_GATED[mode] || [];
+    // A build's basement cell is a support of that build (assessors/downloaded_build.cellJobs).
+    if (job.support_structure) return gated.length;
+    const { FARM_FIELD } = require('@thinking/architect_config');
+    // A field copy (critical mass) is the field it copies.
+    const at = order.indexOf(FARM_FIELD.copyOf[job.structure] || job.structure);
+    if (at === -1) return Infinity;
+    if (at < gated.length) return at;
+    return at === order.length - 1 && job.structure === require('@thinking/architect_config').CREW_BUILD[mode] ? gated.length + 1 : gated.length;
 }
 
 // ── STAGE ─────────────────────────────────────────────────────────────────────────────────────────
@@ -132,6 +146,18 @@ function orderSweep(posted) {
             continue;
         }
         job.asker = JOB_CATEGORY_OF[job.job_type];
+        // ── AN ORDER NET OF THE POOL IS A GATHER ──────────────────────────────
+        // An order whose asker already took the fleet's stock off its figure (`net_of_pool`, a downloaded
+        // building's raw orders) asks only for what the pool lacks, so nothing in the pool can fill it.
+        // Measured against the pool again, the stock its figure is netted of would read as the finished thing
+        // within reach and rank a tree-cutting trip as a build, above the seats of a material the site holds
+        // none of. Its figure is already the measure: it is a gather, and among the site's gathers the
+        // emptiest material is chosen first (dispatcher, by `level`).
+        if (job.net_of_pool) {
+            job.stage = 'gather';
+            job.site_rank = measureSiteRank(job);
+            continue;
+        }
         job.stage = measureStage(job);
         job.site_rank = measureSiteRank(job);
     }
@@ -139,7 +165,7 @@ function orderSweep(posted) {
 }
 
 // ── SELECTION ─────────────────────────────────────────────────────────────────────────────────────
-// THE ONLY PLACE ORDER IS DECIDED. Walk the bands (bot → blueprint → chest → busywork); inside the first
+// THE ONLY PLACE ORDER IS DECIDED. Walk the bands (bot → chest → blueprint); inside the first
 // band that has any work, walk the rungs (build → craft → gather); return the first non-empty group. What
 // comes back is a SET OF EQUALS, not a winner — the caller picks one of them at random.
 //

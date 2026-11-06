@@ -54,9 +54,12 @@ function tally(bot) {
     return t;
 }
 
+// Every entry carries the job its body held when it was written (`j`, the magnet's type/what; 'between_jobs' when
+// none), so the book can say which work took an item from the world, banked it, drew it or threw it.
 function report(entry) {
     if (_queue.length >= QUEUE_CAP) _queue.shift();
-    _queue.push(entry);
+    const m = require('@kernel/corporate_headquarters').readBoardroomChair(process.env.BOT_ID || 'default', {})?.magnet;
+    _queue.push({ ...entry, j: m && m.type ? `${m.type}/${m.what}` : 'between_jobs' });
 }
 
 function flush() {
@@ -148,6 +151,7 @@ function arm(bot) {
         if (!item || !item.name) return;          // an experience orb or an arrow — not an item
         const n = Number.isInteger(packet.pickupItemCount) && packet.pickupItemCount > 0 ? packet.pickupItemCount : item.count;
         if (_last !== null && !_dead) { _picked[item.name] = (_picked[item.name] || 0) + n; _pickedAt = Date.now(); }
+        require('@kernel/bot_minutes').picked(item.name, n);
         const born = _spawnCell.get(entity.id);
         report({ k: 'p', e: entity.id, i: item.name, n, s: born ? born.cell : null, a: cellOf(entity.position) });
     });

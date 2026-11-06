@@ -72,7 +72,7 @@ const { isNotSafeSurface, getClearance, belowDepthFloor } = require('@utils/move
 const { STATION_TYPES } = require('@utils/fragment_utils');
 const { isFluid, isGravityBlock, followGravityColumn } = require('@utils/gravity_utils');
 const { surfaceY: groundYAt, isCanopy } = require('@utils/site_geometry');
-const { STONE_PROSPECT } = require('@thinking/architect_config');
+const { STONE_PIERCE } = require('@thinking/architect_config');
 
 const TAG = 'stone_column_scanner';
 
@@ -98,13 +98,13 @@ const STAND_CLEARANCE = 2;
 // crafting table are the things a body WALKS TO. The blueprint exclusion below is a separate rule about
 // a separate thing (do not mine the building), and both apply.
 //
-// ASKED ONCE PER SCAN, not once per candidate: one `findBlocks` over the prospect radius plus this
+// ASKED ONCE PER SCAN, not once per candidate: one `findBlocks` over the pierce radius plus this
 // clearance, then a distance test per column.
 const STATION_CLEARANCE = 5;
 
 // stationsNear(bot) → [{x, z}] — every station standing within reach of the columns this scan will rank.
 //
-// The radius is the prospect's own outer edge plus the clearance, because a station just past the edge
+// The radius is the pierce's own outer edge plus the clearance, because a station just past the edge
 // still forbids a column just inside it. Ids, not a name-matcher function (the same resolution
 // `surface_filter.targetIds` uses): a name predicate defeats findBlocks' palette skip and turns a
 // bounded query into a full voxel sweep.
@@ -117,7 +117,7 @@ function _stationsNear(bot) {
     if (!ids.length) return [];
     const found = bot.findBlocks({
         matching: ids,
-        maxDistance: STONE_PROSPECT.max_radius + STATION_CLEARANCE,
+        maxDistance: STONE_PIERCE.max_radius + STATION_CLEARANCE,
         count: 64,
     }) || [];
     return found.map(p => ({ x: p.x, z: p.z }));
@@ -143,6 +143,14 @@ function* _ringCells(cx, cz, minR, maxR) {
             }
         }
     }
+}
+
+// _nearestPermitted(feet, banned) → the nearest column outside the gather keep-out, or null within exit_reach.
+function _nearestPermitted(feet, banned) {
+    for (const [x, z] of _ringCells(feet.x, feet.z, 0, STONE_PIERCE.exit_reach)) {
+        if (!banned({ x, z })) return { x, z };
+    }
+    return null;
 }
 
 // A wall the shaft may be opened against: readable, solid, not a fluid, and not a gravity column that
@@ -171,7 +179,7 @@ function _evaluate(bot, reader, x, z, refY, protectedKeys, stations) {
     for (const s of stations) {
         if ((s.x - x) ** 2 + (s.z - z) ** 2 <= STATION_CLEARANCE ** 2) return { fit: null, why: 'near_station' };
     }
-    const ground = groundYAt(reader, x, z, refY, STONE_PROSPECT.scan_up, STONE_PROSPECT.scan_down);
+    const ground = groundYAt(reader, x, z, refY, STONE_PIERCE.scan_up, STONE_PIERCE.scan_down);
     if (!ground) return { fit: null, why: 'no_ground' };
     if (isCanopy(ground.name)) return { fit: null, why: 'canopy' };
     const surfaceY = ground.y;
@@ -193,7 +201,7 @@ function _evaluate(bot, reader, x, z, refY, protectedKeys, stations) {
     // Walk down to the first `stone`. Anything non-solid on the way is a cave mouth or an overhang,
     // and anything unsafe is a hazard the shaft would breach — both disqualify the column outright and
     // are never counted as overburden.
-    while (overburden <= STONE_PROSPECT.max_overburden) {
+    while (overburden <= STONE_PIERCE.max_overburden) {
         const b = reader.blockAt(x, y, z);
         if (!b) return { fit: null, why: 'unloaded' };
         if (b.name === RUN_BLOCK) break;
@@ -207,18 +215,18 @@ function _evaluate(bot, reader, x, z, refY, protectedKeys, stations) {
         overburden++;
         y--;
     }
-    if (overburden > STONE_PROSPECT.max_overburden) return { fit: null, why: 'stone_too_deep' };
+    if (overburden > STONE_PIERCE.max_overburden) return { fit: null, why: 'stone_too_deep' };
 
     // THE GATE. Every one of the next `stone_run` cells must be `stone` — no gap, no other material.
     const topStoneY = y;
-    for (let i = 0; i < STONE_PROSPECT.stone_run; i++) {
+    for (let i = 0; i < STONE_PIERCE.stone_run; i++) {
         const b = reader.blockAt(x, topStoneY - i, z);
         if (!b) return { fit: null, why: 'unloaded' };
         if (b.name !== RUN_BLOCK) return { fit: null, why: 'run_broken' };
     }
 
     // The resting block: one past the run, solid and safe. See the header.
-    const restingY = topStoneY - STONE_PROSPECT.stone_run;
+    const restingY = topStoneY - STONE_PIERCE.stone_run;
     if (belowDepthFloor(restingY)) return { fit: null, why: 'below_depth_floor' };
     const resting = reader.blockAt(x, restingY, z);
     if (!resting || resting.boundingBox !== 'block') return { fit: null, why: 'no_floor' };
@@ -270,8 +278,17 @@ async function scan(bot) {
     // future wall's footprint does not veto a column. See blueprint_survey.worldVoxelKeys.
     const protectedKeys = blueprintSurvey.getAllProtectedBlocks(bot);
     const stations = _stationsNear(bot);
+    const banned = require('@utils/fragment_utils').gatherBanned();
 
-    const cells = _ringCells(feet.x, feet.z, STONE_PROSPECT.min_radius, STONE_PROSPECT.max_radius);
+    // The rings start at the nearest column past the gather keep-out, so the scan's budget is spent on ground a
+    // pierce may open (architect_config.GATHER_KEEPOUT). A body already outside it scans round its own feet.
+    const origin = _nearestPermitted(feet, banned);
+    if (!origin) {
+        watcher.summary(TAG, `no column: nothing past the gather keep-out within ${STONE_PIERCE.exit_reach} blocks`);
+        return { columns: [], summary: { batches: 0, examined: 0, rejects: {} } };
+    }
+    const atFeet = origin.x === feet.x && origin.z === feet.z;
+    const cells = _ringCells(origin.x, origin.z, atFeet ? STONE_PIERCE.min_radius : 0, STONE_PIERCE.max_radius);
     const rejects = {};
     let examined = 0;
     let batches = 0;
@@ -283,14 +300,16 @@ async function scan(bot) {
     // walk, not a target for the world to meet — the sweep still concedes when the batches or the
     // radius run out, and returns whatever it found (Law 25: the answer is what was sensed).
     const allFits = [];
-    while (batches < STONE_PROSPECT.max_batches) {
+    while (batches < STONE_PIERCE.max_batches) {
         let inBatch = 0;
         const fits = [];
-        while (inBatch < STONE_PROSPECT.scan_batch) {
+        while (inBatch < STONE_PIERCE.scan_batch) {
             await pace();
             const next = cells.next();
             if (next.done) break;
             const [x, z] = next.value;
+            // No column within the gather keep-out of the base is pierced, and none spends the scan's budget.
+            if (banned({ x, z })) { rejects.base = (rejects.base || 0) + 1; continue; }
             inBatch++; examined++;
             const { fit, why } = _evaluate(bot, reader, x, z, feet.y, protectedKeys, stations);
             if (!fit) { rejects[why] = (rejects[why] || 0) + 1; continue; }
@@ -299,8 +318,8 @@ async function scan(bot) {
         }
         allFits.push(...fits);
         batches++;
-        const ranOut = inBatch < STONE_PROSPECT.scan_batch;
-        if (allFits.length && (allFits.length >= STONE_PROSPECT.min_fits || ranOut || batches >= STONE_PROSPECT.max_batches)) {
+        const ranOut = inBatch < STONE_PIERCE.scan_batch;
+        if (allFits.length && (allFits.length >= STONE_PIERCE.min_fits || ranOut || batches >= STONE_PIERCE.max_batches)) {
             fits.length = 0;
             fits.push(...allFits);
             // Nearest first, shallowest breaking the tie. Squared horizontal distance — the vertical
@@ -309,11 +328,11 @@ async function scan(bot) {
             fits.sort((a, b) => (a.dist2 - b.dist2) || (a.overburden - b.overburden));
             const best = fits[0];
             watcher.summary(TAG, `${fits.length} column(s), best @${best.x},${best.z} surface y=${best.surfaceY} `
-                + `overburden=${best.overburden} run=${STONE_PROSPECT.stone_run} depth=${best.depth} `
+                + `overburden=${best.overburden} run=${STONE_PIERCE.stone_run} depth=${best.depth} `
                 + `| batch ${batches}, ${examined} columns examined`);
             return { columns: fits, summary: { batches, examined, rejects } };
         }
-        if (inBatch < STONE_PROSPECT.scan_batch) break;   // ran out of world before running out of batches
+        if (inBatch < STONE_PIERCE.scan_batch) break;   // ran out of world before running out of batches
     }
 
     const worst = Object.entries(rejects).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}:${n}`).join(' ');

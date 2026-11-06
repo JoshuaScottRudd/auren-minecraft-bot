@@ -1,10 +1,10 @@
 // fragment: waste_pit
 // purpose: the one route for a pocket's trash (Law 16). The pit is a building (architect_config.WASTE_PIT,
 //          the `waste_pit` blueprint): the foreman sites it beside the yard and the crew builds it on the
-//          building ladder. It takes what no chest should hold — the wooden pickaxes a stone set replaced,
-//          gravel, flint and the stone variants nothing builds with — and the world despawns it five minutes
-//          later. The pit is a trench two blocks long; a body stands on the pad cell at one end of it and
-//          throws along it. Until the pit stands, trash is banked. The trench is a closed box to the route planner (navigator.loadClosedBoxes), so no
+//          building ladder. It takes what the chests' clean-out carries to it (chest_housekeeping_executor) and the
+//          wooden tools no body keeps, and the world despawns it five minutes later. The pit is a trench
+//          two blocks long; a body stands on the pad cell at one end of it and throws along it. Until the pit
+//          stands, trash is banked. The trench is a closed box to the route planner (navigator.loadClosedBoxes), so no
 //          body walks into it and picks the trash back up.
 
 'use strict';
@@ -18,7 +18,6 @@ const TAG = 'waste_pit';
 // The pit's world geometry, read off its blueprint at its locked site, or null while it has no site. The
 // blueprint's origin is the hole at pad level: the hole is its column of `air`, the pad is the floor round it.
 function geometry() {
-    if (!require('@thinking/requested_work').activeWorkRequirements().includes('waste_disposal')) return null;
     const { WASTE_PIT } = require('@thinking/architect_config');
     const o = require('@utils/fragment_utils').readTransposeOrigin(WASTE_PIT.structure);
     if (!o) return null;
@@ -69,85 +68,85 @@ function holds(pos) {
     return x >= b.min.x && x <= b.max.x && z >= b.min.z && z <= b.max.z && y <= b.max.y;
 }
 
-// chestKeeps — WHAT A CHEST HOLDS: everything but what is made to order (architect_config.madeToOrder: a
-// tool or a torch, made for the body that needs it). A crafted good left over — a pane craft makes sixteen,
-// a stair craft four — is banked, and the next trip takes it finished before it crafts from raw
-// (column_preparation STEP 1). A crafted good never goes to the pit; one found there is a fault the pit's
-// whitelist reports.
-function chestKeeps(item) {
-    if (!require('@thinking/requested_work').activeWorkRequirements().includes('waste_disposal')) return true;
-    return !require('@thinking/architect_config').madeToOrder(item);
-}
-
-// ── A MADE-TO-ORDER THING IS KEPT UP TO WHAT THE BUILDING STILL ASKS FOR ────────────────────────────────
-// A torch the building places is banked for the trip that places it; past that order it is pitted.
-
-// How many of one made good the fleet's chests hold now.
-function _madeInChests(item) {
-    let n = 0;
-    for (const chest of require('@perception/station_registry').findChests()) {
-        for (const it of (Array.isArray(chest.items) ? chest.items : [])) if (it.name === item) n += it.count || 0;
-    }
-    return n;
-}
-
-// madeGoodOrdered(item) → how many of a made good the building's last whole reading still asks for; 0 before
-// any reading, so an unread building stores nothing.
-function madeGoodOrdered(item) {
-    return require('@thinking/assessors/downloaded_build').stillOrdered(item) || 0;
-}
-
-// How many more of a made good this body may bank: what the building still asks for past what the chests hold.
-function _madeGoodRoom(item) {
-    return Math.max(0, madeGoodOrdered(item) - _madeInChests(item));
-}
-
-// What in this pocket is trash, as {item: count}. A listed item is trash past what its pocket row keeps
-// and what the held order still wants (inventory_swapper.computeExcess); a wooden pickaxe is trash once
-// the body holds the pickaxe row's stone set, so it goes in the moment the stone ones are taken.
-function trashIn(bot) {
-    if (!require('@thinking/requested_work').activeWorkRequirements().includes('waste_disposal')) return {};
+// isExempt — never taken by a clean-out: the exempt list, and whatever the fleet makes but for what is also gathered.
+function isExempt(aged) {
     const { WASTE_PIT } = require('@thinking/architect_config');
-    const STOCK_THRESHOLDS = require('@thinking/requested_work').activeStockRows();
-    const tossedSaplings = require('@api/sapling_planter').tossedSaplings();
-    const inv = {};
-    for (const it of bot.inventory.items()) inv[it.name] = (inv[it.name] || 0) + it.count;
-    const swapper = require('@api/inventory_swapper');
-    const excess = swapper.computeExcess(inv, require('@thinking/job_board.js').INVENTORY_WHITELIST, swapper.heldOrderDemand());
+    const item = require('@utils/fragment_utils').unaged(aged);
+    if (_keptNone(item) || WASTE_PIT.gathered.includes(item)) return false;
+    return _rowName(WASTE_PIT.exempt, item) !== null || require('@utils/calculators/build_material_calculator').isMade(item);
+}
+
+// What no chest keeps any of: `useless`, and the wooden tools.
+function _keptNone(item) {
+    const { WASTE_PIT } = require('@thinking/architect_config');
+    return WASTE_PIT.useless.includes(item) || WASTE_PIT.wooden_tools.includes(item);
+}
+
+// The item or group name an item goes by in one of the config's tables.
+function _rowName(names, item) {
+    if (names.includes(item)) return item;
+    const groups = require('@utils/fragment_utils').group_to_item;
+    return names.find(g => groups[g] && groups[g].includes(item)) || null;
+}
+
+// chestLimit(item, stackSize) → how many of an item a clean-out leaves in the chests: what the building and the
+// structures still ask for, the dirt the fields' unlaid rows take, and one stack. Infinity for what is exempt or while
+// an order is unread (Law 25); none of what no chest keeps.
+function chestLimit(aged, stackSize) {
+    const item = require('@utils/fragment_utils').unaged(aged);
+    if (isExempt(item)) return Infinity;
+    if (_keptNone(item)) return 0;
+    const trash = require('@utils/trash');
+    const ordered = require('@thinking/assessors/downloaded_build').reservedFor(item);
+    const field = item === trash.STAND_IN ? require('@perception/farming_integrity').fieldDirt() : 0;
+    if (ordered === null || field === null) return Infinity;
+    const structures = require('@thinking/assessors/building').structureNeed();
+    let held = structures[item] || 0;
+    for (const [group, members] of Object.entries(require('@utils/fragment_utils').group_to_item)) {
+        if (members.includes(item)) held += structures[group] || 0;
+    }
+    return ordered + held + field + stackSize;
+}
+
+// valueRank(item) → lowest for what no chest keeps, then its place in WASTE_PIT.value; past the end of it for
+// anything it does not name.
+function valueRank(item) {
+    const { WASTE_PIT } = require('@thinking/architect_config');
+    if (_keptNone(item)) return -1;
+    const row = _rowName(WASTE_PIT.value, item);
+    return row ? WASTE_PIT.value.indexOf(row) : WASTE_PIT.value.length;
+}
+
+// trashList(rows) → {item: count} of [{ item, count, why }], each row's reason in the list's `why`: what discardTrash
+// throws and the item book records.
+function trashList(rows) {
     const trash = {};
-    // A crew that replants keeps its primary sapling (sapling_planter.pocketRow); every other sapling, and
-    // the primary past that keep, is trash.
-    for (const item of [...WASTE_PIT.items, ...tossedSaplings]) {
-        if (item === 'wooden_pickaxe') continue;
-        if (excess[item] > 0) trash[item] = excess[item];
-    }
-    // WHAT A CHEST DOES NOT KEEP IS TRASH past what the pocket's own row keeps, less what the building still
-    // asks for (_madeGoodRoom).
-    for (const [item, n] of Object.entries(excess)) {
-        if (n <= 0 || chestKeeps(item)) continue;
-        const over = n - _madeGoodRoom(item);
-        if (over > 0) trash[item] = over;
-    }
-    // DIRT PAST WHAT THE BUILDING ASKS IS TRASH: the chests already hold the building's dirt, so the pocket's goes in the pit.
-    const dirt = require('@utils/trash');
-    if (excess[dirt.STAND_IN] > 0 && dirt.dirtIsSurplus()) trash[dirt.STAND_IN] = excess[dirt.STAND_IN];
-    const row = STOCK_THRESHOLDS.find(r => r.item === 'pickaxe' && r.holder === 'bot');
-    const stone = require('@thinking/assessors/shared').stoneOrBetter('pickaxe', inv);
-    if (inv.wooden_pickaxe > 0 && row && row.stone_level && stone >= row.stone_level) trash.wooden_pickaxe = inv.wooden_pickaxe;
+    const why = {};
+    Object.defineProperty(trash, 'why', { value: why, enumerable: false });
+    for (const r of rows) { trash[r.item] = (trash[r.item] || 0) + r.count; why[r.item] = r.why; }
     return trash;
 }
 
-// ── WHAT THE PIT AUTHORIZES: A STRICT WHITELIST ────────────────────────────────────────────────────────
-// The pit's own list (WASTE_PIT.items), the saplings a replanting crew does not keep, dirt, and the wooden
-// tool each stone-tiered tool row replaces. Every body that throws reads the pit afterwards and names any
-// other item lying there by its entity id: a crafted good is banked, never thrown, so one found there is a fault.
-function pitAuthorized(item) {
+// What this pocket throws on its own account, so it never reaches a chest while the pit stands: what is useless, and
+// every wooden tool the body does not keep, by the drop-off's own reckoning (computeExcess). A tool row keeps its best
+// tools first, so a wooden one it still keeps is the tool the body has until stone, and an order holds what it asks for.
+function trashIn(bot) {
     const { WASTE_PIT } = require('@thinking/architect_config');
-    if (WASTE_PIT.items.includes(item)) return true;
-    if (require('@api/sapling_planter').tossedSaplings().includes(item)) return true;
-    if (item === require('@utils/trash').STAND_IN) return true;
-    return require('@thinking/requested_work').activeStockRows().some(r => r.holder === 'bot' && r.kind === 'tool'
-        && Array.isArray(r.tiers) && r.tiers.includes('wooden') && r.tiers.includes('stone') && item === `wooden_${r.item}`);
+    const { computeExcess, heldOrderDemand } = require('@api/inventory_swapper');
+    const { INVENTORY_WHITELIST } = require('@thinking/job_board.js');
+    const inv = {};
+    for (const it of bot.inventory.items()) inv[it.name] = (inv[it.name] || 0) + it.count;
+    const excess = computeExcess(inv, INVENTORY_WHITELIST, heldOrderDemand());
+    const useless = WASTE_PIT.useless.filter(item => inv[item] > 0).map(item => ({ item, count: inv[item], why: 'useless' }));
+    const wooden = WASTE_PIT.wooden_tools.filter(item => excess[item] > 0).map(item => ({ item, count: excess[item], why: 'spare_wooden_tool' }));
+    return trashList([...useless, ...wooden]);
+}
+
+// ── WHAT THE PIT AUTHORIZES: A STRICT WHITELIST ────────────────────────────────────────────────────────
+// Whatever a clean-out may take. Every body that throws reads the pit afterwards and names any other item lying there by its entity id: an exempt thing is never thrown, so one
+// found there is a fault.
+function pitAuthorized(item) {
+    return !isExempt(item);
 }
 
 // EACH UNAUTHORIZED ITEM IS REPORTED ONCE, BY THE FIRST BODY TO FIND IT: the foreman spends one
@@ -184,7 +183,14 @@ async function _inspectPit(bot) {
 // What of the pit does not stand yet, read off the world, or null when it is whole: the trench open to its
 // floor, the pad's blocks in place, the air over the pad clear. A cell this body cannot see is not
 // judged. Building it is the building ladder's work (assessors/building, the `waste_pit` blueprint).
+// A body with a foreman reads it off the integrity keeper's structures verdict for the pit, the one reading of it.
 function _notBuilt(bot, g) {
+    const kept = require('@kernel/keeper_verdicts').keptEntry('structures', require('@thinking/architect_config').WASTE_PIT.structure);
+    if (kept) {
+        if (kept.all_complete) return null;
+        const s = kept.steps[0];
+        return `the keeper reads ${kept.steps.length} step(s) left, first ${s.action} ${s.type} at (${s.place.x},${s.place.y},${s.place.z})`;
+    }
     const solid = c => { const b = bot.blockAt(c); return b ? b.boundingBox === 'block' : null; };
     const hole = g.holes.find(c => solid(c) === true);
     if (hole) return `the hole is not dug at (${hole.x},${hole.y},${hole.z})`;
@@ -200,17 +206,17 @@ function _notBuilt(bot, g) {
 function stands(bot) {
     const g = geometry();
     if (!g || !bot || !bot.blockAt) return false;
-    if ([...g.holes, ...g.pad, ...g.open].some(c => !bot.blockAt(c))) return false;
+    if (!require('@kernel/keeper_verdicts').required() && [...g.holes, ...g.pad, ...g.open].some(c => !bot.blockAt(c))) return false;
     return _notBuilt(bot, g) === null;
 }
 
-// discardTrash — walks to a rim of the built pit and throws in everything trashIn names. Returns
+// discardTrash — walks to a rim of the built pit and throws in `taken` (trashList), or what trashIn names. Returns
 // { tossed, items } — tossed 0 and a reason when there is no pit to use, in which case the caller banks the
 // pocket as it always has.
-async function discardTrash(bot) {
+async function discardTrash(bot, taken = null) {
     bot = bot || global.bot;
     if (!bot?.entity?.position) return { tossed: 0, items: [], reason: 'no body' };
-    const trash = trashIn(bot);
+    const trash = taken || trashIn(bot);
     if (Object.keys(trash).length === 0) return { tossed: 0, items: [] };
     const g = geometry();
     if (!g) return { tossed: 0, items: [], reason: 'no pit sited' };
@@ -272,7 +278,7 @@ async function discardTrash(bot) {
         items.push({ item: name, tossed: left });
         const seen = stacks.reduce((s, r) => s + r.count, 0);
         for (const r of stacks) {
-            book.report({ k: 'th', e: r.id, i: name, n: r.count, rest: r.rest, in_pit: r.inPit, end: r.end });
+            book.report({ k: 'th', e: r.id, i: name, n: r.count, rest: r.rest, in_pit: r.inPit, end: r.end, why: trash.why[name] });
             if (r.mergedInto != null) book.report({ k: 'al', from: r.id, to: r.mergedInto });
             if (!r.inPit) {
                 missed += r.count;
@@ -281,16 +287,14 @@ async function discardTrash(bot) {
         }
         if (seen < left) {
             missed += left - seen;
-            book.report({ k: 'th', e: null, i: name, n: left - seen, rest: null, in_pit: false, end: 'not_seen' });
+            book.report({ k: 'th', e: null, i: name, n: left - seen, rest: null, in_pit: false, end: 'not_seen', why: trash.why[name] });
             watcher.warn(TAG, `WASTE PIT THROW NOT SEEN — ${name}x${left - seen} left the pocket and no thrown stack was seen for it.`);
         }
     }
     book.flush();
     const n = items.reduce((s, i) => s + i.tossed, 0);
-    // Made-to-order things are named apart: the only made things the pit takes.
-    const made = items.filter(i => !chestKeeps(i.item));
     watcher.summary(TAG, `WASTE PIT tossed ${n} item(s): ${items.map(i => `${i.item}x${i.tossed}`).join(', ') || 'none'}. `
-        + `Made goods among them: ${made.map(i => `${i.item}x${i.tossed}`).join(', ') || 'none'}. In the pit ${n - missed}, outside it ${missed}.`);
+        + `In the pit ${n - missed}, outside it ${missed}.`);
     await _inspectPit(bot);
     return { tossed: n, items };
 }
@@ -385,4 +389,4 @@ function _watchThrow(bot, name) {
     return { followToRest };
 }
 
-module.exports = { geometry, closedBox, holds, stands, trashIn, discardTrash, chestKeeps, madeGoodOrdered, pitAuthorized };
+module.exports = { geometry, closedBox, holds, stands, trashIn, trashList, discardTrash, chestLimit, valueRank, pitAuthorized };

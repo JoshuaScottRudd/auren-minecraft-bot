@@ -20,7 +20,7 @@
 // ── READING ONE BACK ────────────────────────────────────────────────────────────────────────────────
 // `loadSnapshot` returns the part of a mineflayer bot that voxel scans read: `version`, `registry`, `world`
 // (getColumn / getColumnAt / getColumns / getBiome, and the unload hooks voxel_reader listens on, which never fire),
-// `blockAt`, `spawnPoint`, `game.serverViewDistance`, plus `snapshot` (the header). wheat_plot_scanner,
+// `blockAt`, `spawnPoint`, `game.serverViewDistance`, plus `snapshot` (the header).
 // site_geometry, biome_scanner and voxel_reader's fast path all run on it unchanged.
 
 const fs = require('fs');
@@ -123,10 +123,13 @@ function loadSnapshot(which) {
     getBiome(pos) { const col = world.getColumnAt(pos); return col ? col.getBiome(local(pos)) : 0; },
     on() {}, removeListener() {},    // a snapshot never loads or unloads a column
   };
+  // The world's height is the columns' own (prismarine-chunk carries minY and worldHeight), announced as the server
+  // announces it to a body, so a reader that walks a column top to bottom (ground_line) runs here unchanged.
+  const anyColumn = columns.values().next().value;
   return {
     version: header.mcVersion, registry, world, snapshot: header,
     spawnPoint: new Vec3(header.spawn.x, header.spawn.y, header.spawn.z),
-    game: { serverViewDistance: header.viewDistance },
+    game: { serverViewDistance: header.viewDistance, minY: anyColumn ? anyColumn.minY : undefined, height: anyColumn ? anyColumn.worldHeight : undefined },
     blockAt(pos) {
       const col = world.getColumnAt(pos);
       if (!col) return null;

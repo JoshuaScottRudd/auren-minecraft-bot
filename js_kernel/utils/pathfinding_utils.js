@@ -1,4 +1,5 @@
-﻿// module: pathfinding_utils — A* pathfinder, one algorithm for all locomotion callers.
+// module: pathfinding_utils — the floor graph for ground and water-surface navigation.
+// Free underwater movement belongs to underwater_pathfinding, with its own three-dimensional graph.
 //
 // Non-obvious contracts:
 //  - Pure graph body; the timing wrapper admits expensive work through the foreman's computation gate.
@@ -14,6 +15,7 @@ const { isWalkableSurface, isOpenTopContainer, isStationFloor, belowDepthFloor }
 const { makeExecutionPacer } = require('@utils/execution_yield');
 const { guardExternalSync } = require('@utils/external_library_guard');
 const memoryWorkspace = require('@utils/memory_workspace');
+const { MinHeap } = require('@utils/min_heap');
 
 // Interaction geometry — each value encodes a failure mode, not a preference.
 const MIN_PLACEMENT_DIST = 0.5;  // closer: lookAt angle too steep, placeBlock/anchor clicks misfire
@@ -40,6 +42,10 @@ const COST_PLACE = 25.0;    // place a block (pillar, bridge) — consumes inven
 const COST_WATER_EXIT = 3.0;     // walk out of water onto a bank level with it — the cheapest way out of water there is
 const COST_STAIR_STEP = 10.0;    // one step of a dug staircase — under dig_down's per-block cost (STAIR LINES)
 const MAX_STAIR_RUN = 48;        // longest staircase one edge may be; deeper stairs to the bound, then other edges
+// FLAT GROUND IS PREFERRED: a step up an existing tread, or down one, costs a little more than a flat step, so of two
+// routes of near length the flatter wins and a hill is climbed only for a real saving. A preference, never a ban.
+const COST_CLIMB_UP = 1.5;
+const COST_CLIMB_DOWN = 1.2;
 // PROTECTED_VOXEL_DETOUR_BUDGET — a POLICY number: extra walk-steps the bot spends to spare a blueprint
 // or station voxel, added to the remaining walk. Also sets the search's flood radius (A* must rule out
 // every cheaper route before accepting a priced edge).
@@ -59,8 +65,8 @@ const HEURISTIC_WEIGHT = 1.0;
 // EDGE CATALOG — every edgeType the pathfinder emits, its walker (navigator.js), and its cost. This is
 // the single inspection point for what edges exist and what they cost; keep it in sync on a retune.
 //   walk            COST_LOW  (1)      bridgeLevelStep   one flat cell
-//   climb_up        COST_LOW  (1)      stairUpStep       step up an existing +1 tread
-//   climb_down      COST_LOW  (1)      stairDownStep     step down an existing -1 floor (diagonal); where the
+//   climb_up        COST_CLIMB_UP(1.5) stairUpStep       step up an existing +1 tread
+//   climb_down      COST_CLIMB_DOWN(1.2) stairDownStep   step down an existing -1 floor (diagonal); where the
 //                                                        head's crossing cell holds a block it is one dig_stair_down step
 //   door            COST_LOW  (1)      stepToFeet        walk through a wooden door
 //   swim            COST_HIGH (15)     swimStep          enter / traverse water
@@ -69,7 +75,11 @@ const HEURISTIC_WEIGHT = 1.0;
 //   water_bank_out  COST_PLACE+COST_WATER_EXIT+COST_LOW(29)  waterBankOutStep   WATER TO LAND BY PLACING, onto a bank one
 //                                                        block over the water: a block set in the surface cell beside the
 //                                                        body, against the bank; out onto it; one step up. The second way out.
-//   * no edge DIGS from a water node, and no edge steps UP from one without placing.
+//   water_step_up   2*COST_PLACE+COST_WATER_EXIT(53)  waterStepUpStep  WATER UP BY PLACING, out of one block of water with
+//                                                        no bank to climb: a block set in the shallow water cell beside the body
+//                                                        (solid ground under it), out onto it, one pillar up. The third way out.
+//   * a dig from water costs WATER_DIG_STANDING (5x) standing in it and WATER_DIG_AFLOAT (25x) afloat; no edge steps UP
+//     from a water node without placing. Dug stair lines are never offered from water.
 //   dig_through     COST_HIGH (15)     digThroughStep    dig a same-Y wall, step in
 //   dig_down        COST_HIGH (15)     digDownStep       dig the floor, drop 1
 //   dig_stair_down  COST_STAIR_STEP(10)/step  stairDownStep  ONE straight dug stair to the goal's level (STAIR LINES)
@@ -95,49 +105,10 @@ const straightLine = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 // The 4 cardinals — the neighbor set every move edge (walk, climb, swim, dig) scans.
 const CARDINAL = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
 
-// ── Binary min-heap: frontier ordered by f-score (g + heuristic). ──
-// A*'s speed edge over Dijkstra evaporates with an O(n) linear-scan frontier, so it needs a heap.
-class MinHeap {
-  constructor() { this.data = []; }
-  get size() { return this.data.length; }
-  push(node) {
-    this.data.push(node);
-    this._bubbleUp(this.data.length - 1);
-  }
-  pop() {
-    const top = this.data[0];
-    const last = this.data.pop();
-    if (this.data.length > 0) { this.data[0] = last; this._sinkDown(0); }
-    return top;
-  }
-  _bubbleUp(i) {
-    const d = this.data;
-    while (i > 0) {
-      const parent = (i - 1) >> 1;
-      if (d[i].f >= d[parent].f) break;
-      [d[i], d[parent]] = [d[parent], d[i]];
-      i = parent;
-    }
-  }
-  _sinkDown(i) {
-    const d = this.data;
-    const n = d.length;
-    while (true) {
-      let smallest = i;
-      const l = 2 * i + 1, r = 2 * i + 2;
-      if (l < n && d[l].f < d[smallest].f) smallest = l;
-      if (r < n && d[r].f < d[smallest].f) smallest = r;
-      if (smallest === i) break;
-      [d[i], d[smallest]] = [d[smallest], d[i]];
-      i = smallest;
-    }
-  }
-}
-
 // ── computeAStar — the pathfinder. ──
 // bot — mineflayer bot. startPos — Vec3/{x,y,z}, the bot's FLOOR position (block stood ON).
 // goal — { type:'position', pos } | { type:'multi', positions:[…] } | { type:'los', targetPos }.
-// opts — { maxNodes?, blacklist?, movePenalties?, protectedBlocks?, closedBoxes?, trace?, deadlineMs?, owner?, sense? }.
+// opts — { maxNodes?, blacklist?, movePenalties?, protectedBlocks?, spareBuilds?, closedBoxes?, trace?, deadlineMs?, owner?, sense?, planningGate? }.
 // sense() supplies fresh world-dependent options after workspace admission.
 // Returns { path:[{key,pos,edgeType}], target, cost, partial, residual, provenBound, complete }, or
 // null when no path exists.
@@ -152,6 +123,74 @@ function isWaterBlock(block) { return block && WATER_BLOCKS.has(block.name); }
 // carries a body like a current, so it is a hazard kept out of every route, the same as lava.
 function isStillWater(bot, x, y, z) { return require('@utils/gravity_utils').isWaterSource(bot, x, y, z); }
 
+// RUNNING_WATER_DETOUR_BUDGET — the PREFERENCE price of entering a running-water cell, by swim or wade: a route
+// through running water is taken only when every way round it is longer than this many steps. Equal to the
+// protected-voxel budget, so it does not widen the search's flood radius.
+const RUNNING_WATER_DETOUR_BUDGET = PROTECTED_VOXEL_DETOUR_BUDGET;
+
+// ── TEMPORARY, until a body swims a current and the route prices it as a risky move ─────────────────────────────────
+// No route ENTERS running water: the swim and wade edges into it are refused, and so is a landing beside running water
+// that pours over a drop deeper than FALL_SCAN_DOWN (a ravine's lip, where the current carries a body over the edge). A
+// body already in running water still routes out of it by every edge. This is the cheap form, to be replaced, not kept.
+const RUNNING_WATER_ENTERED = false;
+function isRunningWaterCell(bot, x, y, z) {
+  return isWaterBlock(bot.blockAt(new Vec3(x, y, z))) && !isStillWater(bot, x, y, z);
+}
+// inRunningWater(bot, x, y, z, ownWater) — does the body of the node with floor (x,y,z) stand or float in running water?
+function inRunningWater(bot, x, y, z, ownWater) {
+  if (isRunningWaterCell(bot, x, y, z)) return true;
+  for (const k of ownWater) { const [wx, wy, wz] = k.split(',').map(Number); if (!isStillWater(bot, wx, wy, wz)) return true; }
+  return false;
+}
+// besideCurrentOverDrop(bot, x, y, z) — is the stand on floor (x,y,z) beside running water, at its floor or feet, that
+// leads within CURRENT_REACH cells (through running water, sideways or down) to running water with no solid block within
+// FALL_SCAN_DOWN under it? Water under it is no floor: it may be a falling column. The water beside a lip may stand on
+// ground of its own and still carry a body into the column it feeds.
+const CURRENT_REACH = 4;
+function overDrop(bot, wx, wy, wz) {
+  for (let d = 1; d <= FALL_SCAN_DOWN; d++) {
+    const b = bot.blockAt(new Vec3(wx, wy - d, wz));
+    if (b && b.boundingBox === 'block') return false;
+  }
+  return true;
+}
+function besideCurrentOverDrop(bot, x, y, z) {
+  const seen = new Set();
+  let ring = [];
+  for (const [dx, , dz] of CARDINAL) {
+    for (const wy of [y, y + 1]) {
+      const k = `${x + dx},${wy},${z + dz}`;
+      if (!seen.has(k) && isRunningWaterCell(bot, x + dx, wy, z + dz)) { seen.add(k); ring.push([x + dx, wy, z + dz]); }
+    }
+  }
+  for (let step = 0; ring.length && step <= CURRENT_REACH; step++) {
+    const next = [];
+    for (const [wx, wy, wz] of ring) {
+      if (overDrop(bot, wx, wy, wz)) return true;
+      for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0]]) {
+        const k = `${wx + dx},${wy + dy},${wz + dz}`;
+        if (seen.has(k) || !isRunningWaterCell(bot, wx + dx, wy + dy, wz + dz)) continue;
+        seen.add(k); next.push([wx + dx, wy + dy, wz + dz]);
+      }
+    }
+    ring = next;
+  }
+  return false;
+}
+
+// wadeable — a floor a body stands on in running water: a full, safe floor; running water (not a source, not a
+// falling column) in the feet cell; a head cell the body passes and no water in it.
+function wadeable(bot, floorBlock) {
+  if (!floorBlock || !isFloorSafe(floorBlock) || !isFullHeightFloor(floorBlock)) return false;
+  const p = floorBlock.position;
+  const feet = bot.blockAt(p.offset(0, 1, 0));
+  if (!isWaterBlock(feet)) return false;
+  const level = require('@utils/gravity_utils').waterLevel(bot, p.x, p.y + 1, p.z);
+  if (level === null || level === 0 || level >= 8) return false;
+  const head = bot.blockAt(p.offset(0, 2, 0));
+  return !!head && !isWaterBlock(head) && isBlockPassable(head);
+}
+
 // Wooden doors — openable by hand (activateBlock). Iron doors excluded: they need redstone.
 const DOOR_BLOCKS = new Set([
   'oak_door', 'birch_door', 'spruce_door', 'jungle_door', 'acacia_door', 'dark_oak_door',
@@ -159,6 +198,85 @@ const DOOR_BLOCKS = new Set([
 ]);
 
 function isDoorBlock(block) { return block && DOOR_BLOCKS.has(block.name); }
+
+// ── THE AIRLOCK — an iron door worked by a button, optionally with one fence gate in line ───────────
+// A gate counts only in line with an iron door, so a pen's or a stall's gate is never a route. The whole
+// passage is one edge, from a stand on one side to the floor on the other: a chamber's carpet would read as
+// a floor one cell higher than the doorway, and no body should plan to stop between two barriers.
+const AIRLOCK_SPAN = 4;   // cells searched along the line: the door, the chamber, the gate
+
+function isFenceGate(block) { return !!block && block.name.endsWith('_fence_gate'); }
+function isAirlockChamber(bot, x, y, z) {
+  const foot = bot.blockAt(new Vec3(x, y + 1, z));
+  const head = bot.blockAt(new Vec3(x, y + 2, z));
+  return !!foot && !!head && isBlockPassable(head) && (foot.name.endsWith('_carpet') || isBlockPassable(foot));
+}
+
+// The door's button on the body's side (side = the unit step from the door toward the body), or null. A button
+// beside the door counts by the way it faces, one in front of the door by where it is. Read from the world
+// itself: the search's fast view carries no block properties.
+function airlockButton(bot, door, side) {
+  const hits = [];
+  for (const half of [0, 1]) {
+    for (const [ox, oy, oz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      const at = new Vec3(door.x + ox, door.y + half + oy, door.z + oz);
+      const block = bot.world?.getBlock?.(at);
+      if (!block || !block.name.endsWith('_button')) continue;
+      const along = ox * side.x + oz * side.z;
+      if (along < 0) continue;
+      if (along === 0) {
+        const facing = block.getProperties?.().facing;
+        const out = { north: [0, -1], south: [0, 1], west: [-1, 0], east: [1, 0] }[facing];
+        if (!out || out[0] * side.x + out[1] * side.z <= 0) continue;
+      }
+      hits.push(at);
+    }
+  }
+  return hits[0] || null;
+}
+
+// Reads an airlock ahead of a stand on floor (cx,cy,cz) along (dx,dz): { barriers, chamber, far }, or null.
+// barriers are in walking order; a body standing inside the chamber has one barrier ahead, and the door may
+// then be behind it. Every door barrier has a button on the near side.
+function readAirlock(bot, cx, cy, cz, dx, dz) {
+  const at = (i, up) => bot.blockAt(new Vec3(cx + dx * i, cy + up, cz + dz * i));
+  const isIronDoor = (i) => at(i, 1)?.name === 'iron_door' && at(i, 2)?.name === 'iron_door';
+  const barriers = [], chamber = [];
+  let i = 1;
+  for (; i <= AIRLOCK_SPAN; i++) {
+    const x = cx + dx * i, z = cz + dz * i;
+    if (isIronDoor(i)) {
+      if (barriers.some(b => b.kind === 'door')) return null;
+      barriers.push({ kind: 'door', pos: new Vec3(x, cy + 1, z) });
+    } else if (isFenceGate(at(i, 1)) && isBlockPassable(at(i, 2))) {
+      if (barriers.some(b => b.kind === 'gate')) return null;
+      barriers.push({ kind: 'gate', pos: new Vec3(x, cy + 1, z) });
+    } else if (!isAirlockChamber(bot, x, cy, z)) {
+      break;
+    } else {
+      chamber.push(new Vec3(x, cy + 1, z));
+    }
+  }
+  if (!barriers.length) return null;
+  const last = barriers[barriers.length - 1].pos;
+  const lastAt = Math.abs(last.x - cx) + Math.abs(last.z - cz);
+  if (!barriers.some(b => b.kind === 'door')) {
+    // A gate alone is an airlock only from inside the chamber, with the door straight behind the body.
+    let behind = false;
+    for (let b = 1; b <= AIRLOCK_SPAN && !behind; b++) {
+      if (bot.blockAt(new Vec3(cx - dx * b, cy + 1, cz - dz * b))?.name === 'iron_door') behind = true;
+      else if (!isAirlockChamber(bot, cx - dx * b, cy, cz - dz * b)) break;
+    }
+    if (!behind) return null;
+  }
+  for (const b of barriers) {
+    if (b.kind !== 'door') continue;
+    b.button = airlockButton(bot, b.pos, { x: -dx, z: -dz });
+    if (!b.button) return null;
+  }
+  const far = new Vec3(cx + dx * (lastAt + 1), cy, cz + dz * (lastAt + 1));
+  return { barriers, chamber: chamber.filter(c => Math.abs(c.x - cx) + Math.abs(c.z - cz) < lastAt), far };
+}
 
 // findWaterSurface: from a water block, climb to the surface Y, or null if capped by solid (no swim node).
 function findWaterSurface(bot, x, y, z) {
@@ -257,15 +375,32 @@ const FLOW_NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]]
 // cells that column LEAVES at its top are open too, so each of those is asked the same question. The
 // column falls as far as the first solid block under the broken cell.
 const FALL_SCAN_DOWN = 8;
-function touchesWater(bot, x, y, z) {
+// WATER IS HELD BY MORE THAN WATER: a riverbed's seagrass and kelp, a bubble column and any waterlogged block stand in
+// a water source, and the water flows the moment the block under or beside them opens (the plant pops off its
+// broken floor and leaves its source behind). Answered once per block state.
+const HOLDS_WATER = new Set(['seagrass', 'tall_seagrass', 'kelp', 'kelp_plant', 'bubble_column']);
+const _holdsWater = new Map();
+function holdsWater(b) {
+  if (WATER_BLOCKS.has(b.name) || HOLDS_WATER.has(b.name)) return true;
+  let held = _holdsWater.get(b.stateId);
+  if (held === undefined) {
+    held = typeof b.getProperties === 'function' && b.getProperties().waterlogged === true;
+    _holdsWater.set(b.stateId, held);
+  }
+  return held;
+}
+// THE BODY'S OWN WATER IS NOT NEW WATER: `own` (bodyWater) names the water cells the body already stands in. A dig
+// that opens onto them lets in nothing the body is not already in, so they are passed over; any other water is not.
+function touchesWater(bot, x, y, z, own = null) {
   for (const [dx, dy, dz] of FLOW_NEIGHBORS) {
+    if (own && own.has(`${x + dx},${y + dy},${z + dz}`)) continue;
     const b = bot.blockAt(new Vec3(x + dx, y + dy, z + dz));
-    if (b && WATER_BLOCKS.has(b.name)) return true;
+    if (b && holdsWater(b)) return true;
   }
   return false;
 }
-function opensOntoWater(bot, x, y, z) {
-  if (touchesWater(bot, x, y, z)) return true;
+function opensOntoWater(bot, x, y, z, own = null) {
+  if (touchesWater(bot, x, y, z, own)) return true;
   let top = y;
   for (;;) {
     const b = bot.blockAt(new Vec3(x, top + 1, z));
@@ -278,15 +413,33 @@ function opensOntoWater(bot, x, y, z) {
     const b = bot.blockAt(new Vec3(x, y - drop, z));
     if (b && b.boundingBox === 'block') break;
   }
-  for (let cy = top; cy > top - drop && cy > y; cy--) if (touchesWater(bot, x, cy, z)) return true;
+  for (let cy = top; cy > top - drop && cy > y; cy--) if (touchesWater(bot, x, cy, z, own)) return true;
   return false;
 }
+
+// bodyWater(bot, x, y, z) → 'x,y,z' of the water cells a body whose feet cell is (x,y,z) stands in: below its feet,
+// at its feet and at its head. Empty for a dry body.
+function bodyWater(bot, x, y, z) {
+  const own = new Set();
+  for (let dy = -1; dy <= 1; dy++) {
+    const b = bot.blockAt(new Vec3(x, y + dy, z));
+    if (b && holdsWater(b)) own.add(`${x},${y + dy},${z}`);
+  }
+  return own;
+}
+
+// A DIG FROM WATER IS PRICED AT THE GAME'S OWN TIMES, NOT BANNED: a block breaks five times slower with the head in
+// water (no aqua affinity), and five times slower again off the ground. A body standing in water digs at
+// WATER_DIG_STANDING times the dry price, a body afloat at WATER_DIG_AFLOAT, so a dig from water is the last way out,
+// taken only where no walk, swim or placed block reaches.
+const WATER_DIG_STANDING = 5;
+const WATER_DIG_AFLOAT = 25;
 
 // flowPrice — the floor price for a dig, given the [x,y,z] cells the edge actually BREAKS: 0 for a
 // dry dig, the lava ceiling for a dig that opens onto lava, and null for a dig that opens onto water,
 // which is no edge at all (performDig refuses it, so A* never offers it).
-function flowPrice(bot, cells) {
-  for (const [x, y, z] of cells) if (opensOntoWater(bot, x, y, z)) return null;
+function flowPrice(bot, cells, own = null) {
+  for (const [x, y, z] of cells) if (opensOntoWater(bot, x, y, z, own)) return null;
   for (const [x, y, z] of cells) {
     for (const [dx, dy, dz] of FLOW_NEIGHBORS) {
       const b = bot.blockAt(new Vec3(x + dx, y + dy, z + dz));
@@ -484,7 +637,9 @@ function _fastVoxelView(bot, readerOverride) {
   if (!reader.fast) return bot;
   const view = Object.create(bot);
   view.blockAt = pos => reader.blockAt(pos.x, pos.y, pos.z);
-  view._classifyFloorAt = reader.classifyFloorAt;
+  // A body's own search reads its floors from the body's labels (voxel_labels), the same verdict kept current; a
+  // reader handed in by the caller answers for itself.
+  view._classifyFloorAt = readerOverride ? reader.classifyFloorAt : require('@utils/voxel_labels').labelsFor(bot).floorAt;
   return view;
 }
 
@@ -517,7 +672,7 @@ function drainSearchCensus() {
 // a timer). Checks STILL-VALID, never STILL-OPTIMAL. Only edges needing standable ground are
 // checked; a dig/bridge/pillar step is going to change its destination, so that is caught by the
 // executor and priced through movePenalties instead.
-const VERIFIABLE_EDGES = new Set(['walk', 'climb_up', 'climb_down', 'door', 'jump_out']);
+const VERIFIABLE_EDGES = new Set(['walk', 'climb_up', 'climb_down', 'door', 'airlock', 'jump_out']);
 function pathStillWalkable(bot, path, fromIdx) {
   if (!Array.isArray(path)) return false;
   const view = _fastVoxelView(bot);
@@ -535,14 +690,17 @@ async function computeAStar(bot, startPos, goal, opts = {}) {
   const startsAtBody = liveStart && startPos.x === Math.floor(liveStart.x)
     && startPos.z === Math.floor(liveStart.z) && startPos.y === Math.floor(liveStart.y) - 1;
   let activeAt = t0;
-  const res = await require('@kernel/foreman_link').withComputationWorkspace(() => {
+  const search = () => {
     activeAt = Date.now();
     // A queued body can move under physics; a route from its body starts at the newly sensed floor.
     const current = bot.entity?.position;
     const from = startsAtBody && current ? new Vec3(Math.floor(current.x), Math.floor(current.y) - 1, Math.floor(current.z)) : startPos;
     const sensedOpts = opts.sense ? { ...opts, ...opts.sense() } : opts;
     return memoryWorkspace.withTemporaryMemory(track => _computeAStarBody(bot, from, goal, sensedOpts, track));
-  });
+  };
+  // opts.planningGate === false: a fight's search, bounded by its own short deadline, never waits in the fleet's
+  // planning line behind another body's plan (the combat driver's route). Its heap growth is still bounded below.
+  const res = opts.planningGate === false ? await search() : await require('@kernel/foreman_link').withComputationWorkspace(search);
   const ms = Date.now() - t0;
   const owner = opts.owner || UNATTRIBUTED_SEARCH_OWNER;
   let tally = _census.get(owner);
@@ -602,6 +760,10 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
   // Active blueprint voxels ("x,y,z" keys), charged PROTECTED_VOXEL_DETOUR_BUDGET to dig — finite, so a
   // trapped bot can still break out.
   const protectedBlocks = opts.protectedBlocks || null;
+  // SPARE BUILDS — a route no move of which may dig or cover a protected voxel: the charge becomes a refusal.
+  // For a walk that has no business in any build (a herder chasing or leading an animal), where an
+  // unreached goal is an answer and a cut build is a fault another fragment then trips on.
+  const spareBuilds = opts.spareBuilds === true;
 
   // Optional (label, message) sink — keeps this module watcher-free. Null = silent.
   const trace = opts.trace || null;
@@ -614,6 +776,14 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
   // slow for the fuse). Each defaults to the flag above.
   const allowDig   = opts.allowDig   !== undefined ? !!opts.allowDig   : allowWorldAlteration;
   const allowPlace = opts.allowPlace !== undefined ? !!opts.allowPlace : allowWorldAlteration;
+  // The two STRAIGHT-UP-AND-DOWN moves, each off on its own for a route an animal is led along: a dug
+  // shaft drops the follower into a hole it cannot leave, and a pillar leaves it below. Every other dig
+  // and place edge stays. Each defaults to its family's flag.
+  const allowDigDown = allowDig && opts.allowDigDown !== false;
+  const allowPillar  = allowPlace && opts.allowPillar !== false;
+  // A fight's prices: a dug block and a placed block scaled from the navigator's own (driver's FIGHT_*_SCALE).
+  const digScale = opts.digScale > 0 ? opts.digScale : 1;
+  const placeScale = opts.placeScale > 0 ? opts.placeScale : 1;
 
   // ── CLOSED BOXES: GROUND THE ROUTE MAY NOT ENTER ────────────────────────────────────────────────────
   // `opts.closedBoxes` ([{min, max}]) is every box closed to this body: a downloaded building once its
@@ -697,6 +867,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
         dug.push([x, y, z]);
         if ((protectedBlocks && protectedBlocks.has(`${x},${y},${z}`)) || STATION_TYPES.has(b.name)) stepOwned = true;
       }
+      if (stepOwned && spareBuilds) return null;
       if (stepOwned) owned = true;
       const stepFlow = dug.length ? flowPrice(bot, dug) : 0;
       if (stepFlow === null) return null;
@@ -718,10 +889,29 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
   const parent = new Map();   // key → { parentKey, edgeType }
   const gCost = new Map();     // key → g-score
   const visited = new Set();
+  // besideCurrentOverDrop per landing, once per search: a landing is a neighbour of up to four nodes.
+  const lips = new Map();
+  const wade = !!opts.wade, lipCharged = new Set();
+  const lipAt = (x, y, z) => {
+    const k = `${x},${y},${z}`;
+    if (!lips.has(k)) lips.set(k, besideCurrentOverDrop(bot, x, y, z));
+    return lips.get(k);
+  };
   const heap = new MinHeap();
+  // THE BLOCKS A ROUTE PLACES ARE COUNTED AGAINST THE BLOCKS CARRIED. A bridge or pillar edge is offered only
+  // while the route to the node has placed fewer than the body carries: a route that needs more is no route
+  // for this body, which would otherwise lay its last block and stand on it in open air with no move left.
+  // Set at the pop, when the node's parent is final; a dig along the way is not counted as fuel gained.
+  const fuel = allowPlace ? bot.inventory.items().reduce((n, i) => n + (i.count > 0 && isScaffoldBlock(i.name) ? i.count : 0), 0) : 0;
+  const placedOnRoute = new Map([[startKey, 0]]);
+  // A workspace handed off mid-search (memory_workspace.leave: stand-down, socket close) clears these
+  // collections while the search waits at its pacer; the search ends there, unproven, on its next step.
+  let abandoned = false;
   track(() => {
+    abandoned = true;
     parent.clear(); gCost.clear(); visited.clear(); inRun.clear(); heap.data.length = 0;
     if (penaltyCharged) penaltyCharged.clear();
+    placedOnRoute.clear();
   });
 
   gCost.set(startKey, 0);
@@ -754,6 +944,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
 
   while (heap.size > 0 && nodesVisited < maxNodes) {
     await pace();   // cheap clock-check per node; cedes a real macrotask only at each ~1-tick slice boundary
+    if (abandoned) return { path: [], target: start, cost: 0, nodesVisited, maxNodes, partial: true, residual: bestPartialH, timedOut, resourceLimited, abandoned, provenBound, complete: false };
     // Checked after pace(), which is where the wall clock actually advances.
     if (deadlineAt && Date.now() >= deadlineAt) { timedOut = true; break; }
     // Measured growth is a cooperative bound, sampled between nodes; a partial result is never a no-route proof.
@@ -796,6 +987,31 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
     // at the pop, a hard rule like `blacklist`. Suspended when the body starts below the floor, so a bot
     // that fell into the layer can still route back out — the floor bars descent, not return.
     if (depthFloorArmed && belowDepthFloor(current.pos.y)) { visited.add(current.key); continue; }
+    // TEMPORARY (RUNNING_WATER_ENTERED): no route stands beside a current that runs to a drop, whatever edge reached the
+    // stand (walk, climb, pillar, dug stair, bridge alike). Deleted at the pop, as the depth floor is. The start is exempt,
+    // and so is a node already in running water: a body there routes out.
+    // A search that WADES (opts.wade), the caller's last resort, prices a dry lip instead: a lip is where a body STOOD
+    // and was taken; crossed in one step on dry ground it is not in the water, which pushes only a body in it. Paid once
+    // (RUNNING_WATER_DETOUR_BUDGET, the re-push the move penalties use below), never a route's end (partial or goal).
+    // A lip in the water, a current that runs to a drop, is deleted in every search but a body's own way out of it.
+    let lipCrossed = false;
+    if (!RUNNING_WATER_ENTERED && current.key !== startKey) {
+      const { x: lx, y: ly, z: lz } = current.pos;
+      if (lipAt(lx, ly, lz)) {
+        const wet = inRunningWater(bot, lx, ly, lz, bodyWater(bot, lx, ly + 1, lz));
+        if (wade ? wet : !wet) { visited.add(current.key); continue; }
+        if (wade) {
+          lipCrossed = true;
+          if (!lipCharged.has(current.key)) {
+            lipCharged.add(current.key);
+            const pg = current.g + RUNNING_WATER_DETOUR_BUDGET;
+            gCost.set(current.key, pg);
+            heap.push({ pos: current.pos, key: current.key, g: pg, f: fScore(pg, heuristic(current.pos, goal)) });
+            continue;
+          }
+        }
+      }
+    }
     // min_y floor: reject nodes whose feet would sink below the caller's working height.
     if (goal.min_y != null && current.pos.y < goal.min_y - 1) { visited.add(current.key); continue; }
     // max_y ceiling: reject nodes whose feet would rise above the caller's working height, so a walk
@@ -822,6 +1038,11 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
 
     visited.add(current.key);
     nodesVisited++;
+    if (current.key !== startKey) {
+      const via = parent.get(current.key);
+      placedOnRoute.set(current.key, (placedOnRoute.get(via.parentKey) || 0) + (via.edgeType === 'bridge' || via.edgeType === 'pillar' ? 1 : via.edgeType === 'water_step_up' ? 2 : 0));
+    }
+    const fuelLeft = fuel - placedOnRoute.get(current.key);
     // The proven cost frontier: every route cheaper than this is ruled out, since the heap pops in
     // nondecreasing f and the heuristic is admissible at W=1.0 (sound only at that weight).
     provenBound = current.f;
@@ -829,16 +1050,17 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
     const h = heuristic(current.pos, goal);
     // The partial is a route the body walks and stops on, so it answers to the same station rule as the
     // goal. Skipped WITHOUT lowering bestPartialH, or the station would lock out every cell behind it.
-    if (h < bestPartialH && !endsOnStation(bot, current.pos, null)) {
+    if (h < bestPartialH && !lipCrossed && !endsOnStation(bot, current.pos, null)) {
       if (trace && (bestPartialKey === startKey || h < bestPartialH - 1)) trace('pathfinding', `A* progress: node#${nodesVisited} (${current.pos.x},${current.pos.y + 1},${current.pos.z}) h=${h.toFixed(1)} (was ${bestPartialH.toFixed(1)})`);
       bestPartialH = h;
       bestPartialKey = current.key;
       bestPartialPos = current.pos;
     }
 
-    // Trace only near the goal (within 6 blocks) to keep the log readable.
-    const nearGoal = h < 6;
-    if (goalReached(bot, current.pos, goal, nearGoal ? trace : null)) {
+    // Trace only near the goal (within 6 blocks) to keep the log readable; opts.traceAll traces every node, for a
+    // search too small to flood the log (the navigator's post-mortem of a body walled in).
+    const nearGoal = h < 6 || !!opts.traceAll;
+    if (!lipCrossed && goalReached(bot, current.pos, goal, nearGoal ? trace : null)) {
       if (goal.type === 'los') {
         const d = straightLine(current.pos, goal.targetPos);
         if (d < bestLOSDist) {
@@ -874,10 +1096,20 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
     // From a water node, outgoing walk/climb edges are re-typed 'swim' so the executor uses
     // swimStep (no digging, correct underwater Y model).
     const curNodeBlock = bot.blockAt(new Vec3(cx, cy, cz));
-    const fromWater = isWaterBlock(curNodeBlock);
+    // A NODE A PILLAR REACHED STANDS ON THE BLOCK THE PILLAR PLACED, whatever the world holds there now: the bob-pillar
+    // sets its block in the water cell, so the body stands dry on it and pillars on up from it like any dry pillar.
+    // Read off the world, that floor is still water, and a body in a cave pool under an open shaft reads afloat at the
+    // surface, where neither pillar applies (dry wants a dry floor, bob wants water in the cell above).
+    const fromWater = isWaterBlock(curNodeBlock) && parent.get(current.key)?.edgeType !== 'pillar';
     // A body on a solid floor with water over both its feet and its head cell is afloat to dig_authority
     // (bobbing), which makes no dig there. No dig edge leaves such a node; it walks or swims out.
     const submerged = !fromWater && isWaterBlock(bot.blockAt(new Vec3(cx, cy + 1, cz))) && isWaterBlock(bot.blockAt(new Vec3(cx, cy + 2, cz)));
+    // The water this node's body stands in, and what a dig from here costs over a dry one (WATER_DIG_*).
+    const ownWater = bodyWater(bot, cx, cy + 1, cz);
+    const wetDig = fromWater ? WATER_DIG_AFLOAT : ownWater.size ? WATER_DIG_STANDING : 1;
+    // TEMPORARY (RUNNING_WATER_ENTERED): a node already in running water may go anywhere; any other enters none, except
+    // in a search that wades (opts.wade), the caller's last resort, where it enters at RUNNING_WATER_DETOUR_BUDGET.
+    const mayEnterRunning = RUNNING_WATER_ENTERED || wade || inRunningWater(bot, cx, cy, cz, ownWater);
 
     // ── THE BODY MUST BE ABLE TO JUMP FROM WHERE IT IS, NOT ONLY LAND WHERE IT IS GOING ──────────────
     // A +1 step needs a free cell above the head at the ORIGIN (cy+3), not only clearance at the
@@ -907,7 +1139,8 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
       // --- Walk edge (same Y) ---
       const walkFloorPos = new Vec3(nx, cy, nz);
       const walkFloor = bot.blockAt(walkFloorPos);
-      const walkClass = classifyFloorInline(bot, walkFloor);
+      const lip = !mayEnterRunning && lipAt(nx, cy, nz);
+      const walkClass = !lip && classifyFloorInline(bot, walkFloor);
       if (walkClass) {
         const wk = keyOf(walkFloorPos);
         if (!visited.has(wk)) {
@@ -918,13 +1151,28 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
             heap.push({ pos: walkFloorPos, key: wk, g: ng, f: fScore(ng, heuristic(walkFloorPos, goal)) });
           }
         }
+      } else if (!lip && mayEnterRunning && !fromWater && wadeable(bot, walkFloor)) {
+        // --- Wade edge (same Y): onto a floor with running water in its feet cell and a dry head ---
+        // A body walks through running water ankle- or knee-deep, carried a little by it, so it is a move;
+        // priced RUNNING_WATER_DETOUR_BUDGET so a route wades only when no dry or still way serves. A body
+        // already standing in it leaves by the ordinary walk edges, which cost nothing extra.
+        const wk = keyOf(walkFloorPos);
+        if (!visited.has(wk)) {
+          const ng = currentG + COST_LOW + RUNNING_WATER_DETOUR_BUDGET;
+          if (!gCost.has(wk) || ng < gCost.get(wk)) {
+            gCost.set(wk, ng);
+            parent.set(wk, { parentKey: current.key, edgeType: 'wade' });
+            heap.push({ pos: walkFloorPos, key: wk, g: ng, f: fScore(ng, heuristic(walkFloorPos, goal)) });
+          }
+        }
       }
 
       // --- Stair up edge (+1Y) ---
       // isFullHeightFloor rejects partial-height blocks (chests, slabs) — see its note.
       const upFloorPos = new Vec3(nx, cy + 1, nz);
       const upFloor = bot.blockAt(upFloorPos);
-      const upClass = classifyFloorInline(bot, upFloor);
+      // The lip test holds on every landing, a step up or down as much as a walk.
+      const upClass = !(!mayEnterRunning && lipAt(nx, cy + 1, nz)) && classifyFloorInline(bot, upFloor);
       // originJumpable is the third term and the one that was missing — see its note above.
       // FROM WATER THERE IS NO STEP UP. A water node's `pos` is the surface cell the body floats IN, so a
       // floor one above it is a block and a half over the body's feet. That bank is left by
@@ -932,7 +1180,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
       if (upClass && isFullHeightFloor(upFloor) && originJumpable && !fromWater) {
         const uk = keyOf(upFloorPos);
         if (!visited.has(uk)) {
-          const ng = currentG + COST_LOW;
+          const ng = currentG + COST_CLIMB_UP;
           if (!gCost.has(uk) || ng < gCost.get(uk)) {
             gCost.set(uk, ng);
             parent.set(uk, { parentKey: current.key, edgeType: 'climb_up' });
@@ -969,10 +1217,34 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
         }
       }
 
+      // --- water_step_up: OUT OF SHALLOW WATER BY PLACING, where no bank stands to climb ---
+      // A body afloat in water rises too little to set a block in its own cell, so the block goes in the shallow
+      // water cell beside it: solid ground under that cell, the body climbs onto the block, and pillars once from it.
+      // The move lands a block over the water, a cell no swim reaches, so it is one move with one destination.
+      if (fromWater && allowPlace && allowPillar && fuelLeft >= 2 && !isWaterBlock(bot.blockAt(new Vec3(cx, cy + 1, cz)))
+        && isWaterBlock(bot.blockAt(new Vec3(nx, cy, nz)))) {
+        const under = bot.blockAt(new Vec3(nx, cy - 1, nz));
+        const s1 = bot.blockAt(new Vec3(nx, cy + 1, nz));
+        const s2 = bot.blockAt(new Vec3(nx, cy + 2, nz));
+        const s3 = bot.blockAt(new Vec3(nx, cy + 3, nz));
+        const upPos = new Vec3(nx, cy + 1, nz);
+        const uk = keyOf(upPos);
+        if (isBlockSolid(under) && !HAZARD_BLOCKS.has(under.name)
+          && isBlockPassable(s1) && !isWaterBlock(s1) && isBlockPassable(s2) && !isWaterBlock(s2)
+          && (isBlockPassable(s3) || isCeilingDiggable(s3)) && !visited.has(uk)) {
+          const ng = currentG + 2 * COST_PLACE + COST_WATER_EXIT;
+          if (!gCost.has(uk) || ng < gCost.get(uk)) {
+            gCost.set(uk, ng);
+            parent.set(uk, { parentKey: current.key, edgeType: 'water_step_up' });
+            heap.push({ pos: upPos, key: uk, g: ng, f: fScore(ng, heuristic(upPos, goal)) });
+          }
+        }
+      }
+
       // --- Stair down edge (-1Y) ---
       const downFloorPos = new Vec3(nx, cy - 1, nz);
       const downFloor = bot.blockAt(downFloorPos);
-      const downClass = classifyFloorInline(bot, downFloor);
+      const downClass = !(!mayEnterRunning && lipAt(nx, cy - 1, nz)) && classifyFloorInline(bot, downFloor);
       // The body crosses into the lower column at the height it stands, so its head passes through the
       // cell over the landing's own head (nx, cy+2). 'jumpable' says that cell is open and the step is a
       // walk. Where it holds a block the walker opens it, so the search reads it as every dug cell is
@@ -981,17 +1253,29 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
         const dk = keyOf(downFloorPos);
         const headDug = downClass !== 'jumpable' && !fromWater;
         const over = headDug ? bot.blockAt(new Vec3(nx, cy + 2, nz)) : null;
-        const headFlow = headDug ? flowPrice(bot, [[nx, cy + 2, nz]]) : 0;
-        const offered = !(headDug && isLooseTread(bot, downFloor)) && (!headDug || allowDig && !submerged && !closed(nx, cy + 2, nz) && headFlow !== null
+        const headFlow = headDug ? flowPrice(bot, [[nx, cy + 2, nz]], ownWater) : 0;
+        const offered = !(headDug && isLooseTread(bot, downFloor)) && (!headDug || allowDig && !closed(nx, cy + 2, nz) && headFlow !== null
           && isBlockSolid(over) && over.diggable && !HAZARD_BLOCKS.has(over.name));
         if (offered && !visited.has(dk)) {
           const headOwned = headDug && ((protectedBlocks && protectedBlocks.has(`${nx},${cy + 2},${nz}`)) || STATION_TYPES.has(over.name));
-          const ng = currentG + (headDug ? Math.max(headOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_STAIR_STEP, headFlow) : COST_LOW);
-          if (!gCost.has(dk) || ng < gCost.get(dk)) {
+          const ng = currentG + (headDug ? Math.max(headOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_STAIR_STEP * wetDig * digScale, headFlow) : (fromWater ? COST_LOW : COST_CLIMB_DOWN));
+          if (!(headOwned && spareBuilds) && (!gCost.has(dk) || ng < gCost.get(dk))) {
             gCost.set(dk, ng);
             parent.set(dk, headDug
               ? { parentKey: current.key, edgeType: 'dig_stair_down', protectedVoxel: !!headOwned, flowCharge: headFlow }
               : { parentKey: current.key, edgeType: fromWater ? 'swim' : 'climb_down' });
+            heap.push({ pos: downFloorPos, key: dk, g: ng, f: fScore(ng, heuristic(downFloorPos, goal)) });
+          }
+        }
+      } else if (mayEnterRunning && !fromWater && wadeable(bot, downFloor) && isBlockPassable(bot.blockAt(new Vec3(nx, cy + 2, nz)))) {
+        // --- Wade down (-1Y): a step down into running water, the head passing the open cell over the landing ---
+        // Priced as the level wade is; walked as a stair step down.
+        const dk = keyOf(downFloorPos);
+        if (!visited.has(dk)) {
+          const ng = currentG + COST_LOW + RUNNING_WATER_DETOUR_BUDGET;
+          if (!gCost.has(dk) || ng < gCost.get(dk)) {
+            gCost.set(dk, ng);
+            parent.set(dk, { parentKey: current.key, edgeType: 'wade_down' });
             heap.push({ pos: downFloorPos, key: dk, g: ng, f: fScore(ng, heuristic(downFloorPos, goal)) });
           }
         }
@@ -1066,25 +1350,45 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
         }
       }
 
+      // --- Airlock edge (same Y, through an iron door worked by its button) ---
+      // One edge across door, chamber and gate. Priced per cell walked, and above a wooden door for the work.
+      if (!fromWater) {
+        const lockFoot = bot.blockAt(new Vec3(nx, cy + 1, nz));
+        if (lockFoot && (lockFoot.name === 'iron_door' || isFenceGate(lockFoot) || lockFoot.name.endsWith('_carpet'))) {
+          const lock = readAirlock(bot, cx, cy, cz, dx, dz);
+          if (lock && classifyFloorInline(bot, bot.blockAt(lock.far))) {
+            const lockKey = keyOf(lock.far);
+            if (!visited.has(lockKey)) {
+              const ng = currentG + COST_LOW * (Math.abs(lock.far.x - cx) + Math.abs(lock.far.z - cz) + 2);
+              if (!gCost.has(lockKey) || ng < gCost.get(lockKey)) {
+                gCost.set(lockKey, ng);
+                parent.set(lockKey, { parentKey: current.key, edgeType: 'airlock' });
+                heap.push({ pos: lock.far, key: lockKey, g: ng, f: fScore(ng, heuristic(lock.far, goal)) });
+              }
+            }
+          }
+        }
+      }
+
       // --- Dig-through edge (same Y, through a wall) ---
       // Neighbor has a standable floor (support after digging) + diggable foot/head: dig one column,
-      // step in. A* chains these across thick walls. Blocked from water.
-      if (allowDig && !walkClass && !upClass && !fromWater && !submerged) {
+      // step in. A* chains these across thick walls. From water, priced by wetDig.
+      if (allowDig && !walkClass && !upClass) {
         const dtFloor = bot.blockAt(new Vec3(nx, cy, nz));
         const dtFoot  = bot.blockAt(new Vec3(nx, cy + 1, nz));
         const dtHead  = bot.blockAt(new Vec3(nx, cy + 2, nz));
         if (isBlockSolid(dtFloor) && isFloorSafe(dtFloor) && !HAZARD_BLOCKS.has(dtFloor.name)
-            && dtFoot && isBlockSolid(dtFoot) && dtFoot.diggable
+            && dtFoot && isBlockSolid(dtFoot) && dtFoot.diggable && dtFoot.name !== 'iron_door' && !isFenceGate(dtFoot)
             && dtHead && (isBlockPassable(dtHead) || (isBlockSolid(dtHead) && dtHead.diggable))) {
           const dtPos = new Vec3(nx, cy, nz);
           const dtk = keyOf(dtPos);
-          const dtFlow = flowPrice(bot, (isBlockSolid(dtHead) && dtHead.diggable) ? [[nx, cy + 1, nz], [nx, cy + 2, nz]] : [[nx, cy + 1, nz]]);
+          const dtFlow = flowPrice(bot, (isBlockSolid(dtHead) && dtHead.diggable) ? [[nx, cy + 1, nz], [nx, cy + 2, nz]] : [[nx, cy + 1, nz]], ownWater);
           if (!visited.has(dtk) && dtFlow !== null) {
             const headDug = isBlockSolid(dtHead) && dtHead.diggable;
             const footOwned = (protectedBlocks && protectedBlocks.has(`${nx},${cy + 1},${nz}`)) || STATION_TYPES.has(dtFoot.name);
             const headOwned = headDug && (((protectedBlocks && protectedBlocks.has(`${nx},${cy + 2},${nz}`))) || STATION_TYPES.has(dtHead.name));
-            const ng = currentG + Math.max((footOwned || headOwned) ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH, dtFlow);
-            if (!gCost.has(dtk) || ng < gCost.get(dtk)) {
+            const ng = currentG + Math.max((footOwned || headOwned) ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH * wetDig * digScale, dtFlow);
+            if (!((footOwned || headOwned) && spareBuilds) && (!gCost.has(dtk) || ng < gCost.get(dtk))) {
               gCost.set(dtk, ng);
               parent.set(dtk, { parentKey: current.key, edgeType: 'dig_through', protectedVoxel: !!(footOwned || headOwned), flowCharge: dtFlow });
               heap.push({ pos: dtPos, key: dtk, g: ng, f: fScore(ng, heuristic(dtPos, goal)) });
@@ -1099,12 +1403,12 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
       if (allowPlace && !walkClass && !fromWater) {
         const brFloor = bot.blockAt(new Vec3(nx, cy, nz));
         if (brFloor && !isBlockSolid(brFloor) && !isWaterBlock(brFloor)) {
-          const hasBlocks = bot.inventory.items().some(i => i.count > 0 && isScaffoldBlock(i.name));
+          const hasBlocks = fuelLeft > 0;
           if (hasBlocks) {
             const brPos = new Vec3(nx, cy, nz);
             const brk = keyOf(brPos);
             if (!visited.has(brk)) {
-              const ng = currentG + COST_PLACE; // place a block over the gap
+              const ng = currentG + COST_PLACE * placeScale; // place a block over the gap
               if (!gCost.has(brk) || ng < gCost.get(brk)) {
                 gCost.set(brk, ng);
                 parent.set(brk, { parentKey: current.key, edgeType: 'bridge' });
@@ -1113,7 +1417,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
               if (trace && nearGoal) trace('pathfinding', `  BRIDGE (${cx},${cy},${cz})→(${nx},${cy},${nz}) over ${brFloor.name} cost +${COST_PLACE}`);
             }
           } else if (trace && nearGoal) {
-            trace('pathfinding', `  bridge SKIP (${cx},${cy},${cz})→(${nx},${cy},${nz}): NO construction blocks in inventory`);
+            trace('pathfinding', `  bridge SKIP (${cx},${cy},${cz})→(${nx},${cy},${nz}): no construction block left on this route (${fuel} carried)`);
           }
         }
       }
@@ -1121,18 +1425,21 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
       // --- Swim edge (horizontal water entry / traversal) ---
       // Enter adjacent water at cy/cy±1, or continue water→water. Water→land is water_exit and
       // water_bank_out, above. No fall-into-water edge either —
-      // a ledge is descended by stair/dig_down, never a drop. Only still water is swum: the entered cell
-      // and the surface cell must both be sources (isStillWater).
+      // a ledge is descended by stair/dig_down, never a drop. Still water is swum at COST_HIGH: the entered
+      // cell and the surface cell both sources (isStillWater). Running water is swum too, so a body in it
+      // has a way through and out, priced RUNNING_WATER_DETOUR_BUDGET more: a route takes it only when no
+      // still water or dry ground serves.
       {
         for (const checkY of [cy, cy + 1, cy - 1]) {
           const checkBlock = bot.blockAt(new Vec3(nx, checkY, nz));
           if (isWaterBlock(checkBlock)) {
             const surfY = findWaterSurface(bot, nx, checkY, nz);
-            if (surfY !== null && isStillWater(bot, nx, checkY, nz) && isStillWater(bot, nx, surfY, nz)) {
+            if (surfY !== null) {
+              const still = isStillWater(bot, nx, checkY, nz) && isStillWater(bot, nx, surfY, nz);
               const swimPos = new Vec3(nx, surfY, nz);
               const sk = keyOf(swimPos);
-              if (!visited.has(sk)) {
-                const ng = currentG + COST_HIGH; // swim
+              if (!visited.has(sk) && (still || mayEnterRunning)) {
+                const ng = currentG + COST_HIGH + (still ? 0 : RUNNING_WATER_DETOUR_BUDGET); // swim
                 if (!gCost.has(sk) || ng < gCost.get(sk)) {
                   gCost.set(sk, ng);
                   parent.set(sk, { parentKey: current.key, edgeType: 'swim' });
@@ -1150,7 +1457,8 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
     // Dig the floor, drop onto the block below (solid, standable), priced by flowPrice() like every
     // other dig; a floor that opens onto water is no edge. A body standing on a leaf comes down through
     // the canopy by this edge: from a leaf floor the landing may be a leaf too.
-    if (allowDig && !fromWater && !submerged) {
+    // A body standing in water digs down at wetDig; a body afloat has no floor of its own to dig.
+    if (allowDigDown && !fromWater) {
       const curFloorBlock = bot.blockAt(new Vec3(cx, cy, cz));
       const belowBlock = bot.blockAt(new Vec3(cx, cy - 1, cz));
       if (curFloorBlock && curFloorBlock.diggable
@@ -1160,11 +1468,11 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
         const ddk = keyOf(ddPos);
         // Both the floor cell and the feet cell above it are offered to flowPrice: the bot drops
         // through the feet cell too, so liquid there pours straight down the hole.
-        const ddFlow = flowPrice(bot, [[cx, cy, cz], [cx, cy + 1, cz]]);
+        const ddFlow = flowPrice(bot, [[cx, cy, cz], [cx, cy + 1, cz]], ownWater);
         if (!visited.has(ddk) && ddFlow !== null) {
           const floorOwned = (protectedBlocks && protectedBlocks.has(`${cx},${cy},${cz}`)) || STATION_TYPES.has(curFloorBlock.name);
-          const ng = currentG + Math.max(floorOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH, ddFlow);
-          if (!gCost.has(ddk) || ng < gCost.get(ddk)) {
+          const ng = currentG + Math.max(floorOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : COST_HIGH * wetDig * digScale, ddFlow);
+          if (!(floorOwned && spareBuilds) && (!gCost.has(ddk) || ng < gCost.get(ddk))) {
             gCost.set(ddk, ng);
             parent.set(ddk, { parentKey: current.key, edgeType: 'dig_down', protectedVoxel: !!floorOwned, flowCharge: ddFlow });
             heap.push({ pos: ddPos, key: ddk, g: ng, f: fScore(ng, heuristic(ddPos, goal)) });
@@ -1179,7 +1487,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
     // PROTECTED_VOXEL_DETOUR_BUDGET instead (Law 16). DRY pillar: solid-floored node, place cell
     // passable. WATER bob-pillar: place cell floods, a solid floor within BLOCK_REACH below — bobs and
     // fills the column down, then stands out.
-    if (allowPlace) {
+    if (allowPillar) {
       const pillarDest = new Vec3(cx, cy + 1, cz);
       const pk = keyOf(pillarDest);
       if (!visited.has(pk)) {
@@ -1198,7 +1506,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
         }
         const dryOk = !fromWater && shaftOk(p1);
         const clear = (dryOk || (overWater && waterFloorInReach)) && shaftOk(p2) && shaftOk(p3);
-        const hasBlocks = bot.inventory.items().some(i => i.count > 0 && isScaffoldBlock(i.name));
+        const hasBlocks = fuelLeft > 0;
         const pDug = [];
         if (isBlockSolid(p1)) pDug.push([cx, cy + 1, cz]);
         if (isBlockSolid(p2)) pDug.push([cx, cy + 2, cz]);
@@ -1209,9 +1517,9 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
           // Water-pillar carries a bob surcharge (COST_PLACE + COST_HIGH) over a dry pillar, reserved for
           // getting out where nothing dry reaches. pillarUpStep BREAKS the shaft as it rises, so it is a
           // dig edge too and carries the same flow price; the bob-pillar's own water (p1) is not charged.
-          const pillarCost = Math.max(ceilingOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : (overWater ? COST_PLACE + COST_HIGH : COST_PLACE), pFlow);
+          const pillarCost = Math.max(ceilingOwned ? PROTECTED_VOXEL_DETOUR_BUDGET : (overWater ? COST_PLACE + COST_HIGH : COST_PLACE * placeScale), pFlow);
           const ng = currentG + pillarCost;
-          if (!gCost.has(pk) || ng < gCost.get(pk)) {
+          if (!(ceilingOwned && spareBuilds) && (!gCost.has(pk) || ng < gCost.get(pk))) {
             gCost.set(pk, ng);
             parent.set(pk, { parentKey: current.key, edgeType: 'pillar', protectedVoxel: !!ceilingOwned, flowCharge: pFlow });
             heap.push({ pos: pillarDest, key: pk, g: ng, f: fScore(ng, heuristic(pillarDest, goal)) });
@@ -1219,7 +1527,7 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
           if (trace && nearGoal) trace('pathfinding', `  PILLAR${overWater ? ' (water/bob)' : ''} (${cx},${cy},${cz})→+1Y cost +${ceilingOwned ? PROTECTED_VOXEL_DETOUR_BUDGET + ' (protected ceiling)' : pillarCost}`);
         } else if (trace && nearGoal) {
           // The "why didn't it pillar" answer: which gate deleted the straight-up edge.
-          trace('pathfinding', `  pillar SKIP (${cx},${cy},${cz}): ${!hasBlocks ? 'NO construction blocks in inventory (bridge edge disabled too)' : (overWater && !waterFloorInReach) ? `water: no solid floor within reach (${Math.max(1, Math.floor(BLOCK_REACH))}) below` : `shaft blocked p1=${p1 && p1.name} p2=${p2 && p2.name} p3=${p3 && p3.name}`}`);
+          trace('pathfinding', `  pillar SKIP (${cx},${cy},${cz}): ${!hasBlocks ? `no construction block left on this route (${fuel} carried; bridge edge off too)` : (overWater && !waterFloorInReach) ? `water: no solid floor within reach (${Math.max(1, Math.floor(BLOCK_REACH))}) below` : pFlow === null && clear ? `a dug cell opens onto water (${pDug.map(c => c.join(',')).join(' ')})` : `shaft blocked p1=${p1 && p1.name} p2=${p2 && p2.name} p3=${p3 && p3.name}`}`);
         }
       }
     }
@@ -1296,9 +1604,9 @@ async function _computeAStarBody(bot, startPos, goal, opts = {}, track) {
 module.exports = {
   keyOf, straightLine,
   COST_LOW, COST_HIGH, COST_PLACE, COST_STAIR_STEP, PROTECTED_VOXEL_DETOUR_BUDGET,
-  DOOR_BLOCKS, isDoorBlock,
+  DOOR_BLOCKS, isDoorBlock, readAirlock, airlockButton,
   MIN_PLACEMENT_DIST,
-  LAVA_FLOW_DETOUR_BUDGET, opensOntoWater,
+  LAVA_FLOW_DETOUR_BUDGET, opensOntoWater, bodyWater,
   computeAStar, drainSearchCensus, pathStillWalkable, MinHeap,
   isScaffoldBlock,   // exported so the navigator's give-up post-mortem counts pillar/bridge fuel from the one definition (Law 16)
   // EXPORT-ONLY, no behaviour change. tools/voxel_classifier_prototype derives its per-state-id table
@@ -1307,4 +1615,7 @@ module.exports = {
   // classifyFloorInline is the single definition of a standable dry cell. Exported so the water-escape
   // gate reuses it, never re-deriving shore detection (Law 16).
   classifyFloorInline,
+  // TEMPORARY with RUNNING_WATER_ENTERED: the lip test, so the current reflex (underwater_swimming) takes a body standing
+  // in a current that pours over a drop by the same definition the search refuses that landing by (Law 16).
+  besideCurrentOverDrop,
 };

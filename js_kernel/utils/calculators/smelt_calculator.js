@@ -38,7 +38,18 @@ function isSmeltComplete(startedAt, item, qty, now) {
   return t >= done;
 }
 
+// smeltCookedBy(startedAt, item, qty, now?) → how many of the batch the clock says are cooked, 0 to qty. An estimate
+// that only decides when a body goes to look; the window says what is really there.
+function smeltCookedBy(startedAt, item, qty, now) {
+  const start = new Date(startedAt).getTime();
+  if (!Number.isFinite(start)) return 0;
+  const t = now != null ? new Date(now).getTime() : Date.now();
+  return Math.min(Math.max(1, qty | 0), Math.max(0, Math.floor((t - start) / smeltCookMsPerItem(item))));
+}
+
 module.exports = {
+  smeltCookMsPerItem,
+  smeltCookedBy,
   smeltCompleteAt,
   isSmeltComplete,
 };

@@ -80,14 +80,18 @@ function javaRecordArgs(serverDir) {
 
 // ── THE SERVER'S PULSE, ASKED ONCE A MINUTE AND AFTER EVERY LAG ─────────────────────────────────────
 // `tick query` is the server's own account of its tick times (average and percentiles); the entity counts are
-// the load it is ticking. Each reading is one SERVER PULSE line in the record; a reading that cannot be taken
-// says so in the same line.
+// the load it is ticking. Each reading is one SERVER PULSE line in the record. A reading that cannot be taken
+// means the server's console is not answering, and the run ends (Law 13: nothing proves it safe to continue).
 let pulseTimer = null;
 async function samplePulse(log, why) {
   const r = await guardExternal('foreman_world', 'server pulse', () => rcon.once([
     'tick query', 'execute if entity @e', 'execute if entity @e[type=item]',
   ]));
-  if (!r.ok) { log(`SERVER PULSE why=${why} unread=${r.reason}`); return; }
+  if (!r.ok) {
+    log(`SERVER PULSE why=${why} unread=${r.reason}`);
+    require('../js_kernel/utils/timeout_crash').crashEverything('foreman_world', `the server's console did not answer the pulse (${r.reason})`);
+    return;
+  }
   const flat = (t) => String(t || '').replace(/\s+/g, ' ').trim();
   const count = (t) => { const m = /count: (\d+)/i.exec(String(t || '')); return m ? m[1] : 'none'; };
   log(`SERVER PULSE why=${why} entities=${count(r.value[1].body)} items=${count(r.value[2].body)} | ${flat(r.value[0].body).slice(0, 400)}`);
@@ -247,14 +251,34 @@ function localSteps(log) {
     },
     {
       name: "nothing else is on the server's port",
+      // ── A TAKEN PORT IS MOVED, A HELD WORLD IS NOT ── A server still running on THIS folder's world (its
+      // session.lock held) is refused as before: a second one on the same world would fight it, and a rollback
+      // would pull the world from under it. A port held by anything else — another run's server, from its own
+      // copy — is not this world's business: the next free game and console ports are written into this
+      // server's own file (port_book, server_settings.movePorts) and said out loud.
       proof: async () => {
         ctx.gamePort = settings.serverPort(ctx.dir);
-        if (await settings.serverAnswers(ctx.gamePort)) {
-          return { ok: false, final: true, why: `A server is already answering on port ${ctx.gamePort}, and this foreman did not start it, so it will `
+        const rconWas = settings.rconPort(ctx.dir);
+        if (settings.worldInUse(ctx.dir)) {
+          return { ok: false, final: true, why: `A server is already running on this folder's world (${settings.levelName(ctx.dir)}), and this foreman did not start it, so it will `
             + `not start a second one or stop that one. Stop it (a server left from an earlier start is the usual cause), `
             + `or, to join it as it is, set where: 'remote' in foreman_config.js with its console password.` };
         }
-        return { ok: true, why: `port ${ctx.gamePort} is free` };
+        const portBook = require('@utils/port_book');
+        const gameFree = await portBook.portFree(ctx.gamePort);
+        const rconFree = await portBook.portFree(rconWas);
+        if (gameFree && rconFree) return { ok: true, why: `port ${ctx.gamePort} is free (console ${rconWas})` };
+        const game = gameFree ? ctx.gamePort : await portBook.firstFree({ from: ctx.gamePort + 1, avoid: [rconWas] });
+        const rconNow = rconFree && rconWas !== game ? rconWas : await portBook.firstFree({ from: rconWas + 1, avoid: [game] });
+        if (game === null || rconNow === null) {
+          return { ok: false, final: true, why: `port ${ctx.gamePort} or its console ${rconWas} is in use, and no free one was found in the `
+            + `${portBook.PORT_TRIES} above it. Close what holds them, or set server-port and rcon.port in ${path.join(ctx.dir, 'server.properties')}.` };
+        }
+        settings.movePorts(ctx.dir, { game, rcon: rconNow });
+        log(`SERVER PORTS MOVED in ${path.join(ctx.dir, 'server.properties')}: game ${ctx.gamePort} → ${game}, console ${rconWas} → ${rconNow} `
+          + `— the usual ones are held by another program (another run on this machine), and this world is not in use.`);
+        ctx.gamePort = game;
+        return { ok: true, why: `port ${game} is free (console ${rconNow}), moved off ports another program holds` };
       },
     },
     {
@@ -388,6 +412,7 @@ function launchServer(ctx, log) {
     if (tail.length > TAIL_LINES) tail.shift();
     if (SHOWN.test(line) && !NOT_SHOWN.test(line)) log(`[server] ${line}`);
     if (/\]: Done \(/.test(line) && ctx.launch.how === 'starting') ctx.launch.how = 'done';
+    require('../js_kernel/utils/camera_spots').heard(line, log);
     const lag = LAG_RE.exec(line);
     if (lag) {
       log(`SERVER LAG behind_ms=${lag[1]} ticks=${lag[2]} — server_gc.log and server.jfr hold what Java was doing`);
@@ -534,27 +559,4 @@ async function stopServer(log) {
   return { stopped: false, reason: why };
 }
 
-// ── one line into the server's own console ───────────────────────────────────
-// A teleport is the server's to perform, not a bot's. The foreman's body is an ordinary player without
-// operator rights, so `bot.chat('/tp …')` is a sentence the server refuses. The console IS the operator,
-// and this process already holds that pipe: `stopServer` writes `stop` to it the same way.
-//
-// Acts only on a server this foreman started, the same rule `stopServer` above states. A `remote` world
-// belongs to somebody else; there is no stdin to reach, so the refusal is a return, never a throw — the
-// caller turns it into a sentence a person standing in that world can act on.
-//
-// The line is written whole and nothing is parsed back. A console command's reply arrives in the server's
-// log stream on its own schedule and is not addressed to the asker. What the person sees is the world
-// moving (Law 3 — the world is the report), and what they hear from the desk is that the ask was sent.
-function consoleCommand(line) {
-  if (typeof line !== 'string' || !line.trim()) {
-    throw new Error(`[foreman_world] CODING VIOLATION (Law 13): consoleCommand needs the console line to send, got ${JSON.stringify(line)}.`);
-  }
-  if (!WORLD.ours || !child || child.exitCode !== null || child.signalCode !== null) {
-    return { sent: false, reason: WORLD.ours ? 'the server has already exited' : 'this foreman did not start this world, so it has no console to speak into' };
-  }
-  child.stdin.write(`${line.trim()}\n`);
-  return { sent: true, reason: null };
-}
-
-module.exports = { bringUp, stopServer, startPulse, status, endpoint, onUnexpectedExit, lastLines, onShutdownAsked, askShutdown, consoleCommand };
+module.exports = { bringUp, stopServer, startPulse, status, endpoint, onUnexpectedExit, lastLines, onShutdownAsked, askShutdown };

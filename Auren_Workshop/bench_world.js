@@ -6,14 +6,15 @@ require('../js_kernel/utils/developer_door').enter('Auren_Workshop/bench_world.j
 // categorized as someting that runs and really cant handle anything that goes wrong. it just walks a sequence of
 // events. now i want foreman to control and pace everything without scripts."*
 //
-// Benches (voxel_snapshot, wheat_site_probe, seed_scanner, world_forge) each started the server through
+// Benches (voxel_snapshot, seed_scanner, world_forge) each started the server through
 // fleet_control's `server-start` / `snapshot-restore` / `up` and stopped it with `server-stop` — a second owner of
 // the world beside the foreman, walking a fixed order with nothing checking that each step happened. Those verbs
 // are deleted. A bench now starts THE FOREMAN, exactly as a person does (start_auren.js, with the sentence as
 // flags), and waits on the foreman's own door until its proved startup is done; the foreman restores, starts,
 // verifies and later stops the world. So a bench's world comes up the one way every world comes up (Law 16).
 //
-//   up({ start, crew, soak, build })  → { ok, why, foreman }   defaults: continue · contractor · 0 (a world, no crew)
+//   up({ start, crew, soak, build })  → { ok, why, foreman }   defaults: continue · no crew (the foreman's `world` test:
+//                                                               a world and its spawn, nobody raised, open until stopped)
 //   down(foreman)                     → { ok, why }            the foreman's own shutdown: bots home, world saved
 //
 // The foreman's console goes to fleet_logs/console_desk.log with a window following it (no invisible processes).
@@ -33,21 +34,22 @@ const SHUTDOWN_WAIT_MS = 240000;        // the foreman's own save limit is 180 s
 const POLL_MS = 3000;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function up({ start = 'continue', crew = 'contractor', soak = 0, build = null, say = console.log } = {}) {
+async function up({ start = 'continue', crew = null, soak = 0, build = null, say = console.log } = {}) {
   // Only a rollback start empties the records; a continue start adds to them. Swept here, before this file
-  // opens the desk's console log inside the room, and start_auren is told so (`--records keep`).
+  // opens the foreman's console log inside the room, and start_auren is told so (`--records keep`).
   if (start === 'rollback') sweepRecords();
   fs.mkdirSync(RECORDS_DIR, { recursive: true });
   const logFile = path.join(RECORDS_DIR, 'console_desk.log');
   const fd = fs.openSync(logFile, 'a');
-  const args = [paths.bot('start_auren.js'), '--start', start, '--crew', crew, '--soak', String(soak), '--records', 'keep'];
+  const args = [paths.bot('start_auren.js'), '--start', start, '--soak', String(soak), '--records', 'keep',
+    ...(crew ? ['--crew', crew] : ['--test', 'world'])];
   if (build) args.push('--build', build);
   const child = spawn(process.execPath, args, { cwd: paths.bot(), stdio: ['ignore', fd, fd] });
   fs.closeSync(fd);
-  const window = consoleWindow.followFile({ title: 'auren desk', logFile });
+  const window = consoleWindow.followFile({ title: 'auren foreman', logFile });
   const foreman = { child, window, logFile };
   const tail = () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').slice(-900) : '');
-  say(`bench_world: the foreman is bringing up a world — ${start} start, ${crew}${soak ? `, ${soak} min` : ''} (its window: auren desk)`);
+  say(`bench_world: the foreman is bringing up a world — ${start} start, ${crew || 'no crew'}${soak ? `, ${soak} min` : ''} (its window: auren foreman)`);
 
   let lastStep = null;
   for (const end = Date.now() + READY_WAIT_MS; Date.now() < end;) {

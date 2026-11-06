@@ -252,7 +252,8 @@ const FAMILIES = [
 ];
 
 function familyOf(name) {
-  return FAMILIES.find(f => f.matches(name)) || null;
+  const fresh = require('@utils/fragment_utils').unaged(name);
+  return FAMILIES.find(f => f.matches(fresh)) || null;
 }
 
 // unplaceableReason — why this block/state pair cannot be placed as asked, or null when it can. Gives the

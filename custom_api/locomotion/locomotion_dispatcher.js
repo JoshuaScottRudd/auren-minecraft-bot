@@ -50,12 +50,23 @@ function validCoordinate(c) {
 
 // normalizeGoal: convert either accepted goal shape into { coordinate, candidates_ref,
 // candidates_count, candidates_kind }. Throws on malformed input (Law 13).
+// stepBudget: the caller's cap on how many steps of the planned route one walk may take, or null for the
+// whole route. A walk that spends it stops where it stands and says so; the caller decides what follows.
+function stepBudget(verb, goal) {
+  if (goal == null || goal.max_steps == null) return null;
+  if (!Number.isInteger(goal.max_steps) || goal.max_steps < 1) {
+    throw new Error(`[locomotion_dispatcher] CODING VIOLATION: ${verb} max_steps must be a whole number ≥ 1. Got: ${JSON.stringify(goal.max_steps)}`);
+  }
+  return goal.max_steps;
+}
+
 function normalizeGoal(verb, goal) {
   if (validCoordinate(goal)) {
-    return { coordinate: { x: goal.x, y: goal.y, z: goal.z }, require_los: goal.require_los === true, required_side: goal.required_side || null, min_y: goal.min_y != null ? goal.min_y : null, max_y: goal.max_y != null ? goal.max_y : null, walk_only: goal.walk_only === true, exact: goal.exact === true, candidates_ref: null, candidates_count: 0, candidates_kind: null };
+    return { coordinate: { x: goal.x, y: goal.y, z: goal.z }, require_los: goal.require_los === true, required_side: goal.required_side || null, min_y: goal.min_y != null ? goal.min_y : null, max_y: goal.max_y != null ? goal.max_y : null, walk_only: goal.walk_only === true, leading: goal.leading === true, spare_builds: goal.spare_builds === true, exact: goal.exact === true, max_steps: stepBudget(verb, goal), candidates_ref: null, candidates_count: 0, candidates_kind: null };
   }
   if (goal && typeof goal.candidates_ref === 'string' && goal.candidates_ref && Number(goal.candidates_count) > 0) {
     return {
+      max_steps: stepBudget(verb, goal),
       coordinate: null,
       candidates_ref: goal.candidates_ref,
       candidates_count: Number(goal.candidates_count),
@@ -106,7 +117,10 @@ function dispatchChain(request) {
       min_y: request.min_y != null ? request.min_y : null,
       max_y: request.max_y != null ? request.max_y : null,
       walk_only: request.walk_only === true, // a route with no dig and no place edge (drop_collector's strip chase)
+      leading: request.leading === true,     // a route an animal is led along: no dig_down, no pillar (herd_executor)
+      spare_builds: request.spare_builds === true,   // a route that may not dig or cover any build (herd_executor)
       exact: request.exact || false, // arrive standing ON the target cell; default false keeps ~1.5 tolerance
+      max_steps: request.max_steps ?? null, // steps of the planned route this walk may take; null walks it all
       candidates_ref: request.candidates_ref,
       candidates_count: request.candidates_count,
       candidates_kind: request.candidates_kind,
@@ -202,7 +216,10 @@ function invoke(verb, goal) {
       min_y: normalized.min_y,
       max_y: normalized.max_y,
       walk_only: normalized.walk_only,
+      leading: normalized.leading,
+      spare_builds: normalized.spare_builds,
       exact: normalized.exact,
+      max_steps: normalized.max_steps,
       candidates_ref: normalized.candidates_ref,
       candidates_count: normalized.candidates_count,
       candidates_kind: normalized.candidates_kind,
@@ -373,7 +390,7 @@ async function goToStationStance(pos) {
 
 // ── descendColumn: sink a shaft STRAIGHT DOWN, in one XZ, and never leave it ──────────────────────
 //
-// Owns the descent half of the vertical stone-prospect design: an ordinary A* route can step aside
+// Owns a straight descent in one column: an ordinary A* route can step aside
 // onto a diagonal, since staying in one column is a constraint a route search cannot price (Law 27).
 // Loops navigator.digDownStep and implements nothing of its own — every dig-down safety property is
 // that function's, re-sensed per step (Invariant B); this adds one constraint: no move in X or Z.
@@ -462,9 +479,11 @@ module.exports = {
       watcher.summary('locomotion_dispatcher',
         `✅ ${pending.verb} succeeded on attempt ${verdictCapsule.attempt} in ${elapsedSec}s — bot at ${endPosition ? `(${endPosition.x},${endPosition.y},${endPosition.z})` : 'unknown'} (invocation #${pending.invocationId}).`
       );
-      _ledgerWalk(pending, 'arrived', endPosition);
+      // A walk that spent the caller's step budget succeeded at what was asked and did not arrive.
+      const budgetSpent = verdictCapsule.step_budget_spent === true;
+      _ledgerWalk(pending, budgetSpent ? 'step_budget_spent' : 'arrived', endPosition);
       const resolve = pending.resolve;
-      const result = { arrived: true, verb: pending.verb, position: endPosition, attempts: verdictCapsule.attempt, selected_target: verdictCapsule.selected_target || null }; // selected_target: which candidate the ladder reached
+      const result = { arrived: !budgetSpent, step_budget_spent: budgetSpent, verb: pending.verb, position: endPosition, attempts: verdictCapsule.attempt, selected_target: verdictCapsule.selected_target || null }; // selected_target: which candidate the ladder reached
       pending = null; // free the slot BEFORE resolving so the caller may immediately re-invoke
       resolve(result);
       return;
@@ -482,7 +501,10 @@ module.exports = {
         min_y: verdictCapsule.min_y ?? null,
         max_y: verdictCapsule.max_y ?? null,
         walk_only: verdictCapsule.walk_only === true,
+        leading: verdictCapsule.leading === true,
+        spare_builds: verdictCapsule.spare_builds === true,
         exact: verdictCapsule.exact ?? false,
+        max_steps: verdictCapsule.max_steps ?? null,
         candidates_ref: verdictCapsule.candidates_ref ?? null,
         candidates_count: verdictCapsule.candidates_count ?? 0,
         candidates_kind: verdictCapsule.candidates_kind ?? null,

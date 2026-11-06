@@ -17,7 +17,7 @@
 
 const watcher = require('@kernel/watcher');
 const hq      = require('@kernel/corporate_headquarters');
-const { group_to_item: ROOT_GROUPS, getBotInventory, isUnderground, isProspected, furnace_chain_items, farm_items, hunt_items, normalizeItemName, chestItemCounts, substitutes_for: SUBSTITUTES_FOR } = require('@utils/fragment_utils');
+const { group_to_item: ROOT_GROUPS, getBotInventory, isUnderground, furnace_chain_items, farm_items, hunt_items, normalizeItemName, chestItemCounts, substitutes_for: SUBSTITUTES_FOR } = require('@utils/fragment_utils');
 const { countInInventory, craftsAffordable, heldByVariant } = require('@utils/calculators/inventory_calculator');
 const inventoryLens = require('@kernel/inventory_lens');
 const { routeToJudge, routeSignal } = require('@utils/signal_utils');
@@ -29,7 +29,7 @@ const TAG = 'supply_manager';
 
 // Executors whose return means the bot holds stock it made for this request — the only stock a storage
 // delivery may pay out of; membership is earned by producing.
-const PRODUCER_EXECUTORS = new Set(['harvest_executor', 'craft_executor', 'furnace_executor', 'mining_executor', 'stone_prospect_executor']);
+const PRODUCER_EXECUTORS = new Set(['harvest_executor', 'craft_executor', 'furnace_executor', 'mining_executor']);
 // No station name set here: the recipes' own `requires` names every station, and
 // `crafting_blueprint_registry.stationsRequiredFor` reads it directly (Law 16).
 const CRAFTING_GROUPS = ['logs', 'planks', 'stairs', 'door', 'stone'];
@@ -61,6 +61,16 @@ function _resolveGroupAlias(name) {
 function _getInventoryCount(item, inventory) {
     const alias = _resolveGroupAlias(item);
     return countInInventory(alias, inventory, ROOT_GROUPS);
+}
+
+// A BUILDING'S LOG IS ITS OWN SPECIES: the downloaded build's order names `<wood>_log` species-true
+// (downloaded_build, remainingRawInSpecies), so an oak log the pocket holds is not birch toward a birch order. Every
+// other order counts a log name as any log (CRAFTING_GROUPS). _countFor(magnet) → the counter that order is
+// measured with.
+function _countFor(magnet) {
+    const site = magnet && magnet.structure && magnet.structure === require('@thinking/assessors/downloaded_build').buildName();
+    if (!site) return _getInventoryCount;
+    return (item, inventory) => ((ROOT_GROUPS.logs || []).includes(item) ? countInInventory(item, inventory) : _getInventoryCount(item, inventory));
 }
 
 // How many crafts this pocket can run of `perCraft`, measured in crafts, where `_getInventoryCount` is
@@ -230,28 +240,15 @@ function _dispatchCraft(payload, step) {
     });
 }
 
-// A claim is worked a pledge at a time, bounded by PLEDGES_PER_CLAIM. A pledge is worked until it is whole:
+// A claim is worked a pledge at a time, bounded by PLEDGES_PER_CLAIM (a delivery by its walk instead, _nextTrip).
+// A pledge is worked until it is whole:
 // the body goes out again for the rest of it, and a gather that finds nothing ends the job through the
 // executor's own verdict. State lives on the magnet (Law 6).
 const PLEDGES_PER_CLAIM = 3;
 
-// Whether this body's trip for a delivery order has paid for its walk, from the walk calculator
-// (yield_pledge_calculator.walkOwed): the flat distance from where it stands (at the material) to the
-// order's station, at its own measured pace, against the walking and the working its own clock holds for the
-// order. → { walk, walk_s, elapsed_s, walked_s, owed_s, measured, stays }.
+// Whether this body's trip for a delivery order has paid for its walk (yield_pledge_calculator.tripSize).
 function _tripSize(magnet) {
-    const yieldPledge = require('@utils/calculators/yield_pledge_calculator');
-    const bot = global.bot;
-    const at = bot.entity.position;
-    const [sx, , sz] = String(magnet.station_id).split('|').map(Number);
-    if (!Number.isFinite(sx) || !Number.isFinite(sz)) {
-        throw new Error(`[supply_manager] CODING VIOLATION (Law 13): station_id "${magnet.station_id}" does not begin with x|y|z, `
-            + 'so the walk back to it cannot be measured.');
-    }
-    const walk = Math.round(Math.hypot(at.x - sx, at.z - sz));
-    const span = require('@kernel/bot_minutes').snapshot().open_span;
-    const owed = yieldPledge.walkOwed(walk, require('@locomotion/locomotion_dispatcher').walkPace(), span);
-    return { walk, ...owed, stays: yieldPledge.staysOut(span, owed, 'pledge') };
+    return require('@utils/calculators/yield_pledge_calculator').tripSize(global.bot, magnet, 'pledge');
 }
 
 // Peers' live pledges against this order, read through the dispatcher (Law 16).
@@ -285,6 +282,10 @@ function _anotherPledgeOpen(botId, magnet, rootItem, inventory, taken) {
             ? { open: true,  why: `the kit still owes ${owed}x ${rootItem}` }
             : { open: false, why: `the kit owes no more ${rootItem}` };
     }
+    // Any other asker: open while the pledges carried are short of the order's own need, never past it.
+    if (magnet.need > 0 && taken * PLEDGE >= magnet.need) {
+        return { open: false, why: `${taken * PLEDGE} carried on ${taken} pledge(s) covers ${magnet.job_id}'s need of ${magnet.need}` };
+    }
     return { open: true, why: `${magnet.job_id} is this body's own work and is still short` };
 }
 
@@ -293,7 +294,7 @@ function _anotherPledgeOpen(botId, magnet, rootItem, inventory, taken) {
 // pledge_start, pledges_taken.
 function _nextTrip(botId, boardroom, magnet, root, inventory, note, payload) {
     const PLEDGE = require('@utils/calculators/yield_pledge_calculator').PLEDGE_BLOCK;
-    const held = _getInventoryCount(root.item, inventory);
+    const held = _countFor(magnet)(root.item, inventory);
     if (magnet.pledge_start == null || magnet.pledge_root !== root.item) {
         magnet.pledge_root = root.item;
         magnet.pledge_start = held;
@@ -312,12 +313,29 @@ function _nextTrip(botId, boardroom, magnet, root, inventory, note, payload) {
         _dispatchDelivery(payload, { ...magnet, hold_goal: held });
         return null;
     };
+    // THE DUSK STOP: a whole pledge is this order's natural boundary. At dusk or night a claim the board would hold now
+    // takes no further pledge: a delivery banks what it carries, any other claim ends here, and with every outdoor job
+    // held the body idles at home (job_gates.duskStop).
+    const dusk = got >= PLEDGE ? require('@thinking/job_gates').duskStop(magnet) : null;
+    if (dusk) {
+        const why = typeof dusk === 'string' ? dusk : `${dusk.why}: ${dusk.detail}`;
+        watcher.summary(TAG, `DUSK_STOP job=${magnet.type}/${magnet.what} why=${why} after=${taken} pledge(s) — no further pledge; home`);
+        if (delivers) return bank(`dusk stop after ${taken} pledge(s) of ${root.item} (${why})`);
+        _releaseJob(`dusk stop after ${taken} pledge(s) of ${root.item} (${why}) — no further pledge`);
+        return null;
+    }
     if (got >= PLEDGE && delivers) {
         const valve = _tripSize(magnet);
         const owes = valve.stays;
         const freeSlots = global.bot.inventory.emptySlotCount();
         watcher.summary('trip_size', `trip_size at=pledge item=${root.item} walk=${valve.walk} walk_s=${valve.walk_s} elapsed_s=${valve.elapsed_s} walked_s=${valve.walked_s} owed_s=${valve.owed_s} taken=${taken} held=${held} free_slots=${freeSlots} stays_out=${owes && freeSlots > 0 ? 1 : 0} pace=${valve.measured ? 'measured' : 'unmeasured'}`);
         if (freeSlots === 0) return bank(`the pocket has no free slot after ${taken} pledge(s) of ${root.item}`);
+        // A delivery stays out only for a pledge the order still has open (a delivery's band levels the fleet: need
+        // minus every peer's pledge minus this body's own), and only while its walk is still owed. Those two bound
+        // it, never a count of pledges, which would send a far trip home with its walk unpaid. Without the open check every body on the order worked the whole order
+        // against its own pocket and banked it all at once, long after the order was met.
+        const open = _anotherPledgeOpen(botId, magnet, root.item, inventory, taken);
+        if (!open.open) return bank(`pledge ${taken} of ${root.item} whole and no more to take — ${open.why}`);
         if (!owes) return bank(`${taken} pledge(s) of ${root.item} whole after ${valve.elapsed_s}s on this trip, ${valve.walked_s}s of it walking, ${valve.walk_s}s walk home (${valve.walk} blocks), ${valve.owed_s}s of work still owed`);
         magnet.pledges_taken = taken + 1;
         magnet.pledge_start = held;
@@ -359,20 +377,7 @@ function _nextTrip(botId, boardroom, magnet, root, inventory, note, payload) {
 function _dispatchGather(payload, root, magnet, trip = null) {
     if (trip == null) trip = require('@utils/calculators/yield_pledge_calculator').PLEDGE_BLOCK;
     if (isUnderground(root.item)) {
-        // A classification that moved is not a board bug: `isUnderground` can flip mid-order under
-        // `STONE_SOURCE: 'mine_after_furnace'`. The magnet carries the routing as it stood at the
-        // claim: different now → release for a replan; same → coding violation.
-        if (magnet && magnet.stone_is_mined != null
-            && magnet.stone_is_mined !== require('@utils/fragment_utils').stoneIsMined()) {
-            watcher.summary(TAG,
-                `"${root.item}" was a surface gather when this order was claimed and is a mine pull now — `
-                + `the fleet's stone routing changed mid-order (a furnace registered). Releasing for a `
-                + `replan rather than treating a moved classification as a board fault. `
-                + `Inventory has ${root.have} of ${root.need} needed.`);
-            _releaseJob(`stone routing changed mid-order for ${root.item}`);
-            return;
-        }
-        // A plain `mine` builder never flips routing, so an empty chest here is ordinary (a peer took
+        // Stone routing never flips, so an empty chest here is ordinary (a peer took
         // the stack) unless the item is on job_board's exclusion list, in which case nothing can ever
         // deliver it — release for the first case, throw for the second (Law 13).
         const jobExclusions = require('@thinking/job_exclusions');
@@ -404,21 +409,10 @@ function _dispatchGather(payload, root, magnet, trip = null) {
             `Inventory has ${root.have} of ${root.need} needed.`
         );
     }
-    // One door, two producers, chosen by what the material is: stone's producer is a mined column, not
-    // harvest_executor's surface scan (Law 16). `trip`, sized by `_nextTrip`, is carried to the
-    // producer — never the order's `need`, which Step 1 tracks upstream.
+    // `trip`, sized by `_nextTrip`, is carried to the producer — never the order's `need`, which Step 1
+    // tracks upstream.
     const why = ` (a pledge of this order; it wants ${root.need} in total)`;
 
-    if (isProspected(root.item)) {
-        routeSignal(TAG, 'stone_prospect_executor', {
-            ...payload,
-            manager:   TAG,
-            objective: [root.item],
-            quantity:  trip,
-            readable:  `${TAG}: prospect ${trip}x ${root.item}${why}`,
-        });
-        return;
-    }
     routeSignal(TAG, 'harvest_executor', {
         ...payload,
         manager:   TAG,
@@ -451,7 +445,9 @@ function _fallBackToHarvest(payload, item, amount, note) {
             + 'so the ladder re-enters with that rung stood down');
         return;
     }
-    _dispatchGather(payload, { item, need: amount, have: 0 });
+    // No more than the order's amount, at most one pledge.
+    _dispatchGather(payload, { item, need: amount, have: 0 },
+        null, Math.max(1, Math.min(require('@utils/calculators/yield_pledge_calculator').PLEDGE_BLOCK, amount)));
 }
 
 // Re-enters this manager's own `receive` under the one ceiling that judges the loop (Law 11).
@@ -576,7 +572,8 @@ module.exports = {
 
         const inventory = _readInventory();
         const byItem = _loadBlueprints();
-        const have = _getInventoryCount(targetItem, inventory);
+        const count = _countFor(magnet);
+        const have = count(targetItem, inventory);
 
         // ── Dry gather on a delivery order: what the pocket holds of it goes to the station ──
         // harvest_executor.handBackDelivery marks the return. The deliver return above releases the claim.
@@ -708,7 +705,7 @@ module.exports = {
         // Aimed at creationGoal (Law 16 — must match the craft path's target). Walk belongs to the
         // calculator (Law 16); `need` is already net of the pool.
         const missingRoots = Object.entries(craftShortfall(targetItem, creationGoal, inventory))
-            .map(([item, need]) => ({ item, need, have: _getInventoryCount(item, inventory) }));
+            .map(([item, need]) => ({ item, need, have: count(item, inventory) }));
         if (missingRoots.length > 0) {
             // Step 4a: pull ingredients from a chest before harvesting a raw root.
             // ── A chest-destination job may withdraw an INGREDIENT, never its own TARGET ──
@@ -718,6 +715,25 @@ module.exports = {
                 const chestLedger = require('@perception/chest_ledger');
                 // Every storage station, read once for the whole walk.
                 const chestInv = _readChestInventory();
+                // THE MIDDLE OF THE CHAIN, BANKED. The walk leafs at roots (gray dye → white dye → bone meal → bone), so
+                // the bone meal the chests hold is never a root and was never withdrawn: the order then waited on bone
+                // with bone meal in storage. Every node still to obtain (requirementTree, top-down, the target and the
+                // roots excepted) is pulled from a chest first, the highest node first, past claims and keeps alike.
+                const leafNames = new Set(missingRoots.map(r => r.item));
+                const tree = require('@utils/calculators/build_material_calculator').requirementTree(targetItem, creationGoal, inventory);
+                for (const [node, still] of Object.entries(tree)) {
+                    if (node === targetItem || leafNames.has(node) || still <= 0) continue;
+                    if (payload?.chest_empty_for === node) continue;
+                    const keep = require('@utils/calculators/ingredient_keep').ingredientKeep(node);
+                    const inChest = Math.max(0, _getInventoryCount(node, chestInv) - chestLedger.claimedByOthers(node) - keep);
+                    if (inChest <= 0) continue;
+                    const pull = Math.min(inChest, still);
+                    const station = chestLedger.stationHolding(node);
+                    watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → withdraw ${pull}x ${node} from chest, an intermediate of the chain (chest has ${inChest}) | ${snap}`);
+                    if (station) chestLedger.claim(station, [{ item: node, amount: pull }]);
+                    _withdrawFromChest(payload, node, pull);
+                    return;
+                }
                 // Named root first, then its substitutes (`substitutes_for`).
                 for (const root of missingRoots) {
                     const shortfall = root.need;
@@ -730,7 +746,9 @@ module.exports = {
                         if (payload?.chest_empty_for === source) continue;
                         // The door that files a claim has to honour one, subtracting only its own count
                         // (not `availablePool`, whose station set differs from the gate's — Law 16).
-                        const inChest = Math.max(0, _getInventoryCount(source, chestInv) - chestLedger.claimedByOthers(source));
+                        // An ingredient storage keeps back (calculators/ingredient_keep) is taken only past the keep.
+                        const keep = require('@utils/calculators/ingredient_keep').ingredientKeep(source);
+                        const inChest = Math.max(0, count(source, chestInv) - chestLedger.claimedByOthers(source) - keep);
                         if (inChest <= 0) continue;
                         const pull = Math.min(inChest, shortfall);
                         // An ingredient is claimed the same way a target is — every craft chain comes
@@ -753,8 +771,11 @@ module.exports = {
                 // Never harvest a chain product — reaches the bot by withdrawal only (Step 4a). Skipped,
                 // not thrown (an ordinary timing state), falling through to Step 6.
                 if (_isChainProduct(root.item, byItem)) continue;
-                const trip = _nextTrip(botId, boardroom, magnet, root, inventory, `${targetItem} (have ${have}/${holdGoal})`, payload);
-                if (trip === null) return;
+                const pledged = _nextTrip(botId, boardroom, magnet, root, inventory, `${targetItem} (have ${have}/${holdGoal})`, payload);
+                if (pledged === null) return;
+                // NEVER MORE THAN THE ORDER STILL WANTS: a trip is the rest of its pledge, but no more than the root's
+                // shortfall (`need`, net of everything held). Two brown dye want two cocoa beans, not a pledge of fifteen.
+                const trip = Math.max(1, Math.min(pledged, root.need));
                 const allRoots = missingRoots.map(r => `${r.item}:${r.need}`).join(',');
                 watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | → gather ${trip}x ${root.item} of ${root.need} still wanted (have ${root.have}) | roots=[${allRoots}] | ${snap}`);
                 _dispatchGather(payload, root, magnet, trip);
@@ -785,6 +806,25 @@ module.exports = {
         if (awaiting && payload.executor) {
             watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | AWAITING CHAIN [${rootNames}] — this claim spent every reachable unit | RELEASE remainder to the board | ${snap}`);
             _releaseJob(`partial ${targetItem} (have ${have}/${holdGoal}) — the remainder waits on [${rootNames}] from its chain`);
+            return;
+        }
+        // A peer's claim filed between the gate's read and this one took the chest stock the gate counted
+        // (two per_body seats on one chest batch): a timing state (Law 13), released, never thrown.
+        const chestLedger = require('@perception/chest_ledger');
+        const peerTook = missingRoots.find(r => [r.item, ...(SUBSTITUTES_FOR[r.item] || [])]
+            .some(s => chestLedger.claimedByOthers(s) > 0));
+        if (awaiting && peerTook) {
+            watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | AWAITING CHAIN [${rootNames}] — a peer's claim took the chest's ${peerTook.item} | RELEASE to the board | ${snap}`);
+            _releaseJob(`${targetItem} (have ${have}/${holdGoal}) — a peer claimed the chest's ${peerTook.item} first; the order waits on [${rootNames}] from its chain`);
+            return;
+        }
+        // The gate admitted on a read taken before a spend landed (this body's last craft, a peer's finished
+        // withdrawal), so it is asked again on the stock as it stands: a gate that now holds the order makes this
+        // a timing state, released. A gate that still admits it is a real gap, thrown below.
+        const heldNow = awaiting && require('@thinking/job_gates').chainGate(magnet);
+        if (heldNow) {
+            watcher.summary(TAG, `${targetItem} (have ${have}/${holdGoal}) from=${from} | AWAITING CHAIN [${rootNames}] — the chain gate now holds it (${heldNow.why}: ${heldNow.detail}) | RELEASE to the board | ${snap}`);
+            _releaseJob(`${targetItem} (have ${have}/${holdGoal}) — the stock the gate admitted it on was spent; the order waits on [${rootNames}] from its chain`);
             return;
         }
 

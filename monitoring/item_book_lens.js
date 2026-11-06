@@ -12,6 +12,8 @@ What it answers:
                        dead body's pile.
   WHERE_IT_IS          every item by the kind of place it ended in.
   MOVED_BY_CAUSE       every cause a pocket changed for, with its count.
+  MOVED_BY_JOB         every move by cause, the job its body held and item (`--item=X` for one item).
+  DUG_IN_BOX           `--dug=x0,y0,z0,x1,y1,z1`: every cell in the box a body opened, first digger and its job.
   WASTE_PIT            every thrown stack: who, what, where it stopped, in the pit or not, and who
                        picked it up if anyone did.
   `--all` adds one row per thrown stack, per pocket item and per container item, and every mismatch.
@@ -83,7 +85,7 @@ function pitOf(book, botFilter = null) {
         stacksPickedUp: rows.filter(t => (t.picked_up_by || []).length).length };
 }
 
-function runItems({ bot: botFilter = null, verbose = false } = {}) {
+function runItems({ bot: botFilter = null, verbose = false, item: itemFilter = null, dug: dugBox = null } = {}) {
     const out = require('./data_out');
     const pairs = o => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}=${n}`).join(' ') || 'none';
     const book = readBook();
@@ -135,6 +137,38 @@ function runItems({ bot: botFilter = null, verbose = false } = {}) {
     out.table(['cause', 'kinds', 'items'], Object.entries(book.flows)
         .map(([c, items]) => [c, Object.keys(items).length, _sum(items)]).sort((a, b) => b[2] - a[2]));
 
+    // Every move by the job its body held (the clerk's `j` stamp, foreman/item_book flows_by_job): which work took
+    // an item from the world, banked it, drew it, placed it or threw it. `--item=X` narrows to one item; 40 rows,
+    // `--all` for every row. A book written before the stamp has no such table.
+    out.section('moved_by_job');
+    if (!book.flows_by_job) out.kv('flows_by_job', 'not_recorded');
+    else {
+        const rows = Object.entries(book.flows_by_job)
+            .flatMap(([cause, jobs]) => Object.entries(jobs).flatMap(([job, items]) => Object.entries(items)
+                .filter(([item]) => !itemFilter || item === itemFilter).map(([item, n]) => [cause, job, item, n])))
+            .sort((a, b) => b[3] - a[3]);
+        out.kv('item', itemFilter || 'all');
+        out.table(['cause', 'job', 'item', 'count'], verbose ? rows : rows.slice(0, 40));
+    }
+
+    // Who first opened each cell in a box (`--dug=x0,y0,z0,x1,y1,z1`): a hole nobody planned is named by its digger
+    // and the job it held (foreman/item_book dug_cells). A book written before the cells were kept has none.
+    if (dugBox) {
+        out.section('dug_in_box');
+        const [x0, y0, z0, x1, y1, z1] = dugBox.split(',').map(Number);
+        const lo = [Math.min(x0, x1), Math.min(y0, y1), Math.min(z0, z1)], hi = [Math.max(x0, x1), Math.max(y0, y1), Math.max(z0, z1)];
+        out.kv('box', `${lo.join(',')}..${hi.join(',')}`);
+        if (!book.dug_cells) out.kv('dug_cells', 'not_recorded');
+        else {
+            const rows = Object.entries(book.dug_cells).map(([k, v]) => [k.split(',').map(Number), v])
+                .filter(([c]) => c.every((n, i) => n >= lo[i] && n <= hi[i]))
+                .sort((a, b) => a[1][2] - b[1][2]).map(([c, [bot, job, sec]]) => [sec, c.join('|'), bot, job]);
+            out.kv('cells_dug', rows.length);
+            if (!rows.length) out.zero('cells');
+            else out.table(['at_sec', 'cell', 'bot', 'job'], rows);
+        }
+    }
+
     out.section('unattributed');
     const un = book.holdings.unattributed || {};
     out.kv('items_net', _sum(un));
@@ -153,15 +187,21 @@ function runItems({ bot: botFilter = null, verbose = false } = {}) {
     out.kv('items_outside_pit_by_kind', pairs(pit.missByKind));
     out.kv('stacks_picked_back_up', pit.stacksPickedUp);
     out.kv('items_picked_back_up', pit.backItems);
+    const byWhy = new Map();
+    for (const t of pit.rows) {
+        const k = `${t.why || 'not_recorded'}|${t.item}|${t.thrown_by}`;
+        byWhy.set(k, (byWhy.get(k) || 0) + t.count);
+    }
+    out.table(['why', 'item', 'thrown_by', 'count'], [...byWhy].sort((a, b) => b[1] - a[1]).map(([k, c]) => [...k.split('|'), c]));
     const lastSeen = {};
     for (const t of pit.rows) lastSeen[t.last_seen] = (lastSeen[t.last_seen] || 0) + 1;
     out.kv('stacks_by_last_sight', pairs(lastSeen));
 
     const flagged = pit.rows.filter(t => !t.landed_in_pit || (t.picked_up_by || []).length);
     out.section('waste_pit_stacks_outside_or_picked_up');
-    const throwRow = t => [t.at_sec, t.thrown_by, t.entity, t.item, t.count, t.came_to_rest ? t.came_to_rest.join('|') : null,
+    const throwRow = t => [t.at_sec, t.thrown_by, t.why || 'not_recorded', t.entity, t.item, t.count, t.came_to_rest ? t.came_to_rest.join('|') : null,
         t.landed_in_pit, t.last_seen, (t.picked_up_by || []).map(x => `${x.bot}=${x.n}`).join(' ') || 'nobody'];
-    const throwFields = ['at_sec', 'thrown_by', 'entity_id', 'item', 'count', 'came_to_rest', 'in_pit', 'last_sight', 'picked_up_by'];
+    const throwFields = ['at_sec', 'thrown_by', 'why', 'entity_id', 'item', 'count', 'came_to_rest', 'in_pit', 'last_sight', 'picked_up_by'];
     if (!flagged.length) out.zero('stacks');
     else out.table(throwFields, flagged.map(throwRow));
 

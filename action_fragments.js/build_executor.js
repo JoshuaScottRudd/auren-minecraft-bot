@@ -18,8 +18,8 @@ const watcher = require('@kernel/watcher');
 const locomotion = require('@locomotion/locomotion_dispatcher');
 
 const { group_to_item, groupToReference, normalizeBlockName, BLOCK_REACH, STATION_TYPES, WINDOWLESS_STATIONS } = require('@utils/fragment_utils');
-// Entered through combatCheckpoint, never battleStations directly — one process-wide
-// 500ms clock shared with dig/drive, with an engaging/escaping bypass for combat's own arms.
+// Entered through combatCheckpoint, never battleStations directly — the gate shared with dig/drive,
+// asked on every call, with an engaging/escaping bypass for combat's own arms.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { ensureNoOpenWindow, performDig } = require('@utils/movement/dig_authority');
 const { performPlace } = require('@utils/movement/place_authority');
@@ -274,7 +274,28 @@ module.exports = {
       const pos = new Vec3(step.place.x, step.place.y, step.place.z);
       const block = bot.blockAt(pos);
       if (!block || isAir(block.name)) return true;
+      if (block.name === 'water') return displaceWater(step, pos);
       return performDig(bot, pos, block, 'build_executor');
+    }
+
+    // displaceWater — a water source in a cell the plan leaves open (blueprint_survey asks a dig of a source alone).
+    // Water is not tool-breakable: a scaffold block is placed into the cell, which takes the source, and dug out again.
+    async function displaceWater(step, pos) {
+      const { isScaffoldBlock } = require('@utils/pathfinding_utils');
+      const item = bot.inventory.items().find(i => i.count > 0 && isScaffoldBlock(i.name));
+      if (!item) {
+        watcher.warn('build_executor', `Water source at (${pos.x},${pos.y},${pos.z}) not displaced — no scaffold block in the pocket.`);
+        return false;
+      }
+      const ev = anchoredRepair.evaluatePlacement(bot, step);
+      if (!ev.ok || ev.underFeet) {
+        watcher.warn('build_executor', `Water source at (${pos.x},${pos.y},${pos.z}) not displaced — ${ev.underFeet ? 'the body stands in it' : ev.reason}.`);
+        return false;
+      }
+      const placed = await performPlace(bot, pos, ev.anchor, ev.face, item.name, 'build_executor');
+      if (!placed.ok) return false;
+      const filler = bot.blockAt(pos);
+      return !filler || isAir(filler.name) || performDig(bot, pos, filler, 'build_executor');
     }
 
     // registerStandingStation — opens a station standing in its blueprint cell and writes it
@@ -365,7 +386,8 @@ module.exports = {
         return false;
       }
 
-      if (current && !isAir(current.name)) {
+      // Water is not cleared first: the place takes the cell from it (blueprint_survey reads such a cell missing).
+      if (current && !isAir(current.name) && current.name !== 'water') {
         const mismatch = group_to_item && group_to_item[desiredToken]
           ? !expandGroup(desiredToken).includes(current.name)
           : current.name !== desiredName;
@@ -423,6 +445,9 @@ module.exports = {
     // Per-anchor stuck tracker: zero progress on a whole-cell pass means it's genuinely
     // blocked this run — skip it so the build exits cleanly to cleanup (Law 12).
     const anchorStuck = new Set();
+    // The anchors set aside this run for a material the pocket lacks, as `A<n>(<short list>)`.
+    const shortAnchors = [];
+    const owedAt = new Map();   // anchor → steps it owed at the start of its last pass (the material-short churn test)
 
     // Object lock on the anchor being worked; one at a time, released on switch/exit.
     let heldAnchorClaimKey = null;
@@ -615,13 +640,17 @@ module.exports = {
         return withDig >= 0 ? withDig : worldAnchors.findIndex((_, i) => anchorActionable(i));
       };
 
-      // Anchor selection: a claimed anchor (per-anchor gating) builds only that one, since
-      // only its materials were staged. No claim → stay on the current anchor while it has
-      // work, else pick the first actionable one.
+      // Anchor selection: a claimed anchor (per-anchor gating) builds only its trip — the section the plan
+      // declares from it (blueprint_registry.sectionOf), in order, or that anchor alone — since only the trip's
+      // materials were staged. No claim → stay on the current anchor while it has work, else pick the first
+      // actionable one.
       const claimedAnchor = (payload && payload.anchor_index != null) ? payload.anchor_index : null;
+      const trip = claimedAnchor != null ? blueprintRegistry.sectionOf(blueprintName, claimedAnchor) : null;
+      const nextInTrip = () => (trip.includes(lastAnchorIndex) && anchorActionable(lastAnchorIndex))
+        ? lastAnchorIndex : (trip.find(ai => anchorActionable(ai)) ?? -1);
       let chosen = -1;
-      if (claimedAnchor != null) {
-        chosen = anchorActionable(claimedAnchor) ? claimedAnchor : -1;
+      if (trip) {
+        chosen = nextInTrip();
       } else if (lastAnchorIndex >= 0 && lastAnchorIndex < worldAnchors.length && anchorActionable(lastAnchorIndex)) {
         chosen = lastAnchorIndex;
       } else {
@@ -647,11 +676,22 @@ module.exports = {
 
         watcher.summary('build_executor', `A${chosen} held by a peer — selecting another anchor`);
         anchorStuck.add(chosen);
-        chosen = (claimedAnchor != null) ? -1 : findActionable();
+        chosen = trip ? nextInTrip() : findActionable();
       }
 
       if (chosen < 0) {
         const totalRemaining = anchorSteps.reduce((sum, s) => sum + s.length, 0);
+        // The trip's own anchors owe nothing: this job is done, and the rest of the structure is later jobs'.
+        if (trip && totalRemaining > 0 && trip.every(ai => !anchorSteps[ai] || anchorSteps[ai].length === 0)) {
+          watcher.summary('build_executor', `trip A${trip.join('+A')} built; ${totalRemaining} step(s) remain on other anchors`);
+          if (blueprintName === require('@thinking/architect_config').SPAWN_PROOFING) await require('@api/post_clearing').clearAroundPosts(global.bot, trip);
+          return { done: true, reason: 'trip_complete', remaining: totalRemaining };
+        }
+        // Every anchor left was set aside short of material: the trip waits on resupply (recursive_judge).
+        if (totalRemaining > 0 && shortAnchors.length > 0) {
+          watcher.warn('build_executor', `no anchor left that the staged load pays for — short: ${shortAnchors.join(', ')}; releasing to recursive_judge for resupply`);
+          return { done: true, reason: 'pocket_short', remaining: totalRemaining };
+        }
         if (totalRemaining > 0) {
           // Diagnostic (Law 6): per-anchor breakdown of why nothing is actionable — counts,
           // sample positions+reasons, required-step and stuck/peer-held state.
@@ -757,6 +797,9 @@ module.exports = {
       const result = await setupStationary();
       if (result.done) { exitReason = result.reason; break; }
 
+      const owed = result.job.steps.length;
+      const owedBefore = owedAt.get(result.job.anchorIndex);
+      owedAt.set(result.job.anchorIndex, owed);
       const outcome = await innerBuildStationary(result.job);
       totalDigOk += outcome.dig_ok;
       totalDigFail += outcome.dig_fail;
@@ -773,11 +816,21 @@ module.exports = {
       // A required material ran short mid-pass — distinct from a defer, since retrying won't
       // make a held block reappear, so this releases to recursive_judge's shortfall→supply
       // loop, once a whole pass placed nothing.
-      if (outcome.pocket_short > 0 && !madeProgress) {
+      // THE TRIP'S OTHER ANCHORS ARE STILL BUILT: the board and preconstruction ask affordability of the whole
+      // trip, so an anchor whose material is short (a pen's fences) may stand beside anchors the staged load does
+      // pay for. The short anchor is set aside for this pass; the exit for resupply comes once no anchor is left.
+      // A pass that dug but placed nothing is short all the same: digging never finishes an anchor, and a dig the
+      // world undoes (a block that comes back) would read as progress every pass until the stall judge stops it.
+      // So is a pass that placed something but began owing no fewer steps than the anchor's pass before it: a stand
+      // with no floor under it (the floor is the short material) is dug clear and filled back each pass, the same
+      // count owed every time.
+      const churned = owedBefore !== undefined && owed >= owedBefore;
+      if (outcome.pocket_short > 0 && (outcome.place_ok === 0 || churned)) {
         const shortList = Object.entries(outcome.short_materials || {}).map(([m, c]) => `${c}×${m}`).join(', ');
-        watcher.warn('build_executor', `A${outcome.anchorIndex} material-short (${shortList}), zero progress — releasing to recursive_judge for resupply`);
-        exitReason = 'pocket_short';
-        break;
+        watcher.warn('build_executor', `A${outcome.anchorIndex} material-short (${shortList}), zero progress — set aside for this pass; the trip's other anchors go first`);
+        anchorStuck.add(outcome.anchorIndex);
+        shortAnchors.push(`A${outcome.anchorIndex}(${shortList})`);
+        continue;
       }
 
       if (!madeProgress && outcome.deferred === 0 && (outcome.dig_fail + outcome.place_fail) > 0) {
@@ -836,7 +889,7 @@ module.exports = {
     watcher.summary('build_executor', exitSummary);
 
     const capsule = payload.build_executor || (payload.build_executor = {});
-    capsule.success = exitReason === 'all_complete';
+    capsule.success = exitReason === 'all_complete' || exitReason === 'trip_complete';
     capsule.result = exitReason;
     capsule.building_name = lastBuildingName;
     capsule.iterations = iterations;

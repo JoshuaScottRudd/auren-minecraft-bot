@@ -32,34 +32,6 @@ const EMPTY_HQ = { schema: 'auren.corporate_headquarters.v1' };
 // machine's steadiest disk load, so the wait is long.
 const FLUSH_INTERVAL_MS = 60000;
 
-// ── A CONTRACTOR HAS NO MEMORY OF ITS OWN (STANDING) ──────────────────────────
-// A contractor body keeps this cache in MEMORY — every fragment still reads and writes through it,
-// unchanged — and never touches the disk at either end: it does not load a file at startup and it never
-// flushes one. Its places arrive in the first `hq_broadcast` after it registers, out of the OWNER's file,
-// which the foreman holds (`foreman/owner_memory.js`). The player owns that file; the bot is borrowed.
-//
-// A durably deleted file, not one cleared at launch: a file cleared on the way IN is still written
-// throughout the tenancy and still sits on disk between tenancies, so it is a second durable copy of a
-// player's places that nobody owns, and a failed clear re-broadcasts it into the fleet and hands a
-// previous occupant's rooms to a new person. One durable copy, owned by the person accountable for it
-// (Law 16, Law 28). A launch-time delete is kept as a sweep for files written by earlier versions, not as
-// the mechanism.
-//
-// A homesteader's memory is unchanged and is its own: it answers to nobody, and holds a permanent fleet's
-// own file. The asymmetry is the mandate itself.
-//
-// Required lazily. `bot_mandate` pulls in architect_config and message_schema, and this module is loaded
-// by almost everything — a top-level require here is the shape a cycle comes from. Read once, because a
-// mandate is fixed at birth and never changes (bot_mandate says so in those words).
-let _ephemeral = null;
-function _isEphemeral() {
-  if (_ephemeral === null) {
-    _ephemeral = guardExternalSync('corporate_headquarters', 'read this body\'s mandate',
-      () => require('@kernel/bot_mandate').isContractor()).value === true;
-  }
-  return _ephemeral;
-}
-
 let _cache = null;
 let _dirty = false;
 let _flushTimer = null;
@@ -84,8 +56,6 @@ let _flushing = null;
 // and cannot be reached: not a cold start, a stop. The bot refuses to run blind and overwrite what it
 // could not read (default-stopped: prove it is safe to continue).
 function _loadFromDisk() {
-  // A BORROWED BODY STARTS BLANK, ALWAYS, even if a stale file is sitting right there. See _isEphemeral above.
-  if (_isEphemeral()) return { ...EMPTY_HQ };
   if (!fs.existsSync(HQ_PATH)) return { ...EMPTY_HQ };   // first run — nothing to lose
   const read = guardExternalSync('corporate_headquarters', `read ${HQ_PATH}`, () => fs.readFileSync(HQ_PATH, 'utf-8'));
   if (!read.ok) {
@@ -162,10 +132,6 @@ function _flushToDisk() {
   _flushTimer = null;
   if (_flushing) return _flushing;
   if (!_dirty || !_cache) return;
-  // NOTHING A CONTRACTOR KNOWS REACHES THIS DISK. `_dirty` is cleared, with no retry to arm, because
-  // nothing failed — this body simply has no file. Its places are already safe; they went up to the
-  // foreman in an `hq_delta` and were written into its OWNER's file.
-  if (_isEphemeral()) { _dirty = false; return; }
   // At most one snapshot is writing; mutations during I/O coalesce into the next fresh snapshot.
   _flushing = withCleanup('corporate_headquarters', 'flush memory', async () => {
     while (_dirty) {
@@ -259,7 +225,7 @@ function writeConfRoomFlag(room, chair, data) {
 // particular room would make an identical call mean two different things depending on a string argument,
 // the opaque behaviour Law 6 forbids.
 //
-// A CALLER PASSES THE PLAIN STRUCTURE NAME — `headframe`, `contractor_house`, `farm_plot_2` — and never
+// A CALLER PASSES THE PLAIN STRUCTURE NAME — `headframe`, `laydown_yard`, `wheat_field` — and never
 // an owner. The owner half is supplied here from the process's own mandate (bot_mandate.buildingRoomKey),
 // which is what makes it a keycard: a caller cannot address another crew's base because there is no
 // argument in which to name one (Law 27).
@@ -349,6 +315,20 @@ function mergeBroadcastChairs(chairs) {
     hq.bot_boardroom[id] = chair;
   }
   _markDirty();
+  for (const wake of [..._chairWaiters]) wake();
+}
+
+// A PEER'S WORD WAKES ITS WAITER. onNextChairs(fn) calls fn once, when the next broadcast of peers' chairs has been
+// merged; offNextChairs(fn) withdraws it. A body waiting on what a peer says (pen_gate.waitFor) reads again the
+// moment the word lands instead of on its next poll.
+const _chairWaiters = new Set();
+function onNextChairs(fn) {
+  const once = () => { _chairWaiters.delete(once); fn(); };
+  once.fn = fn;
+  _chairWaiters.add(once);
+}
+function offNextChairs(fn) {
+  for (const w of _chairWaiters) if (w.fn === fn) _chairWaiters.delete(w);
 }
 
 // Merge the foreman's relayed station map into logistics_confrence_room.stations
@@ -371,13 +351,7 @@ function mergeBroadcastStations(stations) {
   const hq = _getCache();
   if (!hq.logistics_confrence_room) hq.logistics_confrence_room = {};
   const local = hq.logistics_confrence_room.stations || {};
-  for (const [id, entry] of Object.entries(stations)) {
-    if (!entry || typeof entry !== 'object') continue;
-    const cur = local[id];
-    const incomingAt = entry.updated_at || 0;
-    const curAt = (cur && cur.updated_at) || 0;
-    if (!cur || incomingAt >= curAt) local[id] = entry;
-  }
+  require('@foreman/message_schema').mergeFresherRows(local, stations);
   hq.logistics_confrence_room.stations = local;
   _markDirty();
 }
@@ -417,6 +391,8 @@ module.exports = {
   writeBoardroomChair,
   getFullBoardroom,
   mergeBroadcastChairs,
+  onNextChairs,
+  offNextChairs,
   releaseAbsentBotMagnets,
   mergeBroadcastStations,
   mergeBroadcastBuildings,

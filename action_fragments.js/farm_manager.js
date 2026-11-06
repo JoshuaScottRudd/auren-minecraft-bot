@@ -19,15 +19,15 @@ const watcher = require('@kernel/watcher');
 const hq = require('@kernel/corporate_headquarters');
 const farmingIntegrity = require('@perception/farming_integrity');
 const landPrep = require('@action/land_prep');
+const { BONE_MEAL_PER_VISIT } = require('@thinking/architect_config');
 const farmExecutor = require('@action/farm_executor');
-// Entered through combatCheckpoint, never battleStations directly. One process-wide 500 ms clock, shared
+// Entered through combatCheckpoint, never battleStations directly. The gate is shared
 // with the dig and drive primitives that carry the same gate, plus the engaging/escaping bypass so
 // combat's own arms cannot re-enter it. The whole reasoning is in its header; a call a primitive already
 // paid for costs nothing here.
 const { combatCheckpoint } = require('@api/battle_stations');
 const { routeToJudge } = require('@utils/signal_utils');
 const blueprintSurvey = require('@perception/blueprint_survey');   // geometryOf: which blueprint this instance is
-const { FARM_ROOM_KEYS } = require('@thinking/architect_config');
 
 const TAG = 'farm_manager';
 
@@ -36,12 +36,11 @@ function _release(reason) {
   routeToJudge(TAG, { readable: `${TAG}: ${reason}` });
 }
 
-// LOWEST ANCHOR FIRST. A tine row stands on the land block of the row behind it, so a row can only
-// be worked once every row between it and the bank is whole — the order walking out along the tine
-// passes them in anyway. FARM_ROOM_KEYS is locked in anchor order (tine by tine, bank outward), so
-// the lowest key still unserviced is the next plot.
+// LOWEST ANCHOR FIRST. The field's room keys are locked in anchor order, so the lowest key still unserviced is
+// the next plot.
 function _lowestAnchor(plots) {
-  return plots.reduce((best, p) => (!best || FARM_ROOM_KEYS.indexOf(p.roomKey) < FARM_ROOM_KEYS.indexOf(best.roomKey) ? p : best), null);
+  const keys = farmingIntegrity.farmField().keys;
+  return plots.reduce((best, p) => (!best || keys.indexOf(p.roomKey) < keys.indexOf(best.roomKey) ? p : best), null);
 }
 
 module.exports = {
@@ -70,24 +69,31 @@ module.exports = {
     // recursive_judge (Law 15); this stops here, keeping that as the one signal for the visit (Law 4).
     // `bonemeal` plots join the same prep call — one resupply per visit — since a growing plot needs
     // its bone meal in the pocket the same way a plant plot needs its seeds there (farm_executor
-    // applies from the hand, not a chest); bonemealReachable spends at most one unit per crop it
-    // advances.
+    // applies from the hand, not a chest); the visit carries every banked one (BONE_MEAL_PER_VISIT) and
+    // bonemealReachable spends them on one crop at a time until it is ripe.
     //
     // The prep question is asked again against each iteration's re-sense (prepIfNeeded below), not
     // only the entry scan, since harvesting is what creates the untilled, unsown cells the next
     // iteration finds (farming_integrity orders `plant` ahead of `harvest` for that reason). The
     // latch below keeps it to one resupply per visit regardless of which iteration triggers it, set
     // before the await so an abandoning prep is not attempted twice inside one visit.
+    // ONE FARMER PER CROP (assessors/farming): the visit tends only the plots of its claim's crop, and carries only
+    // that crop's seeds and that crop's water.
+    const crop = magnet.crop;
+    if (!crop) throw new Error(`[${TAG}] CODING VIOLATION (Law 13): a farm tend was claimed with no crop on its magnet (job ${magnet.job_id}); assessors/farming posts one per crop.`);
+    const ours = scan => scan.actionable_plots.filter(p => farmingIntegrity.tendCrop(p) === crop);
     let prepped = false;
     const prepIfNeeded = async (scan) => {
       if (prepped) return true;
-      const plantablePlots = scan.actionable_plots.filter(p => p.phase === 'build' || p.phase === 'plant');
-      const bonemealPlots  = scan.actionable_plots.filter(p => p.phase === 'bonemeal');
+      const plantablePlots = ours(scan).filter(p => p.phase === 'build' || p.phase === 'plant');
+      const bonemealPlots  = ours(scan).filter(p => p.phase === 'bonemeal');
       if (plantablePlots.length === 0 && bonemealPlots.length === 0) return true;
       prepped = true;
-      // Seeds are counted, not plots: a tine row sows two, and the rows further out that this visit opens as it
-      // builds need theirs in the pocket before it walks out (scanCluster.seeds_for_visit).
-      return landPrep.prepare(bot, { seeds: scan.seeds_for_visit, boneMeal: bonemealPlots.length });
+      // Seeds are counted, not plots: the rows this visit opens as it builds need theirs in the pocket before it
+      // walks out (scanCluster.seeds_for_visit).
+      const boneMeal = bonemealPlots.length ? BONE_MEAL_PER_VISIT : 0;
+      const water = ours(scan).reduce((n, p) => n + (p.water_steps || 0), 0);
+      return landPrep.prepare(bot, { seeds: { [crop]: scan.seeds_for_visit[crop] || 0 }, boneMeal, water });
     };
     if (!await prepIfNeeded(cluster)) return;   // land_prep abandoned to the judge — one signal already lives
 
@@ -106,7 +112,7 @@ module.exports = {
       // environmental failure itself, so an escaping throw is a defect and must surface (Law 13,
       // Law 16).
       const scan = await farmingIntegrity.scanCluster(bot);
-      const remaining = scan.actionable_plots.filter(p => !serviced.has(p.roomKey));
+      const remaining = ours(scan).filter(p => !serviced.has(p.roomKey));
       if (remaining.length === 0) break;
 
       const plot = _lowestAnchor(remaining);
@@ -125,6 +131,39 @@ module.exports = {
       const res = await farmExecutor.tendPlot(bot, plot.roomKey, blueprintSurvey.geometryOf(plot.roomKey));
       workedTotal += res.worked || 0;
       refusedTotal += res.refused || 0;
+    }
+
+    // ── CUT AND PLANT IN ONE VISIT ── A plot serviced before a later plot's harvest filled the pocket is left with
+    // empty slots the visit now holds the seed for (cane cut from a later field). Each such plot is tended once more
+    // before the visit ends, so the crop the visit cut goes into its own fields and never to the chest first.
+    const replanted = new Set();
+    while (bot.inventory.items().some(i => i.name === crop)) {
+      await combatCheckpoint(bot, 'farm_plot');
+      const scan = await farmingIntegrity.scanCluster(bot);
+      const open = ours(scan).filter(p => p.phase === 'plant' && serviced.has(p.roomKey) && !replanted.has(p.roomKey));
+      if (open.length === 0) break;
+      const plot = _lowestAnchor(open);
+      replanted.add(plot.roomKey);
+      const res = await farmExecutor.tendPlot(bot, plot.roomKey, blueprintSurvey.geometryOf(plot.roomKey));
+      workedTotal += res.worked || 0;
+      refusedTotal += res.refused || 0;
+    }
+
+    // ── BONE MEAL UNTIL THE POCKET IS EMPTY ── One visit spends all it carries: each pass over the visit's plots harvests what
+    // ripened, sows it again and ripens that (farm_executor.tendPlot), ending when the pocket is empty or a whole pass
+    // harvested, sowed and treated nothing.
+    const holdsBoneMeal = () => bot.inventory.items().some(i => i.name === 'bone_meal');
+    for (let moved = true; moved && holdsBoneMeal();) {
+      moved = false;
+      for (const roomKey of serviced) {
+        if (!holdsBoneMeal()) break;
+        await combatCheckpoint(bot, 'farm_plot');
+        const res = await farmExecutor.tendPlot(bot, roomKey, blueprintSurvey.geometryOf(roomKey));
+        workedTotal += res.worked || 0;
+        refusedTotal += res.refused || 0;
+        const done = res.metrics || {};
+        if ((done.bonemealed || 0) + (done.harvested || 0) + (done.planted || 0) > 0) moved = true;
+      }
     }
 
     // ── VISIT VERDICT ── Worked something → real progress, success. Serviced plots but worked

@@ -115,11 +115,13 @@ let overlayRaised = false;
 function teardown(why) {
   if (torn || !raised) return;
   torn = true;
-  if (overlayRaised) { try { overlay.reap(why); } catch (e) { console.error(`\n${stamp()} ⚠ the overlay teardown threw: ${e.message}`); } }
+  let wrapPending = false;
+  if (overlayRaised) { try { wrapPending = overlay.reap(why, { deferWrap: true }).wrapPending; } catch (e) { console.error(`\n${stamp()} ⚠ the overlay teardown threw: ${e.message}`); } }
   banner(`TEARDOWN — ${why}`);
   const r = spawnSync(process.execPath, [FLEET, 'down', `--port=${opt('port', '3001')}`],
     { stdio: 'inherit', cwd: REPO_ROOT });
   const left = spawnSync(process.execPath, [FLEET, 'status'], { stdio: 'inherit', cwd: REPO_ROOT });
+  if (wrapPending && !overlay.wrapRecording()) console.error(`\n${stamp()} ⚠ recording archive failed — preserve footage and fleet logs before the next start.`);
   if (r.status !== 0 || left.status !== 0) {
     console.error(`\n${stamp()} ⚠ teardown did not report clean — read the status above. ` +
       `Force-kill route: node ${path.relative(REPO_ROOT, FLEET)} takeover`);

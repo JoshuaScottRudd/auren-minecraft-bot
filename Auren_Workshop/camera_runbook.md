@@ -270,26 +270,34 @@ camera windows and a director standing. Matching is by **command line** (the ins
 deliberately **not** killed: it exits on its own the pass after the last window goes.
 
 Its names are declared once, in `camera_configure.js` (`architect.camNames`), and read from there by every
-consumer — the launcher, the rig, the titler and the recorder (Law 16). Each name is one more window of the
-same kind: `Cam_Timelapse` (the wide fixed view of the build), `Cam_Mine` (the mine below it) and `Cam_Roam`
-(the roaming shot). A run that sites a base puts all of them 8 blocks above it, then leaves each to its pilot.
+consumer — the launcher, the rig, the titler and the recorder (Law 16). Each saved angle is one window,
+`Cam_<number>`, put at its shot when it joins and left to its pilot (§8a).
+
+### 8a. Saving angles: one inspector seat, then one camera per angle
+
+Fly `Cam_Inspector` on an inspection run (`fleet_runbook.md` §3a-bis) to the shot you want, then say so:
+
+| from | save at the next number | save over a number | list | drop one |
+|---|---|---|---|---|
+| that seat's chat | `save` | `save 4` | `list` | `forget 4` |
+| the foreman's console | `camera-save` | `camera-save 4` | `camera-list` | `camera-forget 4` |
+| a terminal | `node Auren_Workshop/fleet_control.js verb camera-save` | `… verb camera-save --number=4` | `… verb camera-list` | `… verb camera-forget --number=4` |
+
+The foreman reads the seat's position and facing off the server and answers in chat. The shots live in
+`camera/clients/camera_spots.json`, gitignored and shared by every copy on this machine, and start from three
+shots until the first change (`js_kernel/utils/camera_spots.js`). Saved shots take effect the next time cameras
+are raised, one window for each:
+
+```
+$env:AUREN_RECORD='cameras'; $env:AUREN_CAMERAS='none'; node start_auren.js --start continue
+$env:AUREN_SEATS='Cam_1,Cam_4'   # only these, for one run
+```
 
 ---
 
-## 9. THE LET'S PLAY — a seat you PLAY, and a camera per contractor
+## 9. THE HOST SEAT — a seat you PLAY, and a camera per bot as it stands up
 
-**Two commands, and nothing else to remember.**
-
-```
-node Auren_Workshop/fleet_control.js run letsplay-watch      # every window, nothing written
-node Auren_Workshop/fleet_control.js down                    # ends the cameras AND the world, one command
-```
-
-(`letsplay-record` is the same run with a recorder; a copy without one refuses it before anything opens.)
-
-Each one rolls the world back to `sub_agent_01_fresh_start`, wipes HQ cold, sets dawn, raises the foreman
-and the foreman with **no bots**, opens the seat you play, and starts the warden. Then you play, and you say
-`foreman get` in chat when you want a crew. The run is **untimed** — nothing ends it but you.
+The host seat and the camera warden serve any run.
 
 ### 9a. Three seats now, and they differ in one property each
 
@@ -303,12 +311,11 @@ and the foreman with **no bots**, opens the seat you play, and starts the warden
 
 **The host is not the eye with a flag, and the difference is the one property that decides whether a client
 may act in the world.** The eye is a spectator on purpose — it cannot fall, die, block a mob or change the
-world the run is measuring. A presenter must do all four: he mines, he builds, he dies, he hires a crew. So
+world the run is measuring. A presenter must do all four: he mines, he builds, he dies, he stands in the crew's way. So
 it is a third declaration rather than a mode on the second.
 
-**It joins under a real name, and that is load-bearing.** `foreman get` stamps the asker's name onto every
-contractor it launches, so a seat joined under an invented name would hire a crew that answers to somebody
-who is not you — and could not run `/time set day` from inside its own window either. The name is
+**It joins under a real name**, one the server ops, so it can run `/time set day` from inside its own
+window. The name is
 `host.playerName` in `camera_configure.js` and it must be one the server ops
 (`MinecraftServer/ops.json`). It is `KaptainKrispyjr`.
 
@@ -323,10 +330,10 @@ that copied them back each run would silently undo whatever you changed last ses
 `tools/camera_warden.js`, raised by the overlay on every camera run and reaped with it.
 
 **It watches the world, not the launcher.** It asks the foreman's registry who is standing, every 6
-seconds, and gives a camera to anyone who has none. That covers `foreman get`, a hand `bot-start`, a revive,
+seconds, and gives a camera to anyone who has none. That covers the foreman's own raise, a hand `bot-start`, a revive,
 and anything not yet written — because none of them is what it is watching.
 
-**The obvious wiring — a hook in `foreman get` — is wrong twice.** `bot-start` returns when the PROCESS is
+**The obvious wiring — a hook in the launcher — is wrong twice.** `bot-start` returns when the PROCESS is
 launched; a body enters the registry only after it connects, spawns and `master_core` initialises, seconds
 later. A camera raised on the launcher's return is aimed at a bot that is not in the world yet — the exact
 defect the foreman's own crew loop was rebuilt to fix. And it would put the film crew inside the fleet's
@@ -346,8 +353,8 @@ director and titler are **restarted, not extended**, because both take their ros
 re-read it: a late camera would otherwise never be armed and never be titled, and an untitled window is
 one nothing outside the game can tell apart. The cost is a few seconds' gap in camera *movement*.
 
-**It attaches only. A camera is never taken down mid-run.** A dismissed contractor leaves the registry and
-its camera goes on showing an empty vantage until the run ends: that costs a window and nothing else,
+**It attaches only. A camera is never taken down mid-run.** A body that leaves the registry keeps
+its camera, which goes on showing an empty vantage until the run ends: that costs a window and nothing else,
 whereas killing a client something may be capturing cuts that capture off mid-file. The whole crew comes
 down together, in order, at teardown. The registry is the right sensor for this too: it holds CONNECTION, not life, so a
 bot that merely **died** keeps its camera and only one that genuinely left drops out.
@@ -361,5 +368,41 @@ once each, rather than silently filming some of them.
 | Symptom | Where to look |
 |---|---|
 | the run says it is up and no window opened | `record_overlay.js status` — is the warden UP? Then `Auren_Workshop\camera\clients\camera_launch_logs\Cam_Architect_Control.*.log` |
-| you said `foreman get`, bots came, no cameras | the warden's own window: it prints every attach and every refusal. A ceiling refusal says so by name |
+| bots came, no cameras | the warden's own window: it prints every attach and every refusal. A ceiling refusal says so by name |
 | the run refuses before anything opens | `AUREN_SERVER_HOST` points off this box. Every camera joins `127.0.0.1`, so the overlay refuses rather than filming an empty world |
+
+## 10. The scout seat — one camera that goes where the activity is
+
+**What it is.** `Cam_Scout` is one directed camera for the whole crew, framed and cut by the director like a bot
+camera, whose bot is not fixed. The bodies write a fact line where a notable stretch of work begins and ends
+(`[ACTIVITY] 📊 start|end`, `custom_api/activity_log.js`): a fight, a squid hunt, herding, animals through the pen
+gate, a shepherd holding, shearing, culling. The director tails every roster bot's story, folds those lines into
+open spans, and films the bot whose open activity ranks highest on the focus. It moves when that activity ends,
+or when a higher-ranked one is open and it has filmed the current one for `scoutSeat.minDwellMs` (8 s). With
+nothing open it stays on the bot it last filmed. Not `scout.*` in `camera_configure.js`, which is the headless
+client that reads the world for every camera and films nothing.
+
+**The focus is set before the run, on the Cutting Room's scout page** (`/scout`, linked from the shelf): the
+activities in rank order, a tick for each one the seat may film, and whether the next filmed run raises the seat
+at all. It is written to `camera/clients/scout_focus.json` (machine-local, shared by every copy through the
+clients junction) and read by `camera/scout_focus.js`. The director re-reads it at every pick, so a change made
+during a run applies at the next pick. The bodies never read it: they state what they do, and only the camera ranks.
+
+**Raising it.** A foreman run with `record` on raises the seat when the focus says so; `record_overlay.js raise
+--scout=on|off` overrides that for one run. The overlay hands the one answer to `start_cameras.ps1 -Scout` (the
+window, and `--scoutcam=Cam_Scout` to the director), to `camera_obs` (`--scout=on`, its capture and file) and to
+the camera warden (so a mid-run converge keeps the seat). It costs two clients: the camera and its gimbal
+`Gim_Scout`, which the director retargets at each change of bot.
+
+**Reading what it did.** `trace_monitor.js --activities` lists every span with its exact start and end, through
+the same board the director read live. The director's own record carries `[CAM_SCOUT] 📊 focus` (each pick: bot,
+kind, rank, what it left), `open` and `closed` (each span as the director saw it), and a narrated line for every
+change of bot (`--narration --bot=camera_rig`). After a filmed run, `Cutting_room/hook_curator.js scan` writes the
+spans into the take's `hook/moments.json` with each one's seconds in every camera file, marking the cameras that
+were following that bot (its own camera, and the scout seat while it was on that bot).
+
+| Symptom | Where to look |
+|---|---|
+| the seat stays on the first bot all run | `--activities`: no spans means no body did a ranked activity, or every open kind is unticked on the page |
+| it switches too often | `minDwellMs` in `camera_configure.js` `scoutSeat`; the focus lines show what pre-empted what |
+| `Cam_Scout` has no file in the take | the overlay's raise line names the seats it raised; the scout page's "Film with the scout camera" was off |

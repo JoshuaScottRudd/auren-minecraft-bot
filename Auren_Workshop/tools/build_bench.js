@@ -36,7 +36,7 @@ require('../../js_kernel/utils/developer_door').enter('Auren_Workshop/tools/buil
 // the blueprint file and the world, so it moves with the codebase (tools/README.md). It asserts nothing
 // about a particular building; it shows what stood.
 //
-// Run (server must be UP — the foreman starts it: `node start_auren.js --start continue --crew contractor --soak 0`):
+// Run (server must be UP — the foreman starts it: `node start_auren.js --start continue --test world`):
 //   node Auren_Workshop/tools/build_bench.js <blueprint> [--at=x,y,z] [--keep]
 //     <blueprint>   a key in js_kernel/building_blueprints.json (run with no name to list them)
 //     --at=x,y,z    the transpose_origin in the world (default: 96 blocks east of world spawn, y=150,
@@ -53,7 +53,6 @@ const paths = require('../workshop_paths');
 const BENCH_NAME = 'BuildBench';
 process.env.BOT_ID = BENCH_NAME;
 process.env.BOT_MODE = 'homesteader';
-delete process.env.BOT_OWNER;
 
 // A bench run starts with no memory: the bench's own HQ record is reset empty each run (this process's
 // scope only, Law 28), so a previous run's site lock cannot make set_buildspot.lock throw. Written empty,
@@ -174,7 +173,7 @@ async function main() {
   const roomKey = blueprintName;
   const reachable = await rconLink.probe();
   if (!reachable.ok) {
-    console.log(`build_bench: the server does not answer on RCON (${reachable.reason}). Start it first (the foreman starts it): node start_auren.js --start continue --crew contractor --soak 0`);
+    console.log(`build_bench: the server does not answer on RCON (${reachable.reason}). Start it first (the foreman starts it): node start_auren.js --start continue --test world`);
     process.exit(1);
   }
 

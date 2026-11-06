@@ -28,7 +28,6 @@ module.exports = {
 
       // Species stamped on the bots at spawn, fixed for that body's life.
       //   'homesteader' — pursues its own goals.
-      //   'contractor'  — waits for orders authored at the foreman desk.
       mode: 'homesteader',
 
       world: {
@@ -43,7 +42,7 @@ module.exports = {
         clock: 'dawn',
       },
 
-      // The in-world desk a contractor is fetched from. Off for a run that starts its own bots by name.
+      // Whether the foreman runs. Off for a run that starts its own bots by name.
       foreman: false,
 
       bots: {
@@ -174,90 +173,6 @@ module.exports = {
     // Each is expressible as one of the four run types above with fields changed; kept as its own
     // entry so a whole set of answers needn't be re-typed.
     // ═════════════════════════════════════════════════════════════════════════════════════════════
-
-    // FOREMAN-ROLLBACK / FOREMAN-CONTINUE ask the rollback/continue pair addressed to the desk: whether
-    // a person can raise and command a crew at all. Both start zero bots so the fetch itself is under
-    // test (Law 25), and both are untimed since a person is present throughout (see rollback.soak).
-    // Driven headless via `tools/proxy_human.js`.
-
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    // FOREMAN-ROLLBACK — the full reset. Snapshot restored, HQ wiped cold, desk on duty, no crew.
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    'foreman-rollback': {
-      description: 'Foreman on known ground: restore, HQ wiped cold, dawn, desk on duty, no crew — you fetch it in chat.',
-      rung: 'rollback',
-      film: 'none',
-      mode: 'contractor',
-      world:     { name: 'sub_agent_01', snapshot: 'sub_agent_01_fresh_start', restore: true, clock: 'dawn' },
-      foreman:     true,
-      bots:      { count: 0 },
-      autonomy:  { start_automatically: false, stop_at_end: true },
-      // Untimed — the operator is present throughout and owns the abort call (see rollback.soak).
-      soak:      { minutes: 0, abort_on_error: false },
-    },
-
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    // FOREMAN-CONTINUE — the desk raised again over the world and crew memory the last session left.
-    // No restore, no HQ wipe. Forced by `count: 0`, its continue preflight audits the whole roster,
-    // since this run starts no bots (`fleet_control.js`). The server must already be serving the
-    // world being continued.
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    'foreman-continue': {
-      description: 'Foreman over the world and crew memory the last session left — no restore, HQ audited, desk on duty, no crew pre-started.',
-      rung: 'continue',
-      film: 'none',
-      mode: 'contractor',
-      // world.name unread on this rung — same arrangement as `continue` above.
-      world:     { name: 'sub_agent_01', snapshot: 'sub_agent_01_fresh_start', restore: false, clock: 'dawn' },
-      foreman:     true,
-      bots:      { count: 0 },
-      autonomy:  { start_automatically: false, stop_at_end: true },
-      // Untimed — the operator is present throughout and owns the abort call (see rollback.soak).
-      soak:      { minutes: 0, abort_on_error: false },
-    },
-
-    // LETSPLAY-WATCH / LETSPLAY-RECORD are `foreman-rollback` with lenses on: same rung, restore,
-    // cold HQ, desk on duty, zero pre-started crew. Filming is a `film` field, not a different
-    // bring-up. The host seat and camera warden are declared in camera_configure (Law 16) —
-    // `bots.count: 0` makes the warden the only source of a camera, so the crew filmed is the crew
-    // hired in chat. Both untimed; closed with `record_overlay.js stop` from another terminal.
-
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    // LETSPLAY-WATCH — the rehearsal. Everything the take has, writing nothing.
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    'letsplay-watch': {
-      description: "Let's play REHEARSAL: restore, desk on duty, your seat open, cameras follow each contractor — and nothing is written.",
-      rung: 'rollback',
-      film: 'watch',
-      mode: 'contractor',
-      // Clock pinned at midday: a take is repeated and light must match across attempts, and this
-      // run is untimed, so dawn would hand a long episode's back half to the dark.
-      world:     { name: 'sub_agent_01', snapshot: 'sub_agent_01_fresh_start', restore: true, clock: 'day' },
-      foreman:     true,
-      // Declares only that this run has a presenter seat; who it is lives in camera_configure (Law 16).
-      host:        true,
-      bots:      { count: 0 },
-      autonomy:  { start_automatically: false, stop_at_end: true },
-      soak:      { minutes: 0, abort_on_error: false },
-    },
-
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    // LETSPLAY-RECORD — the take. One file per window, the presenter's voice on its own.
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
-    'letsplay-record': {
-      description: "Let's play TAKE: restore, desk on duty, your seat recorded with your microphone, and a recording camera on every contractor you hire.",
-      rung: 'rollback',
-      film: 'record',
-      mode: 'contractor',
-      // Clock pinned at midday — same reasoning as letsplay-watch above.
-      world:     { name: 'sub_agent_01', snapshot: 'sub_agent_01_fresh_start', restore: true, clock: 'day' },
-      foreman:     true,
-      // Same seat, same declaration — see letsplay-watch above.
-      host:        true,
-      bots:      { count: 0 },
-      autonomy:  { start_automatically: false, stop_at_end: true },
-      soak:      { minutes: 0, abort_on_error: false },
-    },
 
     // ─────────────────────────────────────────────────────────────────────────────────────────────
     // BARE — server and foreman only, no restore. For work where the world itself is the subject:

@@ -18,61 +18,25 @@
 // ADDING A TEST is one row in TESTS. `upTo` is the step it stops after — the string must match a step's
 // `name` in startup_steps exactly, and `check()` below proves that at load time.
 
-const { FARM_ROOM_KEYS, FARM_ROW_BLUEPRINTS, ALPHA_STRUCTURE } = require('@thinking/architect_config');
-
-// The four tine-row blueprints, by the direction each one reaches. Inverted from the config's offset->name
-// table, so a fifth direction is named in one place only (Law 16).
-const ROW_DIRECTION = Object.fromEntries(
-  Object.values(FARM_ROW_BLUEPRINTS).map(name => [name, name.slice('wheat_tine_row_'.length)]),
-);
+const { ALPHA_STRUCTURE, FARM_FIELD } = require('@thinking/architect_config');
 
 // ── scan ───────────────────────────────────────────────────────────────────────────────────────────
 // What it exercises: the world comes up, the body joins and becomes a spectator, a standing spot clear of
 // world spawn is found in an acceptable biome, the body is put on it, the loaded area is waited for, and
-// the base is SITED — which for a homesteader is the wheat field (the trident scan over every sea-level
-// water body in view) plus the headframe fitted around it. Then it stops.
+// the base is SITED — every structure the crew's layout places (lock_all_buildspots). Then it stops.
 function scanReport(site, species) {
-  const lines = [];
-  const rows = site.filter(r => FARM_ROOM_KEYS.includes(r.roomKey));
-  const others = site.filter(r => !FARM_ROOM_KEYS.includes(r.roomKey));
-
-  for (const r of others) {
+  const lines = site.map((r) => {
     const o = r.candidate.transpose_origin;
-    lines.push(`  ${r.roomKey} — ${r.blueprint} at (${o.x},${o.y},${o.z})`);
-  }
-
-  if (rows.length === 0) {
-    lines.push(`  the wheat field: NO ROWS SITED — ${FARM_ROOM_KEYS.length} row(s) were asked for and none is in the`
-      + ` fleet's memory. Either no sea-level water was in view, or every row the scan found was refused.`);
-    // A homesteader base without its field is the failure this test exists to catch; a species that does not
-    // farm is not judged on one.
-    return { ok: species !== 'homesteader', lines };
-  }
-
-  // EVERY ROW'S DIRECTION IS NAMED, because that is the half the four-blueprint split can break silently.
-  // A row locked as the wrong direction blueprint still reads as a locked row; what would give it away is
-  // the blueprint NAME against the water, and the name is what this prints.
-  const tally = {};
-  const unknown = [];
-  for (const r of rows) {
-    const dir = ROW_DIRECTION[r.blueprint];
-    if (!dir) { unknown.push(`${r.roomKey} is locked as '${r.blueprint}', which is not one of the four tine rows`); continue; }
-    tally[dir] = (tally[dir] || 0) + 1;
-  }
-  const spread = Object.entries(tally).map(([d, n]) => `${n} ${d}`).join(', ');
-  lines.push(`  the wheat field: ${rows.length} of ${FARM_ROOM_KEYS.length} row(s) sited — ${spread || 'none readable'}.`);
-  for (const r of rows.slice(0, 4)) {
-    const o = r.candidate.transpose_origin;
-    lines.push(`    ${r.roomKey} stands at (${o.x},${o.y},${o.z}) and reaches ${ROW_DIRECTION[r.blueprint] || '?'}`);
-  }
-  if (rows.length > 4) lines.push(`    …and ${rows.length - 4} more.`);
-  for (const u of unknown) lines.push(`  WRONG: ${u}`);
-
+    return `  ${r.roomKey} — ${r.blueprint} at (${o.x},${o.y},${o.z})`;
+  });
+  // A base without its field is a failure this test exists to catch.
+  const fieldSited = site.some(r => r.roomKey === FARM_FIELD.structure);
+  if (!fieldSited) lines.push(`  WRONG: the wheat field '${FARM_FIELD.structure}' is not in the site.`);
   const alpha = Object.values(ALPHA_STRUCTURE);
   const seat = site.find(r => alpha.includes(r.roomKey));
   if (!seat) lines.push(`  WRONG: no alpha structure (${alpha.join(' / ')}) is in the site, so a crew would have nowhere to sit.`);
 
-  return { ok: unknown.length === 0 && !!seat, lines };
+  return { ok: fieldSited && !!seat, lines };
 }
 
 // ── inspect ────────────────────────────────────────────────────────────────────────────────────────
@@ -91,13 +55,24 @@ function inspectReport(site) {
   return { ok: !!seat, lines };
 }
 
+// ── world ──────────────────────────────────────────────────────────────────────────────────────────
+// What it is for: a bench that needs a world and a foreman and no crew (seed_scanner, voxel_snapshot,
+// world_forge, through bench_world). The world comes up, the body joins and reads world spawn (published on the
+// door as `run.spawn`), and the run stays open with no body raised until it is stopped. It sites nothing, so it
+// is judged on nothing but its steps.
+function worldReport() {
+  return { ok: true, lines: ['  the world is up and its spawn is known; nothing is sited and nobody is raised.'] };
+}
+
 // A row may also carry:
 //   start  the one `start` the test makes sense on; any other is refused before anything is touched
-//   seat   true: the test keeps the one camera window a person flies, and no bot window
+//   seat   the one camera window a person flies, by name, and no bot window: it raises in place of camera_configure's
+//          seats, and being in none of its fixed spots it is put at the base's alpha structure
 //   open   true: the test stays up until stopped once its steps are proved, in place of shutting down
+//   sites  false: the test sites nothing, so its verdict asks the fleet's memory for no base
 const TESTS = {
   scan: {
-    what: 'the world comes up, the body finds a spot, and the base is sited — the wheat field and the headframe',
+    what: 'the world comes up, the body finds a spot, and the base is sited — every structure of the crew layout',
     upTo: 'the base is sited and in memory',
     report: scanReport,
   },
@@ -105,9 +80,16 @@ const TESTS = {
     what: 'the world comes up as the last run left it, a seat to fly is put at the base, and it stays open until stopped',
     upTo: 'the camera is at the build',
     start: 'continue',
-    seat: true,
+    seat: 'Cam_Inspector',
     open: true,
     report: inspectReport,
+  },
+  world: {
+    what: 'the world comes up and its spawn is known; nobody is raised, and it stays open until stopped',
+    upTo: 'the world spawn is known',
+    open: true,
+    sites: false,
+    report: worldReport,
   },
 };
 
@@ -116,6 +98,7 @@ const NAMES = Object.keys(TESTS);
 // What a named test asks of the run around it; each answers "nothing" for 'off' and for an unknown name.
 const startFor = (name) => (TESTS[name] && TESTS[name].start) || null;
 const keepsSeat = (name) => !!(TESTS[name] && TESTS[name].seat);
+const seatOf = (name) => (TESTS[name] && TESTS[name].seat) || null;
 const staysOpen = (name) => !!(TESTS[name] && TESTS[name].open);
 
 // check(name) → { ok, why } — whether this is a test the foreman knows. Called by foreman_plan's whole-config
@@ -141,9 +124,10 @@ function stepsFor(name, steps) {
 }
 
 // verdict(name, { site, species }) → { ok, lines } — what the test found, in the words of the thing it tested.
-// `site` is `existingSite(door.query().buildings, ownerKey)`.site — the fleet's own answer, live.
+// `site` is `existingSite(door.query().buildings, species)`.site — the fleet's own answer, live.
 function verdict(name, { site, species }) {
   const t = TESTS[name];
+  if (t.sites === false) return t.report();
   if (!site || site.length === 0) {
     return { ok: false, lines: ['  nothing is in the fleet\'s memory — the base was not sited.'] };
   }
@@ -152,4 +136,4 @@ function verdict(name, { site, species }) {
 
 const describe = (name) => (name === 'off' ? null : `test ${name}: ${TESTS[name].what}`);
 
-module.exports = { TESTS, NAMES, check, stepsFor, verdict, describe, startFor, keepsSeat, staysOpen };
+module.exports = { TESTS, NAMES, check, stepsFor, verdict, describe, startFor, keepsSeat, seatOf, staysOpen };

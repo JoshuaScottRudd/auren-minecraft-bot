@@ -1,5 +1,5 @@
 // module: crew_board
-// purpose: the tank crew's shared board. Three named sections — commander, gunner, driver — each with
+// purpose: the tank crew's shared board. Four named sections — commander, gunner, driver, survival — each with
 //          exactly one writer, read by anyone (Law 6: transparent state, one named owner per section).
 //          Monster data is derived nowhere but the commander section, which owns it exclusively; readers
 //          may act on what a section holds but never alter it.
@@ -22,7 +22,7 @@
 // owner's first sweep sees `null` and can say so, instead of acting on a value that reads like "no
 // monsters" (Law 13 — never default a missing field).
 
-const SECTIONS = ['commander', 'gunner', 'driver'];
+const SECTIONS = ['commander', 'gunner', 'driver', 'survival'];
 
 // Every field this board carries, enumerated here so a reader does not need to find the writer to learn
 // the shape.
@@ -50,6 +50,9 @@ function _blankCommander() {
     // every hostile the server says is USING AN ITEM (bit 0 of living_entity_flags), which for a skeleton
     // is a drawn bow.
     notching: [],         // ids of hostiles whose item-use flag is set — a skeleton with an arrow on the string
+    // A shooter and a melee mob on opposite sides of the body: the shooter is the focus and the driver walks past
+    // it, away from the melee mob, until both stand on one side (commander: THE FLANK).
+    flank: null,          // null | { shooterId, meleeId, deg }
   };
 }
 
@@ -74,12 +77,22 @@ function _blankGunner() {
     //             re-senses the cell before acting on it.
     //   failed  — attempted and could not (no material, out of reach, refused by dig authority).
     terrainStatus: null,  // null | { kind, at:{x,y,z}, state, why }
+    // A player inside the sweep of a swing at the target: the swing is withheld and the driver backs off.
+    sweepFriend: null,    // null | { name, d }
+    // A swing at a melee focus held, shield lowered, until the driver publishes `sprinting`: a sprint swing knocks
+    // the mob back out of its reach. The mob's id, or null.
+    knockback: null,
+    loweredAt: null,      // ms of the last time the shield came down, or null
+    readyInMs: null,      // ms until the weapon in hand is charged; 0 when it is
+    // The blast wall against a swelling creeper (gunner, THE BLAST WALL): the body stands still behind it.
+    wall: null,           // null | { creeperId, state: 'placing'|'set'|'moved'|'failed' }
   };
 }
 
 function _blankDriver() {
   return {
     keys: null, standingOrder: null, targetId: null,
+    heading: null,         // null | { x, z } — the flat unit heading the feet press this tick
 
     // A standing want, re-published every tick, never a queued message: the driver re-states it every
     // tick it still holds, and silence is the withdrawal (Invariant B — never act on what was
@@ -88,7 +101,28 @@ function _blankDriver() {
     //
     // `at` is a block cell, never a route: the ask is per-step, since the seat making it is a per-tick
     // step chooser, not a planner.
-    terrainRequest: null,  // null | { kind: 'dig' | 'place', at:{x,y,z}, why }
+    // 'cover' is a block set at `at` to cut a mob's sight ray (the driver's cover wall), against any solid face.
+    terrainRequest: null,  // null | { kind: 'dig' | 'place' | 'cover', at:{x,y,z}, why }
+    route: null,           // null | { purpose: 'approach'|'cover'|'flank', mobId, cells, idx } — the route being walked
+    cover: null,           // null | { mobId, state: 'covering'|'guarding'|'covered'|'cover_failed', why }
+  };
+}
+
+// The body's own life, written by self_preservation (Law 17): whether it is running, healing, or facing a fight it
+// cannot win, and where it runs to.
+function _blankSurvival() {
+  return {
+    at: null,             // ms of the tick that wrote this section, or null before the first
+    hp: null,
+    recovering: false,    // fled at FLEE_HP; no fight is sought until RETURN_HP
+    outmatched: false,    // the fight in view costs more than the body's margin above the flee line
+    fleeing: false,       // running now: recovering or outmatched, with a threat pressing it
+    clear: true,          // nothing the body fights stands within FLEE_CLEAR_B, and nothing has struck it lately
+    why: null,            // 'low_hp' | 'outmatched' | null
+    cost: null,           // the fight's priced cost, hp
+    margin: null,         // hp above the flee line
+    goal: null,           // null | { x, y, z, kind: 'peer'|'home', name } — where the body runs
+    calling: false,       // this body's distress call stands in its chair
   };
 }
 
@@ -96,6 +130,7 @@ const _board = {
   commander: _blankCommander(),
   gunner: _blankGunner(),
   driver: _blankDriver(),
+  survival: _blankSurvival(),
 };
 
 const _pens = new Set();
@@ -145,6 +180,7 @@ function claimPen(section) {
 function readCommander() { return _board.commander; }
 function readGunner() { return _board.gunner; }
 function readDriver() { return _board.driver; }
+function readSurvival() { return _board.survival; }
 
 // reset() — wipe every section back to blank without releasing the pens (Law 8): pens are
 // process-lifetime, claimed once at load and held until the process ends; the contents are
@@ -153,6 +189,7 @@ function reset() {
   _board.commander = _blankCommander();
   _board.gunner = _blankGunner();
   _board.driver = _blankDriver();
+  _board.survival = _blankSurvival();
 }
 
 module.exports = {
@@ -160,6 +197,7 @@ module.exports = {
   readCommander,
   readGunner,
   readDriver,
+  readSurvival,
   reset,
   SECTIONS,
 };

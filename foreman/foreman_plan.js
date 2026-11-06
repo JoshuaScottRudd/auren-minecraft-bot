@@ -9,18 +9,18 @@ const fs = require('fs');
 const path = require('path');
 
 const CONFIG = require('../foreman_config');
-const { BOT_MODES, BUILDER_BUILDS, BOT_SENIORITY } = require('@thinking/architect_config');
+const { BOT_MODES, BUILDER_BUILDS, BOT_SENIORITY, CREW_DIFFICULTY, CREW_BUILD } = require('@thinking/architect_config');
 const { guardExternalSync } = require('@utils/external_library_guard');
 const testModes = require('./utils/test_modes');
 
 const PERMITTED = {
   where: ['local', 'remote'],
   start: ['rollback', 'continue'],
-  crew: [BOT_MODES.CONTRACTOR, BOT_MODES.HOMESTEADER, BOT_MODES.BUILDER],
+  crew: [BOT_MODES.HOMESTEADER, BOT_MODES.BUILDER],
   clock: ['dawn', 'day', 'held'],
   record: ['off', 'cameras', 'film'],
   go: ['now', 'held'],
-  ends: ['soak', 'built'],
+  ends: ['soak', 'built', 'real'],
   landing: ['usual', 'random'],
   windowsPriority: ['normal', 'high'],
   memoryWorkspace: ['adaptive', 'off'],
@@ -39,9 +39,6 @@ function check() {
     wrong.push(`soak: '${CONFIG.soak}' is not a number of minutes (0 runs until you stop it).`);
   }
   if (typeof CONFIG.watch !== 'boolean') wrong.push(`watch: '${CONFIG.watch}' is not true or false.`);
-  if (require('./utils/machine_hour').parse(CONFIG.machineHour) === undefined) {
-    wrong.push(`machineHour: '${CONFIG.machineHour}' is not 'off' or an opening and closing time written like '00:00-01:00'.`);
-  }
   if (!['crew', 'none'].includes(CONFIG.cameras)
       && !(Number.isInteger(CONFIG.cameras) && CONFIG.cameras > 0)) {
     wrong.push(`cameras: '${CONFIG.cameras}' is not 'crew', 'none', or a whole number of windows above zero.`);
@@ -53,34 +50,31 @@ function check() {
     wrong.push(`start: test '${CONFIG.test}' looks at the world the last run left, so it needs start '${testStart}' — `
       + `'${CONFIG.start}' would put the world back to its clean copy and empty the fleet's memory first.`);
   }
-  if (testModes.keepsSeat(CONFIG.test) && CONFIG.crew === BOT_MODES.CONTRACTOR) {
-    wrong.push(`crew: test '${CONFIG.test}' goes to the base a crew built, and a contractor's base belongs to whoever asked `
-      + `for it. Use '${BOT_MODES.BUILDER}' or '${BOT_MODES.HOMESTEADER}'.`);
-  }
   const wakes = Array.isArray(CONFIG.wake) ? CONFIG.wake : [];
   for (const w of wakes) if (!WAKES.includes(w)) wrong.push(`wake: '${w}' is not one of ${WAKES.map(v => `'${v}'`).join(' | ')}.`);
   if (!Array.isArray(CONFIG.wake)) wrong.push(`wake: must be a list, e.g. ['error', 'death'].`);
-  if (CONFIG.crew === BOT_MODES.BUILDER) {
-    const count = CONFIG.builder && CONFIG.builder.count;
+  if (CONFIG.crew === BOT_MODES.BUILDER || CONFIG.crew === BOT_MODES.HOMESTEADER) {
+    const count = CONFIG.count;
     const available = Object.keys(BOT_SENIORITY).length;
-    if (!Number.isInteger(count) || count < 2 || count > available) {
-      wrong.push(`builder.count: '${count}' must be a whole number from 2 to ${available}, the available roster.`);
+    if (CONFIG.only) {
+      const unknown = CONFIG.only.filter(name => !BOT_SENIORITY[name]);
+      if (unknown.length) wrong.push(`only: ${unknown.map(v => `'${v}'`).join(', ')} not in the roster (BOT_SENIORITY).`);
+    } else if (!Number.isInteger(count) || count < 2 || count > available) {
+      wrong.push(`count: '${count}' must be a whole number from 2 to ${available}, the available roster.`);
     }
+  }
+  if (CONFIG.crew === BOT_MODES.BUILDER) {
     const build = CONFIG.builder && CONFIG.builder.build;
     if (!BUILDER_BUILDS[build]) {
       wrong.push(`builder.build: '${build}' is not a building a builder crew knows. Known: `
         + `${Object.keys(BUILDER_BUILDS).map(v => `'${v}'`).join(' | ')}.`);
     }
   }
-  if (CONFIG.ends === 'built' && CONFIG.crew !== BOT_MODES.BUILDER) {
-    wrong.push(`ends: 'built' ends the run when the building stands, and only a '${BOT_MODES.BUILDER}' crew has a building. Use 'soak'.`);
+  if (endsWhenBuilt() && !CREW_BUILD[CONFIG.crew]) {
+    wrong.push(`ends: '${CONFIG.ends}' ends the run when the building stands, but this crew has no configured large build. Use 'soak'.`);
   }
   return { ok: wrong.length === 0, wrong };
 }
-
-// Does the foreman raise the crew itself? A contractor crew belongs to a person, so only a person can ask for
-// one; a homestead or a builder crew answers to nobody, so the configured run is the asker.
-function raisesOwnCrew() { return CONFIG.crew !== BOT_MODES.CONTRACTOR; }
 
 // A test run raises no bots and has no soak. The one place that knows what 'off' means (Law 16).
 function isTest() { return CONFIG.test !== 'off'; }
@@ -101,10 +95,12 @@ function record() {
 // the last run left it standing. The one place that knows what 'continue' means for the crew (Law 16).
 function continues() { return CONFIG.start === 'continue'; }
 
-function build() { return CONFIG.crew === BOT_MODES.BUILDER ? CONFIG.builder.build : null; }
+function build() { return CREW_BUILD[CONFIG.crew] || null; }
 
 // Does the run end the moment the building stands? The one place that knows what 'built' means for the run (Law 16).
-function endsWhenBuilt() { return CONFIG.ends === 'built'; }
+function endsWhenBuilt() { return CONFIG.ends === 'built' || CONFIG.ends === 'real'; }
+// 'real' waits further: no cell of the building still stands as its planks (architect_config.STAND_INS).
+function endsWhenReal() { return CONFIG.ends === 'real'; }
 // A held crew is raised and placed, and waits for the operator's `start` before any body works.
 function heldForGo() { return CONFIG.go === 'held'; }
 
@@ -113,13 +109,14 @@ function landsAtRandom() { return CONFIG.landing === 'random'; }
 
 // Builds the sentence from the fields; the sentence itself is never stored.
 function sentence() {
-  const species = CONFIG.crew === BOT_MODES.BUILDER ? `${CONFIG.builder.count} builders making ${build().replace(/_/g, ' ')}` : `${CONFIG.crew}s`;
+  const difficulty = CREW_DIFFICULTY[CONFIG.crew];
+  const species = `${CONFIG.count} ${CONFIG.crew === BOT_MODES.BUILDER ? 'builders' : 'homesteaders'}${build() ? ` making ${build().replace(/_/g, ' ')}` : ''} on ${difficulty}`;
   // The landing is said for a run that lands a crew: a rollback start of a crew the foreman raises itself.
-  const crew = landsAtRandom() && raisesOwnCrew() && !continues() ? `${species}, landing at random` : species;
+  const crew = landsAtRandom() && !continues() ? `${species}, landing at random` : species;
   // A test states its own name in place of a soak length: a test raises no bots and keeps no soak.
   if (isTest()) return `${CONFIG.where} world · ${CONFIG.start} start · TEST ${CONFIG.test}, no bots raised · for ${crew}`;
   const length = CONFIG.soak > 0 ? `${CONFIG.soak} minutes` : 'until stopped';
-  const soak = endsWhenBuilt() ? `until the building stands (${CONFIG.soak > 0 ? `${CONFIG.soak} minutes at most` : 'no time limit'})` : length;
+  const soak = endsWhenBuilt() ? `until the building stands${endsWhenReal() ? ' with no planks standing in' : ''} (${CONFIG.soak > 0 ? `${CONFIG.soak} minutes at most` : 'no time limit'})` : length;
   return`${CONFIG.where} world · ${CONFIG.start} start · ${soak} · ${crew}`;
 }
 // The overlays, said after the sentence: the clock, the cameras, and whether the run is watched.
@@ -133,8 +130,8 @@ function overlays() {
 }
 
 // ── A ROLLBACK START EMPTIES THE FLEET'S MEMORY ──────────────────────────────────────────────────────
-// Both halves of what the bots know, together, as the workshop's run always did: the hub's per-owner memory
-// (`player_memory/`) and each bot's own headquarters file. 'continue' touches neither.
+// Both halves of what the bots know, together, as the workshop's run always did: the hub's per-crew memory
+// (`player_memory/`, crew_memory) and each bot's own headquarters file. 'continue' touches neither.
 const BOT_DIR = path.join(__dirname, '..');
 function emptyMemory(log) {
   if (CONFIG.start !== 'rollback') { log('start: continue — the bots carry on with what they knew.'); return; }
@@ -180,11 +177,11 @@ function restoreFreshWorld(serverDir, level, log) {
 }
 
 // ── WHERE THE RUN HAS GOT TO, for anybody who asks the door (bench_world waits on it) ─────────────────
-//   crew      'waiting' (a contractor run: people fetch crews) · 'raising' · 'working' · 'failed'
+//   crew      'waiting' (nothing raised yet, or a test) · 'raising' · 'working' · 'failed'
 //   soakEndsAt  when the soak ends, ISO, or null (not started, or 0 = until stopped)
 //   closing   why the foreman is shutting down, once it is — the watch reads this as "the run is over"
 const progress = { sentence: null, crew: 'waiting', soakEndsAt: null, closing: null };
 function note(fields) { Object.assign(progress, fields); }
 function progressNow() { return { ...progress, sentence: sentence() }; }
 
-module.exports = { CONFIG, check, sentence, overlays, raisesOwnCrew, isTest, testName, seatOnly, record, continues, build, endsWhenBuilt, heldForGo, landsAtRandom, emptyMemory, freshWorld, restoreFreshWorld, note, progressNow };
+module.exports = { CONFIG, check, sentence, overlays, isTest, testName, seatOnly, record, continues, build, endsWhenBuilt, endsWhenReal, heldForGo, landsAtRandom, emptyMemory, freshWorld, restoreFreshWorld, note, progressNow };

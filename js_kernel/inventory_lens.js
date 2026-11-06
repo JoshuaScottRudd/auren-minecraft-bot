@@ -282,6 +282,15 @@ function forChestRequest(item, buildClaim = null) {
     // filed in whatever the blueprint asked for — a group token like `logs` as readily as `oak_log` — so
     // it is subtracted through the group-aware counter instead; matching it by name would leave a claim
     // on `logs` invisible against a pool holding birch.
+    // A SIGNED-OUT ITEM (architect_config.SIGNED_OUT_ITEMS) is counted wherever the crew holds it, every pocket
+    // and every form, since a body carrying it is using the crew's one, not keeping its own.
+    const signedOut = !Array.isArray(item) && require('@thinking/architect_config').SIGNED_OUT_ITEMS[item];
+    if (signedOut) {
+        const held = fleetHoldings();
+        const have = signedOut.reduce((n, form) => n + countInInventory(form, held), 0);
+        const claimed = buildClaim ? countInInventory(item, buildClaim) : 0;
+        return Math.max(0, have - claimed);
+    }
     const pool = lessClaim(accessibleMaterialPool(), reservedByBot());
     const items = Array.isArray(item) ? item : [item];
     let have = 0;
@@ -314,10 +323,14 @@ function forChestRequest(item, buildClaim = null) {
 // The two subtractions are different facts and both are needed: a CLAIM is material a peer is walking
 // for, a RESERVE is material this body is keeping. Either one left in makes the board offer work the
 // fulfiller cannot do.
-function rootsNeededFleetWide(item, quantity, alreadyAtDestination = 0) {
+// With `forBot`, the order is that body's own claimed job: its own chest claims and its pocket are the job's material,
+// so neither is taken out of the pool.
+function rootsNeededFleetWide(item, quantity, alreadyAtDestination = 0, { forBot = null } = {}) {
     const { craftShortfall } = require('@utils/calculators/build_material_calculator');
     const chestLedger = require('@perception/chest_ledger');
-    const free = lessClaim(chestLedger.lessClaims(accessibleMaterialPool()), reservedByBot());
+    const free = forBot
+        ? chestLedger.lessClaims(accessibleMaterialPool(), forBot)
+        : lessClaim(chestLedger.lessClaims(accessibleMaterialPool()), reservedByBot());
     return craftShortfall(item, quantity, free, alreadyAtDestination);
 }
 

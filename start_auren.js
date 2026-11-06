@@ -1,17 +1,14 @@
 #!/usr/bin/env node
-// start_auren.js — the one way in: the desk opens, and you hire every bot from inside the game.
+// start_auren.js — the one way in: the foreman opens and raises the crew its run page names.
 //
 //   node start_auren.js
-//   then, in Minecraft chat:   foreman get contractor
-//                        or:   foreman get homesteader
 //
-// Both crews are fetched by name from the desk and brought to wherever the requesting person stands.
-// contractor answers to whoever asks for it in chat; homesteader answers to nobody and works its own
-// agenda. foreman/foreman.js holds both halves this launches: the referee, which arbitrates holds on
-// world objects and the planning turn, and the desk, a client that joins the world and fetches bodies.
+// Both crews (homesteader, builder) answer to nobody and work their own agenda. foreman/foreman.js holds
+// both halves this launches: the referee, which arbitrates holds on world objects and the planning turn,
+// and the body, a client that joins the world, sites the base and fetches bodies.
 //
 // `start_bot.js` remains the one birth (Law 16); this file starts the foreman's process, and the
-// foreman spawns `start_bot.js` when somebody asks for a bot. No bot is started by this script.
+// foreman spawns `start_bot.js` for each body of its crew. No bot is started by this script.
 
 'use strict';
 
@@ -29,11 +26,16 @@ const { guardExternalSync } = require('./js_kernel/utils/external_library_guard'
 // from in there. Rendering only — the recording half stays with the foreman, which owns a record (Law 16).
 const alarmBlock = require('./js_kernel/utils/alarm_block');
 
-// The foreman's own port is fixed, not a CLI flag; only an environment override reaches it, for a
-// machine that already runs a foreman permanently.
-const FOREMAN_PORT = Number(process.env.FOREMAN_PORT) || 3001;
+// ── THE FOREMAN'S PORTS ARE ASSIGNED AT START, NOT FIXED ──────────────────────────────────────────────
+// The foreman holds two ports: its own and the one above it (the in-game door, foreman_hub). A run takes the
+// first free pair from 3001 up (port_book), so a second run on this machine, from its own Auren_Bot copy, takes
+// the next pair and says so instead of being refused. FOREMAN_PORT, when set, names the pair and is not moved.
+// The pair taken is written on the run lock, where the operator's tools read it (port_book.runForemanPort).
+const portBook = require('./js_kernel/utils/port_book');
+const FOREMAN_PORT_ASKED = Number(process.env.FOREMAN_PORT) || null;
+let FOREMAN_PORT = FOREMAN_PORT_ASKED || portBook.FOREMAN_PORT_USUAL;
 
-// Placing a crew where a person stands needs a server console, reachable only through RCON; flags carry
+// Placing a crew on its landing cell needs a server console, reachable only through RCON; flags carry
 // it for a person, environment variables for a non-human caller (`start_bot.js` uses that path). Defaults
 // come from `foreman_config.js`; flags still win over the file as a per-run override (Law 16).
 const WORLD = require('./foreman_config');
@@ -41,17 +43,19 @@ const FLAGS = [
   { flag: 'where', env: 'AUREN_SERVER_WHERE', help: "'local' (the foreman starts your server) or 'remote' (it joins one somebody else runs)" },
   { flag: 'start', env: 'AUREN_START', help: "'rollback' (the bots start knowing nothing) or 'continue'" },
   { flag: 'soak', env: 'AUREN_SOAK', help: 'minutes the run lasts once the crew is working (0 = until stopped)' },
-  { flag: 'ends', env: 'AUREN_ENDS', help: "'soak' (the run lasts the soak) or 'built' (a builder run ends when the building stands)" },
-  { flag: 'crew', env: 'AUREN_CREW', help: "'homesteader', 'builder' or 'contractor'" },
+  { flag: 'ends', env: 'AUREN_ENDS', help: "'soak' (the run lasts the soak), 'built' (a builder run ends when the building stands) or 'real' (built, with no planks standing in)" },
+  { flag: 'crew', env: 'AUREN_CREW', help: "'homesteader' or 'builder'" },
   { flag: 'landing', env: 'AUREN_LANDING', help: "'usual' (the nearest good ground to world spawn) or 'random' (rolled new each run, far from the usual spot)" },
-  { flag: 'test', env: 'AUREN_TEST', help: "exercise the foreman and stop before any bot is raised: 'scan' or 'inspect'" },
+  { flag: 'test', env: 'AUREN_TEST', help: "exercise the foreman and stop before any bot is raised: 'scan', 'inspect' or 'world'" },
+  { flag: 'module', env: 'AUREN_MODULE', help: "'off', or a test module the judge hands every planning turn to in place of the planner: 'walk'" },
+  { flag: 'module-biome', env: 'AUREN_MODULE_BIOME', help: "for --module walk: the biome walked to (default 'jungle')" },
   { flag: 'observer', env: 'AUREN_OBSERVER', help: "a person watching: the name you log in under. The foreman puts it in spectator at the site" },
   { flag: 'build', env: 'AUREN_BUILD', help: "for a builder crew: what it builds" },
-  { flag: 'builder-count', env: 'AUREN_BUILDER_COUNT', help: 'how many builders the run raises, bounded by the available roster' },
+  { flag: 'count', env: 'AUREN_CREW_COUNT', help: 'how many homesteaders or builders the run raises, bounded by the available roster' },
+  { flag: 'only', env: 'AUREN_CREW_ONLY', help: 'roster names raised and no others (comma-separated), in place of --count' },
   { flag: 'clock', env: 'AUREN_CLOCK', help: "'dawn', 'day' (pinned at midday) or 'held' (the world's own time)" },
   { flag: 'go', env: 'AUREN_GO', help: "'now' (bots work as they arrive) or 'held' (every bot is raised and placed first, then all are released)" },
   { flag: 'record', env: 'AUREN_RECORD', help: "'off', 'cameras' (a camera window per bot) or 'film' (cameras + a recorder)" },
-  { flag: 'machine-hour', env: 'AUREN_MACHINE_HOUR', help: "the hour a day the computer has to itself: '00:00-01:00', or 'off'" },
   { flag: 'watch', env: 'AUREN_WATCH', help: "'true' ends the run the moment something in --wake happens, 'false' runs it out" },
   { flag: 'wake', env: 'AUREN_WAKE', help: "what ends a watched run: 'error,death' (the default), or one of them" },
   { flag: 'server-folder', env: 'AUREN_SERVER_DIR', help: "the folder your Minecraft server runs in (the one holding server.properties)" },
@@ -68,7 +72,7 @@ const FLAGS = [
 
 function usage() {
   console.log(`
-  Start Auren: the foreman starts (or joins) your world, and you hire bots from inside it.
+  Start Auren: the foreman starts (or joins) your world, sites a base and raises the crew foreman_config.js names.
 
     node start_auren.js
 
@@ -78,7 +82,7 @@ function usage() {
 
   It brings the world up, joins it, finds a standing spot, sites the base, says what it found
   and shuts everything down. Nothing else about the run changes: it is the ordinary startup
-  with its last two steps left off. The tests there are: scan, inspect.
+  with its last two steps left off. The tests there are: scan, inspect, world.
 
   To LOOK OVER what the last run built — one word:
 
@@ -88,22 +92,22 @@ function usage() {
   window you fly, puts it at the base (a builder's laydown yard), pins midday, and stays
   up until you stop it. Nothing is put back or emptied.
 
-    --test scan|inspect     the same thing said as an option, if you prefer options
+    --test scan|inspect|world   the same thing said as an option, if you prefer options
     --where local|remote    which world  (default: ${WORLD.where}, from foreman_config.js)
     --start rollback|continue   a clean start, or carry on  (default: ${WORLD.start})
     --soak <minutes>        how long it runs once the crew is working  (default: ${WORLD.soak}; 0 = until stopped)
-    --ends soak|built       built: a builder run ends when the building stands, the soak at most  (default: ${WORLD.ends})
-    --crew homesteader|builder|contractor   what kind of bots  (default: ${WORLD.crew})
+    --ends soak|built|real  built: a builder run ends when the building stands, the soak at most;
+                            real: as built, with every stood-in cell its real block  (default: ${WORLD.ends})
+    --crew homesteader|builder   what kind of bots  (default: ${WORLD.crew})
     --build <name>          for a builder crew: what it builds  (default: ${WORLD.builder.build})
-    --builder-count <n>     number of builders, from 2 to the available roster  (default: ${WORLD.builder.count})
+    --count <n>             homesteaders or builders raised, 2 to the available roster  (default: ${WORLD.count})
+    --only <name,...>       raise these roster names and no others, e.g. one body isolated on a continue
     --landing usual|random  random: the crew lands somewhere new each run, 2 to 4 loaded areas
                             from the usual spot  (default: ${WORLD.landing})
     --clock dawn|day|held   the world's time of day  (default: ${WORLD.clock})
     --record off|cameras|film   camera windows on the bots  (default: ${WORLD.record})
     --observer <name>       you watch: log in under that name and the foreman puts you, in
                             spectator, wherever it puts the crew  (default: ${WORLD.observer || 'nobody'})
-    --machine-hour 00:00-01:00|off   the hour a day the computer does its own upkeep; a run
-                            stops for it and carries on after  (default: ${WORLD.machineHour})
     --watch true|false      end the run the moment something goes wrong  (default: ${WORLD.watch})
     --wake error,death      what counts as going wrong  (default: ${WORLD.wake.join(',')})
     --server-folder <dir>   local: the folder your Minecraft server runs in
@@ -118,7 +122,7 @@ function usage() {
   local:  the foreman starts your server itself, and sets up what the bots need
           in its server.properties, printing every change and why:
               online-mode=false       the bots have no Minecraft accounts
-              enable-rcon=true        the crew is brought to you through the server console
+              enable-rcon=true        the crew is placed on its base through the server console
               rcon.password=<random>  a new one every start
           When you stop Auren, it stops the server too and waits for it to save.
   remote: the foreman joins the world at host:port. It never starts or stops it.
@@ -126,20 +130,9 @@ function usage() {
   If anything fails, the foreman says what and where to change it.
 
   What happens:
-    A foreman joins your world. A homesteader or builder crew it raises by
-    itself: it finds open ground away from world spawn, sites the base, and
-    brings the crew there. A contractor crew is yours to ask for: walk to where
-    you want them and ask in chat:
-
-      foreman get contractor    a crew of 2 that works for YOU and hears you
-      foreman get homesteader   a crew of 2 that answers to nobody and builds
-      foreman help              the words it knows
-      foreman stop              send your contractors home
-
-    Either way the crew is brought to where you are standing, and starts
-    working when it arrives. Contractors take orders: say a bot's name and
-    then what you want. Homesteaders have no ear at all — talking to one does
-    nothing, by design.
+    A foreman joins your world and raises its crew by itself: it finds open
+    ground away from world spawn, sites the base, and brings the crew there.
+    The crew answers to nobody: talking to it does nothing, by design.
 
     Ctrl-C stops everything: the bots, the foreman, and a server it started.
 `);
@@ -194,8 +187,8 @@ for (let i = 0; i < argv.length; i++) {
 // (Law 25).
 const FLAG_ENV = {
   where: 'AUREN_SERVER_WHERE', start: 'AUREN_START', soak: 'AUREN_SOAK', ends: 'AUREN_ENDS', crew: 'AUREN_CREW', build: 'AUREN_BUILD', landing: 'AUREN_LANDING',
-  test: 'AUREN_TEST', observer: 'AUREN_OBSERVER', 'builder-count': 'AUREN_BUILDER_COUNT',
-  clock: 'AUREN_CLOCK', go: 'AUREN_GO', record: 'AUREN_RECORD', 'machine-hour': 'AUREN_MACHINE_HOUR', watch: 'AUREN_WATCH', wake: 'AUREN_WAKE',
+  test: 'AUREN_TEST', module: 'AUREN_MODULE', 'module-biome': 'AUREN_MODULE_BIOME',observer: 'AUREN_OBSERVER', count: 'AUREN_CREW_COUNT', only: 'AUREN_CREW_ONLY',
+  clock: 'AUREN_CLOCK', go: 'AUREN_GO', record: 'AUREN_RECORD', watch: 'AUREN_WATCH', wake: 'AUREN_WAKE',
   'server-folder': 'AUREN_SERVER_DIR', host: 'AUREN_SERVER_HOST', port: 'AUREN_SERVER_PORT',
   'rcon-password': 'AUREN_RCON_PASSWORD', 'rcon-port': 'AUREN_RCON_PORT',
 };
@@ -217,6 +210,7 @@ for (const [flag, env] of Object.entries(FLAG_ENV)) {
 // lock is taken before a record is swept or a memory emptied, so a second start is refused with the run
 // that is up named, and nothing of that run is touched (Invariant A, Law 13).
 const RUN_LOCK = path.join(__dirname, 'run_lock.json');
+const MACHINE_BOT_LIMIT = 30;
 const lockHeld = { pid: process.pid, started_at: new Date().toISOString(), asked: process.argv.slice(2).join(' ') || '(the page as written)' };
 
 function isRunning(pid) {
@@ -247,6 +241,31 @@ function takeRunLock() {
   process.on('exit', () => { if (!lockHeld.foreman || lockHeld.foreman.exitCode !== null || lockHeld.foreman.signalCode !== null) fs.rmSync(RUN_LOCK, { force: true }); });
 }
 
+// THE MACHINE CARRIES AT MOST MACHINE_BOT_LIMIT BODIES ACROSS EVERY SEAT, so two full fleets fill it. Other runs count
+// at what their launchers asked, since their bodies may still be rising, or at the bodies up when a probe raised more.
+function crewAsked(only, count) {
+  return only ? only.split(',').filter(Boolean).length : count === undefined ? 15 : Number(count);
+}
+function refuseOverMachineLimit() {
+  if (process.platform !== 'win32') return;
+  const listed = guardExternalSync('start_auren', 'listing the fleets on this machine', () => {
+    const script = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json";
+    return [].concat(JSON.parse(require('child_process').execFileSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8' })));
+  });
+  if (!listed.ok) { console.log('\n  the machine bot limit was not checked: the process list could not be read.'); return; }
+  const others = listed.value.filter(p => p.ProcessId !== process.pid && p.CommandLine);
+  const flag = (line, name) => { const m = new RegExp(`--${name}[ =](\\S+)`).exec(line); return m ? m[1] : undefined; };
+  const launchers = others.filter(p => /start_auren\.js/.test(p.CommandLine) && /--crew/.test(p.CommandLine));
+  const asked = launchers.reduce((n, p) => n + crewAsked(flag(p.CommandLine, 'only'), flag(p.CommandLine, 'count')), 0);
+  const bodies = others.filter(p => /start_bot\.js/.test(p.CommandLine)).length;
+  const mine = process.env.AUREN_CREW || given.crew ? crewAsked(process.env.AUREN_CREW_ONLY, process.env.AUREN_CREW_COUNT) : 0;
+  const elsewhere = Math.max(asked, bodies);
+  if (elsewhere + mine > MACHINE_BOT_LIMIT) {
+    die(`THE MACHINE LIMIT IS ${MACHINE_BOT_LIMIT} BOTS — nothing was started or cleared.\n`
+      + `  ${elsewhere} on other seats, and this run asks for ${mine}. Wait for a run to end, or ask for fewer.`);
+  }
+}
+
 // The foreman (`foreman/foreman_world.js`) owns proving the world — starting a local server or reaching
 // a remote one, and saying why when it cannot. This file sweeps the records and raises the foreman.
 (async () => {
@@ -257,13 +276,44 @@ function takeRunLock() {
     die(`'--test ${test}' looks at the world the last run left, so it needs --start ${testStart}. Nothing was started or cleared.\n`
       + `  The short way:  node start_auren.js ${test}`);
   }
+  const hold = require('./js_kernel/utils/record_homes').architectHold();
+  if (hold) {
+    die(`ARCHITECT HOLD ON THIS SEAT — nothing was started or cleared.\n`
+      + `  held by ${hold.session} since ${hold.at}: ${hold.reason}\n`
+      + `  Only the Architect's release lifts it.`);
+  }
+  refuseOverMachineLimit();
   takeRunLock();
+  if (!FOREMAN_PORT_ASKED) {
+    const pair = await portBook.firstFree({ from: portBook.FOREMAN_PORT_USUAL, width: 2, step: 2 });
+    if (pair === null) {
+      die(`NO FREE PORTS FOR THE FOREMAN — ${portBook.PORT_TRIES} pairs from ${portBook.FOREMAN_PORT_USUAL} up are all in use. Nothing was started or cleared.`);
+    }
+    if (pair !== portBook.FOREMAN_PORT_USUAL) {
+      console.log(`
+  the foreman's usual ports ${portBook.FOREMAN_PORT_USUAL} and ${portBook.FOREMAN_PORT_USUAL + 1} are in use (another run on this machine) — `
+        + `this run's foreman takes ${pair} and ${pair + 1}.`);
+    }
+    FOREMAN_PORT = pair;
+  }
+  lockHeld.foreman_port = FOREMAN_PORT;
+  writeRunLock('w');
   // A ROLLBACK START IS THE ONE THING THAT EMPTIES fleet_logs/ (STANDING): swept here, since this is the one
   // door that starts a whole fleet before any bot exists. Every writer appends (watcher.js, crew_launch.js)
   // and none clears. A launcher that already swept for its own rollback passes `--records keep`.
   const records = given.records || 'sweep';
   if (records !== 'sweep' && records !== 'keep') {
     die(`'--records ${records}' is not a choice. Use 'sweep' (empty fleet_logs/ first) or 'keep' (your launcher already did).`);
+  }
+  // A WORLD ANOTHER SERVER HOLDS IS REFUSED BEFORE ANY RECORD IS SWEPT. The run lock above covers runs started
+  // from this copy; a server started from another copy of the bot, or by a probe, holds the world's session.lock,
+  // and its records may be these records. The foreman refuses that world too, but only after this sweep.
+  if ((process.env.AUREN_SERVER_WHERE || WORLD.where) === 'local') {
+    const serverDir = require('./js_kernel/utils/workstation').findServerDir().dir;
+    if (serverDir && require('./js_kernel/utils/server_settings').worldInUse(serverDir)) {
+      die(`A SERVER IS ALREADY RUNNING ON THIS WORLD (${serverDir}) — nothing was started or cleared.\n`
+        + `  Another run or probe holds it. Wait for it to end, or join it with --where remote.`);
+    }
   }
   // A CONTINUE START KEEPS THE LAST RUN'S RECORDS: the world carries on and so does what was written about
   // it, each run its own segment of the same files. Only a rollback start empties the room.
@@ -276,7 +326,7 @@ function takeRunLock() {
         + `fleet_logs/ now belongs to this one.`);
     }
   } else {
-    console.log(`\n  fleet_logs/ left as it is — the launcher that started this desk already swept it.`);
+    console.log(`\n  fleet_logs/ left as it is — the launcher that started this foreman already swept it.`);
   }
 
   const where = process.env.AUREN_SERVER_WHERE || WORLD.where;
@@ -284,30 +334,15 @@ function takeRunLock() {
   // The crew as this run will have it: a flag set above wins over the page, which was read before the flags.
   const crew = process.env.AUREN_CREW || WORLD.crew;
   console.log(`\n  Auren — the foreman is starting, and it ${where === 'local' ? 'starts your server first' : joins}.`
-    + (crew === 'contractor'
-      ? `\n  when the foreman has joined, walk where you want your bots and type:`
-        + `\n      foreman get contractor     works for you`
-      : `\n  then it finds open ground, sites the base and brings in a ${crew} crew by itself.`)
+    + `\n  then it finds open ground, sites the base and brings in a ${crew} crew by itself.`
     + `\n  Ctrl-C stops everything${where === 'local' ? ', and the foreman stops the server and waits for it to save' : ''}\n`);
 
   // The hub opens inside the foreman before its world and its body (foreman.js requires it first); the
-  // desk names its own record `foreman` instead of inheriting a bot's name. DEP0040 (Node's built-in
+  // foreman names its own record `foreman` instead of inheriting a bot's name. DEP0040 (Node's built-in
   // `punycode` deprecation, raised by a library below mineflayer) is silenced by name via NODE_OPTIONS,
   // which the foreman and every bot it spawns inherit; every other warning still prints.
   const nodeOptions = [process.env.NODE_OPTIONS, '--disable-warning=DEP0040'].filter(Boolean).join(' ');
 
-  // ── THE MACHINE'S HOUR ──────────────────────────────────────────────────────────────────────────
-  // One hour a day belongs to the computer (`foreman/utils/machine_hour.js`). The machine is made to keep
-  // it before anything is raised; a machine that cannot be made to is a start that does not happen.
-  const machineHour = require('./foreman/utils/machine_hour');
-  const hourSetting = process.env.AUREN_MACHINE_HOUR || WORLD.machineHour;
-  const hour = machineHour.ensure(hourSetting);
-  if (!hour.ok) die(`THE MACHINE'S HOUR COULD NOT BE SET UP — nothing was started.\n  ${hour.why}`);
-  console.log(`  ${hour.why}.`);
-
-  raise();
-
-  function raise() {
   const foreman = fleet.start('foreman', 'foreman/foreman.js', {
     NODE_OPTIONS: nodeOptions,
     FOREMAN_PORT: String(FOREMAN_PORT),
@@ -360,26 +395,5 @@ function takeRunLock() {
       'BEFORE STARTING AGAIN, close any leftover terminals:',
       '    node Auren_Workshop/fleet_control.js down',
     ]);
-  }, () => {
-    // The foreman left a note on its way out when the machine's hour opened: the run is not over. This
-    // door waits the hour out and raises the foreman again as a continue start with the soak that was left.
-    const note = machineHour.takeNote();
-    if (!note) return false;
-    const closes = new Date(note.closes_at);
-    const wait = Math.max(0, closes.getTime() - Date.now());
-    console.log(`\n  THE MACHINE'S HOUR — the run stopped for it and carries on at ${machineHour.clock(closes)}`
-      + ` (${Math.round(wait / 60000)} min). The computer is doing its own upkeep. Ctrl-C ends the run here.\n`);
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.once(sig, () => process.exit(0));
-    setTimeout(() => {
-      // The segment that just ended wrote its verdict; the one starting writes its own, and a foreman
-      // that dies without one is told apart by the file being absent.
-      fs.rmSync(outcomeFile(), { force: true });
-      process.env.AUREN_START = 'continue';
-      process.env.AUREN_SOAK = String(note.soak_left_min);
-      console.log(`\n  the machine's hour is over — the foreman is starting again, and the crew carries on where it stopped.\n`);
-      raise();
-    }, wait);
-    return true;
   });
-  }
 })();

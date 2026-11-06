@@ -487,6 +487,7 @@ async function verticalAdjustToBase(bot, baseFeetY) {
 }
 
 module.exports = {
+  fillWaterColumnBelow,   // water_escape stands a floating body up on the same fill the water pillar uses (Law 16)
   pillarStep,
   tryPillarAscent,
   tryBridgeStep,

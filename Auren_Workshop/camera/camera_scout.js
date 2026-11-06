@@ -21,7 +21,9 @@ const { bootstrapModulePath } = require(paths.bot('js_kernel/utils/node_module_h
 
 // createScout: returns a scout handle. Never throws — on require/connection failure returns
 // { available:false, reason } and the rig checks .available.
-function createScout({ host, port, version, username, onReady, onEnd, log, scanSliceMs }) {
+// `fleetView`: the scout reads the world the fleet reads, the spawn-protected square masked as bedrock
+// (`spawn_protection.maskWorldReads`), so a bench siting through it never stands a body where the fleet is blind.
+function createScout({ host, port, version, username, onReady, onEnd, log, scanSliceMs, fleetView = false }) {
   let mineflayer, Vec3;
   try {
     bootstrapModulePath();
@@ -73,7 +75,7 @@ function createScout({ host, port, version, username, onReady, onEnd, log, scanS
     const rec = {
       type, at,
       id: e.id,
-      name: e.name || e.mobType || null,
+      name: e.name || e.displayName || null,
       username: e.username || null,
       position: e.position ? { x: e.position.x, y: e.position.y, z: e.position.z } : null,
       velocity: e.velocity ? { x: e.velocity.x, y: e.velocity.y, z: e.velocity.z } : null,
@@ -90,8 +92,13 @@ function createScout({ host, port, version, username, onReady, onEnd, log, scanS
     const bot = mineflayer.createBot({ host, port, username, version, auth: 'offline' });
     state.bot = bot;
     state.ready = false;
+    // Armed before login completes: `spawn_position` lands before `spawn` (spawn_protection). The mask goes on at
+    // spawn, once the blocks plugin has given the body a blockAt, and before the scout reads as ready.
+    const spawnProtection = fleetView ? require(paths.bot('perception_nodes.js/spawn_protection')) : null;
+    if (spawnProtection) spawnProtection.armSpawnProtection(bot);
 
     bot.once('spawn', () => {
+      if (spawnProtection) spawnProtection.maskWorldReads(bot);
       state.ready = true;
       if (onReady) onReady();
     });
@@ -128,7 +135,7 @@ function createScout({ host, port, version, username, onReady, onEnd, log, scanS
       emitObserved('hurt', e, {
         byId: source ? source.id : null,
         // Username first: entity.name is the entity TYPE, and every player reads 'player' by it.
-        byName: source ? (source.username || source.name || source.mobType || null) : null,
+        byName: source ? (source.username || source.name || source.displayName || null) : null,
         ...(meta || null),
       });
     });
@@ -213,7 +220,7 @@ function createScout({ host, port, version, username, onReady, onEnd, log, scanS
             // uuid: mineflayer never fills entity.health for an observed entity, so the observer reads
             // a mob's health over RCON with `data get entity <uuid> Health`.
             uuid: e.uuid || null,
-            name: e.name || e.mobType || null,
+            name: e.name || e.displayName || null,
             type: e.type || null,
             kind: e.kind || null,
             username: e.username || null,

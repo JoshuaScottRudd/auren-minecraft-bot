@@ -43,20 +43,19 @@ module.exports = {
     const timer = watcher.timer.start('runtimer', { source: 'start_injector' });
     watcher.summary('start_injector', `⏱️ runtimer started (elapsed=${timer.elapsed})`);
 
-    // ── the placement gate: stand beside your person before you plan ─────────
+    // ── the placement gate: stand on your cell before you plan ─────────
     // Gates both start routes — a body born started injects its own, and an operator's `start` verb
     // arrives here too — through this one function, so a start cannot happen without passing it (Law 16).
     // Placed before the route and after the flush: the flush above is what makes the run's record start
     // clean, so a refusal lands in the trace a reader will open, and routing is the start itself.
     //
-    // A body nobody placed starts where it stands. `startNearPlayer()` returns null only when no person
-    // was named, the hand-launched single-bot case `beginsWorkAtBirth` describes, and a body with no
-    // named person is not walked to an invented one (Law 13).
-    const placeBeside = require('@kernel/bot_mandate').startNearPlayer();
-    if (placeBeside) {
-      const recovery = require('@kernel/body_recovery');
-      const placed = await recovery.arriveAtPlace(global.bot, placeBeside);
-      const where = recovery.isCellPlace(placeBeside) ? `at (${placeBeside})` : `with ${placeBeside}`;
+    // A body nobody placed starts where it stands. `startCell()` returns null only when no cell was named,
+    // the hand-launched single-bot case `beginsWorkAtBirth` describes, and a body with no named cell is not
+    // walked to an invented one (Law 13).
+    const cell = require('@kernel/bot_mandate').startCell();
+    if (cell) {
+      const placed = await require('@kernel/body_recovery').arriveAtCell(global.bot, cell);
+      const where = `at (${cell})`;
       if (!placed.arrived) {
         // Refused, not started anyway (Law 13, default-stopped): a base layout lock outlives the run and
         // is read by every later job, so standing still and saying why is recoverable and a base surveyed
@@ -68,6 +67,26 @@ module.exports = {
       }
       watcher.summary('start_injector',
         `📍 Placed ${where} — ${placed.distance.toFixed(1)} blocks off. The base will be surveyed from here.`);
+    }
+
+    // ── a continued body that has never stood in this world goes home ─────────
+    // A continued run places nobody: each body starts where the last run left it. A body the last rollback never
+    // raised has no place in the rolled-back world, so the server puts it at world spawn, inside the square
+    // spawn_protection reads as bedrock, where it cannot move. No crew base stands there (BASE_CLEAR_OF_SPAWN), so a
+    // body found there with a home cell from the foreman is put on its alpha structure, as a rollback puts it.
+    const home = require('@kernel/bot_mandate').homeCell();
+    const atLogin = global.bot && global.bot.entity && global.bot.entity.position;
+    if (!cell && home && atLogin && require('@perception/spawn_protection').isSpawnProtectedAt(global.bot, atLogin)) {
+      const placed = await require('@kernel/body_recovery').arriveAtCell(global.bot, home);
+      if (!placed.arrived) {
+        watcher.error('start_injector',
+          `⛔ NOT STARTED — this body logged in at world spawn (${atLogin.floored()}) and could not be put on its alpha `
+          + `structure at (${home}): ${placed.error}. Nothing was surveyed and nothing was locked.`);
+        return { started: false, why: `it stands at world spawn and could not be put home at (${home}): ${placed.error}` };
+      }
+      watcher.summary('start_injector',
+        `🏠 Logged in at world spawn (${atLogin.floored()}), never placed in this world; put on the alpha structure at (${home}), `
+        + `${placed.distance.toFixed(1)} blocks off.`);
     }
 
     // ── if that place is the world centre, say so loudly ─────────────────────
@@ -140,10 +159,9 @@ module.exports = {
     // one kind of second verification permitted (Law 13) — a throw here says the foreman's step was
     // wrong.
     //
-    // Only a builder, because only a builder has a downloaded building; a homesteader has no
-    // `builder.build` it is answerable for.
-    if (require('@kernel/bot_mandate').isBuilder()) {
-      const buildName = require('../foreman_config').builder.build;
+    // Only a crew with a downloaded building (architect_config.CREW_BUILD) has a plan to load.
+    const buildName = require('@thinking/architect_config').CREW_BUILD[require('@kernel/bot_mandate').currentMode()];
+    if (buildName) {
       const plan = require('@kernel/downloaded_plan_registry').load(buildName);
       watcher.summary('start_injector',
         `📐 Plan in hand for "${buildName}" — ${plan.dimensions.w}×${plan.dimensions.l}, `
@@ -158,6 +176,9 @@ module.exports = {
     // ledger's worked + idle + startup == life covers everything that ran before it. The span closes at
     // the first dispatch or idle pass.
     require('@kernel/bot_minutes').open();
+    // The guard a body stands from spawn ends here, at the start itself (a refused start keeps it); a fight it
+    // opened finishes before any plan takes the body.
+    await require('@api/battle_stations').endGuard();
     routeToJudge('start_injector', {
       readable: 'start_injector: starting autonomous planning loop with clean state',
       start_injector: { success: true },

@@ -76,10 +76,9 @@ js_kernel/corporate_headquarters*.json
 js_kernel/corporate_headquarters*.json.tmp
 js_kernel/find_buildingspot*.json
 
-# ── OTHER PEOPLE'S DATA — the one entry here that is about privacy rather than noise ────────────
-# One file per person a contractor has worked for: their Minecraft name, and every building and
-# workstation they own. Publishing it would publish them. Nothing sweeps these files, by design,
-# so the only thing standing between them and a public repository is this line.
+# ── THE FLEET'S MEMORY OF ITS BASES ─────────────────────────────────────────────────────────────
+# One file per crew the foreman keeps (crew_memory), with every building and workstation the crew holds. It is a
+# world's state, never source. Nothing sweeps these files, by design, so this line keeps them out of the repository.
 player_memory/
 
 # ── Credentials ─────────────────────────────────────────────────────────────────────────────────
